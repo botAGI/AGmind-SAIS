@@ -11,3 +11,4 @@ build/
 *.log
 /var/log/
 config/config.local.yaml
+/.worktrees/
