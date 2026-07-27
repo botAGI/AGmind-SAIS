@@ -10,7 +10,7 @@ contracts:
 	$(UV_RUN) sync --python "$(PYTHON_VERSION)" --frozen --all-groups
 	$(UV_RUN) run --frozen ruff check core tests
 	$(UV_RUN) run --frozen mypy core/agmind_immune
-	$(UV_RUN) run --frozen pytest -q core/tests/test_contract_fixtures.py core/tests/test_contract_regressions.py tests/adversarial/test_contract_fuzz.py
+	$(UV_RUN) run --frozen pytest -q core/tests/test_contract_fixtures.py core/tests/test_contract_regressions.py core/tests/test_contract_rereview.py tests/adversarial/test_contract_fuzz.py
 	$(GO_RUN) go test ./internal/contracts ./internal/specialuse
 	$(GO_RUN) go test -fuzz=FuzzDecodeStrict -fuzztime=10s ./internal/contracts
 	$(GO_RUN) go test -fuzz=FuzzCanonicalJSON -fuzztime=10s ./internal/contracts

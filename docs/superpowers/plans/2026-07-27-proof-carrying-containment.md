@@ -68,6 +68,20 @@ The digests are multi-platform image-index digests containing `linux/amd64` and 
 
 `AGmind Canonical JSON v1` is UTF-8 JSON with recursively lexicographically sorted object keys, no insignificant whitespace, no duplicate keys, no floats/NaN/Infinity, base-10 integers, and no Unicode normalization. Optional fields are omitted rather than emitted as `null`. Identity, enum, digest, IP, and timestamp fields are ASCII-only. Attacker-originated display text is never part of a plan or approval prompt.
 
+Canonical integers are exactly the inclusive range `-9223372036854775808` through
+`18446744073709551615` (`-2^63..2^64-1`); lexical `-0` is invalid. Strict
+decoding and canonical writing allow at most 64 nested JSON containers, counting
+the top-level contract object as depth 1. Inputs exceeding either bound fail
+with a validation error.
+
+Falco `evt.res` is `SUCCESS` only for a completed success and otherwise is an
+errno name. A successful completed tuple requires `evt_rawres >= 0` together
+with `evt_res="SUCCESS"`. The only successful nonblocking tokens are exactly
+`EINPROGRESS` and `EINPROGRESS(115)`, and they require `evt_rawres` to be absent
+or negative. Every other `evt_res` is a hard error, cannot be candidate-capable,
+and may not be paired with a nonnegative `evt_rawres`; contradictory tuples are
+invalid.
+
 Use these exact derivations:
 
 ```text

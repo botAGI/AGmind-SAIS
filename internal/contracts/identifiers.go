@@ -14,6 +14,10 @@ func EventID(event EventEnvelopeV1) (string, error) {
 	if err := event.Validate(); err != nil {
 		return "", err
 	}
+	return eventIDUnchecked(event)
+}
+
+func eventIDUnchecked(event EventEnvelopeV1) (string, error) {
 	digest, err := hex.DecodeString(event.NormalizedFieldsSHA256)
 	if err != nil || len(digest) != sha256.Size {
 		return "", fmt.Errorf("invalid normalized_fields_sha256")

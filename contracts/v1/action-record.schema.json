@@ -102,7 +102,9 @@
           "type": "boolean"
         },
         {
-          "type": "integer"
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 18446744073709551615
         },
         {
           "type": "string",

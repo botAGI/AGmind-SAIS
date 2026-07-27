@@ -16,6 +16,11 @@
     "accepted": false
   },
   {
+    "name": "negative-zero",
+    "input_hex": "7b2278223a2d307d",
+    "accepted": false
+  },
+  {
     "name": "invalid-utf8",
     "input_hex": "7b2278223a22ff227d",
     "accepted": false

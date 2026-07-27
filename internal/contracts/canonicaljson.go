@@ -11,7 +11,7 @@ import (
 
 // CanonicalJSON emits the byte-for-byte AGmind Canonical JSON v1 form.
 func CanonicalJSON(v any) ([]byte, error) {
-	if err := rejectInvalidStrings(reflect.ValueOf(v)); err != nil {
+	if err := rejectInvalidStrings(reflect.ValueOf(v), 0); err != nil {
 		return nil, err
 	}
 	raw, err := json.Marshal(v)
@@ -25,13 +25,13 @@ func CanonicalJSON(v any) ([]byte, error) {
 		return nil, err
 	}
 	var out bytes.Buffer
-	if err := writeCanonical(&out, value); err != nil {
+	if err := writeCanonical(&out, value, 0); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
 }
 
-func rejectInvalidStrings(value reflect.Value) error {
+func rejectInvalidStrings(value reflect.Value, containerDepth int) error {
 	if !value.IsValid() {
 		return nil
 	}
@@ -39,7 +39,7 @@ func rejectInvalidStrings(value reflect.Value) error {
 		if value.IsNil() {
 			return nil
 		}
-		return rejectInvalidStrings(value.Elem())
+		return rejectInvalidStrings(value.Elem(), containerDepth)
 	}
 	switch value.Kind() {
 	case reflect.String:
@@ -49,27 +49,39 @@ func rejectInvalidStrings(value reflect.Value) error {
 	case reflect.Float32, reflect.Float64:
 		return fmt.Errorf("floating-point JSON is forbidden")
 	case reflect.Map:
+		depth := containerDepth + 1
+		if depth > maxJSONNestingDepth {
+			return fmt.Errorf("JSON nesting depth exceeds 64")
+		}
 		for _, key := range value.MapKeys() {
 			if key.Kind() != reflect.String {
 				return fmt.Errorf("JSON object keys must be strings")
 			}
-			if err := rejectInvalidStrings(key); err != nil {
+			if err := rejectInvalidStrings(key, depth); err != nil {
 				return err
 			}
-			if err := rejectInvalidStrings(value.MapIndex(key)); err != nil {
+			if err := rejectInvalidStrings(value.MapIndex(key), depth); err != nil {
 				return err
 			}
 		}
 	case reflect.Array, reflect.Slice:
+		depth := containerDepth + 1
+		if depth > maxJSONNestingDepth {
+			return fmt.Errorf("JSON nesting depth exceeds 64")
+		}
 		for i := 0; i < value.Len(); i++ {
-			if err := rejectInvalidStrings(value.Index(i)); err != nil {
+			if err := rejectInvalidStrings(value.Index(i), depth); err != nil {
 				return err
 			}
 		}
 	case reflect.Struct:
+		depth := containerDepth + 1
+		if depth > maxJSONNestingDepth {
+			return fmt.Errorf("JSON nesting depth exceeds 64")
+		}
 		for i := 0; i < value.NumField(); i++ {
 			if value.Field(i).CanInterface() {
-				if err := rejectInvalidStrings(value.Field(i)); err != nil {
+				if err := rejectInvalidStrings(value.Field(i), depth); err != nil {
 					return err
 				}
 			}
@@ -78,7 +90,7 @@ func rejectInvalidStrings(value reflect.Value) error {
 	return nil
 }
 
-func writeCanonical(out *bytes.Buffer, value any) error {
+func writeCanonical(out *bytes.Buffer, value any, containerDepth int) error {
 	switch value := value.(type) {
 	case nil:
 		out.WriteString("null")
@@ -91,22 +103,30 @@ func writeCanonical(out *bytes.Buffer, value any) error {
 	case string:
 		writeQuoted(out, value)
 	case json.Number:
-		if !integerJSON.MatchString(value.String()) {
-			return fmt.Errorf("floating-point JSON is forbidden")
+		if err := validateCanonicalInteger(value.String()); err != nil {
+			return err
 		}
 		out.WriteString(value.String())
 	case []any:
+		depth := containerDepth + 1
+		if depth > maxJSONNestingDepth {
+			return fmt.Errorf("JSON nesting depth exceeds 64")
+		}
 		out.WriteByte('[')
 		for i, item := range value {
 			if i > 0 {
 				out.WriteByte(',')
 			}
-			if err := writeCanonical(out, item); err != nil {
+			if err := writeCanonical(out, item, depth); err != nil {
 				return err
 			}
 		}
 		out.WriteByte(']')
 	case map[string]any:
+		depth := containerDepth + 1
+		if depth > maxJSONNestingDepth {
+			return fmt.Errorf("JSON nesting depth exceeds 64")
+		}
 		keys := make([]string, 0, len(value))
 		for key := range value {
 			keys = append(keys, key)
@@ -119,7 +139,7 @@ func writeCanonical(out *bytes.Buffer, value any) error {
 			}
 			writeQuoted(out, key)
 			out.WriteByte(':')
-			if err := writeCanonical(out, value[key]); err != nil {
+			if err := writeCanonical(out, value[key], depth); err != nil {
 				return err
 			}
 		}

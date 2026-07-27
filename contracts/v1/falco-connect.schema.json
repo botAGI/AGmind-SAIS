@@ -152,83 +152,62 @@
       }
     },
     {
-      "if": {
-        "properties": {
-          "successful_connect": {
-            "const": true
-          }
-        },
-        "required": [
-          "successful_connect"
-        ]
-      },
-      "then": {
-        "anyOf": [
-          {
-            "required": [
-              "evt_rawres"
-            ],
-            "properties": {
-              "evt_rawres": {
-                "minimum": 0
-              }
+      "oneOf": [
+        {
+          "required": [
+            "evt_rawres"
+          ],
+          "properties": {
+            "evt_res": {
+              "const": "SUCCESS"
+            },
+            "evt_rawres": {
+              "minimum": 0
+            },
+            "successful_connect": {
+              "const": true
             }
-          },
-          {
-            "properties": {
-              "evt_res": {
-                "pattern": "^[Ee][Ii][Nn][Pp][Rr][Oo][Gg][Rr][Ee][Ss][Ss](?:\\(115\\))?$"
-              }
-            },
-            "required": [
-              "evt_res"
-            ]
-          }
-        ]
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "successful_connect": {
-            "const": false
           }
         },
-        "required": [
-          "successful_connect"
-        ]
-      },
-      "then": {
-        "properties": {
-          "investigation_only": {
-            "const": true
-          }
-        },
-        "not": {
-          "anyOf": [
-            {
-              "required": [
-                "evt_rawres"
-              ],
-              "properties": {
-                "evt_rawres": {
-                  "minimum": 0
-                }
-              }
-            },
-            {
-              "properties": {
-                "evt_res": {
-                  "pattern": "^[Ee][Ii][Nn][Pp][Rr][Oo][Gg][Rr][Ee][Ss][Ss](?:\\(115\\))?$"
-                }
-              },
-              "required": [
-                "evt_res"
+        {
+          "properties": {
+            "evt_res": {
+              "enum": [
+                "EINPROGRESS",
+                "EINPROGRESS(115)"
               ]
+            },
+            "evt_rawres": {
+              "maximum": -1
+            },
+            "successful_connect": {
+              "const": true
             }
-          ]
+          }
+        },
+        {
+          "properties": {
+            "evt_res": {
+              "not": {
+                "enum": [
+                  "SUCCESS",
+                  "EINPROGRESS",
+                  "EINPROGRESS(115)"
+                ]
+              }
+            },
+            "evt_rawres": {
+              "maximum": -1
+            },
+            "successful_connect": {
+              "const": false
+            },
+            "investigation_only": {
+              "const": true
+            }
+          }
         }
-      }
+      ]
     }
   ],
   "$defs": {

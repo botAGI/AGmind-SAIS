@@ -28,6 +28,7 @@ MAX_UINT64 = 2**64 - 1
 MIN_INT64 = -(2**63)
 MAX_INT64 = 2**63 - 1
 SUCCESS_RESULTS = {"EINPROGRESS", "EINPROGRESS(115)"}
+MAX_JSON_NESTING_DEPTH = 64
 ACTION_STATES = {
     "PROPOSED",
     "POLICY_ADMITTED",
@@ -51,6 +52,22 @@ def _reject_constant(_: str) -> object:
     raise ValueError("non-finite JSON number is forbidden")
 
 
+def _parse_integer(token: str) -> int:
+    if token == "-0":
+        raise ValueError("lexical negative zero is forbidden")
+    if token.startswith("-"):
+        magnitude = token[1:]
+        limit = str(-MIN_INT64)
+    else:
+        magnitude = token
+        limit = str(MAX_UINT64)
+    if len(magnitude) > len(limit) or (
+        len(magnitude) == len(limit) and magnitude > limit
+    ):
+        raise ValueError("integer exceeds canonical range")
+    return int(token)
+
+
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -58,6 +75,29 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+def _validate_json_depth(text: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_JSON_NESTING_DEPTH:
+                raise ValueError("JSON nesting depth exceeds 64")
+        elif char in "]}":
+            depth -= 1
 
 
 def _validate_unicode(value: object) -> None:
@@ -79,8 +119,10 @@ def decode_strict[T: BaseModel](raw: bytes, model: type[T], max_bytes: int) -> T
     if max_bytes < 1 or len(raw) > max_bytes:
         raise ValueError("JSON input exceeds explicit byte limit")
     text = raw.decode("utf-8", "strict")
+    _validate_json_depth(text)
     decoder = json.JSONDecoder(
         object_pairs_hook=_unique_object,
+        parse_int=_parse_integer,
         parse_float=_reject_float,
         parse_constant=_reject_constant,
     )
@@ -98,6 +140,13 @@ def decode_strict[T: BaseModel](raw: bytes, model: type[T], max_bytes: int) -> T
     if not isinstance(value, dict):
         raise ValueError("contract JSON must be an object")  # noqa: TRY004
     _validate_unicode(value)
+    for field_name, field in model.model_fields.items():
+        wire_name = field.alias or field_name
+        if field.is_required() and wire_name not in value:
+            raise ValueError(f"missing required property: {wire_name}")
+    for field_name, field_value in value.items():
+        if field_value is None:
+            raise ValueError(f"top-level null is forbidden: {field_name}")
     return model.model_validate(value, strict=True)
 
 
@@ -119,6 +168,8 @@ def _ascii(value: str, field: str, maximum: int = 64, *, minimum: int = 1) -> st
         raise ValueError(f"{field} must be ASCII") from error
     if size < minimum or size > maximum:
         raise ValueError(f"{field} must be {minimum}..{maximum} ASCII bytes")
+    if any(not 0x20 <= ord(char) <= 0x7E for char in value):
+        raise ValueError(f"{field} must contain printable ASCII")
     return value
 
 
@@ -157,6 +208,66 @@ def _repo_digests(values: list[str]) -> list[str]:
     for item in values:
         _utf8(item, "repo digest", 256)
     return values
+
+
+def _validate_bounded_nested(
+    value: object,
+    *,
+    maximum_string_characters: int,
+    maximum_array_items: int,
+    maximum_object_properties: int,
+    maximum_property_name_characters: int,
+    container_depth: int = 1,
+) -> None:
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        if not MIN_INT64 <= value <= MAX_UINT64:
+            raise ValueError("nested integer exceeds canonical range")
+        return
+    if isinstance(value, float):
+        raise ValueError("nested floating-point value is forbidden")  # noqa: TRY004
+    if isinstance(value, str):
+        _validate_unicode(value)
+        if len(value) > maximum_string_characters:
+            raise ValueError("nested string exceeds schema bound")
+        return
+    if isinstance(value, list):
+        if container_depth > MAX_JSON_NESTING_DEPTH:
+            raise ValueError("JSON nesting depth exceeds 64")
+        if len(value) > maximum_array_items:
+            raise ValueError("nested array exceeds schema bound")
+        for item in value:
+            _validate_bounded_nested(
+                item,
+                maximum_string_characters=maximum_string_characters,
+                maximum_array_items=maximum_array_items,
+                maximum_object_properties=maximum_object_properties,
+                maximum_property_name_characters=maximum_property_name_characters,
+                container_depth=container_depth + 1,
+            )
+        return
+    if isinstance(value, dict):
+        if container_depth > MAX_JSON_NESTING_DEPTH:
+            raise ValueError("JSON nesting depth exceeds 64")
+        if len(value) > maximum_object_properties:
+            raise ValueError("nested object exceeds schema bound")
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("nested object keys must be strings")
+            _validate_unicode(key)
+            if len(key) > maximum_property_name_characters:
+                raise ValueError("nested property name exceeds schema bound")
+            _validate_bounded_nested(
+                item,
+                maximum_string_characters=maximum_string_characters,
+                maximum_array_items=maximum_array_items,
+                maximum_object_properties=maximum_object_properties,
+                maximum_property_name_characters=maximum_property_name_characters,
+                container_depth=container_depth + 1,
+            )
+        return
+    raise ValueError(f"unsupported nested JSON type: {type(value).__name__}")
 
 
 class EventEnvelopeV1(ContractModel):
@@ -259,11 +370,26 @@ class EventEnvelopeV1(ContractModel):
 
     @model_validator(mode="after")
     def normalized_fields_are_bounded(self) -> EventEnvelopeV1:
+        import hashlib
+
         from .canonicaljson import canonical_json
+        from .canonicaljson import event_id as derive_event_id
 
         canonical = canonical_json(self.normalized_fields)
         if len(canonical) > 32 * 1024:
             raise ValueError("normalized fields exceed 32 KiB")
+        _validate_bounded_nested(
+            self.normalized_fields,
+            maximum_string_characters=8_192,
+            maximum_array_items=128,
+            maximum_object_properties=128,
+            maximum_property_name_characters=512,
+        )
+        digest = hashlib.sha256(canonical).hexdigest()
+        if digest != self.normalized_fields_sha256:
+            raise ValueError("normalized_fields_sha256 does not match normalized_fields")
+        if derive_event_id(self) != self.event_id:
+            raise ValueError("event_id does not match locked derivation")
         return self
 
 
@@ -362,9 +488,23 @@ class FalcoConnectV1(ContractModel):
                 raise ValueError("falco_container_start_ts integer exceeds int64")
         else:
             _ascii(self.falco_container_start_ts, "falco_container_start_ts")
-        computed_success = (
-            self.evt_rawres is not None and self.evt_rawres >= 0
-        ) or self.evt_res.upper() in SUCCESS_RESULTS
+        completed_success = (
+            self.evt_res == "SUCCESS"
+            and self.evt_rawres is not None
+            and self.evt_rawres >= 0
+        )
+        nonblocking_success = (
+            self.evt_res in SUCCESS_RESULTS
+            and (self.evt_rawres is None or self.evt_rawres < 0)
+        )
+        hard_error = self.evt_res not in {"SUCCESS", *SUCCESS_RESULTS}
+        if self.evt_res == "SUCCESS" and not completed_success:
+            raise ValueError("invalid completed Falco result tuple")
+        if self.evt_res in SUCCESS_RESULTS and not nonblocking_success:
+            raise ValueError("invalid nonblocking Falco result tuple")
+        if hard_error and self.evt_rawres is not None and self.evt_rawres >= 0:
+            raise ValueError("invalid hard-error Falco result tuple")
+        computed_success = completed_success or nonblocking_success
         if self.successful_connect != computed_success:
             raise ValueError("successful_connect contradicts Falco result")
         authoritative = (
@@ -702,6 +842,13 @@ class ActionRecordV1(ContractModel):
             canonical_json,
         )
 
+        _validate_bounded_nested(
+            self.details,
+            maximum_string_characters=1_024,
+            maximum_array_items=64,
+            maximum_object_properties=64,
+            maximum_property_name_characters=64,
+        )
         if len(canonical_json(self.details)) > 32 * 1024:
             raise ValueError("action details exceed 32 KiB")
         if self.action_id is not None and self.action_id != action_id(self.plan_hash):

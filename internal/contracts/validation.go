@@ -1,13 +1,14 @@
 package contracts
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"regexp"
 	"sort"
-	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -36,11 +37,95 @@ func boundedASCII(value string, minimum, maximum int) bool {
 		return false
 	}
 	for _, r := range value {
-		if r > 0x7f {
+		if r < 0x20 || r > 0x7e {
 			return false
 		}
 	}
 	return true
+}
+
+type nestedBounds struct {
+	maxStringCharacters       int
+	maxArrayItems             int
+	maxObjectProperties       int
+	maxPropertyNameCharacters int
+}
+
+func validateBoundedNested(value any, bounds nestedBounds, containerDepth int) error {
+	if value == nil {
+		return nil
+	}
+	if number, ok := value.(json.Number); ok {
+		return validateCanonicalInteger(number.String())
+	}
+	current := reflect.ValueOf(value)
+	for current.Kind() == reflect.Interface {
+		if current.IsNil() {
+			return nil
+		}
+		current = current.Elem()
+	}
+	switch current.Kind() {
+	case reflect.Bool:
+		return nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return nil
+	case reflect.Float32, reflect.Float64:
+		return fmt.Errorf("nested floating-point value is forbidden")
+	case reflect.String:
+		value := current.String()
+		if !utf8.ValidString(value) ||
+			utf8.RuneCountInString(value) > bounds.maxStringCharacters {
+			return fmt.Errorf("nested string exceeds schema bound")
+		}
+		return nil
+	case reflect.Array, reflect.Slice:
+		if containerDepth > maxJSONNestingDepth {
+			return fmt.Errorf("JSON nesting depth exceeds 64")
+		}
+		if current.Len() > bounds.maxArrayItems {
+			return fmt.Errorf("nested array exceeds schema bound")
+		}
+		for i := 0; i < current.Len(); i++ {
+			if err := validateBoundedNested(
+				current.Index(i).Interface(),
+				bounds,
+				containerDepth+1,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	case reflect.Map:
+		if containerDepth > maxJSONNestingDepth {
+			return fmt.Errorf("JSON nesting depth exceeds 64")
+		}
+		if current.Type().Key().Kind() != reflect.String {
+			return fmt.Errorf("nested object keys must be strings")
+		}
+		if current.Len() > bounds.maxObjectProperties {
+			return fmt.Errorf("nested object exceeds schema bound")
+		}
+		iterator := current.MapRange()
+		for iterator.Next() {
+			key := iterator.Key().String()
+			if !utf8.ValidString(key) ||
+				utf8.RuneCountInString(key) > bounds.maxPropertyNameCharacters {
+				return fmt.Errorf("nested property name exceeds schema bound")
+			}
+			if err := validateBoundedNested(
+				iterator.Value().Interface(),
+				bounds,
+				containerDepth+1,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported nested JSON type %T", value)
+	}
 }
 
 func sortedUnique(values []string) bool {
@@ -126,6 +211,21 @@ func (event EventEnvelopeV1) Validate() error {
 	if len(canonical) > 32*1024 {
 		return fmt.Errorf("normalized fields exceed 32 KiB")
 	}
+	if err := validateBoundedNested(
+		event.NormalizedFields,
+		nestedBounds{8192, 128, 128, 512},
+		1,
+	); err != nil {
+		return err
+	}
+	digest := sha256.Sum256(canonical)
+	if hex.EncodeToString(digest[:]) != event.NormalizedFieldsSHA256 {
+		return fmt.Errorf("normalized_fields_sha256 does not match normalized_fields")
+	}
+	expectedID, err := eventIDUnchecked(event)
+	if err != nil || expectedID != event.EventID {
+		return fmt.Errorf("event_id does not match locked derivation")
+	}
 	return nil
 }
 
@@ -188,9 +288,25 @@ func (event FalcoConnectV1) Validate() error {
 			return fmt.Errorf("invalid missing field")
 		}
 	}
-	success := (event.EvtRawres != nil && *event.EvtRawres >= 0) ||
-		strings.EqualFold(event.EvtRes, "EINPROGRESS") ||
-		strings.EqualFold(event.EvtRes, "EINPROGRESS(115)")
+	completedSuccess := event.EvtRes == "SUCCESS" &&
+		event.EvtRawres != nil && *event.EvtRawres >= 0
+	nonblockingSuccess := (event.EvtRes == "EINPROGRESS" ||
+		event.EvtRes == "EINPROGRESS(115)") &&
+		(event.EvtRawres == nil || *event.EvtRawres < 0)
+	hardError := event.EvtRes != "SUCCESS" &&
+		event.EvtRes != "EINPROGRESS" &&
+		event.EvtRes != "EINPROGRESS(115)"
+	if event.EvtRes == "SUCCESS" && !completedSuccess {
+		return fmt.Errorf("invalid completed Falco result tuple")
+	}
+	if (event.EvtRes == "EINPROGRESS" || event.EvtRes == "EINPROGRESS(115)") &&
+		!nonblockingSuccess {
+		return fmt.Errorf("invalid nonblocking Falco result tuple")
+	}
+	if hardError && event.EvtRawres != nil && *event.EvtRawres >= 0 {
+		return fmt.Errorf("invalid hard-error Falco result tuple")
+	}
+	success := completedSuccess || nonblockingSuccess
 	if event.SuccessfulConnect != success {
 		return fmt.Errorf("successful_connect contradicts Falco result")
 	}
@@ -384,6 +500,13 @@ func (record ActionRecordV1) Validate() error {
 	details, err := CanonicalJSON(record.Details)
 	if err != nil || len(details) > 32*1024 {
 		return fmt.Errorf("action details exceed bound: %w", err)
+	}
+	if err := validateBoundedNested(
+		record.Details,
+		nestedBounds{1024, 64, 64, 64},
+		1,
+	); err != nil {
+		return err
 	}
 	expectedHash, err := ActionRecordHash(record)
 	if err != nil || expectedHash != record.RecordSHA256 {

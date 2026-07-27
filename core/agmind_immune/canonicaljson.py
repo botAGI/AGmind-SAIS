@@ -9,6 +9,10 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel
 
+MIN_CANONICAL_INTEGER = -(2**63)
+MAX_CANONICAL_INTEGER = 2**64 - 1
+MAX_JSON_NESTING_DEPTH = 64
+
 
 def _quote(value: str) -> str:
     try:
@@ -38,9 +42,9 @@ def _quote(value: str) -> str:
     return "".join(out)
 
 
-def _encode(value: object) -> str:
+def _encode(value: object, container_depth: int = 0) -> str:
     if isinstance(value, BaseModel):
-        return _encode(value.model_dump(exclude_none=True))
+        return _encode(value.model_dump(exclude_none=True), container_depth)
     if value is None:
         return "null"
     if value is True:
@@ -48,21 +52,30 @@ def _encode(value: object) -> str:
     if value is False:
         return "false"
     if isinstance(value, int):
+        if not MIN_CANONICAL_INTEGER <= value <= MAX_CANONICAL_INTEGER:
+            raise ValueError("integer exceeds canonical range")
         return str(value)
     if isinstance(value, float):
         raise ValueError("floating-point JSON is forbidden")  # noqa: TRY004
     if isinstance(value, str):
         return _quote(value)
     if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_encode(item) for item in value) + "]"
+        depth = container_depth + 1
+        if depth > MAX_JSON_NESTING_DEPTH:
+            raise ValueError("JSON nesting depth exceeds 64")
+        return "[" + ",".join(_encode(item, depth) for item in value) + "]"
     if isinstance(value, Mapping):
+        depth = container_depth + 1
+        if depth > MAX_JSON_NESTING_DEPTH:
+            raise ValueError("JSON nesting depth exceeds 64")
         if not all(isinstance(key, str) for key in value):
             raise ValueError("JSON object keys must be strings")
         document = dict(value)
         return (
             "{"
             + ",".join(
-                _quote(key) + ":" + _encode(document[key]) for key in sorted(document)
+                _quote(key) + ":" + _encode(document[key], depth)
+                for key in sorted(document)
             )
             + "}"
         )

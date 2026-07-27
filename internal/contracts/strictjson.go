@@ -5,11 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
 var integerJSON = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
+
+const maxJSONNestingDepth = 64
 
 // DecodeStrict consumes one bounded JSON object. The Contract constraint makes
 // exhaustive validation a compile-time obligation for every generic type.
@@ -40,7 +46,8 @@ func DecodeStrict[T Contract](r io.Reader, maxBytes int64) (T, error) {
 	if value == nil {
 		return zero, fmt.Errorf("contract JSON must be an object")
 	}
-	if _, ok := value.(map[string]any); !ok {
+	document, ok := value.(map[string]any)
+	if !ok {
 		return zero, fmt.Errorf("contract JSON must be an object")
 	}
 	if token, err := decoder.Token(); err != io.EOF {
@@ -48,6 +55,9 @@ func DecodeStrict[T Contract](r io.Reader, maxBytes int64) (T, error) {
 			return zero, fmt.Errorf("trailing JSON data is forbidden: %v", token)
 		}
 		return zero, fmt.Errorf("trailing JSON data: %w", err)
+	}
+	if err := validateRawContractObject(document, reflect.TypeOf(zero)); err != nil {
+		return zero, err
 	}
 	normalized, err := json.Marshal(value)
 	if err != nil {
@@ -63,6 +73,53 @@ func DecodeStrict[T Contract](r io.Reader, maxBytes int64) (T, error) {
 		return zero, err
 	}
 	return zero, nil
+}
+
+func validateRawContractObject(document map[string]any, contractType reflect.Type) error {
+	required := requiredJSONFields(contractType)
+	for _, field := range required {
+		value, exists := document[field]
+		if !exists {
+			return fmt.Errorf("missing required property: %s", field)
+		}
+		if value == nil {
+			return fmt.Errorf("required property must not be null: %s", field)
+		}
+	}
+	for field, value := range document {
+		if value == nil {
+			return fmt.Errorf("top-level null is forbidden: %s", field)
+		}
+	}
+	return nil
+}
+
+func requiredJSONFields(contractType reflect.Type) []string {
+	for contractType.Kind() == reflect.Pointer {
+		contractType = contractType.Elem()
+	}
+	var fields []string
+	for i := 0; i < contractType.NumField(); i++ {
+		field := contractType.Field(i)
+		tag := field.Tag.Get("json")
+		parts := strings.Split(tag, ",")
+		if field.Anonymous && (tag == "" || parts[0] == "") {
+			fields = append(fields, requiredJSONFields(field.Type)...)
+			continue
+		}
+		if parts[0] == "" || parts[0] == "-" {
+			continue
+		}
+		optional := false
+		for _, option := range parts[1:] {
+			optional = optional || option == "omitempty"
+		}
+		if !optional {
+			fields = append(fields, parts[0])
+		}
+	}
+	sort.Strings(fields)
+	return fields
 }
 
 func validateEscapedSurrogates(raw []byte) error {
@@ -129,6 +186,10 @@ func readHexQuad(raw []byte, start int) (uint16, error) {
 }
 
 func strictValue(decoder *json.Decoder) (any, error) {
+	return strictValueAtDepth(decoder, 0)
+}
+
+func strictValueAtDepth(decoder *json.Decoder, containerDepth int) (any, error) {
 	token, err := decoder.Token()
 	if err != nil {
 		return nil, err
@@ -137,6 +198,10 @@ func strictValue(decoder *json.Decoder) (any, error) {
 	case json.Delim:
 		switch token {
 		case '{':
+			depth := containerDepth + 1
+			if depth > maxJSONNestingDepth {
+				return nil, fmt.Errorf("JSON nesting depth exceeds 64")
+			}
 			object := make(map[string]any)
 			for decoder.More() {
 				keyToken, err := decoder.Token()
@@ -150,7 +215,7 @@ func strictValue(decoder *json.Decoder) (any, error) {
 				if _, exists := object[key]; exists {
 					return nil, fmt.Errorf("duplicate JSON key: %s", key)
 				}
-				child, err := strictValue(decoder)
+				child, err := strictValueAtDepth(decoder, depth)
 				if err != nil {
 					return nil, err
 				}
@@ -162,9 +227,13 @@ func strictValue(decoder *json.Decoder) (any, error) {
 			}
 			return object, nil
 		case '[':
+			depth := containerDepth + 1
+			if depth > maxJSONNestingDepth {
+				return nil, fmt.Errorf("JSON nesting depth exceeds 64")
+			}
 			array := make([]any, 0)
 			for decoder.More() {
-				child, err := strictValue(decoder)
+				child, err := strictValueAtDepth(decoder, depth)
 				if err != nil {
 					return nil, err
 				}
@@ -179,8 +248,8 @@ func strictValue(decoder *json.Decoder) (any, error) {
 			return nil, fmt.Errorf("unexpected JSON delimiter")
 		}
 	case json.Number:
-		if !integerJSON.MatchString(token.String()) {
-			return nil, fmt.Errorf("floating-point JSON is forbidden")
+		if err := validateCanonicalInteger(token.String()); err != nil {
+			return nil, err
 		}
 		return token, nil
 	case string, bool, nil:
@@ -188,4 +257,23 @@ func strictValue(decoder *json.Decoder) (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported JSON value")
 	}
+}
+
+func validateCanonicalInteger(token string) error {
+	if !integerJSON.MatchString(token) {
+		return fmt.Errorf("floating-point JSON is forbidden")
+	}
+	if token == "-0" {
+		return fmt.Errorf("lexical negative zero is forbidden")
+	}
+	if strings.HasPrefix(token, "-") {
+		if _, err := strconv.ParseInt(token, 10, 64); err != nil {
+			return fmt.Errorf("integer exceeds canonical range")
+		}
+		return nil
+	}
+	if _, err := strconv.ParseUint(token, 10, 64); err != nil {
+		return fmt.Errorf("integer exceeds canonical range")
+	}
+	return nil
 }
