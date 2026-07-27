@@ -16,6 +16,19 @@ func EventID(event EventEnvelopeV1) (string, error) {
 }
 
 func eventIDUnchecked(event EventEnvelopeV1) (string, error) {
+	return DeriveEventID(event)
+}
+
+// DeriveEventID validates only the fields in the locked event-ID preimage.
+// Producers use it before source_signature and event_id exist; EventID remains
+// the complete-contract validating API for consumers.
+func DeriveEventID(event EventEnvelopeV1) (string, error) {
+	if !uuid4.MatchString(event.HostID) ||
+		!uuid4.MatchString(event.BootID) ||
+		event.KeyEpoch < 1 ||
+		event.SourceSequence < 1 {
+		return "", fmt.Errorf("invalid event ID derivation identity")
+	}
 	digest, err := hex.DecodeString(event.NormalizedFieldsSHA256)
 	if err != nil || len(digest) != sha256.Size {
 		return "", fmt.Errorf("invalid normalized_fields_sha256")
