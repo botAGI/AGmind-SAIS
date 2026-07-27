@@ -5,16 +5,15 @@ package uds
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
-	"unicode/utf8"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -22,14 +21,136 @@ import (
 var umaskMutex sync.Mutex
 
 const (
-	peerStatusMaxBytes  = 16 * 1024
-	peerStatusMaxGroups = 256
+	peerGroupsInitial = 16
+	peerGroupsMax     = 256
 )
 
 type syscallConnection interface {
 	SyscallConn() (syscall.RawConn, error)
 }
 
+type socketPeerGroupsReader func(int) ([]uint32, error)
+
+type socketPeerGroupsCall func(int, []uint32) (uint32, error)
+
+func callSocketPeerGroups(fd int, groups []uint32) (uint32, error) {
+	if fd < 0 || len(groups) == 0 {
+		return 0, ErrInvalidPeer
+	}
+	length := uint32(len(groups) * 4)
+	_, _, errno := unix.Syscall6(
+		unix.SYS_GETSOCKOPT,
+		uintptr(fd),
+		uintptr(unix.SOL_SOCKET),
+		uintptr(unix.SO_PEERGROUPS),
+		uintptr(unsafe.Pointer(&groups[0])),
+		uintptr(unsafe.Pointer(&length)),
+		0,
+	)
+	runtime.KeepAlive(groups)
+	if errno != 0 {
+		return length, errno
+	}
+	return length, nil
+}
+
+func readSocketPeerGroupsWith(
+	fd int,
+	call socketPeerGroupsCall,
+) ([]uint32, error) {
+	if fd < 0 || call == nil {
+		return nil, ErrInvalidPeer
+	}
+	groups := make([]uint32, peerGroupsInitial)
+	for attempt := 0; attempt < 2; attempt++ {
+		length, err := call(fd, groups)
+		if err != nil && !errors.Is(err, unix.ERANGE) {
+			return nil, err
+		}
+		if length%4 != 0 {
+			if errors.Is(err, unix.ERANGE) {
+				return nil, unix.ERANGE
+			}
+			return nil, ErrInvalidPeer
+		}
+		count := int(length / 4)
+		if count > peerGroupsMax {
+			if errors.Is(err, unix.ERANGE) {
+				return nil, unix.ERANGE
+			}
+			return nil, ErrInvalidPeer
+		}
+		if err == nil {
+			if count > len(groups) {
+				return nil, ErrInvalidPeer
+			}
+			return append([]uint32(nil), groups[:count]...), nil
+		}
+		if count <= len(groups) {
+			return nil, unix.ERANGE
+		}
+		if attempt == 1 {
+			return nil, unix.ERANGE
+		}
+		groups = make([]uint32, count)
+	}
+	return nil, unix.ERANGE
+}
+
+func readSocketPeerGroups(fd int) ([]uint32, error) {
+	return readSocketPeerGroupsWith(fd, callSocketPeerGroups)
+}
+
+func applySocketPeerGroups(
+	peer Peer,
+	groups []uint32,
+	groupErr error,
+) (Peer, error) {
+	if groupErr != nil {
+		if errors.Is(groupErr, unix.ENOPROTOOPT) ||
+			errors.Is(groupErr, unix.EOPNOTSUPP) ||
+			errors.Is(groupErr, unix.ERANGE) {
+			// SO_PEERCRED remains authoritative. Supplementary-only
+			// authorization fails closed when the socket option is absent or
+			// the bounded capture cannot contain the peer's group list.
+			return peer, nil
+		}
+		return Peer{}, ErrInvalidPeer
+	}
+	if len(groups) > peerGroupsMax {
+		return Peer{}, ErrInvalidPeer
+	}
+	peer.supplementaryGroups = append([]uint32(nil), groups...)
+	peer.supplementaryGroupsCaptured = true
+	return peer, nil
+}
+
+func peerCredentialsFromFD(
+	fd int,
+	readGroups socketPeerGroupsReader,
+) (Peer, error) {
+	if readGroups == nil {
+		return Peer{}, ErrInvalidPeer
+	}
+	credentials, err := unix.GetsockoptUcred(
+		fd,
+		unix.SOL_SOCKET,
+		unix.SO_PEERCRED,
+	)
+	if err != nil || credentials == nil || credentials.Pid <= 0 {
+		return Peer{}, ErrInvalidPeer
+	}
+	peer := Peer{
+		PID: credentials.Pid,
+		UID: credentials.Uid,
+		GID: credentials.Gid,
+	}
+	groups, groupErr := readGroups(fd)
+	return applySocketPeerGroups(peer, groups, groupErr)
+}
+
+// PeerCredentials captures process and supplementary group credentials from
+// the accepted Unix socket. No PID-indexed process metadata is consulted.
 func PeerCredentials(connection net.Conn) (Peer, error) {
 	if _, ok := connection.LocalAddr().(*net.UnixAddr); !ok {
 		return Peer{}, ErrInvalidPeer
@@ -42,115 +163,29 @@ func PeerCredentials(connection net.Conn) (Peer, error) {
 	if err != nil {
 		return Peer{}, ErrInvalidPeer
 	}
-	var credentials *unix.Ucred
+	var peer Peer
 	var socketErr error
 	if err := raw.Control(func(fd uintptr) {
-		credentials, socketErr = unix.GetsockoptUcred(
+		peer, socketErr = peerCredentialsFromFD(
 			int(fd),
-			unix.SOL_SOCKET,
-			unix.SO_PEERCRED,
+			readSocketPeerGroups,
 		)
 	}); err != nil {
 		return Peer{}, ErrInvalidPeer
 	}
-	if socketErr != nil || credentials == nil || credentials.Pid <= 0 {
+	if socketErr != nil || peer.PID <= 0 {
 		return Peer{}, ErrInvalidPeer
 	}
-	return Peer{
-		PID: credentials.Pid,
-		UID: credentials.Uid,
-		GID: credentials.Gid,
-	}, nil
+	return peer, nil
 }
 
-func peerInGroupStatus(peer Peer, group uint32, raw []byte) (bool, error) {
-	if peer.PID <= 0 ||
-		len(raw) == 0 ||
-		len(raw) > peerStatusMaxBytes ||
-		!utf8.Valid(raw) ||
-		strings.IndexByte(string(raw), 0) >= 0 {
-		return false, ErrInvalidPeer
-	}
-	var pidSeen, uidSeen, gidSeen, groupsSeen bool
-	member := false
-	for _, line := range strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		switch fields[0] {
-		case "Pid:":
-			if pidSeen || len(fields) != 2 {
-				return false, ErrInvalidPeer
-			}
-			value, err := strconv.ParseInt(fields[1], 10, 32)
-			if err != nil || int32(value) != peer.PID {
-				return false, ErrInvalidPeer
-			}
-			pidSeen = true
-		case "Uid:":
-			if uidSeen || len(fields) != 5 {
-				return false, ErrInvalidPeer
-			}
-			for _, field := range fields[1:] {
-				value, err := strconv.ParseUint(field, 10, 32)
-				if err != nil || uint32(value) != peer.UID {
-					return false, ErrInvalidPeer
-				}
-			}
-			uidSeen = true
-		case "Gid:":
-			if gidSeen || len(fields) != 5 {
-				return false, ErrInvalidPeer
-			}
-			for _, field := range fields[1:] {
-				value, err := strconv.ParseUint(field, 10, 32)
-				if err != nil || uint32(value) != peer.GID {
-					return false, ErrInvalidPeer
-				}
-			}
-			gidSeen = true
-		case "Groups:":
-			if groupsSeen ||
-				len(fields) < 2 ||
-				len(fields)-1 > peerStatusMaxGroups {
-				return false, ErrInvalidPeer
-			}
-			for _, field := range fields[1:] {
-				value, err := strconv.ParseUint(field, 10, 32)
-				if err != nil {
-					return false, ErrInvalidPeer
-				}
-				member = member || uint32(value) == group
-			}
-			groupsSeen = true
-		}
-	}
-	if !pidSeen || !uidSeen || !gidSeen || !groupsSeen {
-		return false, ErrInvalidPeer
-	}
-	return member, nil
-}
-
-// PeerInGroup verifies a supplementary group through a bounded parse of the
-// kernel-owned /proc status for the SO_PEERCRED PID. Request headers are never
-// consulted.
+// PeerInGroup trusts only the primary GID from SO_PEERCRED and supplementary
+// groups captured by SO_PEERGROUPS on the accepted socket.
 func PeerInGroup(peer Peer, group uint32) (bool, error) {
-	if peer.PID <= 0 {
-		return false, ErrInvalidPeer
+	if peer.GID == group {
+		return true, nil
 	}
-	file, err := os.Open(
-		"/proc/" + strconv.FormatInt(int64(peer.PID), 10) + "/status",
-	)
-	if err != nil {
-		return false, ErrInvalidPeer
-	}
-	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, peerStatusMaxBytes+1))
-	if err != nil {
-		return false, ErrInvalidPeer
-	}
-	return peerInGroupStatus(peer, group, raw)
+	return peer.inSupplementaryGroup(group), nil
 }
 
 type parentHandle struct {
@@ -173,8 +208,16 @@ func splitAbsolute(path string) ([]string, error) {
 	return parts, nil
 }
 
-func openParent(path string) (parentHandle, error) {
-	if os.Geteuid() != 0 {
+func openParent(path string, gid int) (parentHandle, error) {
+	return openParentWithBoundary(path, gid, nil)
+}
+
+func openParentWithBoundary(
+	path string,
+	gid int,
+	boundary func(socketOwnershipBoundary),
+) (parentHandle, error) {
+	if os.Geteuid() != 0 || gid < 0 || int(uint32(gid)) != gid {
 		return parentHandle{}, ErrUnsupportedPlatform
 	}
 	parts, err := splitAbsolute(path)
@@ -190,30 +233,32 @@ func openParent(path string) (parentHandle, error) {
 		return parentHandle{}, result
 	}
 	for index, part := range parts[:len(parts)-1] {
+		final := index == len(parts)-2
 		next, openErr := unix.Openat(
 			current,
 			part,
 			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
 			0,
 		)
-		if openErr != nil && errors.Is(openErr, unix.ENOENT) &&
-			index == len(parts)-2 {
-			if mkdirErr := unix.Mkdirat(current, part, 0o750); mkdirErr != nil {
-				return fail(ErrUnsafeSocket)
-			}
-			next, openErr = unix.Openat(
-				current,
-				part,
-				unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
-				0,
-			)
-			if openErr == nil {
-				_ = unix.Fchmod(next, 0o750)
-				_ = unix.Fchown(next, 0, 0)
-			}
+		if openErr != nil && errors.Is(openErr, unix.ENOENT) && final {
+			next, openErr = publishSocketParent(current, part, gid, boundary)
 		}
 		if openErr != nil {
 			return fail(ErrUnsafeSocket)
+		}
+		if final {
+			var stat unix.Stat_t
+			if err := unix.Fstat(next, &stat); err != nil {
+				_ = unix.Close(next)
+				return fail(err)
+			}
+			if stat.Mode&unix.S_IFMT != unix.S_IFDIR ||
+				stat.Uid != 0 ||
+				stat.Gid != uint32(gid) ||
+				stat.Mode&0o777 != 0o750 {
+				_ = unix.Close(next)
+				return fail(ErrUnsafeSocket)
+			}
 		}
 		_ = unix.Close(current)
 		current = next
@@ -224,6 +269,7 @@ func openParent(path string) (parentHandle, error) {
 	}
 	if stat.Mode&unix.S_IFMT != unix.S_IFDIR ||
 		stat.Uid != 0 ||
+		stat.Gid != uint32(gid) ||
 		stat.Mode&0o777 != 0o750 {
 		return fail(ErrUnsafeSocket)
 	}
@@ -240,43 +286,115 @@ func socketStat(parent parentHandle) (unix.Stat_t, error) {
 	return stat, err
 }
 
-func existingSocketActive(path string) bool {
-	connection, err := net.DialTimeout("unix", path, 100*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = connection.Close()
-	return true
+func pendingSocketSafe(stat unix.Stat_t) bool {
+	return stat.Mode&unix.S_IFMT == unix.S_IFSOCK &&
+		stat.Uid == 0 &&
+		stat.Nlink == 1
+}
+
+func activeSocketSafe(stat unix.Stat_t, mode os.FileMode, gid int) bool {
+	return pendingSocketSafe(stat) &&
+		stat.Gid == uint32(gid) &&
+		stat.Mode&0o777 == uint32(mode.Perm())
 }
 
 func listenOwned(path string, mode os.FileMode, gid int) (*ownedListener, error) {
-	if mode != 0o600 && mode != 0o660 || gid < 0 {
+	return listenOwnedWithOptions(path, mode, gid, listenOwnedOptions{})
+}
+
+func listenOwnedWithOptions(
+	path string,
+	mode os.FileMode,
+	gid int,
+	options listenOwnedOptions,
+) (*ownedListener, error) {
+	if mode != 0o600 && mode != 0o660 ||
+		gid < 0 ||
+		int(uint32(gid)) != gid {
 		return nil, ErrUnsafeSocket
 	}
-	parent, err := openParent(path)
+	parent, err := openParentWithBoundary(path, gid, options.boundary)
 	if err != nil {
 		return nil, err
 	}
-	fail := func(result error) (*ownedListener, error) {
+	lock, err := acquireSocketLock(parent)
+	if err != nil {
 		_ = unix.Close(parent.fd)
-		return nil, result
+		return nil, err
 	}
-	if stat, statErr := socketStat(parent); statErr == nil {
-		if stat.Mode&unix.S_IFMT != unix.S_IFSOCK ||
-			stat.Uid != uint32(os.Geteuid()) ||
-			stat.Gid != uint32(gid) ||
-			stat.Mode&0o777 != uint32(mode.Perm()) ||
-			stat.Nlink != 1 {
+	var releaseOnce sync.Once
+	var releaseErr error
+	release := func() error {
+		releaseOnce.Do(func() {
+			lockErr := lock.Close()
+			closeErr := unix.Close(parent.fd)
+			parent.fd = -1
+			releaseErr = errors.Join(lockErr, closeErr)
+		})
+		return releaseErr
+	}
+	fail := func(result error) (*ownedListener, error) {
+		return nil, errors.Join(result, release())
+	}
+
+	marker, markerErr := readSocketOwner(parent)
+	markerExists := markerErr == nil
+	if markerExists {
+		if err := marker.validateFor(parent, mode, gid); err != nil {
+			return fail(err)
+		}
+	} else if !errors.Is(markerErr, os.ErrNotExist) {
+		return fail(ErrUnsafeSocket)
+	}
+	stat, statErr := socketStat(parent)
+	if statErr == nil {
+		if !markerExists {
 			return fail(ErrUnsafeSocket)
 		}
-		if existingSocketActive(path) {
-			return fail(ErrSocketInUse)
+		switch marker.State {
+		case "pending":
+			if !pendingSocketSafe(stat) {
+				return fail(ErrUnsafeSocket)
+			}
+		case "active":
+			if !activeSocketSafe(stat, mode, gid) ||
+				marker.Device != uint64(stat.Dev) ||
+				marker.Inode != uint64(stat.Ino) {
+				return fail(ErrUnsafeSocket)
+			}
+		default:
+			return fail(ErrUnsafeSocket)
 		}
 		if err := unix.Unlinkat(parent.fd, parent.base, 0); err != nil {
-			return fail(ErrUnsafeSocket)
+			return fail(err)
+		}
+		if err := syncDirectoryDescriptor(parent.fd); err != nil {
+			return fail(err)
+		}
+		if options.boundary != nil {
+			options.boundary(socketBoundaryStaleUnlinked)
 		}
 	} else if !errors.Is(statErr, unix.ENOENT) {
 		return fail(ErrUnsafeSocket)
+	}
+
+	generation, err := newSocketGeneration()
+	if err != nil {
+		return fail(err)
+	}
+	pending := socketOwnerMarker{
+		SchemaVersion: socketOwnerSchema,
+		State:         "pending",
+		SocketBase:    parent.base,
+		Mode:          uint32(mode.Perm()),
+		GID:           uint32(gid),
+		Generation:    generation,
+	}
+	if err := saveSocketOwner(parent, pending); err != nil {
+		return fail(err)
+	}
+	if options.boundary != nil {
+		options.boundary(socketBoundaryPendingWritten)
 	}
 
 	procPath := "/proc/self/fd/" + strconv.Itoa(parent.fd) + "/" + parent.base
@@ -289,15 +407,17 @@ func listenOwned(path string, mode os.FileMode, gid int) (*ownedListener, error)
 		return fail(fmt.Errorf("%w: bind failed", ErrUnsafeSocket))
 	}
 	listener.SetUnlinkOnClose(false)
+	if options.boundary != nil {
+		options.boundary(socketBoundaryBound)
+	}
 	closeListener := func(result error) (*ownedListener, error) {
 		_ = listener.Close()
-		_ = unix.Unlinkat(parent.fd, parent.base, 0)
 		return fail(result)
 	}
 	if err := unix.Fchownat(
 		parent.fd,
 		parent.base,
-		os.Geteuid(),
+		0,
 		gid,
 		unix.AT_SYMLINK_NOFOLLOW,
 	); err != nil {
@@ -308,39 +428,58 @@ func listenOwned(path string, mode os.FileMode, gid int) (*ownedListener, error)
 	}
 	boundStat, err := socketStat(parent)
 	if err != nil ||
-		boundStat.Mode&unix.S_IFMT != unix.S_IFSOCK ||
-		boundStat.Uid != uint32(os.Geteuid()) ||
-		boundStat.Gid != uint32(gid) ||
-		boundStat.Mode&0o777 != uint32(mode.Perm()) ||
-		boundStat.Nlink != 1 {
+		!activeSocketSafe(boundStat, mode, gid) {
 		return closeListener(ErrUnsafeSocket)
+	}
+	if err := syncDirectoryDescriptor(parent.fd); err != nil {
+		return closeListener(err)
+	}
+	if options.boundary != nil {
+		options.boundary(socketBoundaryConfigured)
+	}
+	active := pending
+	active.State = "active"
+	active.Device = uint64(boundStat.Dev)
+	active.Inode = uint64(boundStat.Ino)
+	if err := saveSocketOwner(parent, active); err != nil {
+		return closeListener(err)
+	}
+	if options.boundary != nil {
+		options.boundary(socketBoundaryActiveWritten)
 	}
 	device, inode := boundStat.Dev, boundStat.Ino
 	var removeOnce sync.Once
 	var removeErr error
 	remove := func() error {
 		removeOnce.Do(func() {
+			currentMarker, markerErr := readSocketOwner(parent)
+			if markerErr != nil || currentMarker != active {
+				removeErr = ErrUnsafeSocket
+				removeErr = errors.Join(removeErr, release())
+				return
+			}
 			current, err := socketStat(parent)
-			if err == nil && current.Dev == device && current.Ino == inode {
+			if err == nil &&
+				activeSocketSafe(current, mode, gid) &&
+				current.Dev == device &&
+				current.Ino == inode {
 				removeErr = unix.Unlinkat(parent.fd, parent.base, 0)
 				if removeErr == nil {
-					directory := os.NewFile(uintptr(parent.fd), parent.path)
-					if directory != nil {
-						removeErr = directory.Sync()
-						_ = directory.Close()
-						parent.fd = -1
-					}
+					removeErr = syncDirectoryDescriptor(parent.fd)
 				}
-			} else if err != nil && !errors.Is(err, unix.ENOENT) {
+				if removeErr == nil {
+					removeErr = removeSocketOwner(parent, active)
+				}
+			} else {
 				removeErr = ErrUnsafeSocket
 			}
-			if parent.fd >= 0 {
-				closeErr := unix.Close(parent.fd)
-				removeErr = errors.Join(removeErr, closeErr)
-				parent.fd = -1
-			}
+			removeErr = errors.Join(removeErr, release())
 		})
 		return removeErr
 	}
-	return &ownedListener{listener: listener, remove: remove}, nil
+	return &ownedListener{
+		listener: listener,
+		remove:   remove,
+		abandon:  release,
+	}, nil
 }

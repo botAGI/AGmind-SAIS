@@ -168,6 +168,8 @@ func TestStartupRejectsSequenceRollbackAndSymlinkAlias(t *testing.T) {
 			state.mutex.Lock()
 			next := state.state
 			next.LastSequence = 0
+			next.PublicationHeadSequence = 0
+			next.PublicationHeadHash = zeroPublicationHash
 			if err := state.replaceLocked(next); err != nil {
 				state.mutex.Unlock()
 				t.Fatal(err)
@@ -353,7 +355,7 @@ func TestAckIsDurableBeforeDeleteAndLogicalOnCleanupFailure(t *testing.T) {
 	}
 	item := spool.items[event.SourceSequence]
 	removeErr := errors.New("injected remove failure")
-	spool.remove = func(string) error { return removeErr }
+	spool.remove = func(string, durablefile.FileIdentity) error { return removeErr }
 	if err := spool.Ack(
 		item.Sequence,
 		item.EventID,
@@ -376,7 +378,9 @@ func TestAckIsDurableBeforeDeleteAndLogicalOnCleanupFailure(t *testing.T) {
 	if len(items) != 0 {
 		t.Fatal("durably acked item was redelivered after cleanup failure")
 	}
-	spool.remove = os.Remove
+	spool.remove = func(path string, identity durablefile.FileIdentity) error {
+		return durablefile.RemoveIfIdentity(path, identity)
+	}
 	if err := spool.Ack(item.Sequence, item.EventID, item.ContentSHA256); err != nil {
 		t.Fatal(err)
 	}
@@ -390,14 +394,14 @@ func TestAckJournalAheadReconcilesForwardButJournalRegressionFailsClosed(t *test
 		mutate    func(*testing.T, string, []byte)
 		wantError bool
 	}{
-		"journal ahead": {
+		"cleaned journal ahead without durable anchor": {
 			mutate: func(t *testing.T, statePath string, oldState []byte) {
 				t.Helper()
 				if err := durablefile.AtomicWrite(statePath, oldState); err != nil {
 					t.Fatal(err)
 				}
 			},
-			wantError: false,
+			wantError: true,
 		},
 		"journal regression": {
 			mutate: func(t *testing.T, statePath string, _ []byte) {
@@ -676,7 +680,7 @@ func TestAckJournalCountsTowardQuotaAndCompactsToOneCheckpoint(t *testing.T) {
 		}
 		var wantTotal uint64 = uint64(ackInfo.Size())
 		for _, remaining := range spool.items {
-			wantTotal += remaining.frameBytes
+			wantTotal += remaining.frameBytes + remaining.publicationBytes
 		}
 		if spool.totalBytes != wantTotal ||
 			spool.totalBytes > spool.config.MaxBytes {

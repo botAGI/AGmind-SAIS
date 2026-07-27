@@ -19,9 +19,11 @@ var (
 )
 
 type journalOptions struct {
-	maxFrame uint32
-	sync     func(*os.File) error
-	write    func(*os.File, []byte) (int, error)
+	maxFrame    uint32
+	sync        func(*os.File) error
+	syncDir     func(int) error
+	write       func(*os.File, []byte) (int, error)
+	beforeFlock func()
 }
 
 // Option customizes journal I/O. The injection points are intentionally small
@@ -40,9 +42,21 @@ func WithSync(syncFn func(*os.File) error) Option {
 	}
 }
 
+func WithDirectorySync(syncFn func(int) error) Option {
+	return func(options *journalOptions) {
+		options.syncDir = syncFn
+	}
+}
+
 func WithWrite(writeFn func(*os.File, []byte) (int, error)) Option {
 	return func(options *journalOptions) {
 		options.write = writeFn
+	}
+}
+
+func withBeforeJournalFlock(hook func()) Option {
+	return func(options *journalOptions) {
+		options.beforeFlock = hook
 	}
 }
 
@@ -61,6 +75,7 @@ type Journal struct {
 	file         *os.File
 	maxFrame     uint32
 	sync         func(*os.File) error
+	syncDir      func(int) error
 	write        func(*os.File, []byte) (int, error)
 	previousHash [sha256.Size]byte
 	offset       int64
@@ -68,40 +83,51 @@ type Journal struct {
 	closed       bool
 }
 
-func openLockedRegular(path string, create bool) (*os.File, error) {
+func openLockedRegular(
+	path string,
+	create bool,
+	beforeFlock func(),
+) (*os.File, bool, error) {
 	parent, err := openSecureParent(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer unix.Close(parent.fd)
-	if stat, statErr := statDestination(parent); statErr == nil {
-		if !regularSingleLink(stat) {
-			return nil, fmt.Errorf("%w: journal path is not a single-link regular file", ErrUnsafePath)
-		}
-		if stat.Mode&0o777 != 0o600 {
-			return nil, fmt.Errorf("%w: journal mode must be 0600", ErrUnsafePath)
-		}
-	} else if !errors.Is(statErr, unix.ENOENT) {
-		return nil, fmt.Errorf("%w: journal stat failed", ErrUnsafePath)
-	} else if !create {
-		return nil, os.ErrNotExist
-	}
 	flags := unix.O_RDWR | unix.O_CLOEXEC | unix.O_NOFOLLOW
-	if create {
-		flags |= unix.O_CREAT
+	fd, err := unix.Openat(parent.fd, parent.base, flags, 0)
+	created := false
+	if errors.Is(err, unix.ENOENT) && create {
+		fd, err = unix.Openat(
+			parent.fd,
+			parent.base,
+			flags|unix.O_CREAT|unix.O_EXCL,
+			0o600,
+		)
+		if errors.Is(err, unix.EEXIST) {
+			fd, err = unix.Openat(parent.fd, parent.base, flags, 0)
+		} else if err == nil {
+			created = true
+		}
 	}
-	fd, err := unix.Openat(parent.fd, parent.base, flags, 0o600)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, unix.ENOENT) {
+			return nil, false, os.ErrNotExist
+		}
+		return nil, false, fmt.Errorf("%w: journal open failed", ErrUnsafePath)
 	}
 	file := os.NewFile(uintptr(fd), parent.base)
 	if file == nil {
 		_ = unix.Close(fd)
-		return nil, fmt.Errorf("failed to own journal descriptor")
+		return nil, false, fmt.Errorf("failed to own journal descriptor")
 	}
-	cleanup := func(result error) (*os.File, error) {
+	cleanup := func(result error) (*os.File, bool, error) {
 		_ = file.Close()
-		return nil, result
+		return nil, false, result
+	}
+	if created {
+		if err := unix.Fchmod(fd, 0o600); err != nil {
+			return cleanup(err)
+		}
 	}
 	var stat unix.Stat_t
 	err = unix.Fstat(fd, &stat)
@@ -111,13 +137,40 @@ func openLockedRegular(path string, create bool) (*os.File, error) {
 	if !regularSingleLink(stat) || stat.Mode&0o777 != 0o600 {
 		return cleanup(fmt.Errorf("%w: unsafe opened journal", ErrUnsafePath))
 	}
+	pathStat, err := statDestination(parent)
+	if err != nil ||
+		pathStat.Dev != stat.Dev ||
+		pathStat.Ino != stat.Ino ||
+		!regularSingleLink(pathStat) {
+		return cleanup(fmt.Errorf("%w: journal path identity changed", ErrUnsafePath))
+	}
+	if beforeFlock != nil {
+		beforeFlock()
+	}
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 			return cleanup(ErrJournalLocked)
 		}
 		return cleanup(err)
 	}
-	return file, nil
+	var lockedStat unix.Stat_t
+	lockedStatErr := unix.Fstat(int(file.Fd()), &lockedStat)
+	lockedPathStat, lockedPathErr := statDestination(parent)
+	if lockedStatErr != nil ||
+		lockedPathErr != nil ||
+		!regularSingleLink(lockedStat) ||
+		!regularSingleLink(lockedPathStat) ||
+		lockedStat.Dev != stat.Dev ||
+		lockedStat.Ino != stat.Ino ||
+		lockedPathStat.Dev != lockedStat.Dev ||
+		lockedPathStat.Ino != lockedStat.Ino {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		return cleanup(fmt.Errorf(
+			"%w: journal path identity changed while locking",
+			ErrUnsafePath,
+		))
+	}
+	return file, created, nil
 }
 
 func unlockAndClose(file *os.File) error {
@@ -126,7 +179,11 @@ func unlockAndClose(file *os.File) error {
 	return errors.Join(unlockErr, closeErr)
 }
 
-func recoverLocked(file *os.File, maxFrame uint32) (Recovery, error) {
+func recoverLocked(
+	file *os.File,
+	maxFrame uint32,
+	beforeTailRepair func() error,
+) (Recovery, error) {
 	if maxFrame == 0 {
 		return Recovery{}, fmt.Errorf("maxFrame must be positive")
 	}
@@ -188,6 +245,11 @@ func recoverLocked(file *os.File, maxFrame uint32) (Recovery, error) {
 	}
 	recovery.VerifiedBytes = offset
 	if recovery.TailRepaired {
+		if beforeTailRepair != nil {
+			if err := beforeTailRepair(); err != nil {
+				return Recovery{}, err
+			}
+		}
 		if err := file.Truncate(offset); err != nil {
 			return Recovery{}, err
 		}
@@ -204,12 +266,26 @@ func recoverLocked(file *os.File, maxFrame uint32) (Recovery, error) {
 // Recover exclusively verifies a journal and durably truncates only an
 // incomplete final frame.
 func Recover(path string, maxFrame uint32) (Recovery, error) {
-	file, err := openLockedRegular(path, false)
+	return RecoverWithTailIntent(path, maxFrame, nil)
+}
+
+// RecoverWithTailIntent verifies a journal and, when a torn tail exists,
+// invokes beforeTailRepair before destructively truncating it. A callback
+// failure leaves the tail intact for a later recovery attempt.
+func RecoverWithTailIntent(
+	path string,
+	maxFrame uint32,
+	beforeTailRepair func() error,
+) (Recovery, error) {
+	file, _, err := openLockedRegular(path, false, nil)
 	if err != nil {
 		return Recovery{}, err
 	}
 	defer unlockAndClose(file)
-	return recoverLocked(file, maxFrame)
+	if err := file.Sync(); err != nil {
+		return Recovery{}, err
+	}
+	return recoverLocked(file, maxFrame, beforeTailRepair)
 }
 
 // NewJournal recovers, exclusively locks, and opens a journal for append.
@@ -217,19 +293,36 @@ func NewJournal(path string, options ...Option) (*Journal, error) {
 	config := journalOptions{
 		maxFrame: defaultMaxFrameSize,
 		sync:     func(file *os.File) error { return file.Sync() },
+		syncDir:  syncDirectoryFD,
 		write:    func(file *os.File, value []byte) (int, error) { return file.Write(value) },
 	}
 	for _, option := range options {
 		option(&config)
 	}
-	if config.maxFrame == 0 || config.sync == nil || config.write == nil {
+	if config.maxFrame == 0 || config.sync == nil ||
+		config.syncDir == nil || config.write == nil {
 		return nil, fmt.Errorf("invalid journal option")
 	}
-	file, err := openLockedRegular(path, true)
+	file, _, err := openLockedRegular(path, true, config.beforeFlock)
 	if err != nil {
 		return nil, err
 	}
-	recovery, err := recoverLocked(file, config.maxFrame)
+	if err := file.Sync(); err != nil {
+		_ = unlockAndClose(file)
+		return nil, err
+	}
+	parent, parentErr := openSecureParent(path)
+	if parentErr != nil {
+		_ = unlockAndClose(file)
+		return nil, parentErr
+	}
+	syncErr := config.syncDir(parent.fd)
+	_ = unix.Close(parent.fd)
+	if syncErr != nil {
+		_ = unlockAndClose(file)
+		return nil, errors.Join(ErrCommitUncertain, syncErr)
+	}
+	recovery, err := recoverLocked(file, config.maxFrame, nil)
 	if err != nil {
 		_ = unlockAndClose(file)
 		return nil, err
@@ -239,6 +332,7 @@ func NewJournal(path string, options ...Option) (*Journal, error) {
 		file:     file,
 		maxFrame: config.maxFrame,
 		sync:     config.sync,
+		syncDir:  config.syncDir,
 		write:    config.write,
 		offset:   recovery.VerifiedBytes,
 	}
@@ -283,6 +377,9 @@ func (journal *Journal) Checkpoint(payload []byte) (RecordMeta, error) {
 			_ = unix.Unlinkat(parent.fd, temporaryName, 0)
 		}
 	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return RecordMeta{}, err
+	}
 	written := 0
 	for written < len(frame) {
 		count, writeErr := temporary.Write(frame[written:])
@@ -296,6 +393,31 @@ func (journal *Journal) Checkpoint(payload []byte) (RecordMeta, error) {
 	}
 	if err := journal.sync(temporary); err != nil {
 		return RecordMeta{}, err
+	}
+	var temporaryStat unix.Stat_t
+	if err := unix.Fstat(int(temporary.Fd()), &temporaryStat); err != nil ||
+		!regularSingleLink(temporaryStat) ||
+		temporaryStat.Mode&0o777 != 0o600 ||
+		temporaryStat.Size != int64(len(frame)) {
+		return RecordMeta{}, fmt.Errorf(
+			"%w: unsafe checkpoint temporary",
+			ErrUnsafePath,
+		)
+	}
+	var temporaryPathStat unix.Stat_t
+	if err := unix.Fstatat(
+		parent.fd,
+		temporaryName,
+		&temporaryPathStat,
+		unix.AT_SYMLINK_NOFOLLOW,
+	); err != nil ||
+		temporaryPathStat.Dev != temporaryStat.Dev ||
+		temporaryPathStat.Ino != temporaryStat.Ino ||
+		!regularSingleLink(temporaryPathStat) {
+		return RecordMeta{}, fmt.Errorf(
+			"%w: checkpoint temporary identity changed",
+			ErrUnsafePath,
+		)
 	}
 	if err := unix.Flock(
 		int(temporary.Fd()),
@@ -323,9 +445,12 @@ func (journal *Journal) Checkpoint(payload []byte) (RecordMeta, error) {
 	journal.offset = int64(meta.Size)
 	meta.Offset = 0
 	closeErr := unlockAndClose(old)
-	syncErr := syncDirectoryFD(parent.fd)
+	syncErr := journal.syncDir(parent.fd)
 	if closeErr != nil || syncErr != nil {
 		journal.failed = true
+		if syncErr != nil {
+			syncErr = errors.Join(ErrCommitUncertain, syncErr)
+		}
 		return RecordMeta{}, errors.Join(closeErr, syncErr)
 	}
 	return meta, nil

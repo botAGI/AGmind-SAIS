@@ -73,8 +73,9 @@ func LoadConfig(path string) (Config, error) {
 }
 
 type bootstrapOptions struct {
-	bootID func() (string, error)
-	now    func() time.Time
+	bootID  func() (string, error)
+	now     func() time.Time
+	persist func(string, ObserverState) error
 }
 
 type BootstrapOption func(*bootstrapOptions)
@@ -87,12 +88,19 @@ func WithBootstrapNow(value func() time.Time) BootstrapOption {
 	return func(options *bootstrapOptions) { options.now = value }
 }
 
+func withBootstrapStatePersist(
+	value func(string, ObserverState) error,
+) BootstrapOption {
+	return func(options *bootstrapOptions) { options.persist = value }
+}
+
 type Daemon struct {
 	lock     *StateLock
 	state    *StateStore
 	spool    *Spool
 	signer   *EnvelopeSigner
 	coverage *Coverage
+	degraded error
 }
 
 func requireLinuxPlatform(goos string) error {
@@ -146,6 +154,23 @@ func initialPublicMetadata(
 	}
 }
 
+func rotationArtifactsPresent(stateDir string) bool {
+	for path, maxBytes := range map[string]int64{
+		markerPath(stateDir):      65_536,
+		rotationKeyPath(stateDir): ed25519.PrivateKeySize,
+	} {
+		if _, err := readSingleLinkRegular(path, maxBytes); err == nil {
+			return true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			// Unsafe, malformed, or unreadable rotation artifacts are still an
+			// incomplete boundary. Ordinary startup must never route around
+			// them.
+			return true
+		}
+	}
+	return false
+}
+
 // Bootstrap starts the Task 2 daemon state machine fenced in
 // reconcile_required. It intentionally creates no Docker client or state.
 func Bootstrap(
@@ -156,7 +181,11 @@ func Bootstrap(
 	if err := requireLinuxPlatform(runtime.GOOS); err != nil {
 		return nil, err
 	}
-	options := bootstrapOptions{bootID: readKernelBootID, now: time.Now}
+	options := bootstrapOptions{
+		bootID:  readKernelBootID,
+		now:     time.Now,
+		persist: persistState,
+	}
 	for _, option := range supplied {
 		option(&options)
 	}
@@ -179,13 +208,50 @@ func Bootstrap(
 	if err != nil {
 		return fail(err, nil)
 	}
+	statePath := filepath.Join(config.StateDir, "observer-state.json")
+	if rotationArtifactsPresent(config.StateDir) {
+		existing, stateErr := loadObserverState(statePath)
+		if stateErr != nil || existing.HostID != hostID {
+			return fail(
+				errors.Join(
+					fmt.Errorf("incomplete observer key rotation"),
+					stateErr,
+				),
+				nil,
+			)
+		}
+		state := &StateStore{
+			path:    statePath,
+			state:   cloneObserverState(existing),
+			persist: options.persist,
+		}
+		degraded := fmt.Errorf("incomplete observer key rotation")
+		if !existing.MutationReadOnly {
+			stateErr = state.PersistReadOnly(
+				"observer_rotation_incomplete",
+			)
+			degraded = errors.Join(degraded, stateErr)
+		} else if existing.ReadOnlyReason != "observer_rotation_incomplete" {
+			degraded = errors.Join(
+				degraded,
+				fmt.Errorf(
+					"observer state remains mutation read-only: %s",
+					existing.ReadOnlyReason,
+				),
+			)
+		}
+		return &Daemon{
+			lock:     lock,
+			state:    state,
+			degraded: degraded,
+		}, nil
+	}
 	bootID, err := options.bootID()
 	if err != nil {
 		return fail(err, nil)
 	}
 	privateKey, err := readPrivateKey(config.PrivateKeyFile)
 	if err != nil {
-		statePath := filepath.Join(config.StateDir, "observer-state.json")
 		existing, stateErr := loadObserverState(statePath)
 		if stateErr != nil ||
 			existing.HostID != hostID {
@@ -195,24 +261,19 @@ func Bootstrap(
 			)
 			return fail(errors.Join(err, stateErr), nil)
 		}
-		state, stateErr := OpenStateStore(
-			statePath,
-			StateIdentity{
-				HostID:   hostID,
-				BootID:   bootID,
-				KeyID:    existing.KeyID,
-				KeyEpoch: existing.KeyEpoch,
-			},
-		)
-		if stateErr != nil {
-			return fail(errors.Join(err, stateErr), nil)
+		state := &StateStore{
+			path:    statePath,
+			state:   cloneObserverState(existing),
+			persist: options.persist,
 		}
-		if stateErr := state.PersistReadOnly(
+		persistErr := state.PersistReadOnly(
 			"observer_private_key_unavailable",
-		); stateErr != nil {
-			return fail(errors.Join(err, stateErr), nil)
-		}
-		return &Daemon{lock: lock, state: state}, nil
+		)
+		return &Daemon{
+			lock:     lock,
+			state:    state,
+			degraded: errors.Join(err, persistErr),
+		}, nil
 	}
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	keyID, err := contracts.KeyID(publicKey)
@@ -221,19 +282,32 @@ func Bootstrap(
 	}
 	epoch := uint64(1)
 	if existing, stateErr := loadObserverState(
-		filepath.Join(config.StateDir, "observer-state.json"),
+		statePath,
 	); stateErr == nil {
 		epoch = existing.KeyEpoch
 		if existing.KeyID != keyID {
-			markExistingStateReadOnly(
-				filepath.Join(config.StateDir, "observer-state.json"),
+			state := &StateStore{
+				path:    statePath,
+				state:   cloneObserverState(existing),
+				persist: options.persist,
+			}
+			persistErr := state.PersistReadOnly(
 				"observer_private_key_mismatch",
 			)
-			return fail(fmt.Errorf("observer private key mismatch"), nil)
+			return &Daemon{
+				lock:  lock,
+				state: state,
+				degraded: errors.Join(
+					fmt.Errorf("observer private key mismatch"),
+					persistErr,
+				),
+			}, nil
 		}
+	} else if !errors.Is(stateErr, os.ErrNotExist) {
+		return fail(stateErr, nil)
 	}
 	state, err := OpenStateStore(
-		filepath.Join(config.StateDir, "observer-state.json"),
+		statePath,
 		StateIdentity{
 			HostID:   hostID,
 			BootID:   bootID,
@@ -246,6 +320,18 @@ func Bootstrap(
 	}
 	metadata, err := LoadPublicKeyMetadata(config.StateDir)
 	if errors.Is(err, os.ErrNotExist) {
+		snapshot := state.Snapshot()
+		if snapshot.KeyEpoch != 1 ||
+			snapshot.LastSequence != 0 ||
+			snapshot.AckSequence != 0 {
+			_ = state.PersistReadOnly(
+				"observer_public_key_metadata_missing",
+			)
+			return fail(
+				fmt.Errorf("observer public key metadata missing"),
+				nil,
+			)
+		}
 		metadata = initialPublicMetadata(hostID, keyID, epoch, publicKey)
 		if err := savePublicKeyMetadata(config.StateDir, metadata); err != nil {
 			return fail(err, nil)
@@ -253,6 +339,11 @@ func Bootstrap(
 	} else if err != nil {
 		_ = state.PersistReadOnly("observer_public_key_metadata_invalid")
 		return fail(err, nil)
+	}
+	if metadata.HostID != hostID ||
+		metadata.HostID != state.Snapshot().HostID {
+		_ = state.PersistReadOnly("observer_public_key_metadata_host_mismatch")
+		return fail(fmt.Errorf("observer public key metadata host mismatch"), nil)
 	}
 	if metadata.CurrentKeyID != keyID || metadata.CurrentEpoch != epoch {
 		_ = state.PersistReadOnly("observer_public_key_metadata_mismatch")
@@ -275,6 +366,17 @@ func Bootstrap(
 	)
 	if err != nil {
 		return fail(err, nil)
+	}
+	if snapshot := state.Snapshot(); snapshot.MutationReadOnly {
+		return &Daemon{
+			lock:  lock,
+			state: state,
+			spool: spool,
+			degraded: fmt.Errorf(
+				"observer mutation is read-only: %s",
+				snapshot.ReadOnlyReason,
+			),
+		}, nil
 	}
 	signer, err := NewEnvelopeSigner(
 		SignerConfig{

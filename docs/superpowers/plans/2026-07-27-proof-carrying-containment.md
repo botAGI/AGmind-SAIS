@@ -214,7 +214,9 @@ Use HTTP/1.1 over Unix sockets with strict JSON and `Content-Type: application/j
 /run/agmind-sais/actuator-admin/socket    root:agmind-admin  0660
 ```
 
-Servers record `SO_PEERCRED`. Administrative operations require UID 0 or membership in the installer-created `agmind-admin` group, verified through socket permissions plus `/proc/<peer-pid>/status`. Core never mounts either observer private socket or actuator admin socket.
+At accept time, servers capture `SO_PEERCRED` and `SO_PEERGROUPS` from the same connected socket. Administrative operations require UID 0, the configured primary GID, or a supplementary GID in that socket-bound snapshot. If `SO_PEERGROUPS` is unavailable or exceeds the bounded capture, UID 0 and the `SO_PEERCRED` primary GID remain authoritative while supplementary-only authorization fails closed. PID-indexed `/proc/<peer-pid>` data is never used for socket authorization. Core never mounts either observer private socket or actuator admin socket.
+
+Each listener atomically publishes a newly created root:`<configured-gid>` mode-0750 parent directory and never repurposes a pre-existing private directory. A persistent root:root mode-0600 lock file is exclusively locked for the listener lifetime. Under that lock, a strict root:root mode-0600 owner marker moves from `pending` before bind to `active` with the exact socket device/inode after bind, ownership, mode, and directory durability. Restart may unlink only a root-owned socket justified by a matching `pending` intent or exact `active` inode; missing, malformed, configuration-mismatched, or inode-mismatched provenance fails closed without unlinking.
 
 The observer private API is bounded to:
 
@@ -282,7 +284,8 @@ internal/durablefile/
   atomic.go                             temp-write/fsync/rename/fsync-dir helper
   *_test.go
 internal/uds/
-  peercred_linux.go                     Linux SO_PEERCRED and group verification
+  peercred_linux.go                     Linux SO_PEERCRED/SO_PEERGROUPS capture
+  socket_owner_linux.go                 durable lock/owner FSM and stale recovery
   peercred_unsupported.go               explicit fail-closed non-Linux build
   server.go                             bounded HTTP-over-UDS server
   *_test.go
@@ -913,19 +916,20 @@ Spool paths are:
 
 `Ack` is monotonic and only deletes an envelope file after the ack record is durable. Coverage, reconcile, key transition, retention tombstone, incident/action mirror, and corruption records are priority. Routine exhaustion emits one coalesced `observer_spool_drop` coverage record; priority exhaustion sets persistent `mutation_read_only=true`.
 
-The `key rotate` subcommand requires EUID 0, acquires an exclusive observer-state lock, and refuses while the daemon holds it. It generates a new Ed25519 key, constructs a consecutive transition signed by old and new keys, durably spools the transition under the old epoch, atomically swaps the private key and public-key epoch file, advances the epoch/sequence state, then emits the first new-epoch start event. A missing old key cannot be “rotated away”; it requires the documented re-enrollment path and remains read-only.
+The `key rotate` subcommand requires EUID 0, acquires an exclusive observer-state lock, and refuses while the daemon holds it. It generates a new Ed25519 key, constructs a consecutive transition signed by old and new keys, durably spools the transition under the old epoch, atomically swaps the private key and public-key epoch file, advances the epoch/sequence state, then emits the first new-epoch start event. Rotation may resume through a mutation-read-only fence only when its reason is exactly `observer_rotation_incomplete` and correlated rotation artifacts exist; it never overwrites or clears an unrelated read-only reason. A missing old key cannot be “rotated away”; it requires the documented re-enrollment path and remains read-only.
 
 - [ ] **Step 5: Implement UDS servers with real peer credentials**
 
 The Linux listener must:
 
-1. create its parent directory root-owned mode 0750;
-2. unlink only an existing socket owned by the expected UID/GID and at the exact configured path;
-3. bind with umask 0077, then `chown`/`chmod` to the locked socket table;
-4. attach `SO_PEERCRED` to request context;
-5. enforce `Content-Type`, body limit, read-header timeout 2 s, read timeout 5 s, write timeout 10 s, and idle timeout 15 s;
-6. reject TCP addresses and symlinks;
-7. escape every error response and never return filesystem paths.
+1. atomically publish a newly created parent as root:`<configured-gid>` mode 0750, and reject every pre-existing parent whose exact metadata does not already match;
+2. acquire a persistent root:root mode-0600 sidecar lock before inspecting or changing the socket path, revalidate the locked inode, and hold the lock for the listener lifetime;
+3. durably write a strict `pending` owner intent before bind, then bind with umask 0077, `chown`/`chmod` to the locked socket table, fsync the parent, and durably replace the marker with `active` plus the exact device/inode;
+4. on restart, unlink only a root-owned single-link socket justified by the matching `pending` intent or exact `active` device/inode, and fsync the parent before rebind;
+5. attach accept-time `SO_PEERCRED` and bounded `SO_PEERGROUPS` to request context, with unavailable supplementary groups failing supplementary-only authorization closed;
+6. enforce `Content-Type`, body limit, read-header timeout 2 s, read timeout 5 s, write timeout 10 s, and idle timeout 15 s;
+7. reject TCP addresses, symlinks, malformed owner markers, and ownership/configuration mismatches;
+8. escape every error response and never return filesystem paths.
 
 The `!linux` implementation returns `ErrUnsupportedPlatform` for peer credentials and privileged startup. It must still compile so Darwin unit tests can run.
 
@@ -2183,7 +2187,7 @@ Expected: compile failure for missing approval/CLI packages.
 
 - [ ] **Step 3: Implement admin-socket authentication and exact plan retrieval**
 
-The admin socket relies on mode/group enforcement and verifies `SO_PEERCRED`. Root is allowed; otherwise `/proc/<peer-pid>/status` must list the configured `agmind-admin` GID and the peer process start ticks must remain stable across the request.
+The admin socket relies on mode/group enforcement and captures `SO_PEERCRED` plus bounded `SO_PEERGROUPS` on the accepted socket. Root and the `SO_PEERCRED` primary `agmind-admin` GID are allowed directly; supplementary membership is allowed only from the socket-bound group snapshot. Unsupported or oversized supplementary capture denies supplementary-only access without weakening root/primary authorization. `/proc/<peer-pid>` is not consulted for authorization.
 
 `GET /v1/admin/plans/{id}` returns the exact persisted plan. CLI:
 

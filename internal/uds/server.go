@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 var (
@@ -23,9 +24,23 @@ var (
 )
 
 type Peer struct {
-	PID int32
-	UID uint32
-	GID uint32
+	PID                         int32
+	UID                         uint32
+	GID                         uint32
+	supplementaryGroups         []uint32
+	supplementaryGroupsCaptured bool
+}
+
+func (peer Peer) inSupplementaryGroup(group uint32) bool {
+	if !peer.supplementaryGroupsCaptured {
+		return false
+	}
+	for _, candidate := range peer.supplementaryGroups {
+		if candidate == group {
+			return true
+		}
+	}
+	return false
 }
 
 type peerContextKey struct{}
@@ -51,8 +66,8 @@ func RequirePeer(authorize func(Peer) bool) func(http.Handler) http.Handler {
 	}
 }
 
-// RequireRootOrGroup authorizes root directly or verifies supplementary group
-// membership from the kernel-owned process status for the recorded peer PID.
+// RequireRootOrGroup authorizes root or a primary GID from SO_PEERCRED, then
+// checks the accept-time SO_PEERGROUPS snapshot for supplementary membership.
 func RequireRootOrGroup(group uint32) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -61,12 +76,11 @@ func RequireRootOrGroup(group uint32) func(http.Handler) http.Handler {
 				fixedError(writer, http.StatusForbidden, "peer_not_authorized")
 				return
 			}
-			if peer.UID != 0 {
-				member, err := PeerInGroup(peer, group)
-				if err != nil || !member {
-					fixedError(writer, http.StatusForbidden, "peer_not_authorized")
-					return
-				}
+			if peer.UID != 0 &&
+				peer.GID != group &&
+				!peer.inSupplementaryGroup(group) {
+				fixedError(writer, http.StatusForbidden, "peer_not_authorized")
+				return
 			}
 			next.ServeHTTP(writer, request)
 		})
@@ -104,6 +118,7 @@ func (listener *credentialListener) Accept() (net.Conn, error) {
 type ownedListener struct {
 	listener net.Listener
 	remove   func() error
+	abandon  func() error
 }
 
 // HTTPServer owns the listener and socket path. ListenHTTP never starts an
@@ -132,21 +147,6 @@ func boundedJSON(maxBody int64, next http.Handler) http.Handler {
 			)
 			return
 		}
-		switch request.Method {
-		case http.MethodPost, http.MethodPut, http.MethodPatch:
-			mediaType, parameters, err := mime.ParseMediaType(
-				request.Header.Get("Content-Type"),
-			)
-			charset, hasCharset := parameters["charset"]
-			if err != nil ||
-				mediaType != "application/json" ||
-				len(parameters) > 1 ||
-				len(parameters) == 1 && !hasCharset ||
-				hasCharset && !strings.EqualFold(charset, "utf-8") {
-				fixedError(writer, http.StatusUnsupportedMediaType, "unsupported_media_type")
-				return
-			}
-		}
 		if request.Body == nil {
 			next.ServeHTTP(writer, request)
 			return
@@ -160,6 +160,24 @@ func boundedJSON(maxBody int64, next http.Handler) http.Handler {
 		if int64(len(raw)) > maxBody {
 			fixedError(writer, http.StatusRequestEntityTooLarge, "body_too_large")
 			return
+		}
+		if len(raw) > 0 && !utf8.Valid(raw) {
+			fixedError(writer, http.StatusBadRequest, "invalid_body")
+			return
+		}
+		if len(raw) > 0 {
+			mediaType, parameters, parseErr := mime.ParseMediaType(
+				request.Header.Get("Content-Type"),
+			)
+			charset, hasCharset := parameters["charset"]
+			if parseErr != nil ||
+				mediaType != "application/json" ||
+				len(parameters) > 1 ||
+				len(parameters) == 1 && !hasCharset ||
+				hasCharset && !strings.EqualFold(charset, "utf-8") {
+				fixedError(writer, http.StatusUnsupportedMediaType, "unsupported_media_type")
+				return
+			}
 		}
 		request.Body = io.NopCloser(bytes.NewReader(raw))
 		request.ContentLength = int64(len(raw))
@@ -201,6 +219,7 @@ func ListenHTTP(
 	return &HTTPServer{server: server, owned: &ownedListener{
 		listener: credentialed,
 		remove:   owned.remove,
+		abandon:  owned.abandon,
 	}}, nil
 }
 

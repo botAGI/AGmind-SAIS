@@ -294,7 +294,7 @@ func TestRouteAuthorizationUsesRecordedPeerCredentials(t *testing.T) {
 	}
 }
 
-func TestPeerInGroupReadsVerifiedCurrentProcStatus(t *testing.T) {
+func TestPeerInGroupAuthorizesSOPEERCREDPrimaryGID(t *testing.T) {
 	member, err := uds.PeerInGroup(
 		uds.Peer{
 			PID: int32(os.Getpid()),
