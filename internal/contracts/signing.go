@@ -1,21 +1,13 @@
 package contracts
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 )
 
 func canonicalDocumentWithout(value any, fields ...string) ([]byte, error) {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	documentValue, err := strictValue(decoder)
+	documentValue, err := programmaticJSONValue(value)
 	if err != nil {
 		return nil, err
 	}
@@ -38,6 +30,9 @@ func EventSigningMessage(event EventEnvelopeV1) ([]byte, error) {
 }
 
 func VerifyEventSignature(event EventEnvelopeV1, publicKey ed25519.PublicKey) error {
+	if err := event.Validate(); err != nil {
+		return err
+	}
 	derived, err := KeyID(publicKey)
 	if err != nil {
 		return err

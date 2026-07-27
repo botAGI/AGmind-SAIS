@@ -12,6 +12,8 @@ from cryptography.exceptions import InvalidSignature
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict
 
+from tests.schema_validation import contract_schema_validator
+
 FIXTURES = Path("contracts/fixtures/v1")
 SCHEMAS = Path("contracts/v1")
 MAX_UINT64 = 2**64 - 1
@@ -39,7 +41,9 @@ def _schema(name: str) -> dict[str, Any]:
 def test_prepared_plan_is_a_standalone_valid_closed_contract() -> None:
     raw = (FIXTURES / "plan.valid.json").read_bytes()
     instance = json.loads(raw)
-    Draft202012Validator(_schema("prepared-temporary-egress-deny-plan.schema.json")).validate(
+    contract_schema_validator(
+        _schema("prepared-temporary-egress-deny-plan.schema.json")
+    ).validate(
         instance
     )
     plan = contracts.decode_strict(
@@ -61,7 +65,7 @@ def test_prepared_plan_is_a_standalone_valid_closed_contract() -> None:
 def test_plan_nonce_is_exactly_32_bytes_of_lowercase_hex(nonce: str) -> None:
     document = _fixture("plan.valid.json")
     document["nonce"] = nonce
-    assert not Draft202012Validator(
+    assert not contract_schema_validator(
         _schema("prepared-temporary-egress-deny-plan.schema.json")
     ).is_valid(document)
     with pytest.raises(ValueError, match="nonce"):
@@ -127,7 +131,7 @@ def test_every_runtime_contract_family_rejects_empty_object(model_name: str) -> 
 def test_every_schema_accepts_its_positive_fixture(
     fixture_name: str, schema_name: str
 ) -> None:
-    Draft202012Validator(_schema(schema_name)).validate(_fixture(fixture_name))
+    contract_schema_validator(_schema(schema_name)).validate(_fixture(fixture_name))
 
 
 @pytest.mark.parametrize(
@@ -161,11 +165,11 @@ def test_schemas_reject_wrong_types_overflow_and_impossible_wire_values(
 ) -> None:
     instance = _fixture(fixture_name)
     instance[field] = invalid
-    assert not Draft202012Validator(_schema(schema_name)).is_valid(instance)
+    assert not contract_schema_validator(_schema(schema_name)).is_valid(instance)
 
 
 def test_falco_schema_and_runtime_cover_candidate_investigation_and_hard_error() -> None:
-    schema = Draft202012Validator(_schema("falco-connect.schema.json"))
+    schema = contract_schema_validator(_schema("falco-connect.schema.json"))
     model = contracts.FalcoConnectV1
 
     candidate = _fixture("falco.candidate.valid.json")
@@ -295,7 +299,7 @@ def test_signatures_bind_the_declared_key_and_exact_record_content() -> None:
 
 def test_key_transition_rejects_missing_signature_nonconsecutive_epoch_and_tampering() -> None:
     document = _fixture("key-transition.valid.json")
-    schema = Draft202012Validator(_schema("key-transition.schema.json"))
+    schema = contract_schema_validator(_schema("key-transition.schema.json"))
 
     missing_signature = copy.deepcopy(document)
     del missing_signature["new_signature"]

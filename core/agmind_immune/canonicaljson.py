@@ -162,8 +162,8 @@ def intent_id(candidate_id_value: str, policy_bundle_sha256: str, ttl_seconds: i
 
 
 def plan_id(intent_id_value: str, nonce: bytes) -> str:
-    if not nonce:
-        raise ValueError("nonce bytes must not be empty")
+    if len(nonce) != 32:
+        raise ValueError("nonce must contain exactly 32 bytes")
     preimage = b"AGMIND_PLAN_ID_V1\0"
     preimage += _ascii(intent_id_value, "intent_id") + b"\0" + nonce
     return "plan_" + hashlib.sha256(preimage).hexdigest()[:32]
@@ -198,12 +198,10 @@ def action_record_hash(record: BaseModel | Mapping[str, object]) -> str:
 
 
 def action_record_id(record_sha256: str) -> str:
-    try:
-        digest = bytes.fromhex(record_sha256)
-    except ValueError as error:
-        raise ValueError("invalid record_sha256") from error
-    if len(digest) != 32:
-        raise ValueError("record_sha256 must contain 32 bytes")
+    if len(record_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in record_sha256
+    ):
+        raise ValueError("record_sha256 must be exactly 64 lowercase hex characters")
     return "ar_" + record_sha256[:32]
 
 

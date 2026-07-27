@@ -4,8 +4,9 @@ from pathlib import Path
 import pytest
 from agmind_immune import canonicaljson, contracts
 from cryptography.exceptions import InvalidSignature
-from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
+
+from tests.schema_validation import contract_schema_validator
 
 FIXTURES = Path("contracts/fixtures/v1")
 
@@ -73,11 +74,11 @@ def test_schemas_accept_positive_fixtures_and_reject_hunter_actions() -> None:
     for schema_name, fixture_name in pairs:
         schema = json.loads((Path("contracts/v1") / schema_name).read_text())
         instance = json.loads((FIXTURES / fixture_name).read_text())
-        Draft202012Validator(schema).validate(instance)
+        contract_schema_validator(schema).validate(instance)
     hunter_schema = json.loads((Path("contracts/v1") / "hunter-output.schema.json").read_text())
     invalid = json.loads((FIXTURES / "hunter.action-field.invalid.json").read_text())
     with pytest.raises(ValidationError):
-        Draft202012Validator(hunter_schema).validate(invalid)
+        contract_schema_validator(hunter_schema).validate(invalid)
 
 
 @pytest.mark.parametrize(

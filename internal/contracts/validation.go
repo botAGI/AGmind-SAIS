@@ -21,7 +21,7 @@ var (
 )
 
 func validUTC(value string) bool {
-	if !utcRFC3339Nano.MatchString(value) {
+	if !utcRFC3339Nano.MatchString(value) || value[:4] == "0000" {
 		return false
 	}
 	_, err := time.Parse(time.RFC3339Nano, value)
@@ -141,7 +141,7 @@ func sortedUnique(values []string) bool {
 }
 
 func validRepoDigests(values []string) bool {
-	if len(values) > 16 || !sortedUnique(values) {
+	if values == nil || len(values) > 16 || !sortedUnique(values) {
 		return false
 	}
 	for _, value := range values {
@@ -160,6 +160,10 @@ func canonicalIPv4(value string) bool {
 func (event EventEnvelopeV1) Validate() error {
 	if event.SchemaVersion != "agmind.event-envelope.v1" {
 		return fmt.Errorf("unsupported event schema version")
+	}
+	if event.NormalizedFields == nil || event.RedactionFlags == nil ||
+		event.CoverageFlags == nil {
+		return fmt.Errorf("required event collections must not be nil")
 	}
 	if !regexp.MustCompile(`^evt_[0-9a-f]{64}$`).MatchString(event.EventID) ||
 		!hex32.MatchString(event.KeyID) || !uuid4.MatchString(event.HostID) ||
@@ -230,6 +234,9 @@ func (event EventEnvelopeV1) Validate() error {
 }
 
 func (event FalcoConnectV1) Validate() error {
+	if event.RepoDigests == nil || event.MissingRequiredFields == nil {
+		return fmt.Errorf("required Falco collections must not be nil")
+	}
 	if event.EvtType != "connect" ||
 		!boundedUTF8(event.DetectorRule, 1, 512) ||
 		!boundedASCII(event.DetectorRuleVersion, 1, 64) ||
@@ -437,6 +444,10 @@ func (plan PreparedTemporaryEgressDenyPlanV1) Validate() error {
 }
 
 func (output HunterOutputV1) Validate() error {
+	if output.Hypotheses == nil || output.SupportingEvidenceIDs == nil ||
+		output.RefutingQuestions == nil || output.Limitations == nil {
+		return fmt.Errorf("required hunter collections must not be nil")
+	}
 	if output.SchemaVersion != "agmind.hunter-output.v1" ||
 		len(output.Hypotheses) > 8 || len(output.SupportingEvidenceIDs) > 8 ||
 		len(output.RefutingQuestions) > 8 || len(output.Limitations) > 8 ||
@@ -466,6 +477,9 @@ func (output HunterOutputV1) Validate() error {
 }
 
 func (record ActionRecordV1) Validate() error {
+	if record.Details == nil {
+		return fmt.Errorf("required action details must not be nil")
+	}
 	if record.SchemaVersion != "agmind.action-record.v1" ||
 		!regexp.MustCompile(`^ar_[0-9a-f]{32}$`).MatchString(record.RecordID) ||
 		!regexp.MustCompile(`^plan_[0-9a-f]{32}$`).MatchString(record.PlanID) ||

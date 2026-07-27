@@ -7,7 +7,7 @@ from agmind_immune import contracts
 from agmind_immune.canonicaljson import canonical_json, event_id
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
-from jsonschema import Draft202012Validator
+from tests.schema_validation import contract_schema_validator
 
 FIXTURES = Path("contracts/fixtures/v1")
 EVENT_SCHEMA = json.loads(Path("contracts/v1/event-envelope.schema.json").read_text())
@@ -22,7 +22,7 @@ def test_arbitrary_bytes_are_validated_or_cleanly_rejected(raw: bytes) -> None:
     except (UnicodeDecodeError, ValueError):
         return
     document = event.model_dump(exclude_none=True)
-    Draft202012Validator(EVENT_SCHEMA).validate(document)
+    contract_schema_validator(EVENT_SCHEMA).validate(document)
     assert event_id(event) == event.event_id
     assert hashlib.sha256(canonical_json(event.normalized_fields)).hexdigest() == (
         event.normalized_fields_sha256

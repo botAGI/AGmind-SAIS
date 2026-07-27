@@ -10,8 +10,9 @@ from typing import Any
 import pytest
 from agmind_immune import canonicaljson, contracts
 from cryptography.exceptions import InvalidSignature
-from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict
+
+from tests.schema_validation import contract_schema_validator
 
 FIXTURES = Path("contracts/fixtures/v1")
 SCHEMAS = Path("contracts/v1")
@@ -127,7 +128,7 @@ def test_every_required_property_is_checked_before_runtime_unmarshal(
     for field in required:
         mutated = copy.deepcopy(document)
         del mutated[field]
-        assert not Draft202012Validator(schema).is_valid(mutated), field
+        assert not contract_schema_validator(schema).is_valid(mutated), field
         with pytest.raises(ValueError, match=field):
             contracts.decode_strict(_wire(mutated), model, 65_536)
 
@@ -161,7 +162,7 @@ def test_omitted_optional_fields_are_allowed_but_explicit_top_level_null_is_reje
 
         explicit_null = copy.deepcopy(document)
         explicit_null[field] = None
-        assert not Draft202012Validator(schema).is_valid(explicit_null), field
+        assert not contract_schema_validator(schema).is_valid(explicit_null), field
         with pytest.raises(ValueError, match="null"):
             contracts.decode_strict(_wire(explicit_null), model, 65_536)
 
@@ -169,7 +170,7 @@ def test_omitted_optional_fields_are_allowed_but_explicit_top_level_null_is_reje
 def test_shared_contradictory_falco_result_is_rejected_everywhere() -> None:
     raw = (FIXTURES / "falco.contradictory.invalid.json").read_bytes()
     document = json.loads(raw)
-    schema = Draft202012Validator(_schema("falco-connect.schema.json"))
+    schema = contract_schema_validator(_schema("falco-connect.schema.json"))
     assert not schema.is_valid(document)
     with pytest.raises(ValueError, match="Falco result"):
         contracts.decode_strict(raw, contracts.FalcoConnectV1, 65_536)
@@ -205,7 +206,7 @@ def test_falco_result_tuple_matrix_is_exact(
         document.pop("evt_rawres", None)
     else:
         document["evt_rawres"] = rawres
-    schema_accepts = Draft202012Validator(
+    schema_accepts = contract_schema_validator(
         _schema("falco-connect.schema.json")
     ).is_valid(document)
     assert schema_accepts is accepted
@@ -299,7 +300,7 @@ def test_event_normalized_fields_recursive_bounds_and_total_size() -> None:
         {"x": MAX_CANONICAL_INTEGER + 1},
         {"x": ["a" * 8_192, "a" * 8_192, "a" * 8_192, "a" * 8_174]},
     ]
-    schema = Draft202012Validator(_schema("event-envelope.schema.json"))
+    schema = contract_schema_validator(_schema("event-envelope.schema.json"))
     for value in valid_values:
         document = _rebind_event({**base, "normalized_fields": value})
         assert schema.is_valid(document)
@@ -347,7 +348,7 @@ def test_action_details_recursive_bounds_and_total_size() -> None:
         {"x": MAX_CANONICAL_INTEGER + 1},
         {"x": ["a" * 1_024] * 31 + ["a" * 922]},
     ]
-    schema = Draft202012Validator(_schema("action-record.schema.json"))
+    schema = contract_schema_validator(_schema("action-record.schema.json"))
     for value in valid_values:
         document = _rebind_action({**base, "details": value})
         assert schema.is_valid(document)
@@ -399,7 +400,7 @@ def test_ascii_contract_fields_require_printable_ascii() -> None:
     ]:
         document = _fixture(fixture_name)
         document[field] = "bad\nvalue"
-        assert not Draft202012Validator(_schema(schema_name)).is_valid(document)
+        assert not contract_schema_validator(_schema(schema_name)).is_valid(document)
         with pytest.raises(ValueError):
             contracts.decode_strict(_wire(document), model, 65_536)
 
@@ -527,7 +528,7 @@ def test_structured_near_valid_wrong_type_bound_and_semantic_mutations() -> None
     ]
     for name, fixture, schema_name, model, wrong_type, over_bound, semantic in mutation_cases:
         base = _fixture(fixture)
-        schema = Draft202012Validator(_schema(schema_name))
+        schema = contract_schema_validator(_schema(schema_name))
         for category, patch in [
             ("wrong-type", wrong_type),
             ("one-over", over_bound),

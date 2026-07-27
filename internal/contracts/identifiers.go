@@ -1,11 +1,9 @@
 package contracts
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"strconv"
 )
@@ -83,8 +81,11 @@ func IntentID(candidateID, policyBundleSHA256 string, ttlSeconds uint64) (string
 }
 
 func PlanID(intentID string, nonce []byte) (string, error) {
-	if intentID == "" || len(nonce) == 0 {
-		return "", fmt.Errorf("plan derivation fields must not be empty")
+	if intentID == "" {
+		return "", fmt.Errorf("intent_id must not be empty")
+	}
+	if len(nonce) != 32 {
+		return "", fmt.Errorf("plan nonce must contain exactly 32 bytes")
 	}
 	preimage := append([]byte("AGMIND_PLAN_ID_V1\x00"+intentID+"\x00"), nonce...)
 	sum := sha256.Sum256(preimage)
@@ -92,15 +93,13 @@ func PlanID(intentID string, nonce []byte) (string, error) {
 }
 
 func PlanHash(plan PreparedTemporaryEgressDenyPlanV1) (string, error) {
-	raw, err := json.Marshal(plan)
+	value, err := programmaticJSONValue(plan)
 	if err != nil {
 		return "", err
 	}
-	var document map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&document); err != nil {
-		return "", err
+	document, ok := value.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("prepared plan must canonicalize as an object")
 	}
 	delete(document, "plan_hash")
 	canonical, err := CanonicalJSON(document)
@@ -121,15 +120,13 @@ func ActionID(planHash string) (string, error) {
 }
 
 func ActionRecordHash(record ActionRecordV1) (string, error) {
-	raw, err := json.Marshal(record)
+	value, err := programmaticJSONValue(record)
 	if err != nil {
 		return "", err
 	}
-	var document map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&document); err != nil {
-		return "", err
+	document, ok := value.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("action record must canonicalize as an object")
 	}
 	delete(document, "record_id")
 	delete(document, "record_sha256")
@@ -145,7 +142,7 @@ func ActionRecordHash(record ActionRecordV1) (string, error) {
 }
 
 func ActionRecordID(recordSHA256 string) string {
-	if len(recordSHA256) < 32 {
+	if !hex64.MatchString(recordSHA256) {
 		return ""
 	}
 	return "ar_" + recordSHA256[:32]
