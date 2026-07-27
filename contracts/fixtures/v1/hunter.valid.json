@@ -1,0 +1,1 @@
+{"schema_version":"agmind.hunter-output.v1","hypotheses":["Unexpected public egress"],"supporting_evidence_ids":["evt_721c18e705f4ef222e5a8fbe0ba74c483cf75b801bb80b71e7ce75889327d971"],"refuting_questions":["Is this destination approved?"],"narrative":"TEST ONLY: bounded analysis.","limitations":["No authority to act"]}
