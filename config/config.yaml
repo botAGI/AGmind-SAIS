@@ -1,0 +1,82 @@
+# AGmind-SAIS Configuration
+# Security AI Sensor — конфигурация
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  debug: false
+
+web_ui:
+  enabled: true
+  port: 3000  # встроенный, если standalone
+
+# ML Provider — универсальная абстракция
+# Поддерживаемые: ollama, vllm, llamacpp, openai (OpenAI-compatible API)
+ml:
+  provider: ollama         # ollama | vllm | llamacpp | openai
+  model: cyberbez-bezopasovich
+  base_url: "http://localhost:11434"  # адрес ML-бэкенда
+  api_key: ""                        # если требуется (vllm, openai)
+  keep_alive: true          # держать модель горячей
+  context_length: 32768
+  temperature: 0.7
+  max_tokens: 4096
+
+# Agent Core
+agent:
+  system_prompt_file: "/app/agmind-hat/cyberbez-system-prompt.md"
+  cycle_interval: 60       # секунд между циклами анализа
+  debug_mode: false
+
+# Мониторинг
+monitoring:
+  enabled: true
+  # Сбор данных
+  system:
+    enabled: true           # CPU, RAM, диск, процессы
+    interval: 30            # секунд
+  network:
+    enabled: true           # порты, соединения, трафик
+    interval: 60
+    promiscuous: false      # захват пакетов (требует root/cap_net_raw)
+  logs:
+    enabled: true
+    paths:
+      - "/var/log/syslog"
+      - "/var/log/auth.log"
+      - "/var/log/nginx/access.log"
+    interval: 120
+  # Анализ угроз
+  threat_analysis:
+    enabled: true
+    scan_interval: 300      # глубокая проверка каждые 5 мин
+    severity_threshold: 3   # от какого уровня слать алерт (1-5)
+
+# Реактор (пресечение угроз)
+reactor:
+  enabled: false            # ВКЛЮЧАТЬ ОСТОРОЖНО!
+  actions:
+    - block_ip             # iptables / nftables бан
+    - kill_process         # прибить подозрительный процесс
+    - quarantine_user      # изолировать пользователя
+    - alert_telegram       # уведомить
+  auto_mode: false          # true = без подтверждения
+  whitelist: []             # список исключений (IP, PID, пользователи)
+
+# Алерты
+alerts:
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+  webhook:
+    enabled: false
+    url: ""
+  log:
+    enabled: true          # всегда пишем в локальный лог
+
+# Интеграция с agmind-hat
+agmind_hat:
+  enabled: false
+  socket_path: "/tmp/agmind-hat.sock"  # unix socket для IPC
+  auto_notify: true                     # дёргать Gbot при аномалиях

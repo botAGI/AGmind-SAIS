@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AGmind-SAIS Dashboard</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <style>
+        :root {
+            --bg: #0a0e14;
+            --bg-card: #131a22;
+            --bg-hover: #1a2533;
+            --text: #c9d1d9;
+            --text-dim: #6e7681;
+            --accent: #58a6ff;
+            --danger: #f85149;
+            --warning: #d29922;
+            --success: #3fb950;
+            --border: #30363d;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            background: var(--bg);
+            color: var(--text);
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+
+        /* Header */
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px;
+        }
+        .header h1 {
+            font-size: 20px; font-weight: 600;
+            background: linear-gradient(135deg, var(--accent), #a371f7);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .header .status-badge {
+            padding: 4px 12px; border-radius: 12px; font-size: 12px;
+            background: var(--success); color: #000; font-weight: 600;
+        }
+        .header .status-badge.degraded { background: var(--warning); }
+        .header .status-badge.offline { background: var(--danger); }
+
+        /* Grid */
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .card {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 8px; padding: 16px;
+        }
+        .card h3 { font-size: 13px; color: var(--text-dim); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .card .value { font-size: 28px; font-weight: 700; }
+        .card .value.danger { color: var(--danger); }
+        .card .value.warning { color: var(--warning); }
+        .card .value.success { color: var(--success); }
+        .card .meta { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+
+        /* Threat list */
+        .threat-item {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 8px 0; border-bottom: 1px solid var(--border);
+        }
+        .threat-item:last-child { border-bottom: none; }
+        .threat-item .severity {
+            padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
+        }
+        .severity.critical { background: var(--danger); color: #fff; }
+        .severity.high { background: var(--warning); color: #000; }
+        .severity.medium { background: var(--accent); color: #000; }
+        .severity.low { background: var(--bg-hover); color: var(--text-dim); }
+
+        /* Chat */
+        .chat-container { height: 300px; overflow-y: auto; margin-bottom: 12px; padding: 8px; background: #000; border-radius: 4px; }
+        .chat-msg { padding: 4px 0; border-bottom: 1px solid var(--border); }
+        .chat-msg .role { font-weight: 600; font-size: 11px; }
+        .chat-msg .role.user { color: var(--accent); }
+        .chat-msg .role.ai { color: var(--success); }
+        .chat-msg .text { font-size: 13px; margin-top: 2px; }
+        .chat-input { display: flex; gap: 8px; }
+        .chat-input input {
+            flex: 1; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
+            border-radius: 4px; color: var(--text); font-family: inherit; font-size: 13px;
+        }
+        .chat-input button {
+            padding: 8px 16px; background: var(--accent); color: #000; border: none;
+            border-radius: 4px; cursor: pointer; font-weight: 600;
+        }
+
+        /* Controls */
+        .btn {
+            padding: 6px 14px; border-radius: 4px; border: none; cursor: pointer;
+            font-family: inherit; font-size: 12px; font-weight: 600;
+        }
+        .btn.danger { background: var(--danger); color: #fff; }
+        .btn.success { background: var(--success); color: #000; }
+        .btn.warning { background: var(--warning); color: #000; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Logs */
+        .log-line { font-size: 11px; padding: 2px 0; color: var(--text-dim); }
+        .log-line.error { color: var(--danger); }
+        .log-line.warn { color: var(--warning); }
+
+        /* Reactor table */
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid var(--border); }
+        th { color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+
+        /* Risk scores */
+        .risk-bar { height: 6px; border-radius: 3px; background: var(--bg-hover); overflow: hidden; margin-top: 4px; }
+        .risk-bar .fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
+
+        @media (max-width: 768px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <!-- Header -->
+    <div class="header">
+        <h1>🛡️ AGmind-SAIS</h1>
+        <div>
+            <span class="status-badge" id="health-badge">checking...</span>
+            <span style="color:var(--text-dim);font-size:11px;margin-left:8px" id="uptime-display"></span>
+        </div>
+    </div>
+
+    <!-- Stats Grid -->
+    <div class="grid" hx-get="/api/status" hx-trigger="every 30s" hx-swap="none" hx-target="this">
+        <div class="card">
+            <h3>Система</h3>
+            <div class="value" id="sys-status">—</div>
+            <div class="meta" id="sys-meta">CPU: — | RAM: — | Диск: —</div>
+        </div>
+        <div class="card">
+            <h3>Угрозы</h3>
+            <div class="value" id="threat-count">0</div>
+            <div class="meta" id="threat-meta">Последняя проверка: —</div>
+        </div>
+        <div class="card">
+            <h3>Reactor</h3>
+            <div class="value warning" id="reactor-status">DISABLED</div>
+            <div class="meta" id="reactor-meta">Действий: 0 | Заблокировано: 0</div>
+        </div>
+        <div class="card">
+            <h3>ML Модель</h3>
+            <div class="value success" id="ml-model">—</div>
+            <div class="meta" id="ml-meta">Провайдер: — | Статус: —</div>
+        </div>
+    </div>
+
+    <!-- Main Layout -->
+    <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:24px;">
+        <!-- Chat -->
+        <div class="card">
+            <h3>🧠 Чат с КиберБезОпасовичем</h3>
+            <div class="chat-container" id="chat-log">
+                <div class="chat-msg"><span class="role ai">System</span><div class="text">AGmind-SAIS запущен. Напишите ваш запрос.</div></div>
+            </div>
+            <div class="chat-input">
+                <input type="text" id="chat-input" placeholder="Ваш запрос..." onkeydown="if(event.key==='Enter')sendChat()">
+                <button onclick="sendChat()">Отправить</button>
+            </div>
+        </div>
+
+        <!-- Risk Scores -->
+        <div class="card">
+            <h3>📊 Баллы риска (RBA)</h3>
+            <div id="risk-list">
+                <div style="color:var(--text-dim);font-size:12px;">Нет данных</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Grid -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+        <!-- Ledger -->
+        <div class="card">
+            <h3>📋 Investigation Ledger</h3>
+            <div id="ledger-entries">
+                <div style="color:var(--text-dim);font-size:12px;">Загрузка...</div>
+            </div>
+        </div>
+
+        <!-- Reactor Controls -->
+        <div class="card">
+            <h3>⚙️ Управление</h3>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+                <button class="btn success" onclick="control('enable')">Включить Reactor</button>
+                <button class="btn danger" onclick="control('disable')">Выключить Reactor</button>
+                <button class="btn warning" onclick="toggleAuto()">Toggle Auto Mode</button>
+            </div>
+            <div style="font-size:12px;color:var(--text-dim);margin-top:8px;">
+                <span id="auto-status">Auto: false</span> |
+                <span id="cooldowns">Cooldowns: 0</span>
+            </div>
+            <div class="risk-bar" style="margin-top:12px;">
+                <div class="fill" id="reactor-fill" style="width:0%;background:var(--danger);"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <div style="text-align:center;padding:24px 0;color:var(--text-dim);font-size:11px;">
+        AGmind-SAIS v0.1.0 — Security AI Sensor
+    </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════
+// Состояние
+// ═══════════════════════════════════════════
+let autoMode = false;
+let chatHistory = [];
+
+// ═══════════════════════════════════════════
+// Обновление статуса
+// ═══════════════════════════════════════════
+async function updateStatus() {
+    try {
+        // Health
+        const health = await fetch('/health').then(r => r.json());
+        const badge = document.getElementById('health-badge');
+        badge.textContent = health.status === 'ok' ? 'ONLINE' : 'DEGRADED';
+        badge.className = 'status-badge' + (health.status === 'ok' ? '' : ' degraded');
+
+        // Status
+        const status = await fetch('/api/status').then(r => r.json());
+
+        // System
+        const sys = status.agent;
+        document.getElementById('sys-status').textContent = sys.running ? '🟢 Активен' : '🔴 Остановлен';
+        document.getElementById('sys-meta').textContent = `Cycles: ${sys.cycles} | ML: ${sys.ml_healthy ? '✅' : '❌'}`;
+        document.getElementById('uptime-display').textContent = status.uptime ? new Date(status.uptime).toLocaleString('ru-RU') : '';
+
+        // Threats
+        const ledger = status.ledger;
+        document.getElementById('threat-count').textContent = ledger.total_threats_found || 0;
+        document.getElementById('threat-meta').textContent = `В журнале: ${ledger.cached_entries} | Review: ${ledger.review_required}`;
+
+        // Reactor
+        const react = status.reactor;
+        document.getElementById('reactor-status').textContent = react.enabled ? 'ENABLED 🔴' : 'DISABLED ⚫';
+        document.getElementById('reactor-status').className = 'value ' + (react.enabled ? 'danger' : 'warning');
+        document.getElementById('reactor-meta').textContent = `Действий: ${react.actions_taken} | Заблокировано: ${react.actions_blocked}`;
+        document.getElementById('cooldowns').textContent = `Cooldowns: ${react.active_cooldowns}`;
+        autoMode = react.auto_mode;
+        document.getElementById('auto-status').textContent = `Auto: ${autoMode}`;
+
+        // Reactor fill
+        const actions = react.actions_taken || 0;
+        const blocked = react.actions_blocked || 0;
+        const total = actions + blocked;
+        const fillPct = total > 0 ? (actions / total * 100) : 0;
+        document.getElementById('reactor-fill').style.width = fillPct + '%';
+
+        // ML
+        document.getElementById('ml-model').textContent = sys.ml_model || '—';
+        document.getElementById('ml-meta').textContent = `Provider: ${sys.ml_provider} | ${sys.ml_healthy ? '✅ Online' : '❌ Offline'}`;
+
+        // Risk scores
+        updateRiskScores(react.risk_scores || []);
+
+    } catch(e) {
+        document.getElementById('health-badge').textContent = 'OFFLINE';
+        document.getElementById('health-badge').className = 'status-badge offline';
+    }
+}
+
+// ═══════════════════════════════════════════
+// Risk Scores
+// ═══════════════════════════════════════════
+function updateRiskScores(scores) {
+    const list = document.getElementById('risk-list');
+    if (!scores || scores.length === 0) {
+        list.innerHTML = '<div style="color:var(--text-dim);font-size:12px;">Нет данных</div>';
+        return;
+    }
+    let html = '';
+    scores.slice(0, 10).forEach(s => {
+        const pct = Math.min(s.score / 5 * 100, 100);
+        const color = s.score >= 3 ? 'var(--danger)' : s.score >= 1.5 ? 'var(--warning)' : 'var(--success)';
+        html += `<div style="margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;font-size:12px;">
+                <span>${s.entity}</span>
+                <span style="color:${color};">${s.score.toFixed(1)}</span>
+            </div>
+            <div class="risk-bar"><div class="fill" style="width:${pct}%;background:${color};"></div></div>
+        </div>`;
+    });
+    list.innerHTML = html;
+}
+
+// ═══════════════════════════════════════════
+// Ledger
+// ═══════════════════════════════════════════
+async function updateLedger() {
+    try {
+        const data = await fetch('/api/ledger?limit=5').then(r => r.json());
+        const entries = data.entries || [];
+        const container = document.getElementById('ledger-entries');
+
+        if (entries.length === 0) {
+            container.innerHTML = '<div style="color:var(--text-dim);font-size:12px;">Нет записей</div>';
+            return;
+        }
+
+        let html = '';
+        entries.forEach(e => {
+            const threats = e.final_verdict ? 
+                (e.final_verdict.log_anomalies?.length || 0) + 
+                (e.final_verdict.network_anomalies?.length || 0) + 
+                (e.final_verdict.system_anomalies?.length || 0) : 0;
+            const sev = e.final_verdict?.overall_severity || 0;
+            const sevClass = sev >= 4 ? 'critical' : sev >= 2 ? 'high' : 'low';
+            html += `<div class="threat-item">
+                <div>
+                    <div style="font-size:12px;">Cycle #${e.cycle_id}</div>
+                    <div style="font-size:11px;color:var(--text-dim);">${e.timestamp ? new Date(e.timestamp).toLocaleTimeString('ru-RU') : '—'}</div>
+                </div>
+                <div>
+                    <span class="severity ${sevClass}">${sev}/5</span>
+                    <span style="margin-left:8px;font-size:12px;">${threats} угроз</span>
+                </div>
+            </div>`;
+        });
+        container.innerHTML = html;
+    } catch(e) {}
+}
+
+// ═══════════════════════════════════════════
+// Chat
+// ═══════════════════════════════════════════
+async function sendChat() {
+    const input = document.getElementById('chat-input');
+    const msg = input.value.trim();
+    if (!msg) return;
+
+    input.value = '';
+    const log = document.getElementById('chat-log');
+
+    // User message
+    log.innerHTML += `<div class="chat-msg"><span class="role user">User</span><div class="text">${escapeHtml(msg)}</div></div>`;
+    log.innerHTML += `<div class="chat-msg"><span class="role ai" style="color:var(--warning);">AI</span><div class="text" style="color:var(--text-dim);">думает...</div></div>`;
+    log.scrollTop = log.scrollHeight;
+
+    try {
+        const resp = await fetch('/api/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({message: msg}),
+        });
+        const data = await resp.json();
+
+        // Заменяем "думает..." на ответ
+        const msgs = log.querySelectorAll('.chat-msg');
+        const lastMsg = msgs[msgs.length - 1];
+        lastMsg.innerHTML = `<span class="role ai">AI</span><div class="text">${escapeHtml(data.response)}</div>`;
+    } catch(e) {
+        const msgs = log.querySelectorAll('.chat-msg');
+        const lastMsg = msgs[msgs.length - 1];
+        lastMsg.innerHTML = `<span class="role ai" style="color:var(--danger);">Error</span><div class="text">${e.message}</div>`;
+    }
+    log.scrollTop = log.scrollHeight;
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// ═══════════════════════════════════════════
+// Управление реактором
+// ═══════════════════════════════════════════
+async function control(cmd) {
+    try {
+        await fetch('/api/reactor', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({command: cmd}),
+        });
+        await updateStatus();
+    } catch(e) {
+        alert('Ошибка: ' + e.message);
+    }
+}
+
+async function toggleAuto() {
+    autoMode = !autoMode;
+    try {
+        await fetch('/api/reactor', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({command: 'set_auto', value: autoMode}),
+        });
+        await updateStatus();
+    } catch(e) {}
+}
+
+// ═══════════════════════════════════════════
+// Инициализация
+// ═══════════════════════════════════════════
+setInterval(updateStatus, 5000);
+setInterval(updateLedger, 10000);
+
+// Периодические принудительные рефрешы
+setTimeout(updateStatus, 500);
+setTimeout(updateLedger, 1000);
+</script>
+</body>
+</html>

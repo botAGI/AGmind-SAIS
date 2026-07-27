@@ -1,0 +1,8 @@
+# AGmind-SAIS dependencies
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+aiohttp>=3.10.0
+pydantic>=2.9.0
+pyyaml>=6.0.2
+python-multipart>=0.0.17
+websockets>=12.0
