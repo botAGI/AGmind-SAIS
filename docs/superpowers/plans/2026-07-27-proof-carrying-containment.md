@@ -98,11 +98,23 @@ action_id    = "act_"  + first_32_hex(SHA256("AGMIND_ACTION_ID_V1\0" ||
                      plan_hash_bytes))
 ```
 
+The prepared-plan wire `nonce` is exactly 32 random bytes encoded as 64
+lowercase hexadecimal characters. `nonce_bytes` in the `plan_id` derivation
+means the decoded 32 bytes, not the UTF-8 bytes of the hexadecimal wire text.
+
 An event signature is Ed25519 over:
 
 ```text
 "AGMIND_EVENT_ENVELOPE_V1\0" ||
 canonical_json(event_envelope_without_source_signature)
+```
+
+A key transition is dual-signed by the old and new Ed25519 keys over the exact
+same domain-separated bytes:
+
+```text
+"AGMIND_KEY_TRANSITION_V1\0" ||
+canonical_json(key_transition_without_old_signature_and_new_signature)
 ```
 
 For each actuator action record:

@@ -1,0 +1,12 @@
+{
+  "schema_version": "agmind.key-transition.v1",
+  "old_key_id": "56475aa75463474c0285df5dbf2bcab7",
+  "new_key_id": "24f6ed6acbfe1009c030d7ca567c33ca",
+  "old_epoch": 1,
+  "new_epoch": 2,
+  "new_public_key": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+  "host_id": "123e4567-e89b-42d3-a456-426614174000",
+  "occurred_at": "2026-07-27T12:00:00Z",
+  "old_signature": "d4abfd51d2734221acfe0e85affdab3ecf3c6e63ef01fc1a1950109514eb725b1836fc905ddbacebab91b9c9f7b41f4ec265992611f1ebd3db3333cf8d6a4e09",
+  "new_signature": "d086fe0909d43615b0556da07030a1a2015c174687e1bc14f12ba794ac7a73c18cc968848921f418ca7a13a46f4c036747cbbf6b9ba1fb59a485235ed39ccc0a"
+}

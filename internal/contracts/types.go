@@ -1,5 +1,11 @@
 package contracts
 
+// Contract is deliberately mandatory for DecodeStrict. New wire types cannot
+// silently bypass validation by falling through a type switch.
+type Contract interface {
+	Validate() error
+}
+
 // EventEnvelopeV1 is the signed observer-to-Core event contract.
 type EventEnvelopeV1 struct {
 	SchemaVersion          string         `json:"schema_version"`
@@ -28,7 +34,51 @@ type EventEnvelopeV1 struct {
 	SourceSignature        string         `json:"source_signature"`
 }
 
-type TemporaryEgressDenyIntentV1 struct {
+// FalcoConnectV1 is the bounded, redacted normalized Falco connect event.
+type FalcoConnectV1 struct {
+	DetectorRule           string   `json:"detector_rule"`
+	DetectorRuleVersion    string   `json:"detector_rule_version"`
+	FalcoVersion           string   `json:"falco_version"`
+	EvtType                string   `json:"evt_type"`
+	EvtRawres              *int64   `json:"evt_rawres,omitempty"`
+	EvtRes                 string   `json:"evt_res"`
+	SuccessfulConnect      bool     `json:"successful_connect"`
+	InvestigationOnly      bool     `json:"investigation_only"`
+	FalcoContainerIDPrefix string   `json:"falco_container_id_prefix"`
+	FalcoContainerFullID   *string  `json:"falco_container_full_id,omitempty"`
+	FalcoContainerStartTS  any      `json:"falco_container_start_ts"`
+	DockerContainerID      *string  `json:"docker_container_id,omitempty"`
+	DockerStartedAt        *string  `json:"docker_started_at,omitempty"`
+	ImageID                *string  `json:"image_id,omitempty"`
+	RepoDigests            []string `json:"repo_digests"`
+	ImmutableSpecSHA256    *string  `json:"immutable_spec_sha256,omitempty"`
+	InventoryRevision      *uint64  `json:"inventory_revision,omitempty"`
+	ProcName               string   `json:"proc_name"`
+	ProcExePath            string   `json:"proc_exe_path"`
+	ProcParentName         string   `json:"proc_parent_name"`
+	DestinationIPv4        string   `json:"destination_ipv4"`
+	DestinationPort        uint16   `json:"destination_port"`
+	L4Protocol             string   `json:"l4_protocol"`
+	MissingRequiredFields  []string `json:"missing_required_fields"`
+	RawEventSHA256         string   `json:"raw_event_sha256"`
+}
+
+// CoverageEventV1 is a bounded normalized coverage interval.
+type CoverageEventV1 struct {
+	Component                   string  `json:"component"`
+	Kind                        string  `json:"kind"`
+	Severity                    string  `json:"severity"`
+	OpenedAt                    string  `json:"opened_at"`
+	ClosedAt                    *string `json:"closed_at,omitempty"`
+	AffectedSourceSequenceStart *uint64 `json:"affected_source_sequence_start,omitempty"`
+	AffectedSourceSequenceEnd   *uint64 `json:"affected_source_sequence_end,omitempty"`
+	DroppedCount                *uint64 `json:"dropped_count,omitempty"`
+	ReasonCode                  string  `json:"reason_code"`
+	ReconcileGeneration         *uint64 `json:"reconcile_generation,omitempty"`
+}
+
+// EgressDenyFields are shared fields, not a standalone wire contract.
+type EgressDenyFields struct {
 	SchemaVersion          string   `json:"schema_version"`
 	IntentID               string   `json:"intent_id"`
 	Verb                   string   `json:"verb"`
@@ -50,8 +100,12 @@ type TemporaryEgressDenyIntentV1 struct {
 	CreatedAt              string   `json:"created_at"`
 }
 
+type TemporaryEgressDenyIntentV1 struct {
+	EgressDenyFields
+}
+
 type PreparedTemporaryEgressDenyPlanV1 struct {
-	TemporaryEgressDenyIntentV1
+	EgressDenyFields
 	PlanID                      string `json:"plan_id"`
 	BootID                      string `json:"boot_id"`
 	InitPID                     uint64 `json:"init_pid"`
@@ -66,6 +120,31 @@ type PreparedTemporaryEgressDenyPlanV1 struct {
 	ApprovalExpiresAt           string `json:"approval_expires_at"`
 	Nonce                       string `json:"nonce"`
 	PlanHashValue               string `json:"plan_hash"`
+}
+
+type HunterOutputV1 struct {
+	SchemaVersion         string   `json:"schema_version"`
+	Hypotheses            []string `json:"hypotheses"`
+	SupportingEvidenceIDs []string `json:"supporting_evidence_ids"`
+	RefutingQuestions     []string `json:"refuting_questions"`
+	Narrative             string   `json:"narrative"`
+	Limitations           []string `json:"limitations"`
+}
+
+type ActionRecordV1 struct {
+	SchemaVersion        string         `json:"schema_version"`
+	RecordID             string         `json:"record_id"`
+	ActionID             *string        `json:"action_id,omitempty"`
+	PlanID               string         `json:"plan_id"`
+	PlanHashValue        string         `json:"plan_hash"`
+	State                string         `json:"state"`
+	ReasonCode           string         `json:"reason_code"`
+	ObservedAt           string         `json:"observed_at"`
+	PreviousRecordSHA256 string         `json:"previous_record_sha256"`
+	RecordSHA256         string         `json:"record_sha256"`
+	Details              map[string]any `json:"details"`
+	ActuatorKeyID        string         `json:"actuator_key_id"`
+	ActuatorSignature    string         `json:"actuator_signature"`
 }
 
 type KeyTransitionV1 struct {

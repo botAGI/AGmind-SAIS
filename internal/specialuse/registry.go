@@ -40,11 +40,20 @@ func Load(r io.Reader) (Registry, error) {
 		if len(row) <= reachable || len(row) <= block {
 			continue
 		}
-		prefix, err := netip.ParsePrefix(strings.Fields(row[block])[0])
-		if err != nil || !prefix.Addr().Is4() {
-			continue
+		for _, rawPrefix := range strings.Split(row[block], ",") {
+			fields := strings.Fields(strings.TrimSpace(rawPrefix))
+			if len(fields) == 0 {
+				continue
+			}
+			prefix, err := netip.ParsePrefix(fields[0])
+			if err != nil || !prefix.Addr().Is4() {
+				continue
+			}
+			entries = append(entries, Entry{
+				Prefix:            prefix,
+				GloballyReachable: row[reachable] == "True",
+			})
 		}
-		entries = append(entries, Entry{Prefix: prefix, GloballyReachable: row[reachable] == "True"})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Prefix.Bits() > entries[j].Prefix.Bits() })
 	return entries, nil

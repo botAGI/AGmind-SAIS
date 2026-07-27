@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
-	"strconv"
 	"unicode/utf8"
 )
 
@@ -47,8 +46,13 @@ func rejectInvalidStrings(value reflect.Value) error {
 		if !utf8.ValidString(value.String()) {
 			return fmt.Errorf("invalid UTF-8 string")
 		}
+	case reflect.Float32, reflect.Float64:
+		return fmt.Errorf("floating-point JSON is forbidden")
 	case reflect.Map:
 		for _, key := range value.MapKeys() {
+			if key.Kind() != reflect.String {
+				return fmt.Errorf("JSON object keys must be strings")
+			}
 			if err := rejectInvalidStrings(key); err != nil {
 				return err
 			}
@@ -155,5 +159,3 @@ func writeQuoted(out *bytes.Buffer, value string) {
 	}
 	out.WriteByte('"')
 }
-
-var _ = strconv.IntSize

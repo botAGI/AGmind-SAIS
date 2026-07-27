@@ -1,0 +1,12 @@
+{
+  "component": "falco-adapter",
+  "kind": "delivery_gap",
+  "severity": "CRITICAL",
+  "opened_at": "2026-07-27T12:00:00Z",
+  "closed_at": "2026-07-27T12:00:01.123456789Z",
+  "affected_source_sequence_start": 7,
+  "affected_source_sequence_end": 8,
+  "dropped_count": 2,
+  "reason_code": "queue_full",
+  "reconcile_generation": 3
+}

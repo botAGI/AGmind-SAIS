@@ -1,0 +1,57 @@
+[
+  {
+    "name": "leading-whitespace",
+    "input_hex": "20090a0d7b2278223a317d",
+    "accepted": true,
+    "canonical_hex": "7b2278223a317d"
+  },
+  {
+    "name": "integral-float",
+    "input_hex": "7b2278223a312e307d",
+    "accepted": false
+  },
+  {
+    "name": "exponent",
+    "input_hex": "7b2278223a3165307d",
+    "accepted": false
+  },
+  {
+    "name": "invalid-utf8",
+    "input_hex": "7b2278223a22ff227d",
+    "accepted": false
+  },
+  {
+    "name": "unpaired-high-surrogate",
+    "input_hex": "7b2278223a225c7564383030227d",
+    "accepted": false
+  },
+  {
+    "name": "unpaired-low-surrogate",
+    "input_hex": "7b2278223a225c7564633030227d",
+    "accepted": false
+  },
+  {
+    "name": "paired-surrogate",
+    "input_hex": "7b2278223a225c75643833645c7564653030227d",
+    "accepted": true,
+    "canonical_hex": "7b2278223a22f09f9880227d"
+  },
+  {
+    "name": "controls",
+    "input_hex": "7b2278223a225c625c665c6e5c725c745c7530303031227d",
+    "accepted": true,
+    "canonical_hex": "7b2278223a225c625c665c6e5c725c745c7530303031227d"
+  },
+  {
+    "name": "line-separators",
+    "input_hex": "7b2278223a225c75323032385c7532303239227d",
+    "accepted": true,
+    "canonical_hex": "7b2278223a22e280a8e280a9227d"
+  },
+  {
+    "name": "unicode-key-order",
+    "input_hex": "7b2278223a7b225c7565303030223a312c225c75643833645c7564653030223a327d7d",
+    "accepted": true,
+    "canonical_hex": "7b2278223a7b22ee8080223a312c22f09f9880223a327d7d"
+  }
+]

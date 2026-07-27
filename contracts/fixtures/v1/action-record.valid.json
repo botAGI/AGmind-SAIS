@@ -1,0 +1,17 @@
+{
+  "schema_version": "agmind.action-record.v1",
+  "record_id": "ar_2d567703a577e321df8a3c8046b97cc3",
+  "action_id": "act_594bbfc8240be724b6e3454db809559c",
+  "plan_id": "plan_e1a0cb9d0b196a0fae911f5e41a93058",
+  "plan_hash": "f1a03c149c9129bc260563d45a8d61fda23e1e6abc438dd50c55aca712ebf42d",
+  "state": "PREPARED",
+  "reason_code": "prepared",
+  "observed_at": "2026-07-27T12:00:02Z",
+  "previous_record_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "record_sha256": "2d567703a577e321df8a3c8046b97cc3beebbce4bd2cb6e536cbaebbc1fef38f",
+  "details": {
+    "message": "TEST ONLY"
+  },
+  "actuator_key_id": "03396219237f75a64f12aeb7f39723ab",
+  "actuator_signature": "69057ce80c134259e6f39394aa39f84b2424d3f8d6b312b3610db3d8f64ed33d86264782d16f8b8c3676242a19fd7f0bb83eeaade7416ac1a2dcc10f792b3b09"
+}

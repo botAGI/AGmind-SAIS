@@ -3,6 +3,8 @@ package contracts
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"os"
 	"testing"
 )
@@ -64,12 +66,66 @@ func TestEventSignatureMatchesCommittedGoldenMessage(t *testing.T) {
 
 func FuzzDecodeStrict(f *testing.F) {
 	f.Add([]byte(`{"schema_version":"agmind.event-envelope.v1"}`))
-	f.Fuzz(func(t *testing.T, raw []byte) { _, _ = DecodeStrict[EventEnvelopeV1](bytes.NewReader(raw), 65536) })
+	f.Add([]byte(`{"schema_version":"agmind.event-envelope.v1","source_sequence":1.0}`))
+	f.Add([]byte(`{"schema_version":"agmind.event-envelope.v1","source_id":"\ud800"}`))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		value, err := DecodeStrict[EventEnvelopeV1](bytes.NewReader(raw), 65536)
+		if err != nil {
+			return
+		}
+		if err := value.Validate(); err != nil {
+			t.Fatalf("decoder returned invalid contract: %v", err)
+		}
+		canonical, err := CanonicalJSON(value)
+		if err != nil {
+			t.Fatalf("accepted contract did not canonicalize: %v", err)
+		}
+		if len(canonical) == 0 {
+			t.Fatal("accepted contract canonicalized to empty bytes")
+		}
+	})
 }
 
 func FuzzCanonicalJSON(f *testing.F) {
-	f.Add("key", "value")
-	f.Fuzz(func(t *testing.T, key, value string) { _, _ = CanonicalJSON(map[string]any{key: value}) })
+	for _, seed := range [][]byte{
+		[]byte(`null`),
+		[]byte(`true`),
+		[]byte(`1`),
+		[]byte(`1.0`),
+		[]byte(`["\u2028",1,false,null]`),
+		[]byte(`{"\ue000":1,"\ud83d\ude00":2}`),
+		{0xff},
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		value, err := strictValue(decoder)
+		if err != nil {
+			return
+		}
+		if token, err := decoder.Token(); err != io.EOF || token != nil {
+			return
+		}
+		canonical, err := CanonicalJSON(value)
+		if err != nil {
+			return
+		}
+		reparsed := json.NewDecoder(bytes.NewReader(canonical))
+		reparsed.UseNumber()
+		roundTrip, err := strictValue(reparsed)
+		if err != nil {
+			t.Fatalf("canonical output did not parse: %v", err)
+		}
+		again, err := CanonicalJSON(roundTrip)
+		if err != nil {
+			t.Fatalf("canonical output did not re-canonicalize: %v", err)
+		}
+		if !bytes.Equal(canonical, again) {
+			t.Fatalf("canonicalization is not idempotent: %q != %q", canonical, again)
+		}
+	})
 }
 
 func TestIntentRejectsPIDInjection(t *testing.T) {

@@ -1,1 +1,279 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"agmind.falco-connect.v1","type":"object","additionalProperties":false,"required":["detector_rule","detector_rule_version","falco_version","evt_type","evt_res","successful_connect","investigation_only","falco_container_id_prefix","falco_container_start_ts","repo_digests","proc_name","proc_exe_path","proc_parent_name","destination_ipv4","destination_port","l4_protocol","missing_required_fields","raw_event_sha256"],"properties":{"evt_type":{"const":"connect"},"successful_connect":{"type":"boolean"},"investigation_only":{"type":"boolean"},"destination_ipv4":{"type":"string"},"destination_port":{"type":"integer","minimum":1,"maximum":65535},"repo_digests":{"type":"array","maxItems":16},"missing_required_fields":{"type":"array"},"raw_event_sha256":{"pattern":"^[0-9a-f]{64}$"}},"allOf":[{"if":{"properties":{"investigation_only":{"const":false}}},"then":{"required":["docker_container_id","docker_started_at","image_id","immutable_spec_sha256","inventory_revision"],"properties":{"successful_connect":{"const":true}}}},{"if":{"properties":{"evt_res":{"pattern":"(?i)error"}}},"then":{"properties":{"successful_connect":{"const":false}}}}]}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agmind.local/contracts/v1/falco-connect.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "detector_rule",
+    "detector_rule_version",
+    "falco_version",
+    "evt_type",
+    "evt_res",
+    "successful_connect",
+    "investigation_only",
+    "falco_container_id_prefix",
+    "falco_container_start_ts",
+    "repo_digests",
+    "proc_name",
+    "proc_exe_path",
+    "proc_parent_name",
+    "destination_ipv4",
+    "destination_port",
+    "l4_protocol",
+    "missing_required_fields",
+    "raw_event_sha256"
+  ],
+  "properties": {
+    "detector_rule": {
+      "$ref": "#/$defs/safeFragment"
+    },
+    "detector_rule_version": {
+      "$ref": "#/$defs/ascii64"
+    },
+    "falco_version": {
+      "$ref": "#/$defs/ascii64"
+    },
+    "evt_type": {
+      "type": "string",
+      "const": "connect"
+    },
+    "evt_rawres": {
+      "type": "integer",
+      "minimum": -9223372036854775808,
+      "maximum": 9223372036854775807
+    },
+    "evt_res": {
+      "$ref": "#/$defs/ascii64"
+    },
+    "successful_connect": {
+      "type": "boolean"
+    },
+    "investigation_only": {
+      "type": "boolean"
+    },
+    "falco_container_id_prefix": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{12,64}$"
+    },
+    "falco_container_full_id": {
+      "$ref": "#/$defs/dockerID"
+    },
+    "falco_container_start_ts": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        {
+          "$ref": "#/$defs/ascii64"
+        }
+      ]
+    },
+    "docker_container_id": {
+      "$ref": "#/$defs/dockerID"
+    },
+    "docker_started_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "image_id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "repo_digests": {
+      "$ref": "#/$defs/repoDigests"
+    },
+    "immutable_spec_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "inventory_revision": {
+      "$ref": "#/$defs/uint64"
+    },
+    "proc_name": {
+      "$ref": "#/$defs/safeFragment"
+    },
+    "proc_exe_path": {
+      "$ref": "#/$defs/safeFragment"
+    },
+    "proc_parent_name": {
+      "$ref": "#/$defs/safeFragment"
+    },
+    "destination_ipv4": {
+      "$ref": "#/$defs/ipv4"
+    },
+    "destination_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "l4_protocol": {
+      "$ref": "#/$defs/ascii64"
+    },
+    "missing_required_fields": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/ascii64"
+      }
+    },
+    "raw_event_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "investigation_only": {
+            "const": false
+          }
+        },
+        "required": [
+          "investigation_only"
+        ]
+      },
+      "then": {
+        "required": [
+          "docker_container_id",
+          "docker_started_at",
+          "image_id",
+          "immutable_spec_sha256",
+          "inventory_revision"
+        ],
+        "properties": {
+          "successful_connect": {
+            "const": true
+          },
+          "missing_required_fields": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "successful_connect": {
+            "const": true
+          }
+        },
+        "required": [
+          "successful_connect"
+        ]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "required": [
+              "evt_rawres"
+            ],
+            "properties": {
+              "evt_rawres": {
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "properties": {
+              "evt_res": {
+                "pattern": "^[Ee][Ii][Nn][Pp][Rr][Oo][Gg][Rr][Ee][Ss][Ss](?:\\(115\\))?$"
+              }
+            },
+            "required": [
+              "evt_res"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "successful_connect": {
+            "const": false
+          }
+        },
+        "required": [
+          "successful_connect"
+        ]
+      },
+      "then": {
+        "properties": {
+          "investigation_only": {
+            "const": true
+          }
+        },
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "evt_rawres"
+              ],
+              "properties": {
+                "evt_rawres": {
+                  "minimum": 0
+                }
+              }
+            },
+            {
+              "properties": {
+                "evt_res": {
+                  "pattern": "^[Ee][Ii][Nn][Pp][Rr][Oo][Gg][Rr][Ee][Ss][Ss](?:\\(115\\))?$"
+                }
+              },
+              "required": [
+                "evt_res"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "ascii64": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[\\x20-\\x7e]+$"
+    },
+    "safeFragment": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "dockerID": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d{1,9})?Z$"
+    },
+    "ipv4": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}$"
+    },
+    "repoDigests": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-"""Strict, bounded mirrors of the versioned AGmind wire contracts."""
+"""Strict, bounded mirrors of every versioned AGmind wire contract."""
 
 from __future__ import annotations
 
@@ -9,16 +9,38 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_HEX32 = re.compile(r"^[0-9a-f]{32}$")
-_UUID4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
-_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$")
-_IPV4 = re.compile(r"^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$")
-_MAX_UINT64 = 2**64 - 1
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX32 = re.compile(r"^[0-9a-f]{32}$")
+UUID4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?Z$"
+)
+IPV4 = re.compile(
+    r"^(?:0|[1-9]|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])"
+    r"(?:\.(?:0|[1-9]|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])){3}$"
+)
+MAX_UINT64 = 2**64 - 1
+MIN_INT64 = -(2**63)
+MAX_INT64 = 2**63 - 1
+SUCCESS_RESULTS = {"EINPROGRESS", "EINPROGRESS(115)"}
+ACTION_STATES = {
+    "PROPOSED",
+    "POLICY_ADMITTED",
+    "PREPARED",
+    "APPROVED",
+    "APPLIED",
+    "VERIFIED",
+    "EXPIRED",
+    "STALE_ABORT",
+    "REJECTED",
+    "FAILED_DIRTY",
+    "EXPIRED_UNAPPLIED",
+}
 
 
 def _reject_float(_: str) -> object:
@@ -38,22 +60,44 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _validate_unicode(value: object) -> None:
+    if isinstance(value, str):
+        if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+            raise ValueError("surrogate code points are forbidden")
+        value.encode("utf-8", "strict")
+    elif isinstance(value, list):
+        for item in value:
+            _validate_unicode(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _validate_unicode(key)
+            _validate_unicode(item)
+
+
 def decode_strict[T: BaseModel](raw: bytes, model: type[T], max_bytes: int) -> T:
-    """Decode exactly one bounded JSON value before Pydantic validation."""
+    """Decode exactly one bounded JSON object before model validation."""
     if max_bytes < 1 or len(raw) > max_bytes:
         raise ValueError("JSON input exceeds explicit byte limit")
     text = raw.decode("utf-8", "strict")
     decoder = json.JSONDecoder(
-        object_pairs_hook=_unique_object, parse_float=_reject_float, parse_constant=_reject_constant
+        object_pairs_hook=_unique_object,
+        parse_float=_reject_float,
+        parse_constant=_reject_constant,
     )
+    start = 0
+    while start < len(text) and text[start] in " \t\r\n":
+        start += 1
     try:
-        value, end = decoder.raw_decode(text)
+        value, end = decoder.raw_decode(text, start)
     except json.JSONDecodeError as error:
         raise ValueError(f"invalid JSON: {error.msg}") from error
-    if text[end:].strip():
+    while end < len(text) and text[end] in " \t\r\n":
+        end += 1
+    if end != len(text):
         raise ValueError("trailing JSON data is forbidden")
     if not isinstance(value, dict):
         raise ValueError("contract JSON must be an object")  # noqa: TRY004
+    _validate_unicode(value)
     return model.model_validate(value, strict=True)
 
 
@@ -61,8 +105,25 @@ class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+def _utf8(value: str, field: str, maximum: int, *, minimum: int = 1) -> str:
+    size = len(value.encode("utf-8", "strict"))
+    if size < minimum or size > maximum:
+        raise ValueError(f"{field} must be {minimum}..{maximum} UTF-8 bytes")
+    return value
+
+
+def _ascii(value: str, field: str, maximum: int = 64, *, minimum: int = 1) -> str:
+    try:
+        size = len(value.encode("ascii"))
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{field} must be ASCII") from error
+    if size < minimum or size > maximum:
+        raise ValueError(f"{field} must be {minimum}..{maximum} ASCII bytes")
+    return value
+
+
 def _valid_ipv4(value: str) -> str:
-    if not _IPV4.fullmatch(value):
+    if not IPV4.fullmatch(value):
         raise ValueError("IPv4 must be canonical dotted decimal")
     try:
         parsed = ipaddress.IPv4Address(value)
@@ -74,47 +135,55 @@ def _valid_ipv4(value: str) -> str:
 
 
 def _valid_timestamp(value: str) -> str:
-    if not _TIMESTAMP.fullmatch(value):
-        raise ValueError("timestamp must be RFC3339 UTC ending in Z")
+    if not TIMESTAMP.fullmatch(value):
+        raise ValueError("timestamp must be RFC3339Nano UTC ending in Z")
     try:
-        dt.datetime.fromisoformat(value)
+        parsed = dt.datetime.fromisoformat(value)
     except ValueError as error:
         raise ValueError("invalid RFC3339 timestamp") from error
+    if parsed.tzinfo != dt.UTC:
+        raise ValueError("timestamp must use UTC")
     return value
 
 
+def _sorted_unique(values: list[str], field: str) -> list[str]:
+    if values != sorted(set(values)):
+        raise ValueError(f"{field} must be unique and sorted")
+    return values
+
+
+def _repo_digests(values: list[str]) -> list[str]:
+    _sorted_unique(values, "repo_digests")
+    for item in values:
+        _utf8(item, "repo digest", 256)
+    return values
+
+
 class EventEnvelopeV1(ContractModel):
-    schema_version: str
+    schema_version: Literal["agmind.event-envelope.v1"]
     event_id: str
-    event_type: str = Field(max_length=64)
-    source_id: str = Field(max_length=512)
-    source_version: str = Field(max_length=64)
+    event_type: str
+    source_id: str
+    source_version: str
     key_id: str
-    key_epoch: int = Field(ge=1, le=_MAX_UINT64)
+    key_epoch: int = Field(ge=1, le=MAX_UINT64)
     host_id: str
     boot_id: str
-    source_sequence: int = Field(ge=0, le=_MAX_UINT64)
+    source_sequence: int = Field(ge=0, le=MAX_UINT64)
     event_time: str
     ingest_time: str
     clock_uncertainty_ms: int = Field(ge=0, le=2_000)
     container_id: str | None = None
     container_start_time: str | None = None
     release_id: str | None = None
-    inventory_generation: int = Field(ge=0, le=_MAX_UINT64)
-    inventory_revision: int | None = Field(default=None, ge=0, le=_MAX_UINT64)
+    inventory_generation: int = Field(ge=0, le=MAX_UINT64)
+    inventory_revision: int | None = Field(default=None, ge=0, le=MAX_UINT64)
     normalized_fields: dict[str, Any]
     normalized_fields_sha256: str
     redaction_flags: list[str] = Field(max_length=64)
     coverage_flags: list[str] = Field(max_length=64)
     source_payload_hash: str
     source_signature: str
-
-    @field_validator("schema_version")
-    @classmethod
-    def schema_is_supported(cls, value: str) -> str:
-        if value != "agmind.event-envelope.v1":
-            raise ValueError("unsupported event schema version")
-        return value
 
     @field_validator("event_id")
     @classmethod
@@ -123,17 +192,27 @@ class EventEnvelopeV1(ContractModel):
             raise ValueError("invalid event_id")
         return value
 
+    @field_validator("event_type", "source_version")
+    @classmethod
+    def short_ascii(cls, value: str, info: Any) -> str:
+        return _ascii(value, info.field_name)
+
+    @field_validator("source_id")
+    @classmethod
+    def source_is_bounded(cls, value: str) -> str:
+        return _utf8(value, "source_id", 512)
+
     @field_validator("key_id")
     @classmethod
     def key_id_is_valid(cls, value: str) -> str:
-        if not _HEX32.fullmatch(value):
+        if not HEX32.fullmatch(value):
             raise ValueError("invalid key_id")
         return value
 
     @field_validator("host_id", "boot_id")
     @classmethod
     def uuid_is_valid(cls, value: str) -> str:
-        if not _UUID4.fullmatch(value):
+        if not UUID4.fullmatch(value):
             raise ValueError("identity must be a lowercase UUIDv4")
         return value
 
@@ -142,10 +221,24 @@ class EventEnvelopeV1(ContractModel):
     def timestamp_is_valid(cls, value: str | None) -> str | None:
         return None if value is None else _valid_timestamp(value)
 
+    @field_validator("container_id")
+    @classmethod
+    def container_is_valid(cls, value: str | None) -> str | None:
+        if value is not None and not HEX64.fullmatch(value):
+            raise ValueError("container_id must be 64 lowercase hex")
+        return value
+
+    @field_validator("release_id")
+    @classmethod
+    def release_is_valid(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"rel_[0-9a-f]{32}", value):
+            raise ValueError("invalid release_id")
+        return value
+
     @field_validator("normalized_fields_sha256", "source_payload_hash")
     @classmethod
     def digest_is_valid(cls, value: str) -> str:
-        if not _HEX64.fullmatch(value):
+        if not HEX64.fullmatch(value):
             raise ValueError("invalid sha256 digest")
         return value
 
@@ -156,65 +249,202 @@ class EventEnvelopeV1(ContractModel):
             raise ValueError("invalid Ed25519 signature")
         return value
 
+    @field_validator("redaction_flags", "coverage_flags")
+    @classmethod
+    def flags_are_bounded(cls, values: list[str], info: Any) -> list[str]:
+        _sorted_unique(values, info.field_name)
+        for value in values:
+            _ascii(value, info.field_name)
+        return values
+
     @model_validator(mode="after")
     def normalized_fields_are_bounded(self) -> EventEnvelopeV1:
         from .canonicaljson import canonical_json
 
-        if len(canonical_json(self.normalized_fields)) > 32 * 1024:
+        canonical = canonical_json(self.normalized_fields)
+        if len(canonical) > 32 * 1024:
             raise ValueError("normalized fields exceed 32 KiB")
         return self
 
 
-class HunterOutputV1(ContractModel):
-    schema_version: str
-    hypotheses: list[str] = Field(max_length=8)
-    supporting_evidence_ids: list[str] = Field(max_length=8)
-    refuting_questions: list[str] = Field(max_length=8)
-    narrative: str = Field(max_length=8_192)
-    limitations: list[str] = Field(max_length=8)
+class FalcoConnectV1(ContractModel):
+    detector_rule: str
+    detector_rule_version: str
+    falco_version: str
+    evt_type: Literal["connect"]
+    evt_rawres: int | None = Field(default=None, ge=MIN_INT64, le=MAX_INT64)
+    evt_res: str
+    successful_connect: bool
+    investigation_only: bool
+    falco_container_id_prefix: str
+    falco_container_full_id: str | None = None
+    falco_container_start_ts: int | str
+    docker_container_id: str | None = None
+    docker_started_at: str | None = None
+    image_id: str | None = None
+    repo_digests: list[str] = Field(max_length=16)
+    immutable_spec_sha256: str | None = None
+    inventory_revision: int | None = Field(default=None, ge=0, le=MAX_UINT64)
+    proc_name: str
+    proc_exe_path: str
+    proc_parent_name: str
+    destination_ipv4: str
+    destination_port: int = Field(ge=1, le=65_535)
+    l4_protocol: str
+    missing_required_fields: list[str] = Field(max_length=32)
+    raw_event_sha256: str
 
-    @field_validator("schema_version")
+    @field_validator("detector_rule", "proc_name", "proc_exe_path", "proc_parent_name")
     @classmethod
-    def schema_is_supported(cls, value: str) -> str:
-        if value != "agmind.hunter-output.v1":
-            raise ValueError("unsupported hunter schema version")
+    def safe_fragment(cls, value: str, info: Any) -> str:
+        return _utf8(value, info.field_name, 512)
+
+    @field_validator("detector_rule_version", "falco_version", "evt_res", "l4_protocol")
+    @classmethod
+    def enum_ascii(cls, value: str, info: Any) -> str:
+        return _ascii(value, info.field_name)
+
+    @field_validator("falco_container_id_prefix")
+    @classmethod
+    def prefix_is_valid(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{12,64}", value):
+            raise ValueError("invalid Falco container ID prefix")
         return value
 
-    @field_validator("hypotheses", "supporting_evidence_ids", "refuting_questions", "limitations")
+    @field_validator("falco_container_full_id", "docker_container_id")
     @classmethod
-    def entries_are_bounded(cls, value: list[str]) -> list[str]:
-        if any(len(item.encode("utf-8")) > 1_024 for item in value):
-            raise ValueError("hunter entry exceeds 1,024 bytes")
+    def full_id_is_valid(cls, value: str | None) -> str | None:
+        if value is not None and not HEX64.fullmatch(value):
+            raise ValueError("Docker full ID must be 64 lowercase hex")
         return value
 
+    @field_validator("docker_started_at")
+    @classmethod
+    def docker_time_is_valid(cls, value: str | None) -> str | None:
+        return None if value is None else _valid_timestamp(value)
 
-class TemporaryEgressDenyIntentV1(ContractModel):
-    schema_version: str
+    @field_validator("image_id")
+    @classmethod
+    def image_is_valid(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValueError("invalid immutable image ID")
+        return value
+
+    @field_validator("immutable_spec_sha256", "raw_event_sha256")
+    @classmethod
+    def digest_is_valid(cls, value: str | None) -> str | None:
+        if value is not None and not HEX64.fullmatch(value):
+            raise ValueError("invalid sha256 digest")
+        return value
+
+    @field_validator("destination_ipv4")
+    @classmethod
+    def destination_is_valid(cls, value: str) -> str:
+        return _valid_ipv4(value)
+
+    @field_validator("repo_digests")
+    @classmethod
+    def repos_are_bounded(cls, values: list[str]) -> list[str]:
+        return _repo_digests(values)
+
+    @field_validator("missing_required_fields")
+    @classmethod
+    def missing_fields_are_bounded(cls, values: list[str]) -> list[str]:
+        _sorted_unique(values, "missing_required_fields")
+        for value in values:
+            _ascii(value, "missing_required_fields")
+        return values
+
+    @model_validator(mode="after")
+    def result_and_candidate_semantics(self) -> FalcoConnectV1:
+        if isinstance(self.falco_container_start_ts, int):
+            if not MIN_INT64 <= self.falco_container_start_ts <= MAX_INT64:
+                raise ValueError("falco_container_start_ts integer exceeds int64")
+        else:
+            _ascii(self.falco_container_start_ts, "falco_container_start_ts")
+        computed_success = (
+            self.evt_rawres is not None and self.evt_rawres >= 0
+        ) or self.evt_res.upper() in SUCCESS_RESULTS
+        if self.successful_connect != computed_success:
+            raise ValueError("successful_connect contradicts Falco result")
+        authoritative = (
+            self.docker_container_id,
+            self.docker_started_at,
+            self.image_id,
+            self.immutable_spec_sha256,
+            self.inventory_revision,
+        )
+        if not self.investigation_only:
+            if not self.successful_connect or any(item is None for item in authoritative):
+                raise ValueError("candidate-capable event lacks authoritative identity")
+            if self.missing_required_fields:
+                raise ValueError("candidate-capable event cannot report missing fields")
+        if not self.successful_connect and not self.investigation_only:
+            raise ValueError("hard errors must be investigation-only")
+        return self
+
+
+class CoverageEventV1(ContractModel):
+    component: str
+    kind: str
+    severity: Literal["INFO", "WARNING", "CRITICAL"]
+    opened_at: str
+    closed_at: str | None = None
+    affected_source_sequence_start: int | None = Field(
+        default=None, ge=0, le=MAX_UINT64
+    )
+    affected_source_sequence_end: int | None = Field(
+        default=None, ge=0, le=MAX_UINT64
+    )
+    dropped_count: int | None = Field(default=None, ge=0, le=MAX_UINT64)
+    reason_code: str
+    reconcile_generation: int | None = Field(default=None, ge=0, le=MAX_UINT64)
+
+    @field_validator("component", "kind", "reason_code")
+    @classmethod
+    def reason_ascii(cls, value: str, info: Any) -> str:
+        return _ascii(value, info.field_name)
+
+    @field_validator("opened_at", "closed_at")
+    @classmethod
+    def timestamp_is_valid(cls, value: str | None) -> str | None:
+        return None if value is None else _valid_timestamp(value)
+
+    @model_validator(mode="after")
+    def intervals_are_ordered(self) -> CoverageEventV1:
+        if self.closed_at is not None:
+            opened = dt.datetime.fromisoformat(self.opened_at)
+            closed = dt.datetime.fromisoformat(self.closed_at)
+            if closed < opened:
+                raise ValueError("closed_at precedes opened_at")
+        if (
+            self.affected_source_sequence_start is not None
+            and self.affected_source_sequence_end is not None
+            and self.affected_source_sequence_end < self.affected_source_sequence_start
+        ):
+            raise ValueError("coverage sequence interval is reversed")
+        return self
+
+
+class _EgressDenyFields(ContractModel):
     intent_id: str
-    verb: str
+    verb: Literal["temporary_egress_deny"]
     host_id: str
     docker_container_id: str
     docker_started_at: str
     image_id: str
     repo_digests: list[str] = Field(max_length=16)
     immutable_spec_sha256: str
-    inventory_generation: int = Field(ge=0, le=_MAX_UINT64)
-    inventory_revision: int = Field(ge=0, le=_MAX_UINT64)
+    inventory_generation: int = Field(ge=0, le=MAX_UINT64)
+    inventory_revision: int = Field(ge=0, le=MAX_UINT64)
     destination_ipv4: str
     ttl_seconds: int = Field(ge=30, le=300)
     evidence_ids: list[str] = Field(min_length=1, max_length=32)
     detector_bundle_sha256: str
-    policy_bundle_version: str = Field(max_length=64)
+    policy_bundle_version: str
     policy_bundle_sha256: str
     coverage_snapshot_sha256: str
     created_at: str
-
-    @field_validator("schema_version")
-    @classmethod
-    def schema_is_supported(cls, value: str) -> str:
-        if value != "agmind.temporary-egress-deny-intent.v1":
-            raise ValueError("unsupported intent schema version")
-        return value
 
     @field_validator("intent_id")
     @classmethod
@@ -223,24 +453,17 @@ class TemporaryEgressDenyIntentV1(ContractModel):
             raise ValueError("invalid intent_id")
         return value
 
-    @field_validator("verb")
-    @classmethod
-    def only_deny_verb(cls, value: str) -> str:
-        if value != "temporary_egress_deny":
-            raise ValueError("unsupported intent verb")
-        return value
-
     @field_validator("host_id")
     @classmethod
     def host_is_uuid(cls, value: str) -> str:
-        if not _UUID4.fullmatch(value):
+        if not UUID4.fullmatch(value):
             raise ValueError("host_id must be lowercase UUIDv4")
         return value
 
     @field_validator("docker_container_id")
     @classmethod
     def container_is_valid(cls, value: str) -> str:
-        if not _HEX64.fullmatch(value):
+        if not HEX64.fullmatch(value):
             raise ValueError("docker_container_id must be 64 lowercase hex")
         return value
 
@@ -264,7 +487,7 @@ class TemporaryEgressDenyIntentV1(ContractModel):
     )
     @classmethod
     def digest_is_valid(cls, value: str) -> str:
-        if not _HEX64.fullmatch(value):
+        if not HEX64.fullmatch(value):
             raise ValueError("invalid sha256 digest")
         return value
 
@@ -273,32 +496,280 @@ class TemporaryEgressDenyIntentV1(ContractModel):
     def destination_is_valid(cls, value: str) -> str:
         return _valid_ipv4(value)
 
-    @model_validator(mode="after")
-    def sorted_collections(self) -> TemporaryEgressDenyIntentV1:
-        if self.evidence_ids != sorted(set(self.evidence_ids)):
-            raise ValueError("evidence_ids must be unique and sorted")
-        if self.repo_digests != sorted(set(self.repo_digests)):
-            raise ValueError("repo_digests must be unique and sorted")
-        if any(len(item.encode("utf-8")) > 256 for item in self.repo_digests):
-            raise ValueError("repo digest exceeds 256 bytes")
-        return self
+    @field_validator("policy_bundle_version")
+    @classmethod
+    def policy_version_is_ascii(cls, value: str) -> str:
+        return _ascii(value, "policy_bundle_version")
+
+    @field_validator("repo_digests")
+    @classmethod
+    def repos_are_bounded(cls, values: list[str]) -> list[str]:
+        return _repo_digests(values)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def evidence_is_valid(cls, values: list[str]) -> list[str]:
+        _sorted_unique(values, "evidence_ids")
+        if any(not re.fullmatch(r"evt_[0-9a-f]{64}", value) for value in values):
+            raise ValueError("invalid evidence ID")
+        return values
 
 
-class PreparedTemporaryEgressDenyPlanV1(TemporaryEgressDenyIntentV1):
+class TemporaryEgressDenyIntentV1(_EgressDenyFields):
+    schema_version: Literal["agmind.temporary-egress-deny-intent.v1"]
+
+
+class PreparedTemporaryEgressDenyPlanV1(_EgressDenyFields):
+    schema_version: Literal["agmind.prepared-temporary-egress-deny-plan.v1"]
     plan_id: str
     boot_id: str
-    init_pid: int = Field(gt=0, le=_MAX_UINT64)
-    pid_start_ticks: int = Field(gt=0, le=_MAX_UINT64)
+    init_pid: int = Field(gt=0, le=MAX_UINT64)
+    pid_start_ticks: int = Field(gt=0, le=MAX_UINT64)
     cgroup_path_sha256: str
-    network_namespace_inode: int = Field(gt=0, le=_MAX_UINT64)
+    network_namespace_inode: int = Field(gt=0, le=MAX_UINT64)
     docker_network_snapshot_sha256: str
     special_use_registry_sha256: str
     management_denylist_sha256: str
-    hard_limits_version: str
+    hard_limits_version: Literal["pcc-hard-limits-v1"]
     prepared_at: str
     approval_expires_at: str
     nonce: str
     plan_hash: str
+
+    @field_validator("plan_id")
+    @classmethod
+    def plan_id_is_valid(cls, value: str) -> str:
+        if not re.fullmatch(r"plan_[0-9a-f]{32}", value):
+            raise ValueError("invalid plan_id")
+        return value
+
+    @field_validator("boot_id")
+    @classmethod
+    def boot_is_uuid(cls, value: str) -> str:
+        if not UUID4.fullmatch(value):
+            raise ValueError("boot_id must be lowercase UUIDv4")
+        return value
+
+    @field_validator(
+        "cgroup_path_sha256",
+        "docker_network_snapshot_sha256",
+        "special_use_registry_sha256",
+        "management_denylist_sha256",
+        "plan_hash",
+    )
+    @classmethod
+    def plan_digest_is_valid(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("invalid sha256 digest")
+        return value
+
+    @field_validator("prepared_at", "approval_expires_at")
+    @classmethod
+    def plan_time_is_valid(cls, value: str) -> str:
+        return _valid_timestamp(value)
+
+    @field_validator("nonce")
+    @classmethod
+    def nonce_is_valid(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("nonce must encode exactly 32 bytes as lowercase hex")
+        return value
+
+    @model_validator(mode="after")
+    def identifiers_and_expiry_match(self) -> PreparedTemporaryEgressDenyPlanV1:
+        from .canonicaljson import plan_hash, plan_id
+
+        if plan_id(self.intent_id, bytes.fromhex(self.nonce)) != self.plan_id:
+            raise ValueError("plan_id does not match locked derivation")
+        if plan_hash(self) != self.plan_hash:
+            raise ValueError("plan_hash does not match locked derivation")
+        prepared = dt.datetime.fromisoformat(self.prepared_at)
+        expires = dt.datetime.fromisoformat(self.approval_expires_at)
+        if expires - prepared != dt.timedelta(minutes=5):
+            raise ValueError("approval_expires_at must be exactly five minutes after prepared_at")
+        return self
+
+
+class HunterOutputV1(ContractModel):
+    schema_version: Literal["agmind.hunter-output.v1"]
+    hypotheses: list[str] = Field(max_length=8)
+    supporting_evidence_ids: list[str] = Field(max_length=8)
+    refuting_questions: list[str] = Field(max_length=8)
+    narrative: str
+    limitations: list[str] = Field(max_length=8)
+
+    @field_validator("hypotheses", "refuting_questions", "limitations")
+    @classmethod
+    def entries_are_bounded(cls, values: list[str], info: Any) -> list[str]:
+        for value in values:
+            _utf8(value, info.field_name, 1_024)
+        return values
+
+    @field_validator("supporting_evidence_ids")
+    @classmethod
+    def supporting_evidence_is_valid(cls, values: list[str]) -> list[str]:
+        _sorted_unique(values, "supporting_evidence_ids")
+        if any(not re.fullmatch(r"evt_[0-9a-f]{64}", value) for value in values):
+            raise ValueError("invalid supporting evidence ID")
+        return values
+
+    @field_validator("narrative")
+    @classmethod
+    def narrative_is_bounded(cls, value: str) -> str:
+        return _utf8(value, "narrative", 8_192, minimum=0)
+
+
+class ActionRecordV1(ContractModel):
+    schema_version: Literal["agmind.action-record.v1"]
+    record_id: str
+    action_id: str | None = None
+    plan_id: str
+    plan_hash: str
+    state: str
+    reason_code: str
+    observed_at: str
+    previous_record_sha256: str
+    record_sha256: str
+    details: dict[str, Any]
+    actuator_key_id: str
+    actuator_signature: str
+
+    @field_validator("record_id")
+    @classmethod
+    def record_id_is_valid(cls, value: str) -> str:
+        if not re.fullmatch(r"ar_[0-9a-f]{32}", value):
+            raise ValueError("invalid record_id")
+        return value
+
+    @field_validator("action_id")
+    @classmethod
+    def action_id_is_valid(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"act_[0-9a-f]{32}", value):
+            raise ValueError("invalid action_id")
+        return value
+
+    @field_validator("plan_id")
+    @classmethod
+    def plan_id_is_valid(cls, value: str) -> str:
+        if not re.fullmatch(r"plan_[0-9a-f]{32}", value):
+            raise ValueError("invalid plan_id")
+        return value
+
+    @field_validator("plan_hash", "previous_record_sha256", "record_sha256")
+    @classmethod
+    def digest_is_valid(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("invalid sha256 digest")
+        return value
+
+    @field_validator("state")
+    @classmethod
+    def state_is_valid(cls, value: str) -> str:
+        if value not in ACTION_STATES:
+            raise ValueError("invalid action state")
+        return value
+
+    @field_validator("reason_code")
+    @classmethod
+    def reason_is_ascii(cls, value: str) -> str:
+        return _ascii(value, "reason_code")
+
+    @field_validator("observed_at")
+    @classmethod
+    def observed_is_valid(cls, value: str) -> str:
+        return _valid_timestamp(value)
+
+    @field_validator("actuator_key_id")
+    @classmethod
+    def key_id_is_valid(cls, value: str) -> str:
+        if not HEX32.fullmatch(value):
+            raise ValueError("invalid actuator_key_id")
+        return value
+
+    @field_validator("actuator_signature")
+    @classmethod
+    def signature_is_valid(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{128}", value):
+            raise ValueError("invalid actuator signature")
+        return value
+
+    @model_validator(mode="after")
+    def record_hashes_match(self) -> ActionRecordV1:
+        from .canonicaljson import (
+            action_id,
+            action_record_hash,
+            action_record_id,
+            canonical_json,
+        )
+
+        if len(canonical_json(self.details)) > 32 * 1024:
+            raise ValueError("action details exceed 32 KiB")
+        if self.action_id is not None and self.action_id != action_id(self.plan_hash):
+            raise ValueError("action_id does not match plan_hash")
+        expected = action_record_hash(self)
+        if self.record_sha256 != expected:
+            raise ValueError("record_sha256 does not match locked derivation")
+        if self.record_id != action_record_id(expected):
+            raise ValueError("record_id does not match record_sha256")
+        return self
+
+
+class KeyTransitionV1(ContractModel):
+    schema_version: Literal["agmind.key-transition.v1"]
+    old_key_id: str
+    new_key_id: str
+    old_epoch: int = Field(ge=1, le=MAX_UINT64)
+    new_epoch: int = Field(ge=2, le=MAX_UINT64)
+    new_public_key: str
+    host_id: str
+    occurred_at: str
+    old_signature: str
+    new_signature: str
+
+    @field_validator("old_key_id", "new_key_id")
+    @classmethod
+    def key_id_is_valid(cls, value: str) -> str:
+        if not HEX32.fullmatch(value):
+            raise ValueError("invalid key_id")
+        return value
+
+    @field_validator("new_public_key")
+    @classmethod
+    def public_key_is_valid(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("new_public_key must contain 32 bytes")
+        return value
+
+    @field_validator("host_id")
+    @classmethod
+    def host_is_valid(cls, value: str) -> str:
+        if not UUID4.fullmatch(value):
+            raise ValueError("host_id must be lowercase UUIDv4")
+        return value
+
+    @field_validator("occurred_at")
+    @classmethod
+    def occurred_is_valid(cls, value: str) -> str:
+        return _valid_timestamp(value)
+
+    @field_validator("old_signature", "new_signature")
+    @classmethod
+    def signature_is_valid(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{128}", value):
+            raise ValueError("invalid Ed25519 signature")
+        return value
+
+    @model_validator(mode="after")
+    def epochs_and_new_key_match(self) -> KeyTransitionV1:
+        from .canonicaljson import key_id
+
+        if self.new_epoch != self.old_epoch + 1:
+            raise ValueError("key epochs must be consecutive")
+        if self.new_key_id != key_id(bytes.fromhex(self.new_public_key)):
+            raise ValueError("new_key_id does not bind new_public_key")
+        if self.old_key_id == self.new_key_id:
+            raise ValueError("key transition must change keys")
+        return self
 
 
 @dataclass(frozen=True)
@@ -311,13 +782,18 @@ def load_special_use_registry(path: Path) -> list[SpecialUseEntry]:
     entries: list[SpecialUseEntry] = []
     with path.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
-            block = row["Address Block"].split()[0]
-            try:
-                network = ipaddress.ip_network(block, strict=False)
-            except ValueError:
-                continue
-            if isinstance(network, ipaddress.IPv4Network):
-                entries.append(SpecialUseEntry(network, row["Globally Reachable"] == "True"))
+            for raw_block in row["Address Block"].split(","):
+                block = re.sub(r"\s+\[\d+\]\s*$", "", raw_block.strip())
+                try:
+                    network = ipaddress.ip_network(block, strict=False)
+                except ValueError:
+                    continue
+                if isinstance(network, ipaddress.IPv4Network):
+                    entries.append(
+                        SpecialUseEntry(
+                            network, row["Globally Reachable"] == "True"
+                        )
+                    )
     return entries
 
 
@@ -341,5 +817,6 @@ def is_permitted_public_ipv4(
     except ValueError:
         return False
     matches = [entry for entry in registry if value in entry.network]
-    # Addresses absent from the special-use registry are ordinary public IPv4.
-    return not matches or max(matches, key=lambda entry: entry.network.prefixlen).globally_reachable
+    return not matches or max(
+        matches, key=lambda entry: entry.network.prefixlen
+    ).globally_reachable

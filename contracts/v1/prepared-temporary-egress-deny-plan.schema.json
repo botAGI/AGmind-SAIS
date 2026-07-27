@@ -1,1 +1,208 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"agmind.prepared-temporary-egress-deny-plan.v1","allOf":[{"$ref":"temporary-egress-deny-intent.schema.json"}],"type":"object","additionalProperties":false,"required":["plan_id","boot_id","init_pid","pid_start_ticks","cgroup_path_sha256","network_namespace_inode","docker_network_snapshot_sha256","special_use_registry_sha256","management_denylist_sha256","hard_limits_version","prepared_at","approval_expires_at","nonce","plan_hash"],"properties":{"plan_id":{"pattern":"^plan_[0-9a-f]{32}$"},"boot_id":{"type":"string"},"init_pid":{"type":"integer","minimum":1},"pid_start_ticks":{"type":"integer","minimum":1},"cgroup_path_sha256":{"pattern":"^[0-9a-f]{64}$"},"network_namespace_inode":{"type":"integer","minimum":1},"docker_network_snapshot_sha256":{"pattern":"^[0-9a-f]{64}$"},"special_use_registry_sha256":{"pattern":"^[0-9a-f]{64}$"},"management_denylist_sha256":{"pattern":"^[0-9a-f]{64}$"},"hard_limits_version":{"const":"pcc-hard-limits-v1"},"prepared_at":{"pattern":"Z$"},"approval_expires_at":{"pattern":"Z$"},"nonce":{"type":"string","maxLength":512},"plan_hash":{"pattern":"^[0-9a-f]{64}$"}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agmind.local/contracts/v1/prepared-temporary-egress-deny-plan.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "intent_id",
+    "verb",
+    "host_id",
+    "docker_container_id",
+    "docker_started_at",
+    "image_id",
+    "repo_digests",
+    "immutable_spec_sha256",
+    "inventory_generation",
+    "inventory_revision",
+    "destination_ipv4",
+    "ttl_seconds",
+    "evidence_ids",
+    "detector_bundle_sha256",
+    "policy_bundle_version",
+    "policy_bundle_sha256",
+    "coverage_snapshot_sha256",
+    "created_at",
+    "plan_id",
+    "boot_id",
+    "init_pid",
+    "pid_start_ticks",
+    "cgroup_path_sha256",
+    "network_namespace_inode",
+    "docker_network_snapshot_sha256",
+    "special_use_registry_sha256",
+    "management_denylist_sha256",
+    "hard_limits_version",
+    "prepared_at",
+    "approval_expires_at",
+    "nonce",
+    "plan_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "agmind.prepared-temporary-egress-deny-plan.v1"
+    },
+    "intent_id": {
+      "type": "string",
+      "pattern": "^int_[0-9a-f]{32}$"
+    },
+    "verb": {
+      "type": "string",
+      "const": "temporary_egress_deny"
+    },
+    "host_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "docker_container_id": {
+      "$ref": "#/$defs/dockerID"
+    },
+    "docker_started_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "image_id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "repo_digests": {
+      "$ref": "#/$defs/repoDigests"
+    },
+    "immutable_spec_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "inventory_generation": {
+      "$ref": "#/$defs/uint64"
+    },
+    "inventory_revision": {
+      "$ref": "#/$defs/uint64"
+    },
+    "destination_ipv4": {
+      "$ref": "#/$defs/ipv4"
+    },
+    "ttl_seconds": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 300
+    },
+    "evidence_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^evt_[0-9a-f]{64}$"
+      }
+    },
+    "detector_bundle_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "policy_bundle_version": {
+      "$ref": "#/$defs/ascii64"
+    },
+    "policy_bundle_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "coverage_snapshot_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "created_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^plan_[0-9a-f]{32}$"
+    },
+    "boot_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "init_pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "pid_start_ticks": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "cgroup_path_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "network_namespace_inode": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "docker_network_snapshot_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "special_use_registry_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "management_denylist_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "hard_limits_version": {
+      "type": "string",
+      "const": "pcc-hard-limits-v1"
+    },
+    "prepared_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "approval_expires_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "plan_hash": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "ascii64": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[\\x20-\\x7e]+$"
+    },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "dockerID": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d{1,9})?Z$"
+    },
+    "ipv4": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}$"
+    },
+    "repoDigests": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    }
+  }
+}

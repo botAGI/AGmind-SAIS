@@ -1,0 +1,38 @@
+{
+  "release": {
+    "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "immutable_spec_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "expected": "rel_c697b57d98f844494f64f5567ff7d34a"
+  },
+  "candidate": {
+    "event_id": "evt_5ca264c47eb4ca4cf63114dba860fb95179167fcd0674d5d976a15c9e7473e98",
+    "docker_container_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "docker_started_at": "2026-07-27T12:00:00Z",
+    "destination_ipv4": "1.1.1.1",
+    "detector_bundle_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "expected": "cand_07400f1685fc8796e98a6a8de81f1f06589d980b138d230b1ceb27514eb84082"
+  },
+  "intent": {
+    "candidate_id": "cand_07400f1685fc8796e98a6a8de81f1f06589d980b138d230b1ceb27514eb84082",
+    "policy_bundle_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "ttl_seconds": 120,
+    "expected": "int_875f0f15c0ddb3aed2ad402b38423b6b"
+  },
+  "plan": {
+    "intent_id": "int_875f0f15c0ddb3aed2ad402b38423b6b",
+    "nonce_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "expected": "plan_e1a0cb9d0b196a0fae911f5e41a93058"
+  },
+  "action": {
+    "plan_hash": "f1a03c149c9129bc260563d45a8d61fda23e1e6abc438dd50c55aca712ebf42d",
+    "expected": "act_594bbfc8240be724b6e3454db809559c"
+  },
+  "keys": {
+    "event_public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "event_key_id": "56475aa75463474c0285df5dbf2bcab7",
+    "new_public_key_hex": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+    "new_key_id": "24f6ed6acbfe1009c030d7ca567c33ca",
+    "actuator_public_key_hex": "2543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d",
+    "actuator_key_id": "03396219237f75a64f12aeb7f39723ab"
+  }
+}

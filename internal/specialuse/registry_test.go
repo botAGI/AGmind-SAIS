@@ -3,6 +3,7 @@ package specialuse
 import (
 	"net/netip"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -38,5 +39,24 @@ func TestPermittedPublicIPv4(t *testing.T) {
 	}
 	if IsPermittedPublicIPv4(netip.MustParseAddr("8.8.8.8"), registry, nil, []netip.Addr{netip.MustParseAddr("8.8.8.8")}) {
 		t.Error("management address must deny")
+	}
+}
+
+func TestLoadParsesEveryPrefixInMultiPrefixRows(t *testing.T) {
+	const registryCSV = `Address Block,Globally Reachable
+"192.0.0.170/32, 192.0.0.171/32",False
+`
+	registry, err := Load(strings.NewReader(registryCSV))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, entry := range registry {
+		got[entry.Prefix.String()] = true
+	}
+	for _, want := range []string{"192.0.0.170/32", "192.0.0.171/32"} {
+		if !got[want] {
+			t.Errorf("missing %s", want)
+		}
 	}
 }

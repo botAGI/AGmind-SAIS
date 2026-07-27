@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"unicode/utf8"
 )
 
 var integerJSON = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
 
-// DecodeStrict consumes one bounded JSON object, rejecting duplicates, floats,
-// unknown fields, and trailing values before handing a typed contract to callers.
-func DecodeStrict[T any](r io.Reader, maxBytes int64) (T, error) {
+// DecodeStrict consumes one bounded JSON object. The Contract constraint makes
+// exhaustive validation a compile-time obligation for every generic type.
+func DecodeStrict[T Contract](r io.Reader, maxBytes int64) (T, error) {
 	var zero T
 	if maxBytes < 1 {
 		return zero, fmt.Errorf("invalid explicit JSON byte limit")
@@ -23,6 +24,12 @@ func DecodeStrict[T any](r io.Reader, maxBytes int64) (T, error) {
 	}
 	if int64(len(raw)) > maxBytes {
 		return zero, fmt.Errorf("JSON input exceeds explicit byte limit")
+	}
+	if !utf8.Valid(raw) {
+		return zero, fmt.Errorf("invalid UTF-8 JSON")
+	}
+	if err := validateEscapedSurrogates(raw); err != nil {
+		return zero, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
@@ -47,14 +54,78 @@ func DecodeStrict[T any](r io.Reader, maxBytes int64) (T, error) {
 		return zero, err
 	}
 	typed := json.NewDecoder(bytes.NewReader(normalized))
+	typed.UseNumber()
 	typed.DisallowUnknownFields()
 	if err := typed.Decode(&zero); err != nil {
 		return zero, err
 	}
-	if err := validateContract(any(zero)); err != nil {
+	if err := zero.Validate(); err != nil {
 		return zero, err
 	}
 	return zero, nil
+}
+
+func validateEscapedSurrogates(raw []byte) error {
+	inString := false
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '"':
+			inString = !inString
+		case '\\':
+			if !inString {
+				continue
+			}
+			if i+1 >= len(raw) {
+				return fmt.Errorf("unterminated JSON escape")
+			}
+			i++
+			if raw[i] != 'u' {
+				continue
+			}
+			first, err := readHexQuad(raw, i+1)
+			if err != nil {
+				return err
+			}
+			i += 4
+			if first >= 0xd800 && first <= 0xdbff {
+				if i+6 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+					return fmt.Errorf("unpaired high surrogate escape")
+				}
+				second, err := readHexQuad(raw, i+3)
+				if err != nil {
+					return err
+				}
+				if second < 0xdc00 || second > 0xdfff {
+					return fmt.Errorf("unpaired high surrogate escape")
+				}
+				i += 6
+			} else if first >= 0xdc00 && first <= 0xdfff {
+				return fmt.Errorf("unpaired low surrogate escape")
+			}
+		}
+	}
+	return nil
+}
+
+func readHexQuad(raw []byte, start int) (uint16, error) {
+	if start+4 > len(raw) {
+		return 0, fmt.Errorf("short Unicode escape")
+	}
+	var value uint16
+	for _, char := range raw[start : start+4] {
+		value <<= 4
+		switch {
+		case char >= '0' && char <= '9':
+			value += uint16(char - '0')
+		case char >= 'a' && char <= 'f':
+			value += uint16(char-'a') + 10
+		case char >= 'A' && char <= 'F':
+			value += uint16(char-'A') + 10
+		default:
+			return 0, fmt.Errorf("invalid Unicode escape")
+		}
+	}
+	return value, nil
 }
 
 func strictValue(decoder *json.Decoder) (any, error) {

@@ -1,1 +1,188 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"agmind.event-envelope.v1","type":"object","additionalProperties":false,"required":["schema_version","event_id","event_type","source_id","source_version","key_id","key_epoch","host_id","boot_id","source_sequence","event_time","ingest_time","clock_uncertainty_ms","inventory_generation","normalized_fields","normalized_fields_sha256","redaction_flags","coverage_flags","source_payload_hash","source_signature"],"properties":{"schema_version":{"const":"agmind.event-envelope.v1"},"event_id":{"pattern":"^evt_[0-9a-f]{64}$"},"event_type":{"type":"string","maxLength":64},"source_id":{"type":"string","maxLength":512},"source_version":{"type":"string","maxLength":64},"key_id":{"pattern":"^[0-9a-f]{32}$"},"key_epoch":{"type":"integer","minimum":1},"host_id":{"pattern":"^[0-9a-f-]{36}$"},"boot_id":{"pattern":"^[0-9a-f-]{36}$"},"source_sequence":{"type":"integer","minimum":0},"event_time":{"pattern":"Z$"},"ingest_time":{"pattern":"Z$"},"clock_uncertainty_ms":{"type":"integer","minimum":0,"maximum":2000},"container_id":{"pattern":"^[0-9a-f]{64}$"},"container_start_time":{"pattern":"Z$"},"release_id":{"pattern":"^rel_[0-9a-f]{32}$"},"inventory_generation":{"type":"integer","minimum":0},"inventory_revision":{"type":"integer","minimum":0},"normalized_fields":{"type":"object"},"normalized_fields_sha256":{"pattern":"^[0-9a-f]{64}$"},"redaction_flags":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":64}},"coverage_flags":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":64}},"source_payload_hash":{"pattern":"^[0-9a-f]{64}$"},"source_signature":{"pattern":"^[0-9a-f]{128}$"}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agmind.local/contracts/v1/event-envelope.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "event_type",
+    "source_id",
+    "source_version",
+    "key_id",
+    "key_epoch",
+    "host_id",
+    "boot_id",
+    "source_sequence",
+    "event_time",
+    "ingest_time",
+    "clock_uncertainty_ms",
+    "inventory_generation",
+    "normalized_fields",
+    "normalized_fields_sha256",
+    "redaction_flags",
+    "coverage_flags",
+    "source_payload_hash",
+    "source_signature"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "agmind.event-envelope.v1"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^evt_[0-9a-f]{64}$"
+    },
+    "event_type": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[\\x20-\\x7e]+$"
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "source_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[\\x20-\\x7e]+$"
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "key_epoch": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "host_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "boot_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "source_sequence": {
+      "$ref": "#/$defs/uint64"
+    },
+    "event_time": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "ingest_time": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "clock_uncertainty_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2000
+    },
+    "container_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "container_start_time": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "release_id": {
+      "type": "string",
+      "pattern": "^rel_[0-9a-f]{32}$"
+    },
+    "inventory_generation": {
+      "$ref": "#/$defs/uint64"
+    },
+    "inventory_revision": {
+      "$ref": "#/$defs/uint64"
+    },
+    "normalized_fields": {
+      "$ref": "#/$defs/boundedObject"
+    },
+    "normalized_fields_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "redaction_flags": {
+      "$ref": "#/$defs/flags"
+    },
+    "coverage_flags": {
+      "$ref": "#/$defs/flags"
+    },
+    "source_payload_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "source_signature": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    }
+  },
+  "$defs": {
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d{1,9})?Z$"
+    },
+    "flags": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[\\x20-\\x7e]+$"
+      }
+    },
+    "boundedValue": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string",
+          "maxLength": 8192
+        },
+        {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/boundedValue"
+          }
+        },
+        {
+          "$ref": "#/$defs/boundedObject"
+        }
+      ]
+    },
+    "boundedObject": {
+      "type": "object",
+      "maxProperties": 128,
+      "propertyNames": {
+        "maxLength": 512
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/boundedValue"
+      }
+    }
+  }
+}
