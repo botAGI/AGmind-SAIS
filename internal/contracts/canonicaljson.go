@@ -22,6 +22,7 @@ var (
 type programmaticReference struct {
 	valueType reflect.Type
 	pointer   uintptr
+	length    int
 }
 
 // CanonicalJSON emits the byte-for-byte AGmind Canonical JSON v1 form.
@@ -40,7 +41,6 @@ func CanonicalJSON(v any) ([]byte, error) {
 func programmaticJSONValue(value any) (any, error) {
 	if err := validateProgrammaticJSON(
 		reflect.ValueOf(value),
-		0,
 		make(map[programmaticReference]bool),
 	); err != nil {
 		return nil, err
@@ -60,6 +60,12 @@ func programmaticJSONValue(value any) (any, error) {
 	if err := validateEscapedSurrogates(raw); err != nil {
 		return nil, err
 	}
+	// The pre-marshal walk enforces the closed producer domain and terminates
+	// reference cycles; it deliberately does not approximate encoded depth
+	// from Go reflection. Programmatic inputs are trusted in-process producer
+	// values, while untrusted wire inputs are byte-bounded by DecodeStrict.
+	// strictValue below is authoritative for the actual encoded 64-container
+	// limit after encoding/json has applied field promotion and omitempty.
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	decoded, err := strictValue(decoder)
@@ -87,7 +93,6 @@ func implementsForbiddenMarshaler(valueType reflect.Type) bool {
 
 func validateProgrammaticJSON(
 	value reflect.Value,
-	containerDepth int,
 	activeReferences map[programmaticReference]bool,
 ) error {
 	if !value.IsValid() {
@@ -107,7 +112,7 @@ func validateProgrammaticJSON(
 		if value.IsNil() {
 			return nil
 		}
-		return validateProgrammaticJSON(value.Elem(), containerDepth, activeReferences)
+		return validateProgrammaticJSON(value.Elem(), activeReferences)
 	}
 	if value.Kind() == reflect.Pointer ||
 		value.Kind() == reflect.Map ||
@@ -123,6 +128,12 @@ func validateProgrammaticJSON(
 			valueType: value.Type(),
 			pointer:   uintptr(value.UnsafePointer()),
 		}
+		if value.Kind() == reflect.Slice {
+			// encoding/json observes a slice's data and length, not capacity.
+			// Omitting capacity also ensures a cycle whose recurring logical
+			// header was full-sliced to a different cap still fails closed.
+			reference.length = value.Len()
+		}
 		if activeReferences[reference] {
 			return fmt.Errorf("cyclic canonical JSON value")
 		}
@@ -130,7 +141,7 @@ func validateProgrammaticJSON(
 		defer delete(activeReferences, reference)
 	}
 	if value.Kind() == reflect.Pointer {
-		return validateProgrammaticJSON(value.Elem(), containerDepth, activeReferences)
+		return validateProgrammaticJSON(value.Elem(), activeReferences)
 	}
 	switch value.Kind() {
 	case reflect.Bool,
@@ -146,20 +157,12 @@ func validateProgrammaticJSON(
 	case reflect.Float32, reflect.Float64:
 		return fmt.Errorf("floating-point JSON is forbidden")
 	case reflect.Map:
-		depth := containerDepth + 1
-		if depth > maxJSONNestingDepth {
-			return fmt.Errorf("JSON nesting depth exceeds 64")
-		}
 		for _, key := range value.MapKeys() {
-			if key.Kind() != reflect.String {
-				return fmt.Errorf("JSON object keys must be strings")
-			}
-			if err := validateProgrammaticJSON(key, depth, activeReferences); err != nil {
+			if err := validateProgrammaticMapKey(key); err != nil {
 				return err
 			}
 			if err := validateProgrammaticJSON(
 				value.MapIndex(key),
-				depth,
 				activeReferences,
 			); err != nil {
 				return err
@@ -170,14 +173,9 @@ func validateProgrammaticJSON(
 		if value.Kind() == reflect.Slice && value.Type().Elem().Kind() == reflect.Uint8 {
 			return fmt.Errorf("byte slices are forbidden in canonical JSON")
 		}
-		depth := containerDepth + 1
-		if depth > maxJSONNestingDepth {
-			return fmt.Errorf("JSON nesting depth exceeds 64")
-		}
 		for i := 0; i < value.Len(); i++ {
 			if err := validateProgrammaticJSON(
 				value.Index(i),
-				depth,
 				activeReferences,
 			); err != nil {
 				return err
@@ -185,10 +183,6 @@ func validateProgrammaticJSON(
 		}
 		return nil
 	case reflect.Struct:
-		depth := containerDepth + 1
-		if depth > maxJSONNestingDepth {
-			return fmt.Errorf("JSON nesting depth exceeds 64")
-		}
 		for i := 0; i < value.NumField(); i++ {
 			field := value.Type().Field(i)
 			tagName := strings.Split(field.Tag.Get("json"), ",")[0]
@@ -205,7 +199,6 @@ func validateProgrammaticJSON(
 			}
 			if err := validateProgrammaticJSON(
 				value.Field(i),
-				depth,
 				activeReferences,
 			); err != nil {
 				return err
@@ -215,6 +208,16 @@ func validateProgrammaticJSON(
 	default:
 		return fmt.Errorf("unsupported canonical JSON value %s", valueType)
 	}
+}
+
+func validateProgrammaticMapKey(key reflect.Value) error {
+	if key.Kind() != reflect.String {
+		return fmt.Errorf("JSON object keys must be strings")
+	}
+	if !utf8.ValidString(key.String()) {
+		return fmt.Errorf("invalid UTF-8 string")
+	}
+	return nil
 }
 
 func writeCanonical(out *bytes.Buffer, value any, containerDepth int) error {
