@@ -144,11 +144,26 @@ actuator_signature = Ed25519.Sign(
 
 The signed form includes both `record_sha256` and `previous_record_sha256`.
 
-`key_id` is the first 32 hex characters of SHA-256 of the 32-byte Ed25519 public key. `key_epoch` is an unsigned integer starting at 1. A rotation transition contains old/new key IDs, consecutive epochs, the new public key, host ID, and UTC timestamp and is signed by both old and new keys before the observer switches epochs.
+`key_id` is the first 32 hex characters of SHA-256 of the 32-byte Ed25519
+public key. `key_epoch` is an unsigned integer starting at 1. A rotation
+transition contains the exact host ID, old/new key IDs, consecutive epochs, new
+public key, and UTC timestamp and is signed by both old and new keys. For Core,
+that transition creates only a pending candidate key. The exact next published
+event must be `observer_key_epoch_start` at transition sequence plus one,
+signed by the candidate key; only its acceptance activates the new epoch.
+Before that start, the old key remains active. Afterwards it is valid only for
+historical replay before the accepted boundary.
 
 The installer creates `host_id` once as a lowercase UUIDv4 and stores it at `/var/lib/agmind-sais/identity/host-id`; observer reads `boot_id` as the lowercase kernel UUID from `/proc/sys/kernel/random/boot_id`. `detector_bundle_sha256` is SHA-256 over domain `AGMIND_DETECTOR_BUNDLE_V1\0`, the exact Falco rule-file bytes, adapter schema version, and Falco version. `coverage_snapshot_sha256` is SHA-256 of canonical JSON containing every relevant gap interval, readiness flag, observer generation, and decision timestamp. Management and Docker-network snapshot hashes are over their canonical JSON; the policy hash is over the exact mounted `pcc.rego` bytes.
 
-The initial public key is pinned during installation. A missing private key, non-consecutive epoch, key rollback, signature failure, segment-chain break, or unexplained sequence rollback makes the mutation path read-only.
+The initial `(host_id,key_id,key_epoch=1,public_key)` trust root is pinned
+during installation in a root-owned Core configuration. Observer-served public
+key metadata is transition evidence, never a self-authorizing replacement for
+that pin. A missing private key, non-consecutive epoch, key rollback, signature
+failure, segment-chain break, unexplained sequence rollback, or boot transition
+outside the closed boundary union below makes the mutation path read-only.
+Replacing the pin requires the explicit re-enrollment runbook; neither restart
+nor key rotation performs trust-on-first-use.
 
 ### Identity and freshness semantics
 
@@ -156,7 +171,18 @@ The initial public key is pinned during installation. A missing private key, non
 - The immutable-spec hash is canonical JSON SHA-256 over schema version, image ID, entrypoint hash, command hash, network mode, privileged flag, sorted `CapAdd`, sorted `CapDrop`, read-only-rootfs flag, and sorted mount tuples `(type,target,read_only,source_kind)`. It never contains environment values, label values, registry credentials, host source paths, or command text.
 - `inventory_generation` is observer-wide and increments after every successful full reconcile and every detected Docker daemon/event-stream gap. Admission is fenced until that reconcile completes.
 - `inventory_revision` is per full container ID and increments whenever any selected identity/spec fact changes. Both counters survive observer process restart within the same boot.
-- `source_sequence` is monotonic for `(host_id, boot_id, key_epoch)` and survives observer process restart. A host reboot changes `boot_id`; it does not reuse an old tuple.
+- `source_sequence` is one host-global unsigned counter for `host_id`. It starts
+  at 1, survives observer process restart, kernel reboot, and key rotation, and
+  is never reset or reused. `boot_id` and `key_epoch` are signed dimensions of
+  an event, not separate sequence domains.
+- A changed `boot_id` is accepted only as the first successfully published
+  event in the closed boot-boundary union: dedicated
+  `observer_boot_boundary`, a strict current-old-key
+  `observer_key_transition`, or its exact adjacent candidate-key
+  `observer_key_epoch_start`. Exactly the rotation event that is first in the
+  unseen boot carries signed `boot_transition`; its same-boot partner carries
+  only `key_rotation`. The rotation boundary substitutes for, rather than
+  precedes, a dedicated boundary.
 - Candidate admission requires event age at most 30 seconds, authoritative inventory age at most 10 seconds, clock uncertainty at most 2,000 ms, and no critical coverage gap intersecting `[event_time - clock_uncertainty, decision_time]`.
 - Candidate cooldown is 10 minutes for `(container_id, docker_started_at, detector_bundle_sha256, destination_ipv4)` after any terminal candidate state.
 
@@ -230,8 +256,15 @@ GET  /v1/private/integrity
 
 ### Crash and kill-switch semantics
 
-- Observer, Core evidence, and actuator journals use framed append-only records with length, CRC32C, previous-record hash, and `fsync` before acknowledging a security-critical transition.
-- A torn final frame is truncated during recovery and produces a coverage/repair record. A bad frame before the tail is corruption and forces read-only mode.
+- Observer spool/state and actuator journals use framed append-only records with
+  length, CRC32C, previous-record hash, and `fsync` before acknowledging a
+  security-critical transition. Their component-specific recovery rules remain
+  fail-closed on complete-frame or non-tail corruption.
+- Core evidence never auto-truncates. An incomplete frame is repairable only in
+  the active `.open` segment through the two-phase signed authorization and
+  completion protocol in Task 5C; until both records are accepted, mutation is
+  read-only. Any closed-segment, complete-frame, or non-tail corruption is
+  permanent evidence corruption and is never truncated.
 - `FAILED_DIRTY` atomically persists a global mutation lock before returning the error. New prepare/apply requests fail with `kill_switch_active`; existing kernel timeouts are not removed or extended.
 - `agmindctl kill-switch clear <lock-record-id>` clears a manual lock only when no dirty action exists; for a `FAILED_DIRTY` lock it additionally succeeds only after the actuator can prove the referenced owned element is absent or the old namespace no longer exists. Otherwise it refuses and points to the manual runbook.
 - On restart the actuator reconstructs rate limits, nonce consumption, active-action accounting, and the kill switch from the journal. It audits observed expiry but never repeats an apply.
@@ -892,7 +925,10 @@ N bytes  canonical JSON payload
 
 Reject frames over the caller limit. `Append(..., critical=true)` performs file `fsync` before returning. Atomic files use a same-directory mode-0600 temporary file, file `fsync`, `rename`, then directory `fsync`. Recovery truncates only an incomplete final frame; CRC/hash failure in a complete frame is fatal.
 
-The Python decoder implements exactly this read-only format for evidence replay; it does not write the root actuator journal.
+The Task 2 Python surface implements the exact read-only decoder for replay; it
+does not write the root actuator journal. Task 5B extends the same module with a
+Go-compatible evidence-frame encoder and streaming iterator rather than
+reimplementing AGF1 in `SegmentStore`.
 
 - [ ] **Step 4: Implement observer identity, sequence, signing, key transitions, and spool**
 
@@ -910,7 +946,16 @@ Configuration is strict JSON loaded from `/etc/agmind-sais/observer.json` by def
 }
 ```
 
-Read boot ID from `/proc/sys/kernel/random/boot_id`. Persist `{host_id,boot_id,key_epoch,last_sequence}` with the atomic helper. `Wrap` increments/persists sequence before exposing the envelope, canonicalizes and hashes `normalized_fields`, derives `event_id`, signs the full unsigned envelope, appends it to the durable spool, then returns it.
+Read boot ID from `/proc/sys/kernel/random/boot_id`. Persist
+`{host_id,boot_id,key_epoch,last_sequence,boot_history}` with the atomic helper.
+`last_sequence` is host-global across boot IDs and key epochs. Before generic
+`Wrap` may publish in an unseen boot, observer recovery must commit exactly one
+first-event boundary from the closed A/B/C union specified in Task 5A. `Wrap`
+increments and persists the global sequence before exposure, canonicalizes and
+hashes `normalized_fields`, derives `event_id`, signs the full unsigned
+envelope, appends it to the durable spool, and only then returns it. A crash
+between reservation and append creates a sequence gap; it never authorizes
+counter reuse.
 
 Spool paths are:
 
@@ -920,9 +965,28 @@ Spool paths are:
 <state_dir>/spool/acked.agf
 ```
 
-`Ack` is monotonic and only deletes an envelope file after the ack record is durable. Coverage, reconcile, key transition, retention tombstone, incident/action mirror, and corruption records are priority. Routine exhaustion emits one coalesced `observer_spool_drop` coverage record; priority exhaustion sets persistent `mutation_read_only=true`.
+`Ack` is monotonic and only deletes an envelope file after the ack record is
+durable. It never crosses a reserved-but-unpublished range until Core has
+durably appended the signed `observer_sequence_gap` coverage record for that
+range; unsigned fetch-page gap hints are diagnostic only. Boot boundary,
+coverage, reconcile, key transition, retention tombstone, incident/action
+mirror, and corruption records are priority. Routine exhaustion emits one
+coalesced `observer_spool_drop` coverage record; priority exhaustion sets
+persistent `mutation_read_only=true`.
 
-The `key rotate` subcommand requires EUID 0, acquires an exclusive observer-state lock, and refuses while the daemon holds it. It generates a new Ed25519 key, constructs a consecutive transition signed by old and new keys, durably spools the transition under the old epoch, atomically swaps the private key and public-key epoch file, advances the epoch/sequence state, then emits the first new-epoch start event. Rotation may resume through a mutation-read-only fence only when its reason is exactly `observer_rotation_incomplete` and correlated rotation artifacts exist; it never overwrites or clears an unrelated read-only reason. A missing old key cannot be “rotated away”; it requires the documented re-enrollment path and remains read-only.
+The `key rotate` subcommand requires EUID 0, acquires an exclusive observer-state
+lock, and refuses while the daemon holds it. It generates a new Ed25519 key,
+constructs a consecutive transition signed by old and new keys, and durably
+spools that transition under the old active epoch. It then installs the
+candidate private key solely to sign and durably spool the exact adjacent
+`observer_key_epoch_start`; only after both publications are recoverable does it
+commit the new observer epoch/public metadata as active. Every crash window
+resumes from exact transition/start identities and never emits an intervening
+event. Rotation may resume through a mutation-read-only fence only when its
+reason is exactly `observer_rotation_incomplete` and correlated rotation
+artifacts exist; it never overwrites or clears an unrelated read-only reason. A
+missing old key cannot be “rotated away”; it requires the documented
+re-enrollment path and remains read-only.
 
 - [ ] **Step 5: Implement UDS servers with real peer credentials**
 
@@ -943,8 +1007,10 @@ The `!linux` implementation returns `ErrUnsupportedPlatform` for peer credential
 
 Add table tests for:
 
-- process restart resumes the same boot/key-epoch sequence;
-- new boot ID creates a new sequence domain;
+- process restart resumes the same host-global sequence;
+- new boot ID and new key epoch continue the same host-global sequence;
+- generic events cannot become the first successful publication of an unseen
+  boot, and every accepted boot transition is exactly one A/B/C boundary;
 - sequence file rollback below a spooled sequence forces read-only mode;
 - missing key forces read-only mode and emits no unsigned envelope;
 - valid consecutive dual-signed key transition succeeds;
@@ -1111,11 +1177,25 @@ The route accepts only `FalcoConnectV1`, uniquely resolves the prefix among runn
 GET  /v1/events?after=<sequence>&limit=1..100
 POST /v1/events/ack
 POST /v1/events/retention-tombstone
+POST /v1/events/evidence-repair-authorize
+POST /v1/events/evidence-repair-complete
 GET  /v1/inventory/{full_id}
 GET  /v1/coverage
 ```
 
-The tombstone route accepts only a bounded tombstone schema from UID 0 or the exact Core UID, not merely a member of the Core group, and signs it before Core deletion. It is physically absent from the sensor-owned ingest socket so Core never needs access to a Falco route.
+The fetch response is strict
+`schema_version="agmind.observer-events-page.v1"` with bounded `events`,
+diagnostic `uncovered_gaps`, `gaps_truncated`, `acked_through`, and
+`reserved_through`. Every event item contains exactly `sequence`, `event_id`,
+`content_sha256`, and `envelope`. Page gap/cursor fields are unsigned transport
+hints; Task 5B binds every item to its signed envelope before acceptance.
+
+The tombstone and two evidence-repair routes accept only their bounded exact
+schemas from UID 0 or the exact Core UID, not merely a member of the Core group,
+and sign/spool the resulting event before returning success. The repair routes
+are added in Task 5C; they authorize only the exact active-tail repair protocol
+defined there. All three routes are physically absent from the sensor-owned
+ingest socket, so Core never needs access to a Falco route.
 
 `observer-actuator.sock`:
 
@@ -1373,7 +1453,16 @@ values.
 ### Task 5: Tamper-Evident Evidence Segments and Rebuildable Projection
 
 **Files:**
-- Create: `core/agmind_immune/ingest/{__init__,envelope,service}.py`
+- Modify: `internal/contracts/{types,validation}.go`
+- Modify: `core/agmind_immune/contracts.py`
+- Modify: `contracts/v1/event-envelope.schema.json`
+- Create: `contracts/v1/observer-trust-root.schema.json`
+- Create: `contracts/v1/observer-boot-boundary.schema.json`
+- Create: `contracts/fixtures/v1/observer-trust-root.valid.json`
+- Create: `contracts/fixtures/v1/observer-boot-boundary.valid.json`
+- Modify: `host/observerd/{config,envelope,spool,core_api}.go`
+- Modify: `core/agmind_immune/evidence/frames.py`
+- Create: `core/agmind_immune/ingest/{__init__,envelope,ack_journal,service}.py`
 - Create: `core/agmind_immune/evidence/{__init__,segments,manifest,retention,projection}.py`
 - Create: `core/agmind_immune/evidence/schema.sql`
 - Create: `core/agmind_immune/coverage/{__init__,state}.py`
@@ -1384,15 +1473,121 @@ values.
 - Create: `tests/replay/fixtures/m1-evidence.jsonl`
 
 **Interfaces:**
-- Consumes: signed `EventEnvelopeV1` pages from observer-core UDS.
+- Consumes: strict versioned observer event pages, the immutable installation
+  trust root, and observer key metadata only as an untrusted proof carrier.
 - Produces:
-  - `EnvelopeVerifier.verify(raw: bytes) -> VerifiedEnvelope`.
+  - `decode_events_page(raw: bytes) -> CoreEventsPageV1`.
+  - `EnvelopeVerifier.verify(envelope_value: object, *, sequence: int, event_id: str, content_sha256: str) -> VerifiedEnvelope`.
   - `SegmentStore.append(envelope: VerifiedEnvelope, priority: EvidencePriority) -> EvidenceRef`.
   - `SegmentStore.flush_security_boundary() -> None`.
-  - `ProjectionStore.apply(envelope: VerifiedEnvelope) -> None`.
+  - `AckJournal.record_pending(ref: EvidenceRef) -> None` and
+    `AckJournal.record_confirmed(ref: EvidenceRef) -> None`.
+  - `ProjectionStore.apply(envelope: VerifiedEnvelope, ref: EvidenceRef) -> None`.
   - `ProjectionStore.rebuild(segment_store: SegmentStore) -> RebuildReport`.
   - `CoverageState.mutation_readiness(at: datetime) -> MutationReadiness`.
   - A deterministic replay source of truth independent of SQLite.
+
+#### Task 5 phase authority
+
+Task 5 is implemented in three security-reviewable slices. A later phase may
+consume an earlier phase's contract but must not weaken or reinterpret it:
+
+1. **Phase 5A — signed boot-boundary production.** Add the typed trust-root and
+   boot-boundary contracts and make observerd publish or recover exactly one
+   first-event boundary for every observable kernel boot. Generic `Wrap` is
+   unavailable while the current boundary is pending. Bootstrap completes that
+   boundary before sequence-gap coverage and `observer_start`; resumable key
+   rotation preserves transition/start adjacency.
+2. **Phase 5B — pinned verification plus authoritative evidence.** Strictly
+   decode the versioned page, bind every outer item to its envelope, validate
+   the pinned key/boot/global-sequence FSM, and append only a verifier-created
+   `VerifiedEnvelope` to the authoritative AGF1 `SegmentStore`. This phase owns
+   segment rotation, immutable manifests, chain head, startup recovery, and
+   typed torn-tail detection. It emits no observer ACK yet and never trusts key
+   metadata, `/v1/coverage`, `reserved_through`, or `uncovered_gaps` as
+   authority by themselves.
+3. **Phase 5C — delivery commit, projection, repair, and retention.** Add the
+   independent ACK journal and polling loop, advance only a signed-or-covered
+   contiguous prefix, project from evidence, evaluate coverage readiness,
+   complete the two-phase signed tail-repair protocol, and delete payloads only
+   behind signed retention tombstones. Projection deduplication never changes
+   authoritative evidence or transport cursors.
+
+Each phase gets one compact RED matrix, one focused GREEN gate, and its own
+commit before the next phase consumes it.
+
+The immutable installation trust root is exact:
+
+```text
+schema_version="agmind.observer-trust-root.v1"
+host_id=<lowercase UUIDv4>
+key_id=<32 lowercase hex>
+key_epoch=1
+public_key=<64 lowercase hex>
+```
+
+Core opens that root-owned single-link regular file independently of observer
+state and verifies `key_id` from `public_key`. Replacing it is re-enrollment.
+`observer-public-keys.json` is only a bounded carrier of candidate keys,
+transition proofs, and epoch-start envelopes: substitution, prefix removal,
+rollback, or a claimed current epoch not derivable from the pin fails closed.
+
+The dedicated Phase 5A normalized contract is exact:
+
+```text
+schema_version="agmind.observer-boot-boundary.v1"
+kind="observer_boot_boundary"
+reason_code="observer_genesis" | "kernel_boot_id_changed"
+previous_boot_id?=<lowercase UUIDv4>
+previous_source_sequence=<uint64>
+```
+
+For genesis, `previous_boot_id` is omitted and
+`previous_source_sequence=0`. For a changed boot, `previous_boot_id` is the
+last successfully published boot and `previous_source_sequence` is the
+host-global cursor captured when the new boot range began. The current boot ID
+is the signed envelope `boot_id` and is not duplicated. The event has
+`event_type=observer_boot_boundary`, priority tier,
+`source_payload_hash=normalized_fields_sha256`, empty redaction flags, and
+sorted coverage flags `["boot_transition","reconcile_required"]`.
+
+Exactly one of these may be the first successful publication of an unseen
+boot:
+
+- **A:** the dedicated event above under the current key and epoch;
+- **B:** the exact consecutive dual-signed `observer_key_transition`, signed in
+  its envelope by the active old key/epoch, is first in the new boot and carries
+  sorted `["boot_transition","key_rotation"]`; its exact adjacent candidate-key
+  epoch start stays in that boot and carries only `["key_rotation"]`;
+- **C:** the transition is the immediately preceding durable event in the old
+  boot and carries only `["key_rotation"]`; its exact sequence-plus-one
+  `observer_key_epoch_start`, signed by the candidate key/epoch, is first in the
+  new boot and carries sorted `["boot_transition","key_rotation"]`.
+
+B and C are mutually exclusive combined boot/key paths and replace A for that
+boot. A same-boot rotation carries only `["key_rotation"]` on both transition
+and start. Exactly one event is first in the unseen boot and exactly that event
+claims `boot_transition`. `observer_start` is a process-lifecycle event and
+never a boot boundary. A graceful shutdown event is not a predecessor
+requirement because a crash or power loss cannot provide one.
+
+Boundary publication is crash-safe. A reservation that never produced a
+durable event remains a gap and may make the eventual boundary sequence greater
+than `previous_source_sequence+1`; every intervening range must later be
+covered by signed critical sequence-gap evidence. A durable allowed boundary
+whose state marker was not committed is recovered by exact
+event/signature/publication identity and is never emitted twice. A reboot
+before any successful publication collapses the unobservable pending boot
+rather than inventing an unverifiable Core-visible hop. A non-boundary first
+publication, conflicting recovered identity, historical boot reuse, or legacy
+state whose first-event boundary cannot be proved persists mutation read-only.
+
+For key rotation, Core keeps `(old_epoch,new_epoch,transition_sequence)` pending
+after validating exact host/key binding, consecutive epochs, both transition
+signatures, and the old-key envelope. No other event or gap may intervene. Only
+the exact next epoch-start envelope activates the candidate; old-key events
+after that boundary and new-key events before it are rejected. Public keys have
+no validity timestamps, so historical signatures remain verifiable.
 
 Evidence frames use the Task 2 format inside files named:
 
@@ -1401,6 +1596,8 @@ segments/<UTC-date>/<20-digit-first-sequence>-<segment-uuid>.open
 segments/<UTC-date>/<20-digit-first-sequence>-<segment-uuid>.agseg
 manifests/<segment-uuid>.json
 chain-head.json
+ack-journal.agf
+retention-boundary.json
 ```
 
 The SQLite projection tables are:
@@ -1408,6 +1605,7 @@ The SQLite projection tables are:
 ```text
 schema_meta
 events
+projection_dedup
 coverage_intervals
 containers
 process_observations
@@ -1423,33 +1621,35 @@ retention_tombstones
 ingest_cursors
 ```
 
-Every table has a stable primary key. Projection rows store references and normalized bounded facts, never raw Falco lines or secrets.
+Every table has a stable primary key. Projection rows store `EvidenceRef`
+provenance and normalized bounded facts, never raw Falco lines or secrets.
+`ingest_cursors` is a rebuildable projection mirror; it is never authority for
+observer acknowledgement.
 
-- [ ] **Step 1: Write failing verification, recovery, and rebuild tests**
+- [ ] **Step 1: Write the compact Phase 5 contract matrix**
 
 ```python
 async def test_signature_is_verified_before_append(
-    verifier: EnvelopeVerifier,
+    ingest: IngestService,
     segment_store: RecordingSegmentStore,
-    bad_signature_bytes: bytes,
+    bad_signature_item: CoreEventV1,
 ) -> None:
     with pytest.raises(EnvelopeSignatureError):
-        await verifier.verify(bad_signature_bytes)
+        await ingest.accept_page_item(bad_signature_item)
     assert segment_store.append_calls == []
 
 
-def test_duplicate_event_is_idempotent_but_conflict_is_critical(
+def test_transport_retry_is_idempotent_but_valid_conflict_is_critical(
     ingest: IngestService,
-    valid_envelope: EventEnvelopeV1,
+    valid_item: CoreEventV1,
+    exact_retry_item: CoreEventV1,
+    valid_signed_same_sequence_conflict: CoreEventV1,
 ) -> None:
-    first = ingest.accept(valid_envelope)
-    second = ingest.accept(valid_envelope)
+    first = ingest.accept_page_item(valid_item)
+    second = ingest.accept_page_item(exact_retry_item)
     assert first.evidence_ref == second.evidence_ref
-    changed = valid_envelope.model_copy(
-        update={"normalized_fields_sha256": "f" * 64}
-    )
     with pytest.raises(EvidenceConflict):
-        ingest.accept(changed)
+        ingest.accept_page_item(valid_signed_same_sequence_conflict)
     assert ingest.coverage.mutation_ready is False
 
 
@@ -1463,7 +1663,21 @@ def test_delete_sqlite_and_rebuild_is_deterministic(tmp_path: Path) -> None:
     assert report.rejected_records == 0
 ```
 
-Add tests for torn tail recovery, middle corruption, broken previous-segment hash, manifest replacement failure, sequence rollback, key epoch rollback, expired public key, event-time clock uncertainty, and projection write failure after durable append.
+Use eight parameterized contract groups rather than one test per permutation:
+
+1. page/envelope outer binding, bad signature/hash/event ID, and sequence zero;
+2. pinned-root substitution, metadata prefix removal, and metadata rollback;
+3. valid transition plus adjacent epoch start and invalid host/key/epoch/order;
+4. exact transport retry versus two valid signed same-sequence conflicts;
+5. two Falco envelopes with one raw hash: two evidence refs, one projection row;
+6. every ACK-journal crash boundary and exact retry after restart;
+7. the lease/readiness truth table;
+8. replay with reversed `ingest_time` still reducing by source sequence.
+
+One additional table-driven file-operation matrix covers active-tail detection,
+closed/middle corruption, manifest/head publication windows, projection swap,
+and tombstone/unlink uncertainty through injected `write`, `fsync`, `rename`,
+and directory-sync failures.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -1476,51 +1690,98 @@ uv run --frozen pytest -q core/tests/ingest core/tests/evidence \
 
 Expected: collection fails for missing ingest/evidence packages.
 
-- [ ] **Step 3: Implement envelope verification and key-epoch state**
+- [ ] **Step 3: Implement pinned page verification and durable acceptance**
 
 Verification order is fixed:
 
-1. enforce 64 KiB input and strict JSON;
-2. validate schema and supported version;
-3. load the pinned current/transitioned public key;
-4. recompute canonical normalized-field hash;
-5. verify Ed25519 signature;
-6. recompute event ID;
-7. validate `(host_id,boot_id,key_epoch,source_sequence)` ordering;
-8. validate container and source semantics;
-9. append evidence durably;
-10. acknowledge the observer sequence;
-11. apply SQLite projection from the durable evidence cursor.
+1. enforce the 4 MiB page and 64 KiB canonical-envelope limits with strict JSON,
+   duplicate-key, depth, integer, trailing-data, and version checks;
+2. require exact page schema `agmind.observer-events-page.v1`;
+3. canonicalize the envelope and require outer
+   `sequence == envelope.source_sequence`,
+   `event_id == envelope.event_id`, and
+   `content_sha256 == SHA256(canonical_envelope)`;
+4. select the host only from the immutable pinned
+   `(host_id,key_id,key_epoch=1,public_key)` root plus transitions already
+   completed by an accepted adjacent epoch-start;
+5. recompute the normalized-field hash, verify the selected Ed25519 signature,
+   and recompute the derived event ID;
+6. require `source_sequence >= 1`, pinned `source_id="agmind-observerd"`, the
+   host-global sequence state, current/candidate key state, historical boot set,
+   and closed A/B/C boot FSM;
+7. validate event-type-specific container, coverage, transition, and source
+   semantics;
+8. append the canonical signed envelope and bounded acceptance facts through a
+   verifier-sealed `VerifiedEnvelope`, and `fsync` before exposing
+   `EvidenceRef`.
 
-Never acknowledge observer delivery before step 9. Projection failure after the durable append/ack leaves the observer event safe because SQLite is rebuildable; record `projection_degraded` and retry projection from the evidence cursor.
+The transport duplicate key is exactly `(host_id,source_sequence)`. An exact
+canonical retry returns the original `EvidenceRef`; a different event ID or
+canonical content under that key is persistent critical corruption, receives no
+ACK, and sets mutation read-only. A lower sequence is otherwise rejected.
 
-A lower sequence is accepted only when it is an identical already-indexed event. A different payload for an existing ID, broken key transition, or unexplained epoch/sequence rollback persists mutation read-only state.
+The service may scan and durably preserve verified later events while a
+sequence hole is unresolved, but marks them pending and neither projects nor
+ACKs across the hole. It scans forward until it receives a signed critical
+`observer_sequence_gap` whose bounded affected range exactly covers missing
+reserved sequences and overlaps no accepted envelope. Only durable signed gap
+evidence closes the structural hole; page `uncovered_gaps`,
+`reserved_through`, and `/v1/coverage` remain diagnostic hints.
+
+The gap proof opens a temporal critical coverage interval for its exact range.
+A later signed close must repeat that range, carry a strictly later successful
+authoritative reconcile generation, and use the matching reconciliation reason.
+Only then can readiness recover; the range proof itself is not modeled as an
+eternally open interval.
+
+Phase 5C keeps four distinct durable positions: evidence head, contiguous
+signed-or-covered acceptance cursor, observer-confirmed ACK cursor, and
+projection cursor. For each newly contiguous exact event reference it performs:
+
+1. evidence append and file `fsync`;
+2. append+`fsync` `pending_ack(sequence,event_id,content_sha256)`;
+3. POST that exact ACK and accept only HTTP 204;
+4. append+`fsync` the matching `confirmed_ack`;
+5. project from evidence and advance the projection cursor transactionally.
+
+Restart repeats an unmatched pending ACK byte-for-byte; observer exact ACK is
+idempotent. SQLite loss never loses ACK authority. Evidence may lead ACK, and
+ACK may lead projection, but any projection lag or unhealthy ACK journal blocks
+mutation readiness.
 
 Falco adapter delivery is at-least-once except for a positive heartbeat lease
 discarded locally after its 15-second monotonic transport expiry. For every
 non-expired item, an observer response timeout can occur after durable append,
 and the retry can therefore receive a new signed envelope sequence. After
-signature/sequence verification and durable evidence append, but before
-projection or candidate creation, deduplicate `falco_connect` by the
-exact tuple `(source_id,event_type,source_payload_hash)`. The payload hash
-remains the exact Falco raw-body SHA-256. Deduplicate coverage transitions by
-`(source_id,event_type,normalized_fields_sha256,source_payload_hash)`, so an
-identical transport retry is idempotent while recurring transitions with
-different timestamps/counts do not collide. Retain all signed envelopes as
-evidence, project an identical observation/transition once, and never create a
-second candidate for a duplicate connect payload.
+signature/global-sequence verification and durable evidence append, but before
+projection or candidate creation, apply a separate projection-dedup layer.
+For `falco_connect`, first require
+`normalized_fields.raw_event_sha256 == envelope.source_payload_hash`, then use
+logical key `(host_id,event_type,source_payload_hash)`. Coverage uses
+`(host_id,event_type,normalized_fields_sha256,source_payload_hash)`. Retain
+every distinct signed envelope; a logical duplicate stores
+`duplicate_of_event_id` and every `EvidenceRef`, runs its reducer once, and
+never creates a second candidate. Recurring coverage with changed normalized
+timestamps or counts remains distinct.
 
-Coverage state is externally fail-closed. For the latest signed
-`falco_heartbeat_lease`, let `opened_at` be its signed normalized coverage
-field and `ingest_time` its signed observer-envelope receipt. No mutation is
-ready unless both `0 <= ingest_time - opened_at <= 15 seconds` and
-`0 <= decision_time - opened_at <= 15 seconds`, and that lease `opened_at` is
-strictly newer than the latest signed `falco_adapter_stop.opened_at`. Any
-future-dated or late lease blocks readiness. Use both signed times for these
-checks, never the Falco sensor event timestamp. A stale lease covers an adapter
-crash; a stop blocks immediately until a later fully valid heartbeat lease.
-`falco_adapter_start` alone never grants readiness, and the ordinary
-no-open-critical-gap gates still apply.
+Coverage state is externally fail-closed. Select the latest logical lease and
+stop by verified host-global source sequence, never by their timestamps. A
+usable lease is exact `component="falco-adapter"`,
+`kind="falco_heartbeat_lease"`, `severity="INFO"`,
+`closed_at == opened_at`, and `reason_code="valid_heartbeat"`; its sequence must
+be later than the latest exact CRITICAL closed-point
+`falco_adapter_stop`/`adapter_stopping`. Require
+`opened_at <= ingest_time <= decision_time <= opened_at+15s`, a live Core
+monotonic deadline derived at receipt, and healthy bounded Core clock state.
+After restart, readiness waits for a new lease rather than reconstructing a
+monotonic deadline from wall time.
+
+`falco_adapter_start` alone never grants readiness. A boot boundary always
+closes readiness. It may reopen only after the boundary and later signed
+`observer_start`, a signed Docker startup reconcile open/close, a fully
+signed-or-covered contiguous cursor, the lease rule above, no open critical
+gap, projection cursor equal to evidence acceptance cursor, and healthy key,
+evidence-chain, manifest, clock, ACK-journal, and projection state.
 
 - [ ] **Step 4: Implement segment rotation, manifests, and chain verification**
 
@@ -1529,28 +1790,57 @@ Manifest fields are:
 ```text
 schema_version="agmind.segment-manifest.v1"
 segment_id
+segment_relative_path
+host_id
+evidence_priority="routine" | "protected"
 first_event_id
 last_event_id
-first_sequence
-last_sequence
+first_source_sequence
+last_source_sequence
 record_count
 opened_at
 closed_at
 segment_size_bytes
 segment_sha256
+first_frame_sha256
+last_frame_sha256
 previous_manifest_sha256
 manifest_sha256
 ```
 
-At 64 MiB or 10 minutes:
+M1 evidence segments are single-host. The source-sequence bounds are the
+verified host-global values, not boot/key-local counters and not a substitute
+for scanning every frame. A priority-class change rotates before append so one
+protected event never pins a large routine segment. `segment_sha256` hashes the
+exact closed bytes. `manifest_sha256` is SHA-256 over domain
+`AGMIND_SEGMENT_MANIFEST_V1\0` plus canonical JSON of every manifest field
+except `manifest_sha256`. Verification recomputes the segment hash, record
+count, host, priority, frame hashes, first/last event IDs, source bounds, and
+manifest hash. `chain-head.json` is exact
+`agmind.segment-chain-head.v1` with `head_segment_id`,
+`head_manifest_sha256`, `last_event_id`, and `last_source_sequence`; it is a
+location cache, never authority. Manifest links begin at the all-zero genesis
+hash and always remain present.
+
+Hold one lifetime `flock` on the mode-0700 evidence root; files are mode 0600,
+regular, single-link, and opened through `dir_fd` with no-follow/close-on-exec
+semantics. Rotate before append at 64 MiB, 600 monotonic seconds, or a priority
+change:
 
 1. `fsync` the `.open` file;
-2. compute segment hash;
-3. atomically write and fsync manifest;
-4. rename `.open` to `.agseg` and fsync its directory;
-5. atomically advance `chain-head.json`.
+2. reread/verify it and compute exact segment/frame facts;
+3. publish the mode-0600 manifest without replacement and fsync its directory;
+4. rename without replacement `.open` to `.agseg` and fsync its directory;
+5. atomically replace `chain-head.json` and fsync the evidence root.
 
-Startup recovery validates every retained manifest from the oldest retention boundary through the head. A torn last frame is truncated and a signed repair event is appended. Any complete-frame or non-tail corruption forces mutation read-only.
+Append uses the shared AGF1 encoder, full-write loops, and file `fsync` before
+updating indexes or returning `EvidenceRef`. Startup rebuilds the unique
+manifest chain from genesis, reconciles only the documented
+manifest/open/promoted/head crash windows, and permits a missing `.agseg` only
+when covered by accepted signed retention tombstones. An incomplete active
+`.open` tail returns `TornTailRepairRequired` without mutation. Complete-frame,
+closed-segment, non-tail, fork, fact mismatch, missing unauthorized payload, or
+head rollback forces read-only.
 
 - [ ] **Step 5: Implement SQLite WAL projection and deterministic replay**
 
@@ -1564,52 +1854,51 @@ PRAGMA trusted_schema=OFF;
 PRAGMA busy_timeout=5000;
 ```
 
-All projection reducers are pure functions of the ordered verified evidence stream. Order by `(ingest_time, host_id, boot_id, source_sequence, event_id)` only after signature/sequence validation; never order action TTL by wall clock. Rebuild creates a new database, validates its snapshot hash/counts, then atomically swaps it into place.
+All projection reducers are pure functions of the durable verified evidence
+stream in manifest/frame and verified host-global sequence order, never
+`ingest_time`. Each event uses one `BEGIN IMMEDIATE` transaction to insert or
+verify its evidence row, projection-dedup provenance, reducer output, and
+projection cursor. `boot_id` is not a sequence-domain sort key.
 
-The projection stores separate unique sensor-source keys: `falco_connect` uses
-`(source_id,event_type,source_payload_hash)`, while coverage uses
-`(source_id,event_type,normalized_fields_sha256,source_payload_hash)`. Check
-the applicable key before any reducer or candidate builder. Rebuild applies
-the identical event-type-specific rule, so retries with distinct envelope
-IDs/sequences reproduce one projection transition and at most one candidate,
-without collapsing recurring coverage transitions.
+Snapshot hash is
+`SHA256("AGMIND_PROJECTION_SNAPSHOT_V1\0" || canonical_stream)` over fixed
+table/column order and primary-key-sorted logical rows, never SQLite file bytes.
+Rebuild creates a same-directory temporary DB, uses the identical reducers and
+dedup rules, verifies hash/counts, checkpoints WAL with `TRUNCATE`, closes and
+fsyncs the main file, atomically replaces the target, fsyncs its parent, reopens
+WAL, and verifies again. It never mutates source segments.
 
 `python -m agmind_immune.replay verify <evidence-dir>` returns non-zero for a bad segment/signature/manifest/action-chain reference. `rebuild` creates only SQLite and never mutates source segments.
 
-- [ ] **Step 6: Implement retention with signed tombstone before deletion**
+- [ ] **Step 6: Implement signed tail repair and retention**
 
-Select routine segments older than 7 days or beyond the 5 GiB cap while preserving any segment referenced by a non-terminal incident, approval, action, expiry, coverage gap, or the current chain boundary. Before deletion, submit a bounded tombstone containing the ordered removed manifest hashes, last removed manifest hash, first retained manifest hash, byte count, reason, policy version, and current chain head to observerd. Append and fsync the signed tombstone event, then atomically advance `retention-boundary.json` to that signed event ID. Only then unlink selected segments and fsync directories. Retained manifests are never rewritten; verification starts from the signed boundary and requires the first retained manifest’s `previous_manifest_sha256` to equal the recorded last removed hash.
+Tail-repair authorization contains exact `repair_id`, `segment_id`,
+`verified_bytes`, `discarded_bytes`, `discarded_sha256`,
+`last_verified_frame_sha256`, `current_chain_head_sha256`, and
+`reason="torn_open_tail"`. Observer signs/spools authorization; Core verifies
+it, truncates only that `.open` tail and fsyncs; observer then signs/spools
+completion referencing the authorization event ID. Core remains mutation
+read-only until both signed records enter evidence. No other repair is exposed.
 
-If observer signing, evidence append, or directory sync fails, delete nothing. Never delete priority evidence merely to meet the cap; emit `retention_blocked_priority_evidence` and set degraded storage health.
+Retention selects only routine `.agseg` payloads older than 7 days or beyond
+5 GiB. It preserves protected segments, tombstones, and every key-transition
+plus epoch-start proof required by retained/newer epoch evidence. Each signed
+tombstone authorizes one contiguous manifest run; multiple runs accumulate.
+Manifests are never deleted or rewritten, and `retention-boundary.json` is only
+a rebuildable cache. After the signed tombstone is appended/fsynced, unlink
+payloads and fsync their directories. A failure before the first unlink deletes
+nothing; a failure after any unlink sets persistent
+`retention_commit_uncertain`, blocks mutation, and recovery reconciles only
+missing payloads already authorized by signed tombstones. Priority blockage
+emits `retention_blocked_priority_evidence`.
 
 - [ ] **Step 7: Prove the full evidence failure matrix**
 
-Tests must establish:
-
-- valid signature before append;
-- invalid signature leaves no record;
-- identical duplicate is idempotent;
-- distinct signed `falco_connect` envelopes with the same
-  `(source_id,event_type,source_payload_hash)` remain in evidence but are
-  deduplicated before projection/candidate creation;
-- coverage transport retries with the same
-  `(source_id,event_type,normalized_fields_sha256,source_payload_hash)` are
-  idempotent, while recurring transitions with changed normalized timestamps or
-  counts remain distinct;
-- startup without a lease; negative or greater-than-15-second
-  `ingest_time - opened_at`; negative or greater-than-15-second
-  `decision_time - opened_at`; and a lease whose `opened_at` is not strictly
-  newer than the latest adapter-stop `opened_at` all keep mutation readiness
-  false;
-- conflicting duplicate is corruption/read-only;
-- torn final frame repairs with explicit record;
-- middle corruption blocks mutation;
-- deleted SQLite rebuilds identically;
-- projection failure never loses the authoritative envelope;
-- tombstone is signed/durable before unlink;
-- injected `write`, `fsync`, `rename`, and directory-sync failures cause no deletion or mutation readiness;
-- canary environment/label/path strings do not occur anywhere under the evidence root;
-- retention protects coverage/incidents/approval/action/expiry records.
+Run the compact contract and file-operation matrices from Step 1. They must
+also prove the exact runtime fixture uses `source_id="agmind-observerd"` and
+`event_type="falco_connect"`, tail mutation requires authorization plus
+completion, and post-unlink sync failure enters
+`retention_commit_uncertain`.
 
 Run:
 
@@ -2540,7 +2829,7 @@ Core configuration is strict JSON at `/etc/agmind-sais/core.json`. It contains s
   "actuator_socket": "/run/agmind-sais/actuator-intent/socket",
   "evidence_dir": "/var/lib/agmind-sais/core/evidence",
   "projection_db": "/var/lib/agmind-sais/core/projection.sqlite3",
-  "observer_public_key_file": "/etc/agmind-sais/public/observer-ed25519.pub",
+  "observer_trust_root_file": "/etc/agmind-sais/observer-trust-root.json",
   "actuator_public_key_file": "/etc/agmind-sais/public/actuator-ed25519.pub",
   "api_token_file": "/run/secrets/core-api.token",
   "api_bind_host": "127.0.0.1",
