@@ -67,7 +67,9 @@
       "$ref": "#/$defs/uuid4"
     },
     "source_sequence": {
-      "$ref": "#/$defs/uint64"
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
     },
     "event_time": {
       "$ref": "#/$defs/timestamp"

@@ -65,6 +65,20 @@ def test_python_rejects_non_nanosecond_timestamps_and_uint64_overflow() -> None:
         )
 
 
+def test_event_source_sequence_zero_is_rejected_at_both_contract_layers() -> None:
+    document = json.loads((FIXTURES / "envelope.valid.json").read_text())
+    document["source_sequence"] = 0
+    document["event_id"] = "evt_46661781770926e5720f74d49d3e6e32d6cc77b5502ab90f6f64a574a70ce145"
+    raw = json.dumps(document).encode()
+
+    with pytest.raises(ValueError):
+        contracts.decode_strict(raw, contracts.EventEnvelopeV1, 65_536)
+
+    schema = json.loads(Path("contracts/v1/event-envelope.schema.json").read_text())
+    with pytest.raises(ValidationError):
+        contract_schema_validator(schema).validate(document)
+
+
 def test_schemas_accept_positive_fixtures_and_reject_hunter_actions() -> None:
     pairs = [
         ("event-envelope.schema.json", "envelope.valid.json"),

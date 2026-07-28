@@ -49,6 +49,15 @@ func TestCoreEventsFetchIsBoundedOrderedAndAckDeletesOnlyExactEvent(
 	if response.Code != http.StatusOK {
 		t.Fatalf("fetch status=%d body=%s", response.Code, response.Body)
 	}
+	var versionedPage struct {
+		SchemaVersion string `json:"schema_version"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &versionedPage); err != nil {
+		t.Fatal(err)
+	}
+	if versionedPage.SchemaVersion != "agmind.observer-events-page.v1" {
+		t.Fatalf("events page schema_version=%q", versionedPage.SchemaVersion)
+	}
 	var page CoreEventsPageV1
 	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
 		t.Fatal(err)

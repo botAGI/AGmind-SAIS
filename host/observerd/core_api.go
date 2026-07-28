@@ -32,6 +32,7 @@ type CoreSequenceGapV1 struct {
 }
 
 type CoreEventsPageV1 struct {
+	SchemaVersion   string              `json:"schema_version"`
 	Events          []CoreEventV1       `json:"events"`
 	UncoveredGaps   []CoreSequenceGapV1 `json:"uncovered_gaps"`
 	GapsTruncated   bool                `json:"gaps_truncated"`
@@ -133,6 +134,7 @@ func (service *Service) FetchCoreEvents(
 	}
 	snapshot := service.daemon.state.Snapshot()
 	return CoreEventsPageV1{
+		SchemaVersion:   "agmind.observer-events-page.v1",
 		Events:          events,
 		UncoveredGaps:   gaps,
 		GapsTruncated:   len(allGaps) > gapCount,

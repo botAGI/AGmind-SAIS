@@ -290,7 +290,7 @@ class EventEnvelopeV1(ContractModel):
     key_epoch: int = Field(ge=1, le=MAX_UINT64)
     host_id: str
     boot_id: str
-    source_sequence: int = Field(ge=0, le=MAX_UINT64)
+    source_sequence: int = Field(ge=1, le=MAX_UINT64)
     event_time: str
     ingest_time: str
     clock_uncertainty_ms: int = Field(ge=0, le=2_000)
