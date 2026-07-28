@@ -325,10 +325,219 @@ func bootAllowed(
 func eventAllowedByState(
 	event contracts.EventEnvelopeV1,
 	snapshot ObserverState,
+	rotation *rotationMarker,
 ) bool {
-	return event.HostID == snapshot.HostID &&
+	if event.HostID == snapshot.HostID &&
 		bootAllowed(snapshot, event.BootID, event.SourceSequence) &&
-		event.KeyEpoch <= snapshot.KeyEpoch
+		event.KeyEpoch <= snapshot.KeyEpoch {
+		return true
+	}
+	if rotation == nil ||
+		snapshot.KeyID != rotation.Transition.OldKeyID ||
+		snapshot.KeyEpoch != rotation.Transition.OldEpoch {
+		return false
+	}
+	transitionBootID := snapshot.BootID
+	if snapshot.PendingBootBoundary != nil &&
+		snapshot.PendingBootBoundary.PreviousBootID != nil {
+		transitionBootID = *snapshot.PendingBootBoundary.PreviousBootID
+	}
+	transition := contracts.EventEnvelopeV1{
+		SchemaVersion:          "agmind.event-envelope.v1",
+		EventType:              "observer_key_transition",
+		SourceID:               "agmind-observerd",
+		SourceVersion:          "0.1.0",
+		KeyID:                  rotation.Transition.OldKeyID,
+		KeyEpoch:               rotation.Transition.OldEpoch,
+		HostID:                 rotation.HostID,
+		BootID:                 transitionBootID,
+		SourceSequence:         rotation.TransitionSequence,
+		NormalizedFields:       map[string]any{},
+		NormalizedFieldsSHA256: event.NormalizedFieldsSHA256,
+		RedactionFlags:         []string{},
+		CoverageFlags:          []string{"key_rotation"},
+		SourcePayloadHash:      event.NormalizedFieldsSHA256,
+	}
+	authorization := rotationPublicationAuthorization{
+		marker:          *rotation,
+		role:            rotationEpochStartPublication,
+		transitionEvent: &transition,
+	}
+	mode := rotationModeForState(snapshot, authorization)
+	expectedFields, err := rotationFieldsForAuthorization(authorization)
+	return err == nil &&
+		mode != rotationBoundaryInvalid &&
+		event.EventType == "observer_key_epoch_start" &&
+		event.SourceID == "agmind-observerd" &&
+		event.SourceVersion == "0.1.0" &&
+		event.HostID == snapshot.HostID &&
+		event.BootID == snapshot.BootID &&
+		event.KeyID == rotation.Transition.NewKeyID &&
+		event.KeyEpoch == rotation.Transition.NewEpoch &&
+		event.SourceSequence == rotation.StartSequence &&
+		eventHasExactFields(event, expectedFields) &&
+		event.SourcePayloadHash == event.NormalizedFieldsSHA256 &&
+		exactFlags(
+			event.CoverageFlags,
+			rotationCoverageFlags(
+				mode,
+				rotationEpochStartPublication,
+			)...,
+		)
+}
+
+func recoverPendingDedicatedBootBoundary(
+	items map[uint64]SpoolItem,
+	state *StateStore,
+) error {
+	snapshot := state.Snapshot()
+	if snapshot.BootBoundaryState != bootBoundaryPending {
+		return nil
+	}
+	if snapshot.PendingBootBoundary == nil ||
+		len(snapshot.BootHistory) == 0 ||
+		snapshot.MutationReadOnly {
+		return ErrSpoolCorrupt
+	}
+	firstSequence := snapshot.BootHistory[len(snapshot.BootHistory)-1].FirstSequence
+	var candidate *SpoolItem
+	for sequence, item := range items {
+		if sequence < firstSequence ||
+			candidate != nil && sequence >= candidate.Sequence {
+			continue
+		}
+		itemCopy := item
+		candidate = &itemCopy
+	}
+	if candidate == nil {
+		if snapshot.PublicationHeadSequence >= firstSequence {
+			return ErrSpoolCorrupt
+		}
+		return nil
+	}
+	if candidate.Sequence > snapshot.PublicationHeadSequence ||
+		candidate.Tier != PriorityTier {
+		return ErrSpoolCorrupt
+	}
+	event, err := contracts.DecodeStrict[contracts.EventEnvelopeV1](
+		bytes.NewReader(candidate.Canonical),
+		65_536,
+	)
+	if err != nil ||
+		event.SourceSequence != candidate.Sequence ||
+		event.EventID != candidate.EventID ||
+		!dedicatedBootBoundaryMatchesState(event, snapshot) {
+		return ErrSpoolCorrupt
+	}
+	return state.commitPendingBootBoundary(event)
+}
+
+func rotationEventFromItems(
+	items map[uint64]SpoolItem,
+	sequence uint64,
+) (contracts.EventEnvelopeV1, bool, error) {
+	item, exists := items[sequence]
+	if !exists {
+		return contracts.EventEnvelopeV1{}, false, nil
+	}
+	if item.Tier != PriorityTier ||
+		item.Sequence != sequence ||
+		len(item.Canonical) == 0 {
+		return contracts.EventEnvelopeV1{}, false, ErrSpoolCorrupt
+	}
+	event, err := contracts.DecodeStrict[contracts.EventEnvelopeV1](
+		bytes.NewReader(item.Canonical),
+		65_536,
+	)
+	if err != nil ||
+		event.SourceSequence != sequence ||
+		event.EventID != item.EventID {
+		return contracts.EventEnvelopeV1{}, false, ErrSpoolCorrupt
+	}
+	return event, true, nil
+}
+
+func recoverRotationPublication(
+	items map[uint64]SpoolItem,
+	state *StateStore,
+	keys *Keyring,
+	rotation *rotationMarker,
+) error {
+	if rotation == nil {
+		return nil
+	}
+	transition, transitionExists, err := rotationEventFromItems(
+		items,
+		rotation.TransitionSequence,
+	)
+	if err != nil {
+		return err
+	}
+	start, startExists, err := rotationEventFromItems(
+		items,
+		rotation.StartSequence,
+	)
+	if err != nil {
+		return err
+	}
+	if transitionExists &&
+		(!transitionEnvelopeMatchesMarker(transition, *rotation) ||
+			keys.Verify(transition) != nil) {
+		return ErrSpoolCorrupt
+	}
+	snapshot := state.Snapshot()
+	if snapshot.BootBoundaryState == bootBoundaryPending &&
+		snapshot.KeyID == rotation.Transition.OldKeyID &&
+		snapshot.KeyEpoch == rotation.Transition.OldEpoch &&
+		transitionExists &&
+		transition.SourceSequence <= snapshot.PublicationHeadSequence {
+		authorization := rotationPublicationAuthorization{
+			marker: *rotation,
+			role:   rotationTransitionPublication,
+		}
+		mode := rotationModeForState(snapshot, authorization)
+		if mode == rotationBoundaryB &&
+			rotationEnvelopeMatches(
+				transition,
+				snapshot,
+				authorization,
+				mode,
+			) {
+			if err := state.commitRotationPublication(
+				transition,
+				authorization,
+			); err != nil {
+				return err
+			}
+			snapshot = state.Snapshot()
+		}
+	}
+	if snapshot.KeyID == rotation.Transition.OldKeyID &&
+		snapshot.KeyEpoch == rotation.Transition.OldEpoch &&
+		startExists &&
+		start.SourceSequence <= snapshot.PublicationHeadSequence {
+		if !transitionExists ||
+			keys.Verify(start) != nil {
+			return ErrSpoolCorrupt
+		}
+		authorization := rotationPublicationAuthorization{
+			marker:          *rotation,
+			role:            rotationEpochStartPublication,
+			transitionEvent: &transition,
+		}
+		mode := rotationModeForState(snapshot, authorization)
+		if mode == rotationBoundaryInvalid ||
+			!rotationEnvelopeMatches(
+				start,
+				snapshot,
+				authorization,
+				mode,
+			) {
+			return ErrSpoolCorrupt
+		}
+		return state.commitRotationPublication(start, authorization)
+	}
+	return nil
 }
 
 func ensurePrivateDirectory(path string) error {
@@ -396,6 +605,7 @@ func scanTier(
 	tier Tier,
 	keys *Keyring,
 	snapshot ObserverState,
+	rotation *rotationMarker,
 	items map[uint64]SpoolItem,
 	tempArtifacts *[]spoolRecoveryArtifact,
 ) (uint64, error) {
@@ -435,7 +645,7 @@ func scanTier(
 		if err != nil ||
 			event.SourceSequence != sequence ||
 			tierForEvent(event) != tier ||
-			!eventAllowedByState(event, snapshot) {
+			!eventAllowedByState(event, snapshot, rotation) {
 			return 0, ErrSpoolCorrupt
 		}
 		if ^uint64(0)-used < frameBytes {
@@ -465,15 +675,28 @@ func scanTier(
 func publicationAllowedByState(
 	record publicationRecord,
 	snapshot ObserverState,
+	rotation *rotationMarker,
 ) bool {
-	return record.HostID == snapshot.HostID &&
+	if record.HostID == snapshot.HostID &&
 		bootAllowed(snapshot, record.BootID, record.Sequence) &&
-		record.KeyEpoch <= snapshot.KeyEpoch
+		record.KeyEpoch <= snapshot.KeyEpoch {
+		return true
+	}
+	return rotation != nil &&
+		snapshot.KeyID == rotation.Transition.OldKeyID &&
+		snapshot.KeyEpoch == rotation.Transition.OldEpoch &&
+		record.Tier == PriorityTier &&
+		record.HostID == snapshot.HostID &&
+		record.BootID == snapshot.BootID &&
+		record.KeyID == rotation.Transition.NewKeyID &&
+		record.KeyEpoch == rotation.Transition.NewEpoch &&
+		record.Sequence == rotation.StartSequence
 }
 
 func scanPublications(
 	stateDir string,
 	state *StateStore,
+	rotation *rotationMarker,
 	items map[uint64]SpoolItem,
 	tempArtifacts *[]spoolRecoveryArtifact,
 	cleanupArtifacts *[]spoolRecoveryArtifact,
@@ -522,7 +745,7 @@ func scanPublications(
 		if readErr != nil ||
 			record.Sequence != sequence ||
 			record.Sequence > snapshot.LastSequence ||
-			!publicationAllowedByState(record, snapshot) {
+			!publicationAllowedByState(record, snapshot, rotation) {
 			return 0, 0, ErrSpoolCorrupt
 		}
 		nodeRaw, nodeHash, hashErr := publicationNodeHash(record)
@@ -925,9 +1148,6 @@ func validateIdentityHistory(
 		return ErrSpoolCorrupt
 	}
 	stateIsOld := snapshot.KeyEpoch == rotation.Transition.OldEpoch
-	if stateIsOld && startExists {
-		return ErrSpoolCorrupt
-	}
 	switch rotation.Stage {
 	case "prepared":
 		if !stateIsOld ||
@@ -942,7 +1162,10 @@ func validateIdentityHistory(
 			return ErrSpoolCorrupt
 		}
 	case "key_switched":
-		if !transitionExists || stateIsOld ||
+		if !transitionExists ||
+			stateIsOld &&
+				metadataEpoch != rotation.Transition.OldEpoch ||
+			!stateIsOld && !startExists ||
 			metadataEpoch == rotation.Transition.NewEpoch && !startExists {
 			return ErrSpoolCorrupt
 		}
@@ -1049,6 +1272,7 @@ func NewSpool(
 		RoutineTier,
 		keys,
 		snapshot,
+		config.rotation,
 		items,
 		&createOnlyTemps,
 	)
@@ -1061,6 +1285,7 @@ func NewSpool(
 		PriorityTier,
 		keys,
 		snapshot,
+		config.rotation,
 		items,
 		&createOnlyTemps,
 	)
@@ -1084,6 +1309,7 @@ func NewSpool(
 		scanPublications(
 			config.StateDir,
 			state,
+			config.rotation,
 			items,
 			&createOnlyTemps,
 			&publicationCleanup,
@@ -1250,6 +1476,23 @@ func NewSpool(
 		pendingPublication,
 	); err != nil {
 		_ = state.PersistReadOnly("observer_publication_recovery_failed")
+		return nil, err
+	}
+	if err := recoverRotationPublication(
+		items,
+		state,
+		keys,
+		config.rotation,
+	); err != nil {
+		_ = state.PersistReadOnly(
+			"observer_rotation_publication_recovery_failed",
+		)
+		return nil, err
+	}
+	if err := recoverPendingDedicatedBootBoundary(items, state); err != nil {
+		_ = state.PersistReadOnly(
+			"observer_boot_boundary_recovery_failed",
+		)
 		return nil, err
 	}
 	ackBytes := uint64(ackRecovery.VerifiedBytes)
@@ -1465,6 +1708,22 @@ func (spool *Spool) Append(
 	event contracts.EventEnvelopeV1,
 	tier Tier,
 ) (SpoolItem, error) {
+	return spool.append(event, tier, nil)
+}
+
+func (spool *Spool) appendRotationEpochStart(
+	event contracts.EventEnvelopeV1,
+	tier Tier,
+	authorization rotationPublicationAuthorization,
+) (SpoolItem, error) {
+	return spool.append(event, tier, &authorization)
+}
+
+func (spool *Spool) append(
+	event contracts.EventEnvelopeV1,
+	tier Tier,
+	rotationAuthorization *rotationPublicationAuthorization,
+) (SpoolItem, error) {
 	spool.mutex.Lock()
 	defer spool.mutex.Unlock()
 	if spool.closed {
@@ -1486,11 +1745,25 @@ func (spool *Spool) Append(
 		return SpoolItem{}, ErrSpoolCorrupt
 	}
 	snapshot := spool.state.Snapshot()
+	rotationCandidate := false
+	if rotationAuthorization != nil {
+		mode := rotationModeForState(snapshot, *rotationAuthorization)
+		rotationCandidate =
+			rotationAuthorization.role == rotationEpochStartPublication &&
+				mode != rotationBoundaryInvalid &&
+				rotationEnvelopeMatches(
+					validated,
+					snapshot,
+					*rotationAuthorization,
+					mode,
+				)
+	}
 	if snapshot.MutationReadOnly ||
 		validated.HostID != snapshot.HostID ||
 		validated.BootID != snapshot.BootID ||
-		validated.KeyID != snapshot.KeyID ||
-		validated.KeyEpoch != snapshot.KeyEpoch ||
+		!rotationCandidate &&
+			(validated.KeyID != snapshot.KeyID ||
+				validated.KeyEpoch != snapshot.KeyEpoch) ||
 		validated.SourceSequence > snapshot.LastSequence {
 		_ = spool.state.PersistReadOnly("observer_spool_identity_history_invalid")
 		return SpoolItem{}, ErrSpoolCorrupt

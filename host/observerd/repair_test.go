@@ -4743,7 +4743,7 @@ func TestBootstrapCoversReservedGapExactlyOnceBeforeAckAdvances(
 		}
 	}
 	if gapEvents != 1 ||
-		daemon.state.Snapshot().LastCoveredGapEnd != 2 {
+		daemon.state.Snapshot().LastCoveredGapEnd != 3 {
 		_ = daemon.Close()
 		t.Fatalf(
 			"gap events=%d snapshot=%+v",

@@ -1,0 +1,6 @@
+{
+  "schema_version": "agmind.observer-boot-boundary.v1",
+  "kind": "observer_boot_boundary",
+  "reason_code": "observer_genesis",
+  "previous_source_sequence": 0
+}

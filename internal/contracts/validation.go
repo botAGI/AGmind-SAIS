@@ -175,7 +175,8 @@ func (event EventEnvelopeV1) Validate() error {
 		!boundedASCII(event.SourceVersion, 1, 64) {
 		return fmt.Errorf("invalid event source fields")
 	}
-	if event.KeyEpoch < 1 || !validUTC(event.EventTime) || !validUTC(event.IngestTime) {
+	if event.KeyEpoch < 1 || event.SourceSequence == 0 ||
+		!validUTC(event.EventTime) || !validUTC(event.IngestTime) {
 		return fmt.Errorf("invalid event counters or timestamp")
 	}
 	if event.ContainerStartTime != nil && !validUTC(*event.ContainerStartTime) {
@@ -436,6 +437,29 @@ func validateEgress(fields EgressDenyFields, version string) error {
 	}
 	if !boundedASCII(fields.PolicyBundleVersion, 1, 64) {
 		return fmt.Errorf("invalid policy_bundle_version")
+	}
+	return nil
+}
+
+func (boundary ObserverBootBoundaryV1) Validate() error {
+	if boundary.SchemaVersion != "agmind.observer-boot-boundary.v1" ||
+		boundary.Kind != "observer_boot_boundary" {
+		return fmt.Errorf("invalid observer boot boundary identity")
+	}
+	switch boundary.ReasonCode {
+	case "observer_genesis":
+		if boundary.PreviousBootID != nil ||
+			boundary.PreviousSourceSequence != 0 {
+			return fmt.Errorf("observer genesis cannot name a predecessor")
+		}
+	case "kernel_boot_id_changed":
+		if boundary.PreviousBootID == nil ||
+			!uuid4.MatchString(*boundary.PreviousBootID) ||
+			boundary.PreviousSourceSequence == 0 {
+			return fmt.Errorf("changed boot requires a valid predecessor")
+		}
+	default:
+		return fmt.Errorf("invalid observer boot boundary reason")
 	}
 	return nil
 }

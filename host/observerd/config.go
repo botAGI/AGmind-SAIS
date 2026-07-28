@@ -172,6 +172,50 @@ func rotationArtifactsPresent(stateDir string) bool {
 	return false
 }
 
+func ensureDedicatedBootBoundary(
+	ctx context.Context,
+	state *StateStore,
+	signer *EnvelopeSigner,
+	now time.Time,
+) error {
+	snapshot := state.Snapshot()
+	if snapshot.BootBoundaryState == bootBoundaryCommitted {
+		return nil
+	}
+	if snapshot.BootBoundaryState != bootBoundaryPending ||
+		snapshot.PendingBootBoundary == nil {
+		return ErrBootBoundaryPending
+	}
+	pending := snapshot.PendingBootBoundary
+	fields := map[string]any{
+		"schema_version":           "agmind.observer-boot-boundary.v1",
+		"kind":                     "observer_boot_boundary",
+		"reason_code":              pending.ReasonCode,
+		"previous_source_sequence": pending.PreviousSourceSequence,
+	}
+	if pending.PreviousBootID != nil {
+		fields["previous_boot_id"] = *pending.PreviousBootID
+	}
+	canonical, err := contracts.CanonicalJSON(fields)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(canonical)
+	_, err = signer.wrapAuthorizedBootBoundary(
+		ctx,
+		observerBootBoundaryPublication,
+		"observer_boot_boundary",
+		fields,
+		EventMetadata{
+			EventTime:         now.UTC(),
+			RedactionFlags:    []string{},
+			CoverageFlags:     []string{"boot_transition", "reconcile_required"},
+			SourcePayloadHash: hex.EncodeToString(digest[:]),
+		},
+	)
+	return err
+}
+
 // Bootstrap starts the Task 2 daemon state machine fenced in
 // reconcile_required. It intentionally creates no Docker client or state.
 func Bootstrap(
@@ -397,6 +441,14 @@ func Bootstrap(
 		privateKey,
 	)
 	if err != nil {
+		return fail(err, spool)
+	}
+	if err := ensureDedicatedBootBoundary(
+		ctx,
+		state,
+		signer,
+		options.now(),
+	); err != nil {
 		return fail(err, spool)
 	}
 	for _, gap := range spool.UncoveredGaps(state.Snapshot().LastCoveredGapEnd) {

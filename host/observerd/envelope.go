@@ -24,15 +24,61 @@ import (
 	"agmind.local/sais/internal/durablefile"
 )
 
-const observerStateSchema = "agmind.observer-state.v1"
+const observerStateSchemaV1 = "agmind.observer-state.v1"
+const observerStateSchema = "agmind.observer-state.v2"
 const zeroPublicationHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
+const (
+	bootBoundaryPending        = "pending"
+	bootBoundaryCommitted      = "committed"
+	bootBoundaryLegacyUnproven = "legacy_unproven"
+)
+
 type BootBoundary struct {
-	BootID        string `json:"boot_id"`
-	FirstSequence uint64 `json:"first_sequence"`
+	BootID            string `json:"boot_id"`
+	FirstSequence     uint64 `json:"first_sequence"`
+	BoundaryEventID   string `json:"boundary_event_id,omitempty"`
+	BoundaryEventType string `json:"boundary_event_type,omitempty"`
+}
+
+type PendingBootBoundary struct {
+	ReasonCode             string  `json:"reason_code"`
+	PreviousBootID         *string `json:"previous_boot_id,omitempty"`
+	PreviousSourceSequence uint64  `json:"previous_source_sequence"`
 }
 
 type ObserverState struct {
+	SchemaVersion           string               `json:"schema_version"`
+	HostID                  string               `json:"host_id"`
+	BootID                  string               `json:"boot_id"`
+	KeyID                   string               `json:"key_id"`
+	KeyEpoch                uint64               `json:"key_epoch"`
+	LastSequence            uint64               `json:"last_sequence"`
+	MutationReadOnly        bool                 `json:"mutation_read_only"`
+	ReadOnlyReason          string               `json:"read_only_reason"`
+	ReconcileRequired       bool                 `json:"reconcile_required"`
+	RoutineDropped          uint64               `json:"routine_dropped"`
+	DropEventPending        bool                 `json:"drop_event_pending"`
+	AckSequence             uint64               `json:"ack_sequence"`
+	AckEventID              string               `json:"ack_event_id"`
+	AckContentSHA256        string               `json:"ack_content_sha256"`
+	AckRecordHash           string               `json:"ack_record_hash"`
+	AckPayloadSHA256        string               `json:"ack_payload_sha256"`
+	LastCoveredGapEnd       uint64               `json:"last_covered_gap_end"`
+	BootHistory             []BootBoundary       `json:"boot_history,omitempty"`
+	AckRepairPending        bool                 `json:"ack_repair_pending"`
+	AckRepairReason         string               `json:"ack_repair_reason"`
+	PublicationBaseSequence uint64               `json:"publication_base_sequence"`
+	PublicationBaseHash     string               `json:"publication_base_hash"`
+	PublicationHeadSequence uint64               `json:"publication_head_sequence"`
+	PublicationHeadHash     string               `json:"publication_head_hash"`
+	BootBoundaryState       string               `json:"boot_boundary_state"`
+	PendingBootBoundary     *PendingBootBoundary `json:"pending_boot_boundary,omitempty"`
+}
+
+// observerStateV1 exists only to make the one-way migration strict. It is
+// never persisted after a successful read.
+type observerStateV1 struct {
 	SchemaVersion           string         `json:"schema_version"`
 	HostID                  string         `json:"host_id"`
 	BootID                  string         `json:"boot_id"`
@@ -59,6 +105,124 @@ type ObserverState struct {
 	PublicationHeadHash     string         `json:"publication_head_hash"`
 }
 
+func observerStateFromV1(legacy observerStateV1) ObserverState {
+	return ObserverState{
+		SchemaVersion:           observerStateSchema,
+		HostID:                  legacy.HostID,
+		BootID:                  legacy.BootID,
+		KeyID:                   legacy.KeyID,
+		KeyEpoch:                legacy.KeyEpoch,
+		LastSequence:            legacy.LastSequence,
+		MutationReadOnly:        legacy.MutationReadOnly,
+		ReadOnlyReason:          legacy.ReadOnlyReason,
+		ReconcileRequired:       legacy.ReconcileRequired,
+		RoutineDropped:          legacy.RoutineDropped,
+		DropEventPending:        legacy.DropEventPending,
+		AckSequence:             legacy.AckSequence,
+		AckEventID:              legacy.AckEventID,
+		AckContentSHA256:        legacy.AckContentSHA256,
+		AckRecordHash:           legacy.AckRecordHash,
+		AckPayloadSHA256:        legacy.AckPayloadSHA256,
+		LastCoveredGapEnd:       legacy.LastCoveredGapEnd,
+		BootHistory:             append([]BootBoundary(nil), legacy.BootHistory...),
+		AckRepairPending:        legacy.AckRepairPending,
+		AckRepairReason:         legacy.AckRepairReason,
+		PublicationBaseSequence: legacy.PublicationBaseSequence,
+		PublicationBaseHash:     legacy.PublicationBaseHash,
+		PublicationHeadSequence: legacy.PublicationHeadSequence,
+		PublicationHeadHash:     legacy.PublicationHeadHash,
+	}
+}
+
+func (legacy observerStateV1) Validate() error {
+	if legacy.SchemaVersion != observerStateSchemaV1 ||
+		legacy.MutationReadOnly != (legacy.ReadOnlyReason != "") {
+		return fmt.Errorf("invalid legacy observer state")
+	}
+	state := observerStateFromV1(legacy)
+	state.MutationReadOnly = true
+	state.ReadOnlyReason = "observer_legacy_boot_boundary_unproven"
+	state.ReconcileRequired = true
+	state.BootBoundaryState = bootBoundaryLegacyUnproven
+	return state.Validate()
+}
+
+func pristineObserverStateV1(legacy observerStateV1) bool {
+	return legacy.KeyEpoch == 1 &&
+		legacy.ReconcileRequired &&
+		legacy.LastSequence == 0 &&
+		!legacy.MutationReadOnly &&
+		legacy.ReadOnlyReason == "" &&
+		legacy.RoutineDropped == 0 &&
+		!legacy.DropEventPending &&
+		legacy.AckSequence == 0 &&
+		legacy.AckEventID == "" &&
+		legacy.AckContentSHA256 == "" &&
+		legacy.AckRecordHash == "" &&
+		legacy.AckPayloadSHA256 == "" &&
+		legacy.LastCoveredGapEnd == 0 &&
+		!legacy.AckRepairPending &&
+		legacy.AckRepairReason == "" &&
+		legacy.PublicationBaseSequence == 0 &&
+		legacy.PublicationBaseHash == zeroPublicationHash &&
+		legacy.PublicationHeadSequence == 0 &&
+		legacy.PublicationHeadHash == zeroPublicationHash &&
+		len(legacy.BootHistory) == 1 &&
+		legacy.BootHistory[0].BootID == legacy.BootID &&
+		legacy.BootHistory[0].FirstSequence == 1
+}
+
+func migrateObserverStateV1(legacy observerStateV1) ObserverState {
+	state := observerStateFromV1(legacy)
+	if pristineObserverStateV1(legacy) {
+		state.BootBoundaryState = bootBoundaryPending
+		state.PendingBootBoundary = &PendingBootBoundary{
+			ReasonCode: "observer_genesis",
+		}
+		return state
+	}
+	state.MutationReadOnly = true
+	state.ReadOnlyReason = "observer_legacy_boot_boundary_unproven"
+	state.ReconcileRequired = true
+	state.BootBoundaryState = bootBoundaryLegacyUnproven
+	state.PendingBootBoundary = nil
+	return state
+}
+
+func decodeObserverState(raw []byte) (ObserverState, bool, error) {
+	var header struct {
+		SchemaVersion string `json:"schema_version"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return ObserverState{}, false, err
+	}
+	switch header.SchemaVersion {
+	case observerStateSchema:
+		state, err := contracts.DecodeStrict[ObserverState](
+			bytes.NewReader(raw),
+			65_536,
+		)
+		return state, false, err
+	case observerStateSchemaV1:
+		legacy, err := contracts.DecodeStrict[observerStateV1](
+			bytes.NewReader(raw),
+			65_536,
+		)
+		if err != nil {
+			return ObserverState{}, false, err
+		}
+		state := migrateObserverStateV1(legacy)
+		if err := state.Validate(); err != nil {
+			return ObserverState{}, false, err
+		}
+		return state, true, nil
+	default:
+		return ObserverState{}, false, fmt.Errorf(
+			"unsupported observer state schema version",
+		)
+	}
+}
+
 var (
 	uuid4Pattern = regexp.MustCompile(
 		`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
@@ -81,6 +245,10 @@ func (state ObserverState) Validate() error {
 	}
 	if !state.MutationReadOnly && state.ReadOnlyReason != "" {
 		return fmt.Errorf("healthy state cannot retain read-only reason")
+	}
+	if state.BootBoundaryState != bootBoundaryCommitted &&
+		!state.ReconcileRequired {
+		return fmt.Errorf("non-committed boot boundary requires reconcile fence")
 	}
 	if state.AckSequence == 0 {
 		if state.AckEventID != "" ||
@@ -134,6 +302,30 @@ func (state ObserverState) Validate() error {
 						boundary.FirstSequence != state.LastSequence+1) {
 				return fmt.Errorf("invalid observer boot history")
 			}
+			proofPresent := eventPattern.MatchString(boundary.BoundaryEventID) &&
+				isBootBoundaryEventType(boundary.BoundaryEventType)
+			proofAbsent := boundary.BoundaryEventID == "" &&
+				boundary.BoundaryEventType == ""
+			switch state.BootBoundaryState {
+			case bootBoundaryCommitted:
+				if !proofPresent {
+					return fmt.Errorf("committed boot boundary lacks event identity")
+				}
+			case bootBoundaryPending:
+				if index == len(state.BootHistory)-1 {
+					if !proofAbsent {
+						return fmt.Errorf("pending boot boundary already has event identity")
+					}
+				} else if !proofPresent {
+					return fmt.Errorf("historical boot boundary lacks event identity")
+				}
+			case bootBoundaryLegacyUnproven:
+				if !proofAbsent {
+					return fmt.Errorf("legacy boot history cannot claim event identity")
+				}
+			default:
+				return fmt.Errorf("invalid observer boot boundary state")
+			}
 			if _, exists := seen[boundary.BootID]; exists {
 				return fmt.Errorf("duplicate observer boot history")
 			}
@@ -141,7 +333,59 @@ func (state ObserverState) Validate() error {
 			priorFirst = boundary.FirstSequence
 		}
 	}
+	switch state.BootBoundaryState {
+	case bootBoundaryPending:
+		if state.PendingBootBoundary == nil {
+			return fmt.Errorf("pending boot boundary details are required")
+		}
+		pending := state.PendingBootBoundary
+		switch pending.ReasonCode {
+		case "observer_genesis":
+			if len(state.BootHistory) != 1 ||
+				pending.PreviousBootID != nil ||
+				pending.PreviousSourceSequence != 0 {
+				return fmt.Errorf("invalid pending genesis boundary")
+			}
+		case "kernel_boot_id_changed":
+			if len(state.BootHistory) < 2 ||
+				pending.PreviousBootID == nil ||
+				*pending.PreviousBootID !=
+					state.BootHistory[len(state.BootHistory)-2].BootID ||
+				pending.PreviousSourceSequence == 0 ||
+				pending.PreviousSourceSequence == math.MaxUint64 ||
+				state.BootHistory[len(state.BootHistory)-1].FirstSequence !=
+					pending.PreviousSourceSequence+1 {
+				return fmt.Errorf("invalid pending changed-boot boundary")
+			}
+		default:
+			return fmt.Errorf("invalid pending boot boundary reason")
+		}
+	case bootBoundaryCommitted:
+		if state.PendingBootBoundary != nil {
+			return fmt.Errorf("committed boot boundary cannot remain pending")
+		}
+	case bootBoundaryLegacyUnproven:
+		if state.PendingBootBoundary != nil ||
+			!state.MutationReadOnly ||
+			state.ReadOnlyReason !=
+				"observer_legacy_boot_boundary_unproven" {
+			return fmt.Errorf("unproven legacy state must remain fenced")
+		}
+	default:
+		return fmt.Errorf("invalid observer boot boundary state")
+	}
 	return nil
+}
+
+func isBootBoundaryEventType(eventType string) bool {
+	switch eventType {
+	case "observer_boot_boundary",
+		"observer_key_transition",
+		"observer_key_epoch_start":
+		return true
+	default:
+		return false
+	}
 }
 
 type StateIdentity struct {
@@ -165,6 +409,14 @@ func cloneObserverState(state ObserverState) ObserverState {
 		[]BootBoundary(nil),
 		state.BootHistory...,
 	)
+	if state.PendingBootBoundary != nil {
+		pending := *state.PendingBootBoundary
+		if pending.PreviousBootID != nil {
+			previous := *pending.PreviousBootID
+			pending.PreviousBootID = &previous
+		}
+		cloned.PendingBootBoundary = &pending
+	}
 	return cloned
 }
 
@@ -199,6 +451,10 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 			BootID:        identity.BootID,
 			FirstSequence: 1,
 		}},
+		BootBoundaryState: bootBoundaryPending,
+		PendingBootBoundary: &PendingBootBoundary{
+			ReasonCode: "observer_genesis",
+		},
 	}
 	raw, err := readSingleLinkRegular(path, 65_536)
 	if errors.Is(err, os.ErrNotExist) {
@@ -214,7 +470,7 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	state, err := contracts.DecodeStrict[ObserverState](bytes.NewReader(raw), 65_536)
+	state, migrated, err := decodeObserverState(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +479,19 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 		state.KeyEpoch != identity.KeyEpoch {
 		return nil, fmt.Errorf("observer state identity mismatch")
 	}
-	needsPersist := false
+	needsPersist := migrated
+	if state.BootBoundaryState == bootBoundaryLegacyUnproven {
+		if needsPersist {
+			if err := persistState(path, state); err != nil {
+				return nil, err
+			}
+		}
+		return &StateStore{
+			path:    path,
+			state:   cloneObserverState(state),
+			persist: persistState,
+		}, nil
+	}
 	if state.BootID != identity.BootID {
 		for _, boundary := range state.BootHistory {
 			if boundary.BootID == identity.BootID {
@@ -242,11 +510,20 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 			return nil, fmt.Errorf("observer sequence exhausted")
 		}
 		lastIndex := len(state.BootHistory) - 1
-		if state.BootHistory[lastIndex].FirstSequence ==
-			state.LastSequence+1 {
+		if state.BootBoundaryState == bootBoundaryPending {
+			if state.PublicationHeadSequence >=
+				state.BootHistory[lastIndex].FirstSequence {
+				state.MutationReadOnly = true
+				state.ReadOnlyReason =
+					"observer_pending_boot_boundary_recovery_unproven"
+				state.ReconcileRequired = true
+				_ = persistState(path, state)
+				return nil, ErrBootBoundaryRecoveryUnproven
+			}
 			state.BootID = identity.BootID
 			state.BootHistory[lastIndex].BootID = identity.BootID
 		} else {
+			previousBootID := state.BootID
 			if len(state.BootHistory) >= 1_024 {
 				state.MutationReadOnly = true
 				state.ReadOnlyReason = "observer_boot_history_exhausted"
@@ -259,6 +536,12 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 				BootID:        identity.BootID,
 				FirstSequence: state.LastSequence + 1,
 			})
+			state.BootBoundaryState = bootBoundaryPending
+			state.PendingBootBoundary = &PendingBootBoundary{
+				ReasonCode:             "kernel_boot_id_changed",
+				PreviousBootID:         &previousBootID,
+				PreviousSourceSequence: state.LastSequence,
+			}
 		}
 		state.ReconcileRequired = true
 		needsPersist = true
@@ -372,6 +655,105 @@ func (store *StateStore) reserve(identity StateIdentity) (uint64, error) {
 		return 0, err
 	}
 	return next.LastSequence, nil
+}
+
+func (store *StateStore) commitPendingBootBoundary(
+	event contracts.EventEnvelopeV1,
+) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.state.BootBoundaryState != bootBoundaryPending ||
+		store.state.PendingBootBoundary == nil ||
+		store.state.MutationReadOnly ||
+		len(store.state.BootHistory) == 0 ||
+		event.SourceSequence > store.state.LastSequence ||
+		event.SourceSequence <
+			store.state.BootHistory[len(store.state.BootHistory)-1].FirstSequence ||
+		!dedicatedBootBoundaryMatchesState(event, store.state) {
+		return fmt.Errorf("invalid pending boot boundary commit")
+	}
+	next := cloneObserverState(store.state)
+	last := len(next.BootHistory) - 1
+	next.BootHistory[last].BoundaryEventID = event.EventID
+	next.BootHistory[last].BoundaryEventType = event.EventType
+	next.BootBoundaryState = bootBoundaryCommitted
+	next.PendingBootBoundary = nil
+	return store.replaceLocked(next)
+}
+
+func (store *StateStore) reserveRotationEpochStart(
+	authorization rotationPublicationAuthorization,
+	identity StateIdentity,
+) (uint64, error) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	marker := authorization.marker
+	if authorization.role != rotationEpochStartPublication ||
+		store.state.MutationReadOnly ||
+		store.state.HostID != identity.HostID ||
+		store.state.BootID != identity.BootID ||
+		store.state.KeyID != marker.Transition.OldKeyID ||
+		store.state.KeyEpoch != marker.Transition.OldEpoch ||
+		identity.KeyID != marker.Transition.NewKeyID ||
+		identity.KeyEpoch != marker.Transition.NewEpoch ||
+		store.state.LastSequence != marker.TransitionSequence ||
+		marker.StartSequence != marker.TransitionSequence+1 ||
+		rotationModeForState(store.state, authorization) ==
+			rotationBoundaryInvalid {
+		return 0, ErrRotationPublicationMismatch
+	}
+	next := cloneObserverState(store.state)
+	next.LastSequence = marker.StartSequence
+	if err := store.replaceLocked(next); err != nil {
+		return 0, err
+	}
+	return marker.StartSequence, nil
+}
+
+func (store *StateStore) commitRotationPublication(
+	event contracts.EventEnvelopeV1,
+	authorization rotationPublicationAuthorization,
+) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	mode := rotationModeForState(store.state, authorization)
+	if store.state.MutationReadOnly ||
+		mode == rotationBoundaryInvalid ||
+		event.SourceSequence > store.state.LastSequence ||
+		!rotationEnvelopeMatches(
+			event,
+			store.state,
+			authorization,
+			mode,
+		) {
+		return ErrRotationPublicationMismatch
+	}
+	next := cloneObserverState(store.state)
+	switch authorization.role {
+	case rotationTransitionPublication:
+		if mode != rotationBoundaryB {
+			return ErrRotationPublicationMismatch
+		}
+		last := len(next.BootHistory) - 1
+		next.BootHistory[last].BoundaryEventID = event.EventID
+		next.BootHistory[last].BoundaryEventType = event.EventType
+		next.BootBoundaryState = bootBoundaryCommitted
+		next.PendingBootBoundary = nil
+	case rotationEpochStartPublication:
+		next.KeyID = authorization.marker.Transition.NewKeyID
+		next.KeyEpoch = authorization.marker.Transition.NewEpoch
+		next.ReconcileRequired = true
+		if mode == rotationBoundaryC {
+			last := len(next.BootHistory) - 1
+			next.BootHistory[last].BoundaryEventID = event.EventID
+			next.BootHistory[last].BoundaryEventType = event.EventType
+			next.BootBoundaryState = bootBoundaryCommitted
+			next.PendingBootBoundary = nil
+		}
+	default:
+		return ErrRotationPublicationMismatch
+	}
+	return store.replaceLocked(next)
 }
 
 func (store *StateStore) applyAck(
@@ -520,7 +902,8 @@ func (store *StateStore) completeDockerReconcile() error {
 	next := cloneObserverState(store.state)
 	next.ReconcileRequired = next.MutationReadOnly ||
 		next.AckRepairPending ||
-		next.DropEventPending
+		next.DropEventPending ||
+		next.BootBoundaryState != bootBoundaryCommitted
 	if next.ReconcileRequired == store.state.ReconcileRequired {
 		return nil
 	}
@@ -623,6 +1006,134 @@ type EventMetadata struct {
 	SourcePayloadHash   string
 }
 
+type bootBoundaryPublicationAuthorization uint8
+
+const (
+	noBootBoundaryPublication bootBoundaryPublicationAuthorization = iota
+	observerBootBoundaryPublication
+)
+
+type rotationPublicationRole uint8
+
+const (
+	rotationTransitionPublication rotationPublicationRole = iota + 1
+	rotationEpochStartPublication
+)
+
+type rotationPublicationAuthorization struct {
+	marker          rotationMarker
+	role            rotationPublicationRole
+	transitionEvent *contracts.EventEnvelopeV1
+}
+
+func exactFlags(actual []string, expected ...string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range expected {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func (authorization bootBoundaryPublicationAuthorization) permits(
+	eventType string,
+	metadata EventMetadata,
+) bool {
+	switch authorization {
+	case observerBootBoundaryPublication:
+		return eventType == "observer_boot_boundary" &&
+			exactFlags(
+				metadata.CoverageFlags,
+				"boot_transition",
+				"reconcile_required",
+			)
+	default:
+		return false
+	}
+}
+
+func decodeBootBoundaryFields(
+	normalizedFields map[string]any,
+) (contracts.ObserverBootBoundaryV1, []byte, error) {
+	raw, err := contracts.CanonicalJSON(normalizedFields)
+	if err != nil {
+		return contracts.ObserverBootBoundaryV1{}, nil, err
+	}
+	boundary, err := contracts.DecodeStrict[contracts.ObserverBootBoundaryV1](
+		bytes.NewReader(raw),
+		65_536,
+	)
+	return boundary, raw, err
+}
+
+func pendingBoundaryMatches(
+	boundary contracts.ObserverBootBoundaryV1,
+	pending *PendingBootBoundary,
+) bool {
+	if pending == nil ||
+		boundary.ReasonCode != pending.ReasonCode ||
+		boundary.PreviousSourceSequence != pending.PreviousSourceSequence ||
+		(boundary.PreviousBootID == nil) != (pending.PreviousBootID == nil) {
+		return false
+	}
+	return boundary.PreviousBootID == nil ||
+		*boundary.PreviousBootID == *pending.PreviousBootID
+}
+
+func dedicatedBoundaryMetadataMatches(
+	metadata EventMetadata,
+	normalizedCanonical []byte,
+) bool {
+	digest := sha256.Sum256(normalizedCanonical)
+	return metadata.ContainerID == nil &&
+		metadata.ContainerStartTime == nil &&
+		metadata.ReleaseID == nil &&
+		metadata.InventoryGeneration == 0 &&
+		metadata.InventoryRevision == nil &&
+		len(metadata.RedactionFlags) == 0 &&
+		exactFlags(
+			metadata.CoverageFlags,
+			"boot_transition",
+			"reconcile_required",
+		) &&
+		metadata.SourcePayloadHash == hex.EncodeToString(digest[:])
+}
+
+func dedicatedBootBoundaryMatchesState(
+	event contracts.EventEnvelopeV1,
+	state ObserverState,
+) bool {
+	if state.BootBoundaryState != bootBoundaryPending ||
+		state.PendingBootBoundary == nil ||
+		event.EventType != "observer_boot_boundary" ||
+		event.SourceID != "agmind-observerd" ||
+		event.SourceVersion != "0.1.0" ||
+		event.HostID != state.HostID ||
+		event.BootID != state.BootID ||
+		event.KeyID != state.KeyID ||
+		event.KeyEpoch != state.KeyEpoch ||
+		event.ContainerID != nil ||
+		event.ContainerStartTime != nil ||
+		event.ReleaseID != nil ||
+		event.InventoryGeneration != 0 ||
+		event.InventoryRevision != nil ||
+		len(event.RedactionFlags) != 0 ||
+		!exactFlags(
+			event.CoverageFlags,
+			"boot_transition",
+			"reconcile_required",
+		) ||
+		event.SourcePayloadHash != event.NormalizedFieldsSHA256 {
+		return false
+	}
+	boundary, _, err := decodeBootBoundaryFields(event.NormalizedFields)
+	return err == nil &&
+		pendingBoundaryMatches(boundary, state.PendingBootBoundary)
+}
+
 type EnvelopeSigner struct {
 	config     SignerConfig
 	state      *StateStore
@@ -694,6 +1205,7 @@ func cloneNormalized(fields map[string]any) (map[string]any, []byte, error) {
 func priorityEventType(eventType string) bool {
 	switch eventType {
 	case "coverage",
+		"observer_boot_boundary",
 		"observer_start",
 		"observer_key_transition",
 		"observer_key_epoch_start",
@@ -708,6 +1220,58 @@ func priorityEventType(eventType string) bool {
 
 func (signer *EnvelopeSigner) Wrap(
 	ctx context.Context,
+	eventType string,
+	normalizedFields map[string]any,
+	metadata EventMetadata,
+) (contracts.EventEnvelopeV1, error) {
+	return signer.wrap(
+		ctx,
+		noBootBoundaryPublication,
+		nil,
+		eventType,
+		normalizedFields,
+		metadata,
+	)
+}
+
+func (signer *EnvelopeSigner) wrapAuthorizedBootBoundary(
+	ctx context.Context,
+	authorization bootBoundaryPublicationAuthorization,
+	eventType string,
+	normalizedFields map[string]any,
+	metadata EventMetadata,
+) (contracts.EventEnvelopeV1, error) {
+	return signer.wrap(
+		ctx,
+		authorization,
+		nil,
+		eventType,
+		normalizedFields,
+		metadata,
+	)
+}
+
+func (signer *EnvelopeSigner) wrapAuthorizedRotation(
+	ctx context.Context,
+	authorization rotationPublicationAuthorization,
+	eventType string,
+	normalizedFields map[string]any,
+	metadata EventMetadata,
+) (contracts.EventEnvelopeV1, error) {
+	return signer.wrap(
+		ctx,
+		noBootBoundaryPublication,
+		&authorization,
+		eventType,
+		normalizedFields,
+		metadata,
+	)
+}
+
+func (signer *EnvelopeSigner) wrap(
+	ctx context.Context,
+	authorization bootBoundaryPublicationAuthorization,
+	rotationAuthorization *rotationPublicationAuthorization,
 	eventType string,
 	normalizedFields map[string]any,
 	metadata EventMetadata,
@@ -729,12 +1293,72 @@ func (signer *EnvelopeSigner) Wrap(
 		return contracts.EventEnvelopeV1{}, ctx.Err()
 	default:
 	}
-	sequence, err := signer.state.reserve(StateIdentity{
-		HostID:   signer.config.HostID,
-		BootID:   signer.config.BootID,
-		KeyID:    signer.keyID,
-		KeyEpoch: signer.config.KeyEpoch,
-	})
+	snapshot := signer.state.Snapshot()
+	boundaryPending := snapshot.BootBoundaryState == bootBoundaryPending
+	rotationAuthorized := rotationAuthorization != nil &&
+		rotationAuthorization.matchesRequest(
+			snapshot,
+			signer,
+			eventType,
+			normalizedFields,
+			metadata,
+		)
+	if rotationAuthorization != nil && !rotationAuthorized {
+		return contracts.EventEnvelopeV1{}, ErrRotationPublicationMismatch
+	}
+	if boundaryPending &&
+		!authorization.permits(eventType, metadata) &&
+		!rotationAuthorized {
+		return contracts.EventEnvelopeV1{}, ErrBootBoundaryPending
+	}
+	if authorization != noBootBoundaryPublication &&
+		rotationAuthorization != nil {
+		return contracts.EventEnvelopeV1{}, fmt.Errorf(
+			"conflicting observer publication authorization",
+		)
+	}
+	if authorization != noBootBoundaryPublication && !boundaryPending {
+		return contracts.EventEnvelopeV1{}, ErrBootBoundaryNotPending
+	}
+	if authorization != noBootBoundaryPublication &&
+		!authorization.permits(eventType, metadata) {
+		return contracts.EventEnvelopeV1{}, fmt.Errorf(
+			"boot boundary authorization does not match publication",
+		)
+	}
+	if authorization == observerBootBoundaryPublication {
+		boundary, raw, err := decodeBootBoundaryFields(normalizedFields)
+		if err != nil {
+			return contracts.EventEnvelopeV1{}, err
+		}
+		if !pendingBoundaryMatches(
+			boundary,
+			snapshot.PendingBootBoundary,
+		) || !dedicatedBoundaryMetadataMatches(metadata, raw) {
+			return contracts.EventEnvelopeV1{}, ErrBootBoundaryPayloadMismatch
+		}
+	}
+	var sequence uint64
+	var err error
+	if rotationAuthorization != nil &&
+		rotationAuthorization.role == rotationEpochStartPublication {
+		sequence, err = signer.state.reserveRotationEpochStart(
+			*rotationAuthorization,
+			StateIdentity{
+				HostID:   signer.config.HostID,
+				BootID:   signer.config.BootID,
+				KeyID:    signer.keyID,
+				KeyEpoch: signer.config.KeyEpoch,
+			},
+		)
+	} else {
+		sequence, err = signer.state.reserve(StateIdentity{
+			HostID:   signer.config.HostID,
+			BootID:   signer.config.BootID,
+			KeyID:    signer.keyID,
+			KeyEpoch: signer.config.KeyEpoch,
+		})
+	}
 	if err != nil {
 		return contracts.EventEnvelopeV1{}, err
 	}
@@ -797,7 +1421,19 @@ func (signer *EnvelopeSigner) Wrap(
 	if priorityEventType(eventType) {
 		tier = PriorityTier
 	}
-	if _, err := signer.spool.Append(event, tier); err != nil {
+	var appendErr error
+	if rotationAuthorization != nil &&
+		rotationAuthorization.role == rotationEpochStartPublication {
+		_, appendErr = signer.spool.appendRotationEpochStart(
+			event,
+			tier,
+			*rotationAuthorization,
+		)
+	} else {
+		_, appendErr = signer.spool.Append(event, tier)
+	}
+	if appendErr != nil {
+		err := appendErr
 		if errors.Is(err, ErrRoutineQuota) {
 			locked = false
 			signer.state.publicationMutex.Unlock()
@@ -808,13 +1444,48 @@ func (signer *EnvelopeSigner) Wrap(
 		}
 		return contracts.EventEnvelopeV1{}, err
 	}
+	if boundaryPending {
+		var commitErr error
+		if rotationAuthorization != nil {
+			commitErr = signer.state.commitRotationPublication(
+				event,
+				*rotationAuthorization,
+			)
+		} else {
+			commitErr = signer.state.commitPendingBootBoundary(event)
+		}
+		if commitErr != nil {
+			return contracts.EventEnvelopeV1{}, commitErr
+		}
+	} else if rotationAuthorization != nil &&
+		rotationAuthorization.role == rotationEpochStartPublication {
+		if err := signer.state.commitRotationPublication(
+			event,
+			*rotationAuthorization,
+		); err != nil {
+			return contracts.EventEnvelopeV1{}, err
+		}
+	}
 	return event, nil
 }
 
 var (
-	ErrRootRequired         = errors.New("root privileges required")
-	ErrStateLocked          = errors.New("observer state is locked")
-	ErrInjectedRotationStop = errors.New("injected rotation stop")
+	ErrRootRequired           = errors.New("root privileges required")
+	ErrStateLocked            = errors.New("observer state is locked")
+	ErrInjectedRotationStop   = errors.New("injected rotation stop")
+	ErrBootBoundaryPending    = errors.New("observer boot boundary publication pending")
+	ErrBootBoundaryNotPending = errors.New(
+		"observer boot boundary publication is not pending",
+	)
+	ErrBootBoundaryRecoveryUnproven = errors.New(
+		"observer pending boot boundary recovery is unproven",
+	)
+	ErrBootBoundaryPayloadMismatch = errors.New(
+		"observer boot boundary does not match pending state",
+	)
+	ErrRotationPublicationMismatch = errors.New(
+		"observer rotation publication does not match durable marker",
+	)
 )
 
 type StateLock struct {
@@ -968,6 +1639,45 @@ func (metadata PublicKeyMetadata) Validate() error {
 				ed25519.PublicKey(publicKey),
 			); err != nil {
 				return fmt.Errorf("invalid observer epoch-start envelope: %w", err)
+			}
+			exactEnvelopeShape := func(
+				event contracts.EventEnvelopeV1,
+			) bool {
+				return event.ContainerID == nil &&
+					event.ContainerStartTime == nil &&
+					event.ReleaseID == nil &&
+					event.InventoryGeneration == 0 &&
+					event.InventoryRevision == nil &&
+					len(event.RedactionFlags) == 0
+			}
+			sameBoot := transitionEnvelope.BootID == startEnvelope.BootID
+			sameBootRotation := sameBoot &&
+				exactFlags(
+					transitionEnvelope.CoverageFlags,
+					"key_rotation",
+				) &&
+				exactFlags(startEnvelope.CoverageFlags, "key_rotation")
+			bBoundary := sameBoot &&
+				exactFlags(
+					transitionEnvelope.CoverageFlags,
+					"boot_transition",
+					"key_rotation",
+				) &&
+				exactFlags(startEnvelope.CoverageFlags, "key_rotation")
+			cBoundary := !sameBoot &&
+				exactFlags(
+					transitionEnvelope.CoverageFlags,
+					"key_rotation",
+				) &&
+				exactFlags(
+					startEnvelope.CoverageFlags,
+					"boot_transition",
+					"key_rotation",
+				)
+			if !exactEnvelopeShape(transitionEnvelope) ||
+				!exactEnvelopeShape(startEnvelope) ||
+				!sameBootRotation && !bBoundary && !cBoundary {
+				return fmt.Errorf("observer rotation boundary shape mismatch")
 			}
 			if priorStartSequence != 0 &&
 				transitionEnvelope.SourceSequence <= priorStartSequence {
@@ -1223,7 +1933,16 @@ func loadObserverState(path string) (ObserverState, error) {
 	if err != nil {
 		return ObserverState{}, err
 	}
-	return contracts.DecodeStrict[ObserverState](bytes.NewReader(raw), 65_536)
+	state, migrated, err := decodeObserverState(raw)
+	if err != nil {
+		return ObserverState{}, err
+	}
+	if migrated {
+		if err := persistState(path, state); err != nil {
+			return ObserverState{}, err
+		}
+	}
+	return state, nil
 }
 
 func markExistingStateReadOnly(path, reason string) {
@@ -1239,19 +1958,297 @@ func markExistingStateReadOnly(path, reason string) {
 	_ = store.PersistReadOnly(reason)
 }
 
+type rotationBoundaryMode uint8
+
+const (
+	rotationBoundaryInvalid rotationBoundaryMode = iota
+	rotationBoundarySameBoot
+	rotationBoundaryB
+	rotationBoundaryC
+)
+
+func rotationModeForState(
+	state ObserverState,
+	authorization rotationPublicationAuthorization,
+) rotationBoundaryMode {
+	marker := authorization.marker
+	if marker.Validate() != nil ||
+		len(state.BootHistory) == 0 ||
+		state.HostID != marker.HostID ||
+		state.KeyID != marker.Transition.OldKeyID ||
+		state.KeyEpoch != marker.Transition.OldEpoch ||
+		marker.TransitionSequence == 0 ||
+		marker.StartSequence != marker.TransitionSequence+1 {
+		return rotationBoundaryInvalid
+	}
+	lastBoundary := state.BootHistory[len(state.BootHistory)-1]
+	switch authorization.role {
+	case rotationTransitionPublication:
+		if authorization.transitionEvent != nil ||
+			state.LastSequence < marker.TransitionSequence-1 ||
+			state.LastSequence > marker.TransitionSequence {
+			return rotationBoundaryInvalid
+		}
+		if state.BootBoundaryState == bootBoundaryPending &&
+			state.PendingBootBoundary != nil &&
+			lastBoundary.FirstSequence == marker.TransitionSequence &&
+			state.PendingBootBoundary.PreviousSourceSequence ==
+				marker.TransitionSequence-1 {
+			return rotationBoundaryB
+		}
+		if state.BootBoundaryState == bootBoundaryCommitted {
+			return rotationBoundarySameBoot
+		}
+	case rotationEpochStartPublication:
+		if authorization.transitionEvent == nil ||
+			state.LastSequence < marker.StartSequence-1 ||
+			state.LastSequence > marker.StartSequence {
+			return rotationBoundaryInvalid
+		}
+		transition := *authorization.transitionEvent
+		if state.BootBoundaryState == bootBoundaryPending &&
+			state.PendingBootBoundary != nil &&
+			state.PendingBootBoundary.PreviousBootID != nil &&
+			*state.PendingBootBoundary.PreviousBootID == transition.BootID &&
+			state.PendingBootBoundary.PreviousSourceSequence ==
+				marker.TransitionSequence &&
+			lastBoundary.FirstSequence == marker.StartSequence &&
+			transition.BootID != state.BootID {
+			return rotationBoundaryC
+		}
+		if state.BootBoundaryState == bootBoundaryCommitted &&
+			transition.BootID == state.BootID {
+			return rotationBoundarySameBoot
+		}
+	}
+	return rotationBoundaryInvalid
+}
+
+func rotationCoverageFlags(
+	mode rotationBoundaryMode,
+	role rotationPublicationRole,
+) []string {
+	if mode == rotationBoundaryB && role == rotationTransitionPublication ||
+		mode == rotationBoundaryC && role == rotationEpochStartPublication {
+		return []string{"boot_transition", "key_rotation"}
+	}
+	return []string{"key_rotation"}
+}
+
+func rotationFieldsForAuthorization(
+	authorization rotationPublicationAuthorization,
+) (map[string]any, error) {
+	switch authorization.role {
+	case rotationTransitionPublication:
+		return transitionMap(authorization.marker.Transition)
+	case rotationEpochStartPublication:
+		return map[string]any{
+			"kind":      "observer_key_epoch_start",
+			"key_id":    authorization.marker.Transition.NewKeyID,
+			"key_epoch": authorization.marker.Transition.NewEpoch,
+		}, nil
+	default:
+		return nil, ErrRotationPublicationMismatch
+	}
+}
+
+func rotationMetadataMatches(
+	metadata EventMetadata,
+	fields map[string]any,
+	expectedFlags []string,
+) bool {
+	canonical, err := contracts.CanonicalJSON(fields)
+	if err != nil {
+		return false
+	}
+	sum := sha256.Sum256(canonical)
+	return metadata.ContainerID == nil &&
+		metadata.ContainerStartTime == nil &&
+		metadata.ReleaseID == nil &&
+		metadata.InventoryGeneration == 0 &&
+		metadata.InventoryRevision == nil &&
+		len(metadata.RedactionFlags) == 0 &&
+		exactFlags(metadata.CoverageFlags, expectedFlags...) &&
+		metadata.SourcePayloadHash == hex.EncodeToString(sum[:])
+}
+
+func transitionEnvelopeMatchesMarker(
+	event contracts.EventEnvelopeV1,
+	marker rotationMarker,
+) bool {
+	fields, err := transitionMap(marker.Transition)
+	return err == nil &&
+		event.EventType == "observer_key_transition" &&
+		event.SourceID == "agmind-observerd" &&
+		event.SourceVersion == "0.1.0" &&
+		event.HostID == marker.HostID &&
+		event.KeyID == marker.Transition.OldKeyID &&
+		event.KeyEpoch == marker.Transition.OldEpoch &&
+		event.SourceSequence == marker.TransitionSequence &&
+		event.ContainerID == nil &&
+		event.ContainerStartTime == nil &&
+		event.ReleaseID == nil &&
+		event.InventoryGeneration == 0 &&
+		event.InventoryRevision == nil &&
+		len(event.RedactionFlags) == 0 &&
+		event.SourcePayloadHash == event.NormalizedFieldsSHA256 &&
+		eventHasExactFields(event, fields)
+}
+
+func rotationTransitionCoverageMatches(
+	state ObserverState,
+	transition contracts.EventEnvelopeV1,
+	mode rotationBoundaryMode,
+) bool {
+	expected := []string{"key_rotation"}
+	if mode == rotationBoundarySameBoot &&
+		len(state.BootHistory) > 0 {
+		last := state.BootHistory[len(state.BootHistory)-1]
+		if last.BoundaryEventType == "observer_key_transition" &&
+			last.BoundaryEventID == transition.EventID {
+			expected = []string{"boot_transition", "key_rotation"}
+		}
+	}
+	return exactFlags(transition.CoverageFlags, expected...)
+}
+
+func rotationEnvelopeMatches(
+	event contracts.EventEnvelopeV1,
+	state ObserverState,
+	authorization rotationPublicationAuthorization,
+	mode rotationBoundaryMode,
+) bool {
+	fields, err := rotationFieldsForAuthorization(authorization)
+	if err != nil ||
+		event.SourceID != "agmind-observerd" ||
+		event.SourceVersion != "0.1.0" ||
+		event.HostID != state.HostID ||
+		event.BootID != state.BootID ||
+		event.ContainerID != nil ||
+		event.ContainerStartTime != nil ||
+		event.ReleaseID != nil ||
+		event.InventoryGeneration != 0 ||
+		event.InventoryRevision != nil ||
+		len(event.RedactionFlags) != 0 ||
+		event.SourcePayloadHash != event.NormalizedFieldsSHA256 ||
+		!eventHasExactFields(event, fields) ||
+		!exactFlags(
+			event.CoverageFlags,
+			rotationCoverageFlags(mode, authorization.role)...,
+		) {
+		return false
+	}
+	marker := authorization.marker
+	switch authorization.role {
+	case rotationTransitionPublication:
+		return event.EventType == "observer_key_transition" &&
+			event.KeyID == marker.Transition.OldKeyID &&
+			event.KeyEpoch == marker.Transition.OldEpoch &&
+			event.SourceSequence == marker.TransitionSequence
+	case rotationEpochStartPublication:
+		if authorization.transitionEvent == nil ||
+			!transitionEnvelopeMatchesMarker(
+				*authorization.transitionEvent,
+				marker,
+			) ||
+			authorization.transitionEvent.SourceSequence+1 !=
+				event.SourceSequence {
+			return false
+		}
+		return rotationTransitionCoverageMatches(
+			state,
+			*authorization.transitionEvent,
+			mode,
+		) &&
+			event.EventType == "observer_key_epoch_start" &&
+			event.KeyID == marker.Transition.NewKeyID &&
+			event.KeyEpoch == marker.Transition.NewEpoch &&
+			event.SourceSequence == marker.StartSequence
+	default:
+		return false
+	}
+}
+
+func (authorization rotationPublicationAuthorization) matchesRequest(
+	state ObserverState,
+	signer *EnvelopeSigner,
+	eventType string,
+	fields map[string]any,
+	metadata EventMetadata,
+) bool {
+	mode := rotationModeForState(state, authorization)
+	expectedFields, err := rotationFieldsForAuthorization(authorization)
+	if mode == rotationBoundaryInvalid ||
+		err != nil ||
+		!canonicalEqual(fields, expectedFields) ||
+		!rotationMetadataMatches(
+			metadata,
+			expectedFields,
+			rotationCoverageFlags(mode, authorization.role),
+		) ||
+		signer.config.HostID != state.HostID ||
+		signer.config.BootID != state.BootID {
+		return false
+	}
+	marker := authorization.marker
+	switch authorization.role {
+	case rotationTransitionPublication:
+		if state.LastSequence != marker.TransitionSequence-1 ||
+			eventType != "observer_key_transition" ||
+			signer.keyID != marker.Transition.OldKeyID ||
+			signer.config.KeyEpoch != marker.Transition.OldEpoch ||
+			contracts.VerifyKeyTransition(
+				marker.Transition,
+				signer.privateKey.Public().(ed25519.PublicKey),
+			) != nil {
+			return false
+		}
+	case rotationEpochStartPublication:
+		publicKey, err := hex.DecodeString(marker.Transition.NewPublicKey)
+		if err != nil ||
+			state.LastSequence != marker.StartSequence-1 ||
+			eventType != "observer_key_epoch_start" ||
+			signer.keyID != marker.Transition.NewKeyID ||
+			signer.config.KeyEpoch != marker.Transition.NewEpoch ||
+			!bytes.Equal(
+				signer.privateKey.Public().(ed25519.PublicKey),
+				publicKey,
+			) ||
+			authorization.transitionEvent == nil ||
+			!transitionEnvelopeMatchesMarker(
+				*authorization.transitionEvent,
+				marker,
+			) ||
+			!rotationTransitionCoverageMatches(
+				state,
+				*authorization.transitionEvent,
+				mode,
+			) {
+			return false
+		}
+	default:
+		return false
+	}
+	return true
+}
+
 func rotationMetadata(
 	now time.Time,
 	fields map[string]any,
+	coverageFlags ...string,
 ) (EventMetadata, error) {
 	canonical, err := contracts.CanonicalJSON(fields)
 	if err != nil {
 		return EventMetadata{}, err
 	}
 	sum := sha256.Sum256(canonical)
+	if len(coverageFlags) == 0 {
+		coverageFlags = []string{"key_rotation"}
+	}
 	return EventMetadata{
 		EventTime:         now.UTC(),
 		RedactionFlags:    []string{},
-		CoverageFlags:     []string{"key_rotation"},
+		CoverageFlags:     append([]string(nil), coverageFlags...),
 		SourcePayloadHash: hex.EncodeToString(sum[:]),
 	}, nil
 }
@@ -1740,17 +2737,47 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		if err != nil {
 			return err
 		}
-		eventMetadata, err := rotationMetadata(options.now(), transitionFields)
+		transitionAuthorization := rotationPublicationAuthorization{
+			marker: marker,
+			role:   rotationTransitionPublication,
+		}
+		mode := rotationModeForState(
+			state.Snapshot(),
+			transitionAuthorization,
+		)
+		if mode == rotationBoundaryInvalid {
+			_ = state.PersistReadOnly(
+				"observer_rotation_transition_authorization_invalid",
+			)
+			return ErrRotationPublicationMismatch
+		}
+		eventMetadata, err := rotationMetadata(
+			options.now(),
+			transitionFields,
+			rotationCoverageFlags(
+				mode,
+				rotationTransitionPublication,
+			)...,
+		)
 		if err != nil {
 			return err
 		}
-		transitionEvent, err = signer.Wrap(
+		transitionEvent, err = signer.wrapAuthorizedRotation(
 			context.Background(),
+			transitionAuthorization,
 			"observer_key_transition",
 			transitionFields,
 			eventMetadata,
 		)
 		if err != nil {
+			if errors.Is(err, ErrRotationPublicationMismatch) {
+				return errors.Join(
+					err,
+					state.PersistReadOnly(
+						"observer_rotation_transition_authorization_invalid",
+					),
+				)
+			}
 			return err
 		}
 		if transitionEvent.SourceSequence != marker.TransitionSequence {
@@ -1766,17 +2793,6 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 	}
 	if options.stopAfter == marker.Stage {
 		return ErrInjectedRotationStop
-	}
-	if state.Snapshot().KeyID == marker.Transition.OldKeyID {
-		if err := state.switchKey(
-			marker.Transition.NewKeyID,
-			marker.Transition.NewEpoch,
-		); err != nil {
-			return err
-		}
-	}
-	if err := durablefile.AtomicWrite(config.PrivateKeyFile, newPrivate); err != nil {
-		return err
 	}
 	marker.Stage = "key_switched"
 	if err := saveRotationMarker(config.StateDir, marker); err != nil {
@@ -1807,8 +2823,8 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 			)
 			return fmt.Errorf("observer rotation epoch-start sequence lost")
 		}
-		signer, err := NewEnvelopeSigner(
-			SignerConfig{
+		startSigner := &EnvelopeSigner{
+			config: SignerConfig{
 				HostID:        hostID,
 				BootID:        bootID,
 				KeyEpoch:      marker.Transition.NewEpoch,
@@ -1816,24 +2832,53 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 				SourceVersion: "0.1.0",
 				Now:           options.now,
 			},
-			state,
-			spool,
-			newPrivate,
+			state:      state,
+			spool:      spool,
+			privateKey: append(ed25519.PrivateKey(nil), newPrivate...),
+			keyID:      marker.Transition.NewKeyID,
+		}
+		startAuthorization := rotationPublicationAuthorization{
+			marker:          marker,
+			role:            rotationEpochStartPublication,
+			transitionEvent: &transitionEvent,
+		}
+		mode := rotationModeForState(
+			state.Snapshot(),
+			startAuthorization,
+		)
+		if mode == rotationBoundaryInvalid {
+			_ = state.PersistReadOnly(
+				"observer_rotation_epoch_start_authorization_invalid",
+			)
+			return ErrRotationPublicationMismatch
+		}
+		eventMetadata, err := rotationMetadata(
+			options.now(),
+			startFields,
+			rotationCoverageFlags(
+				mode,
+				rotationEpochStartPublication,
+			)...,
 		)
 		if err != nil {
 			return err
 		}
-		eventMetadata, err := rotationMetadata(options.now(), startFields)
-		if err != nil {
-			return err
-		}
-		startEvent, err = signer.Wrap(
+		startEvent, err = startSigner.wrapAuthorizedRotation(
 			context.Background(),
+			startAuthorization,
 			"observer_key_epoch_start",
 			startFields,
 			eventMetadata,
 		)
 		if err != nil {
+			if errors.Is(err, ErrRotationPublicationMismatch) {
+				return errors.Join(
+					err,
+					state.PersistReadOnly(
+						"observer_rotation_epoch_start_authorization_invalid",
+					),
+				)
+			}
 			return err
 		}
 		if startEvent.SourceSequence != marker.StartSequence {
@@ -1846,6 +2891,16 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 	if options.stopAfter == "start_durable" ||
 		options.stopAfter == "start_spooled_metadata_old" {
 		return ErrInjectedRotationStop
+	}
+	if state.Snapshot().KeyID != marker.Transition.NewKeyID ||
+		state.Snapshot().KeyEpoch != marker.Transition.NewEpoch {
+		_ = state.PersistReadOnly(
+			"observer_rotation_epoch_start_activation_missing",
+		)
+		return ErrRotationPublicationMismatch
+	}
+	if err := durablefile.AtomicWrite(config.PrivateKeyFile, newPrivate); err != nil {
+		return err
 	}
 	newEntry := PublicKeyEpoch{
 		KeyID:              marker.Transition.NewKeyID,

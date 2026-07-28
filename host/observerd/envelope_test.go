@@ -35,6 +35,37 @@ func openSignerFixture(
 	bootID string,
 	privateKey ed25519.PrivateKey,
 ) (*StateStore, *Spool, *EnvelopeSigner) {
+	return openSignerFixtureWithBoundaryState(
+		t,
+		root,
+		bootID,
+		privateKey,
+		true,
+	)
+}
+
+func openPendingSignerFixture(
+	t *testing.T,
+	root string,
+	bootID string,
+	privateKey ed25519.PrivateKey,
+) (*StateStore, *Spool, *EnvelopeSigner) {
+	return openSignerFixtureWithBoundaryState(
+		t,
+		root,
+		bootID,
+		privateKey,
+		false,
+	)
+}
+
+func openSignerFixtureWithBoundaryState(
+	t *testing.T,
+	root string,
+	bootID string,
+	privateKey ed25519.PrivateKey,
+	commitTestBoundary bool,
+) (*StateStore, *Spool, *EnvelopeSigner) {
 	t.Helper()
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
@@ -57,6 +88,21 @@ func openSignerFixture(
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if commitTestBoundary {
+		state.mutex.Lock()
+		next := cloneObserverState(state.state)
+		last := len(next.BootHistory) - 1
+		next.BootHistory[last].BoundaryEventID =
+			"evt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		next.BootHistory[last].BoundaryEventType = "observer_boot_boundary"
+		next.BootBoundaryState = bootBoundaryCommitted
+		next.PendingBootBoundary = nil
+		if err := state.replaceLocked(next); err != nil {
+			state.mutex.Unlock()
+			t.Fatal(err)
+		}
+		state.mutex.Unlock()
 	}
 	keys := NewKeyring()
 	if err := keys.Add(1, privateKey.Public().(ed25519.PublicKey)); err != nil {

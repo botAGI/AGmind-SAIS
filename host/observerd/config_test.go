@@ -138,25 +138,42 @@ func TestBootstrapStartsDockerFreeAndFencedReconcileRequired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 {
+	if len(items) != 2 {
 		t.Fatalf("startup items=%d", len(items))
 	}
-	event, err := contracts.DecodeStrict[contracts.EventEnvelopeV1](
+	boundary, err := contracts.DecodeStrict[contracts.EventEnvelopeV1](
 		bytes.NewReader(items[0].Canonical),
 		65_536,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.EventType != "observer_start" ||
-		event.CoverageFlags[0] != "reconcile_required" {
-		t.Fatalf("startup event=%+v", event)
-	}
-	if err := contracts.VerifyEventSignature(
-		event,
-		oldKey.Public().(ed25519.PublicKey),
-	); err != nil {
+	event, err := contracts.DecodeStrict[contracts.EventEnvelopeV1](
+		bytes.NewReader(items[1].Canonical),
+		65_536,
+	)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if boundary.EventType != "observer_boot_boundary" ||
+		boundary.SourceSequence != 1 ||
+		!exactFlags(
+			boundary.CoverageFlags,
+			"boot_transition",
+			"reconcile_required",
+		) ||
+		event.EventType != "observer_start" ||
+		event.SourceSequence != 2 ||
+		event.CoverageFlags[0] != "reconcile_required" {
+		t.Fatalf("boundary=%+v startup=%+v", boundary, event)
+	}
+	for _, published := range []contracts.EventEnvelopeV1{boundary, event} {
+		if err := contracts.VerifyEventSignature(
+			published,
+			oldKey.Public().(ed25519.PublicKey),
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(config.StateDir, "docker-state")); !errors.Is(
 		err,

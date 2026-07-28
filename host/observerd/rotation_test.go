@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +73,82 @@ func fixedRotationOptions(newKey ed25519.PrivateKey) []RotationOption {
 	}
 }
 
+func fixedRotationOptionsForBoot(
+	newKey ed25519.PrivateKey,
+	bootID string,
+) []RotationOption {
+	options := fixedRotationOptions(newKey)
+	options[1] = WithRotationBootID(func() (string, error) { return bootID, nil })
+	return options
+}
+
+func bootstrapRotationFixture(
+	t *testing.T,
+	configPath string,
+	bootID string,
+) {
+	t.Helper()
+	daemon, err := Bootstrap(
+		context.Background(),
+		configPath,
+		WithBootstrapBootID(func() (string, error) { return bootID, nil }),
+		WithBootstrapNow(func() time.Time {
+			return time.Date(2026, 7, 27, 12, 30, 0, 0, time.UTC)
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func loadRotationFixtureEvents(
+	t *testing.T,
+	config Config,
+	bootID string,
+) ([]contracts.EventEnvelopeV1, ObserverState) {
+	t.Helper()
+	publicMetadata, err := LoadPublicKeyMetadata(config.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(
+		filepath.Join(config.StateDir, "observer-state.json"),
+		StateIdentity{
+			HostID:   testHostID,
+			BootID:   bootID,
+			KeyID:    publicMetadata.CurrentKeyID,
+			KeyEpoch: publicMetadata.CurrentEpoch,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyring, err := publicMetadata.Keyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spool, err := NewSpool(
+		SpoolConfig{
+			StateDir:             config.StateDir,
+			MaxBytes:             config.SpoolMaxBytes,
+			PriorityReserveBytes: config.SpoolPriorityReserveBytes,
+		},
+		state,
+		keyring,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := fetchEnvelopeEvents(t, spool)
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return events, state.Snapshot()
+}
+
 func TestOfflineRotationIsRootOnlyAndRefusesLiveDaemonLock(t *testing.T) {
 	configPath, config, _, newKey := rotationFixture(t)
 	options := fixedRotationOptions(newKey)
@@ -95,7 +173,7 @@ func TestOfflineRotationIsRootOnlyAndRefusesLiveDaemonLock(t *testing.T) {
 	}
 }
 
-func TestOfflineRotationSpoolsOldEnvelopeThenOneNewEpochStart(t *testing.T) {
+func TestOfflineRotationUsesFreshGenesisB(t *testing.T) {
 	configPath, config, oldKey, newKey := rotationFixture(t)
 	if err := RotateKeys(configPath, fixedRotationOptions(newKey)...); err != nil {
 		t.Fatal(err)
@@ -169,8 +247,24 @@ func TestOfflineRotationSpoolsOldEnvelopeThenOneNewEpochStart(t *testing.T) {
 		startEnvelope.EventType != "observer_key_epoch_start" ||
 		startEnvelope.KeyEpoch != 2 ||
 		transitionEnvelope.SourceSequence != 1 ||
-		startEnvelope.SourceSequence != 2 {
+		startEnvelope.SourceSequence != 2 ||
+		transitionEnvelope.BootID != testBootID ||
+		startEnvelope.BootID != testBootID ||
+		!exactFlags(
+			transitionEnvelope.CoverageFlags,
+			"boot_transition",
+			"key_rotation",
+		) ||
+		!exactFlags(startEnvelope.CoverageFlags, "key_rotation") {
 		t.Fatalf("transition=%+v start=%+v", transitionEnvelope, startEnvelope)
+	}
+	snapshot := state.Snapshot()
+	if snapshot.BootBoundaryState != bootBoundaryCommitted ||
+		len(snapshot.BootHistory) != 1 ||
+		snapshot.BootHistory[0].BoundaryEventID != transitionEnvelope.EventID ||
+		snapshot.BootHistory[0].BoundaryEventType !=
+			"observer_key_transition" {
+		t.Fatalf("fresh B boundary state=%+v", snapshot)
 	}
 	transitionRaw, err := contracts.CanonicalJSON(transitionEnvelope.NormalizedFields)
 	if err != nil {
@@ -194,6 +288,669 @@ func TestOfflineRotationSpoolsOldEnvelopeThenOneNewEpochStart(t *testing.T) {
 		newKey.Public().(ed25519.PublicKey),
 	); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRotationBoundaryRoutesAndSameBootFlags(t *testing.T) {
+	tests := []struct {
+		name              string
+		prepare           func(*testing.T, string, ed25519.PrivateKey)
+		resumeBoot        string
+		transitionBoot    string
+		startBoot         string
+		transitionFlags   []string
+		startFlags        []string
+		wantBoundaryEvent string
+	}{
+		{
+			name: "same boot after committed A",
+			prepare: func(
+				t *testing.T,
+				configPath string,
+				_ ed25519.PrivateKey,
+			) {
+				bootstrapRotationFixture(t, configPath, testBootID)
+			},
+			resumeBoot:        testBootID,
+			transitionBoot:    testBootID,
+			startBoot:         testBootID,
+			transitionFlags:   []string{"key_rotation"},
+			startFlags:        []string{"key_rotation"},
+			wantBoundaryEvent: "observer_boot_boundary",
+		},
+		{
+			name: "B after reboot before transition durability",
+			prepare: func(
+				t *testing.T,
+				configPath string,
+				newKey ed25519.PrivateKey,
+			) {
+				bootstrapRotationFixture(t, configPath, testBootID)
+				options := append(
+					fixedRotationOptionsForBoot(newKey, testBootID),
+					WithRotationStopAfter("prepared"),
+				)
+				if err := RotateKeys(configPath, options...); !errors.Is(
+					err,
+					ErrInjectedRotationStop,
+				) {
+					t.Fatalf("prepare B: %v", err)
+				}
+			},
+			resumeBoot:        testBootID2,
+			transitionBoot:    testBootID2,
+			startBoot:         testBootID2,
+			transitionFlags:   []string{"boot_transition", "key_rotation"},
+			startFlags:        []string{"key_rotation"},
+			wantBoundaryEvent: "observer_key_transition",
+		},
+		{
+			name: "C after transition durability and reboot",
+			prepare: func(
+				t *testing.T,
+				configPath string,
+				newKey ed25519.PrivateKey,
+			) {
+				bootstrapRotationFixture(t, configPath, testBootID)
+				options := append(
+					fixedRotationOptionsForBoot(newKey, testBootID),
+					WithRotationStopAfter("transition_spooled"),
+				)
+				if err := RotateKeys(configPath, options...); !errors.Is(
+					err,
+					ErrInjectedRotationStop,
+				) {
+					t.Fatalf("prepare C: %v", err)
+				}
+			},
+			resumeBoot:        testBootID2,
+			transitionBoot:    testBootID,
+			startBoot:         testBootID2,
+			transitionFlags:   []string{"key_rotation"},
+			startFlags:        []string{"boot_transition", "key_rotation"},
+			wantBoundaryEvent: "observer_key_epoch_start",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath, config, _, newKey := rotationFixture(t)
+			test.prepare(t, configPath, newKey)
+			if err := RotateKeys(
+				configPath,
+				fixedRotationOptionsForBoot(newKey, test.resumeBoot)...,
+			); err != nil {
+				t.Fatal(err)
+			}
+			events, snapshot := loadRotationFixtureEvents(
+				t,
+				config,
+				test.resumeBoot,
+			)
+			var transition, start contracts.EventEnvelopeV1
+			for _, event := range events {
+				switch event.EventType {
+				case "observer_key_transition":
+					transition = event
+				case "observer_key_epoch_start":
+					start = event
+				}
+			}
+			if transition.EventID == "" ||
+				start.EventID == "" ||
+				transition.SourceSequence+1 != start.SourceSequence ||
+				transition.BootID != test.transitionBoot ||
+				start.BootID != test.startBoot ||
+				!exactFlags(
+					transition.CoverageFlags,
+					test.transitionFlags...,
+				) ||
+				!exactFlags(start.CoverageFlags, test.startFlags...) {
+				t.Fatalf("transition=%+v start=%+v", transition, start)
+			}
+			lastBoundary := snapshot.BootHistory[len(snapshot.BootHistory)-1]
+			if lastBoundary.BoundaryEventType != test.wantBoundaryEvent {
+				t.Fatalf("boundary=%+v", lastBoundary)
+			}
+		})
+	}
+}
+
+func TestRotationCandidateRemainsInactiveUntilExactStartIsDurable(
+	t *testing.T,
+) {
+	configPath, config, oldKey, newKey := rotationFixture(t)
+	bootstrapRotationFixture(t, configPath, testBootID)
+	options := append(
+		fixedRotationOptions(newKey),
+		WithRotationStopAfter("key_switched"),
+	)
+	if err := RotateKeys(configPath, options...); !errors.Is(
+		err,
+		ErrInjectedRotationStop,
+	) {
+		t.Fatalf("stop before epoch start: %v", err)
+	}
+	active, err := os.ReadFile(config.PrivateKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadObserverState(
+		filepath.Join(config.StateDir, "observer-state.json"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKeyID, err := contracts.KeyID(oldKey.Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(active, oldKey) ||
+		state.KeyID != oldKeyID ||
+		state.KeyEpoch != 1 {
+		t.Fatalf("candidate activated before start: state=%+v", state)
+	}
+	if err := RotateKeys(configPath, fixedRotationOptions(newKey)...); err != nil {
+		t.Fatal(err)
+	}
+	active, err = os.ReadFile(config.PrivateKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(active, newKey) {
+		t.Fatal("candidate did not activate after exact durable start")
+	}
+}
+
+func TestRotationRecoversDurableBoundaryMarkersWithoutDuplicates(
+	t *testing.T,
+) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string, Config, ed25519.PrivateKey)
+		bootID  string
+	}{
+		{
+			name:   "B transition append before boundary marker",
+			bootID: testBootID,
+			prepare: func(
+				t *testing.T,
+				configPath string,
+				config Config,
+				newKey ed25519.PrivateKey,
+			) {
+				options := append(
+					fixedRotationOptions(newKey),
+					WithRotationStopAfter("transition_spooled"),
+				)
+				if err := RotateKeys(configPath, options...); !errors.Is(
+					err,
+					ErrInjectedRotationStop,
+				) {
+					t.Fatalf("durable B transition: %v", err)
+				}
+				statePath := filepath.Join(
+					config.StateDir,
+					"observer-state.json",
+				)
+				state, err := loadObserverState(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				state.BootHistory[0].BoundaryEventID = ""
+				state.BootHistory[0].BoundaryEventType = ""
+				state.BootBoundaryState = bootBoundaryPending
+				state.PendingBootBoundary = &PendingBootBoundary{
+					ReasonCode: "observer_genesis",
+				}
+				if err := persistState(statePath, state); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "C start append before activation marker",
+			bootID: testBootID2,
+			prepare: func(
+				t *testing.T,
+				configPath string,
+				config Config,
+				newKey ed25519.PrivateKey,
+			) {
+				bootstrapRotationFixture(t, configPath, testBootID)
+				transitionOptions := append(
+					fixedRotationOptionsForBoot(newKey, testBootID),
+					WithRotationStopAfter("transition_spooled"),
+				)
+				if err := RotateKeys(
+					configPath,
+					transitionOptions...,
+				); !errors.Is(err, ErrInjectedRotationStop) {
+					t.Fatalf("durable old-boot transition: %v", err)
+				}
+				metadata, err := LoadPublicKeyMetadata(config.StateDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				statePath := filepath.Join(
+					config.StateDir,
+					"observer-state.json",
+				)
+				pendingStore, err := OpenStateStore(
+					statePath,
+					StateIdentity{
+						HostID:   testHostID,
+						BootID:   testBootID2,
+						KeyID:    metadata.CurrentKeyID,
+						KeyEpoch: metadata.CurrentEpoch,
+					},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pending := pendingStore.Snapshot()
+				startOptions := append(
+					fixedRotationOptionsForBoot(newKey, testBootID2),
+					WithRotationStopAfter("start_durable"),
+				)
+				if err := RotateKeys(
+					configPath,
+					startOptions...,
+				); !errors.Is(err, ErrInjectedRotationStop) {
+					t.Fatalf("durable C start: %v", err)
+				}
+				afterAppend, err := loadObserverState(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pending.LastSequence = afterAppend.LastSequence
+				pending.PublicationHeadSequence =
+					afterAppend.PublicationHeadSequence
+				pending.PublicationHeadHash =
+					afterAppend.PublicationHeadHash
+				if err := persistState(statePath, pending); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath, config, _, newKey := rotationFixture(t)
+			test.prepare(t, configPath, config, newKey)
+			if err := RotateKeys(
+				configPath,
+				fixedRotationOptionsForBoot(newKey, test.bootID)...,
+			); err != nil {
+				state, _ := loadObserverState(filepath.Join(
+					config.StateDir,
+					"observer-state.json",
+				))
+				t.Fatalf("resume: %v state=%+v", err, state)
+			}
+			events, snapshot := loadRotationFixtureEvents(
+				t,
+				config,
+				test.bootID,
+			)
+			rotationEvents := 0
+			for _, event := range events {
+				if event.EventType == "observer_key_transition" ||
+					event.EventType == "observer_key_epoch_start" {
+					rotationEvents++
+				}
+			}
+			if rotationEvents != 2 ||
+				snapshot.KeyEpoch != 2 ||
+				snapshot.BootBoundaryState != bootBoundaryCommitted {
+				t.Fatalf(
+					"events=%+v state=%+v",
+					events,
+					snapshot,
+				)
+			}
+		})
+	}
+}
+
+func TestRotationDoesNotReinterpretDurableBAsC(t *testing.T) {
+	configPath, config, oldKey, newKey := rotationFixture(t)
+	options := append(
+		fixedRotationOptionsForBoot(newKey, testBootID),
+		WithRotationStopAfter("transition_spooled"),
+	)
+	if err := RotateKeys(configPath, options...); !errors.Is(
+		err,
+		ErrInjectedRotationStop,
+	) {
+		t.Fatalf("durable B transition: %v", err)
+	}
+	if err := RotateKeys(
+		configPath,
+		fixedRotationOptionsForBoot(newKey, testBootID2)...,
+	); err == nil {
+		t.Fatal("durable B transition was reinterpreted as C")
+	}
+	state, err := loadObserverState(
+		filepath.Join(config.StateDir, "observer-state.json"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, keyErr := os.ReadFile(config.PrivateKeyFile)
+	if keyErr != nil {
+		t.Fatal(keyErr)
+	}
+	if !state.MutationReadOnly ||
+		state.KeyEpoch != 1 ||
+		!bytes.Equal(active, oldKey) {
+		t.Fatalf("conflicting B/C route did not fail closed: %+v", state)
+	}
+}
+
+func resignRotationEvent(
+	t *testing.T,
+	event contracts.EventEnvelopeV1,
+	privateKey ed25519.PrivateKey,
+) contracts.EventEnvelopeV1 {
+	t.Helper()
+	event.EventID = ""
+	event.SourceSignature = ""
+	eventID, err := contracts.DeriveEventID(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.EventID = eventID
+	message, err := contracts.EventSigningMessage(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.SourceSignature = hex.EncodeToString(ed25519.Sign(privateKey, message))
+	return event
+}
+
+func TestPublicKeyMetadataRejectsNonExactRotationBoundaries(t *testing.T) {
+	tests := []struct {
+		name   string
+		tamper func(
+			*contracts.EventEnvelopeV1,
+			*contracts.EventEnvelopeV1,
+		)
+	}{
+		{
+			name: "wrong start flags",
+			tamper: func(
+				_ *contracts.EventEnvelopeV1,
+				start *contracts.EventEnvelopeV1,
+			) {
+				start.CoverageFlags = []string{
+					"boot_transition",
+					"key_rotation",
+				}
+			},
+		},
+		{
+			name: "wrong boot",
+			tamper: func(
+				transition *contracts.EventEnvelopeV1,
+				_ *contracts.EventEnvelopeV1,
+			) {
+				transition.BootID = testBootID2
+			},
+		},
+		{
+			name: "wrong candidate epoch",
+			tamper: func(
+				_ *contracts.EventEnvelopeV1,
+				start *contracts.EventEnvelopeV1,
+			) {
+				start.KeyEpoch++
+			},
+		},
+		{
+			name: "non adjacent intervening sequence",
+			tamper: func(
+				_ *contracts.EventEnvelopeV1,
+				start *contracts.EventEnvelopeV1,
+			) {
+				start.SourceSequence++
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath, config, oldKey, newKey := rotationFixture(t)
+			if err := RotateKeys(
+				configPath,
+				fixedRotationOptions(newKey)...,
+			); err != nil {
+				t.Fatal(err)
+			}
+			metadata, err := LoadPublicKeyMetadata(config.StateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			transition := *metadata.Keys[1].TransitionEnvelope
+			start := *metadata.Keys[1].EpochStartEnvelope
+			test.tamper(&transition, &start)
+			transition = resignRotationEvent(t, transition, oldKey)
+			start = resignRotationEvent(t, start, newKey)
+			metadata.Keys[1].TransitionEnvelope = &transition
+			metadata.Keys[1].EpochStartEnvelope = &start
+			if err := metadata.Validate(); err == nil {
+				t.Fatal("non-exact rotation boundary accepted")
+			}
+		})
+	}
+}
+
+func TestRotationAuthorizationRejectsNonExactBoundaryRequests(t *testing.T) {
+	configPath, config, oldKey, newKey := rotationFixture(t)
+	options := append(
+		fixedRotationOptions(newKey),
+		WithRotationStopAfter("prepared"),
+	)
+	if err := RotateKeys(configPath, options...); !errors.Is(
+		err,
+		ErrInjectedRotationStop,
+	) {
+		t.Fatalf("prepare rotation: %v", err)
+	}
+	marker, err := loadRotationMarker(config.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(
+		filepath.Join(config.StateDir, "observer-state.json"),
+		StateIdentity{
+			HostID:   testHostID,
+			BootID:   testBootID,
+			KeyID:    marker.Transition.OldKeyID,
+			KeyEpoch: marker.Transition.OldEpoch,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := LoadPublicKeyMetadata(config.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyring, err := metadata.Keyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPublic, err := hex.DecodeString(marker.Transition.NewPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keyring.Add(
+		marker.Transition.NewEpoch,
+		ed25519.PublicKey(newPublic),
+	); err != nil {
+		t.Fatal(err)
+	}
+	spool, err := NewSpool(
+		SpoolConfig{
+			StateDir:             config.StateDir,
+			MaxBytes:             config.SpoolMaxBytes,
+			PriorityReserveBytes: config.SpoolPriorityReserveBytes,
+			rotation:             &marker,
+		},
+		state,
+		keyring,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+	signer, err := NewEnvelopeSigner(
+		SignerConfig{
+			HostID:        testHostID,
+			BootID:        testBootID,
+			KeyEpoch:      marker.Transition.OldEpoch,
+			SourceID:      "agmind-observerd",
+			SourceVersion: "0.1.0",
+			Now:           time.Now,
+		},
+		state,
+		spool,
+		oldKey,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, err := transitionMap(marker.Transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventMetadata, err := rotationMetadata(
+		time.Date(2026, 7, 27, 13, 0, 0, 0, time.UTC),
+		fields,
+		"boot_transition",
+		"key_rotation",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(
+			*rotationPublicationAuthorization,
+			*ObserverState,
+			*EnvelopeSigner,
+			*map[string]any,
+			*EventMetadata,
+		)
+	}{
+		{
+			name: "wrong flags",
+			mutate: func(
+				_ *rotationPublicationAuthorization,
+				_ *ObserverState,
+				_ *EnvelopeSigner,
+				_ *map[string]any,
+				metadata *EventMetadata,
+			) {
+				metadata.CoverageFlags = []string{"key_rotation"}
+			},
+		},
+		{
+			name: "wrong boot",
+			mutate: func(
+				_ *rotationPublicationAuthorization,
+				_ *ObserverState,
+				signer *EnvelopeSigner,
+				_ *map[string]any,
+				_ *EventMetadata,
+			) {
+				signer.config.BootID = testBootID2
+			},
+		},
+		{
+			name: "wrong epoch and key",
+			mutate: func(
+				authorization *rotationPublicationAuthorization,
+				_ *ObserverState,
+				_ *EnvelopeSigner,
+				_ *map[string]any,
+				_ *EventMetadata,
+			) {
+				authorization.marker.Transition.OldEpoch++
+				authorization.marker.Transition.OldKeyID =
+					strings.Repeat("a", 32)
+			},
+		},
+		{
+			name: "non adjacency",
+			mutate: func(
+				authorization *rotationPublicationAuthorization,
+				_ *ObserverState,
+				_ *EnvelopeSigner,
+				_ *map[string]any,
+				_ *EventMetadata,
+			) {
+				authorization.marker.StartSequence++
+			},
+		},
+		{
+			name: "intervening reserved event",
+			mutate: func(
+				_ *rotationPublicationAuthorization,
+				snapshot *ObserverState,
+				_ *EnvelopeSigner,
+				_ *map[string]any,
+				_ *EventMetadata,
+			) {
+				snapshot.LastSequence++
+			},
+		},
+		{
+			name: "wrong source hash",
+			mutate: func(
+				_ *rotationPublicationAuthorization,
+				_ *ObserverState,
+				_ *EnvelopeSigner,
+				_ *map[string]any,
+				metadata *EventMetadata,
+			) {
+				metadata.SourcePayloadHash = strings.Repeat("0", 64)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authorization := rotationPublicationAuthorization{
+				marker: marker,
+				role:   rotationTransitionPublication,
+			}
+			snapshot := state.Snapshot()
+			signerCopy := *signer
+			fieldsCopy := make(map[string]any, len(fields))
+			for key, value := range fields {
+				fieldsCopy[key] = value
+			}
+			metadataCopy := eventMetadata
+			metadataCopy.CoverageFlags = append(
+				[]string(nil),
+				eventMetadata.CoverageFlags...,
+			)
+			test.mutate(
+				&authorization,
+				&snapshot,
+				&signerCopy,
+				&fieldsCopy,
+				&metadataCopy,
+			)
+			if authorization.matchesRequest(
+				snapshot,
+				&signerCopy,
+				"observer_key_transition",
+				fieldsCopy,
+				metadataCopy,
+			) {
+				t.Fatal("non-exact rotation request authorized")
+			}
+		})
 	}
 }
 

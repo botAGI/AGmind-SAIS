@@ -71,9 +71,7 @@ def _parse_integer(token: str) -> int:
     else:
         magnitude = token
         limit = str(MAX_UINT64)
-    if len(magnitude) > len(limit) or (
-        len(magnitude) == len(limit) and magnitude > limit
-    ):
+    if len(magnitude) > len(limit) or (len(magnitude) == len(limit) and magnitude > limit):
         raise ValueError("integer exceeds canonical range")
     return int(token)
 
@@ -507,13 +505,10 @@ class FalcoConnectV1(ContractModel):
         elif isinstance(self.falco_container_start_ts, str):
             _ascii(self.falco_container_start_ts, "falco_container_start_ts")
         completed_success = (
-            self.evt_res == "SUCCESS"
-            and self.evt_rawres is not None
-            and self.evt_rawres >= 0
+            self.evt_res == "SUCCESS" and self.evt_rawres is not None and self.evt_rawres >= 0
         )
-        nonblocking_success = (
-            self.evt_res in SUCCESS_RESULTS
-            and (self.evt_rawres is None or self.evt_rawres < 0)
+        nonblocking_success = self.evt_res in SUCCESS_RESULTS and (
+            self.evt_rawres is None or self.evt_rawres < 0
         )
         hard_error = self.evt_res not in {"SUCCESS", *SUCCESS_RESULTS}
         if self.evt_res == "SUCCESS" and not completed_success:
@@ -570,12 +565,8 @@ class CoverageEventV1(ContractModel):
     severity: Literal["INFO", "WARNING", "CRITICAL"]
     opened_at: str
     closed_at: str | None = None
-    affected_source_sequence_start: int | None = Field(
-        default=None, ge=0, le=MAX_UINT64
-    )
-    affected_source_sequence_end: int | None = Field(
-        default=None, ge=0, le=MAX_UINT64
-    )
+    affected_source_sequence_start: int | None = Field(default=None, ge=0, le=MAX_UINT64)
+    affected_source_sequence_end: int | None = Field(default=None, ge=0, le=MAX_UINT64)
     dropped_count: int | None = Field(default=None, ge=0, le=MAX_UINT64)
     reason_code: str
     reconcile_generation: int | None = Field(default=None, ge=0, le=MAX_UINT64)
@@ -603,6 +594,30 @@ class CoverageEventV1(ContractModel):
             and self.affected_source_sequence_end < self.affected_source_sequence_start
         ):
             raise ValueError("coverage sequence interval is reversed")
+        return self
+
+
+class ObserverBootBoundaryV1(ContractModel):
+    schema_version: Literal["agmind.observer-boot-boundary.v1"]
+    kind: Literal["observer_boot_boundary"]
+    reason_code: Literal["observer_genesis", "kernel_boot_id_changed"]
+    previous_boot_id: str | None = None
+    previous_source_sequence: int = Field(ge=0, le=MAX_UINT64)
+
+    @field_validator("previous_boot_id")
+    @classmethod
+    def previous_boot_is_valid(cls, value: str | None) -> str | None:
+        if value is not None and not UUID4.fullmatch(value):
+            raise ValueError("previous_boot_id must be a lowercase UUIDv4")
+        return value
+
+    @model_validator(mode="after")
+    def predecessor_matches_reason(self) -> ObserverBootBoundaryV1:
+        if self.reason_code == "observer_genesis":
+            if self.previous_boot_id is not None or self.previous_source_sequence != 0:
+                raise ValueError("observer genesis cannot name a predecessor")
+        elif self.previous_boot_id is None or self.previous_source_sequence == 0:
+            raise ValueError("changed boot requires a valid predecessor")
         return self
 
 
@@ -976,11 +991,7 @@ def load_special_use_registry(path: Path) -> list[SpecialUseEntry]:
                 except ValueError:
                     continue
                 if isinstance(network, ipaddress.IPv4Network):
-                    entries.append(
-                        SpecialUseEntry(
-                            network, row["Globally Reachable"] == "True"
-                        )
-                    )
+                    entries.append(SpecialUseEntry(network, row["Globally Reachable"] == "True"))
     return entries
 
 
@@ -1004,6 +1015,4 @@ def is_permitted_public_ipv4(
     except ValueError:
         return False
     matches = [entry for entry in registry if value in entry.network]
-    return not matches or max(
-        matches, key=lambda entry: entry.network.prefixlen
-    ).globally_reachable
+    return not matches or max(matches, key=lambda entry: entry.network.prefixlen).globally_reachable

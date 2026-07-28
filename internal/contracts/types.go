@@ -78,6 +78,16 @@ type CoverageEventV1 struct {
 	ReconcileGeneration         *uint64 `json:"reconcile_generation,omitempty"`
 }
 
+// ObserverBootBoundaryV1 is the signed normalized payload that makes a new
+// kernel boot observable to Core before ordinary observer events may publish.
+type ObserverBootBoundaryV1 struct {
+	SchemaVersion          string  `json:"schema_version"`
+	Kind                   string  `json:"kind"`
+	ReasonCode             string  `json:"reason_code"`
+	PreviousBootID         *string `json:"previous_boot_id,omitempty"`
+	PreviousSourceSequence uint64  `json:"previous_source_sequence"`
+}
+
 // EgressDenyFields are shared fields, not a standalone wire contract.
 type EgressDenyFields struct {
 	SchemaVersion          string   `json:"schema_version"`
