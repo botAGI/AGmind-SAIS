@@ -432,7 +432,7 @@ func TestDurableDedicatedBoundaryRecoversMarkerBeforeRetry(t *testing.T) {
 	}
 }
 
-func TestDifferentBootNeverRewritesDurableUnmarkedBoundary(t *testing.T) {
+func TestRecoverPendingBootBoundaryBeforeBootChange(t *testing.T) {
 	root := t.TempDir()
 	privateKey := testKey(t, 125)
 	_, spool := createDurableUnmarkedBoundary(t, root, privateKey)
@@ -441,23 +441,34 @@ func TestDifferentBootNeverRewritesDurableUnmarkedBoundary(t *testing.T) {
 	}
 	identity := stateIdentityForKey(t, privateKey)
 	identity.BootID = testBootID2
-	if state, err := OpenStateStore(
-		filepath.Join(root, "observer-state.json"),
-		identity,
-	); !errors.Is(err, ErrBootBoundaryRecoveryUnproven) || state != nil {
-		t.Fatalf("different boot recovery state=%v err=%v", state, err)
+	keys := NewKeyring()
+	if err := keys.Add(1, privateKey.Public().(ed25519.PublicKey)); err != nil {
+		t.Fatal(err)
 	}
-	persisted, err := loadObserverState(
-		filepath.Join(root, "observer-state.json"),
-	)
+	statePath := filepath.Join(root, "observer-state.json")
+	if err := recoverPendingBootBoundaryBeforeBootChange(
+		statePath,
+		identity,
+		SpoolConfig{
+			StateDir:             root,
+			MaxBytes:             4 * 1024 * 1024,
+			PriorityReserveBytes: 1024 * 1024,
+		},
+		keys,
+	); err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(statePath, identity)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.BootID != testBootID ||
-		!persisted.MutationReadOnly ||
-		persisted.ReadOnlyReason !=
-			"observer_pending_boot_boundary_recovery_unproven" {
-		t.Fatalf("unsafe pending boot rewrite=%+v", persisted)
+	snapshot := state.Snapshot()
+	if snapshot.BootID != testBootID2 ||
+		snapshot.BootBoundaryState != bootBoundaryPending ||
+		snapshot.PendingBootBoundary == nil ||
+		snapshot.PendingBootBoundary.ReasonCode != "kernel_boot_id_changed" ||
+		snapshot.MutationReadOnly {
+		t.Fatalf("changed boot state=%+v", snapshot)
 	}
 }
 

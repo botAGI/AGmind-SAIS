@@ -478,14 +478,21 @@ func TestRotationRecoversDurableBoundaryMarkersWithoutDuplicates(
 				config Config,
 				newKey ed25519.PrivateKey,
 			) {
+				injected := errors.New("injected B marker persistence failure")
 				options := append(
 					fixedRotationOptions(newKey),
-					WithRotationStopAfter("transition_spooled"),
+					withRotationPersist(func(
+						path string,
+						next ObserverState,
+					) error {
+						if next.BootBoundaryState == bootBoundaryCommitted &&
+							next.PendingBootBoundary == nil {
+							return injected
+						}
+						return persistState(path, next)
+					}),
 				)
-				if err := RotateKeys(configPath, options...); !errors.Is(
-					err,
-					ErrInjectedRotationStop,
-				) {
+				if err := RotateKeys(configPath, options...); !errors.Is(err, injected) {
 					t.Fatalf("durable B transition: %v", err)
 				}
 				statePath := filepath.Join(
@@ -496,20 +503,15 @@ func TestRotationRecoversDurableBoundaryMarkersWithoutDuplicates(
 				if err != nil {
 					t.Fatal(err)
 				}
-				state.BootHistory[0].BoundaryEventID = ""
-				state.BootHistory[0].BoundaryEventType = ""
-				state.BootBoundaryState = bootBoundaryPending
-				state.PendingBootBoundary = &PendingBootBoundary{
-					ReasonCode: "observer_genesis",
-				}
-				if err := persistState(statePath, state); err != nil {
-					t.Fatal(err)
+				if state.BootBoundaryState != bootBoundaryPending ||
+					state.PublicationHeadSequence != 1 {
+					t.Fatalf("B failure did not leave exact durable pending state: %+v", state)
 				}
 			},
 		},
 		{
 			name:   "C start append before activation marker",
-			bootID: testBootID2,
+			bootID: testBootID3,
 			prepare: func(
 				t *testing.T,
 				configPath string,
@@ -527,48 +529,43 @@ func TestRotationRecoversDurableBoundaryMarkersWithoutDuplicates(
 				); !errors.Is(err, ErrInjectedRotationStop) {
 					t.Fatalf("durable old-boot transition: %v", err)
 				}
-				metadata, err := LoadPublicKeyMetadata(config.StateDir)
-				if err != nil {
-					t.Fatal(err)
-				}
+				injected := errors.New("injected C activation persistence failure")
 				statePath := filepath.Join(
 					config.StateDir,
 					"observer-state.json",
 				)
-				pendingStore, err := OpenStateStore(
-					statePath,
-					StateIdentity{
-						HostID:   testHostID,
-						BootID:   testBootID2,
-						KeyID:    metadata.CurrentKeyID,
-						KeyEpoch: metadata.CurrentEpoch,
-					},
-				)
-				if err != nil {
-					t.Fatal(err)
-				}
-				pending := pendingStore.Snapshot()
 				startOptions := append(
 					fixedRotationOptionsForBoot(newKey, testBootID2),
-					WithRotationStopAfter("start_durable"),
+					withRotationPersist(func(
+						path string,
+						next ObserverState,
+					) error {
+						if next.KeyEpoch == 2 &&
+							next.BootBoundaryState == bootBoundaryCommitted &&
+							next.PendingBootBoundary == nil {
+							return injected
+						}
+						return persistState(path, next)
+					}),
 				)
 				if err := RotateKeys(
 					configPath,
 					startOptions...,
-				); !errors.Is(err, ErrInjectedRotationStop) {
+				); !errors.Is(err, injected) {
 					t.Fatalf("durable C start: %v", err)
 				}
-				afterAppend, err := loadObserverState(statePath)
+				pending, err := loadObserverState(statePath)
 				if err != nil {
 					t.Fatal(err)
 				}
-				pending.LastSequence = afterAppend.LastSequence
-				pending.PublicationHeadSequence =
-					afterAppend.PublicationHeadSequence
-				pending.PublicationHeadHash =
-					afterAppend.PublicationHeadHash
-				if err := persistState(statePath, pending); err != nil {
+				marker, err := loadRotationMarker(config.StateDir)
+				if err != nil {
 					t.Fatal(err)
+				}
+				if pending.BootBoundaryState != bootBoundaryPending ||
+					pending.KeyEpoch != 1 ||
+					pending.PublicationHeadSequence != marker.StartSequence {
+					t.Fatalf("C failure did not leave exact durable pending state: %+v", pending)
 				}
 			},
 		},
@@ -614,14 +611,18 @@ func TestRotationRecoversDurableBoundaryMarkersWithoutDuplicates(
 
 func TestRotationDoesNotReinterpretDurableBAsC(t *testing.T) {
 	configPath, config, oldKey, newKey := rotationFixture(t)
+	injected := errors.New("injected B marker persistence failure")
 	options := append(
 		fixedRotationOptionsForBoot(newKey, testBootID),
-		WithRotationStopAfter("transition_spooled"),
+		withRotationPersist(func(path string, next ObserverState) error {
+			if next.BootBoundaryState == bootBoundaryCommitted &&
+				next.PendingBootBoundary == nil {
+				return injected
+			}
+			return persistState(path, next)
+		}),
 	)
-	if err := RotateKeys(configPath, options...); !errors.Is(
-		err,
-		ErrInjectedRotationStop,
-	) {
+	if err := RotateKeys(configPath, options...); !errors.Is(err, injected) {
 		t.Fatalf("durable B transition: %v", err)
 	}
 	if err := RotateKeys(
@@ -644,6 +645,15 @@ func TestRotationDoesNotReinterpretDurableBAsC(t *testing.T) {
 		state.KeyEpoch != 1 ||
 		!bytes.Equal(active, oldKey) {
 		t.Fatalf("conflicting B/C route did not fail closed: %+v", state)
+	}
+	frames, err := filepath.Glob(
+		filepath.Join(config.StateDir, "spool", "priority", "*.agf"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("conflicting B/C route emitted %d priority frames", len(frames))
 	}
 }
 
@@ -951,6 +961,108 @@ func TestRotationAuthorizationRejectsNonExactBoundaryRequests(t *testing.T) {
 				t.Fatal("non-exact rotation request authorized")
 			}
 		})
+	}
+}
+
+func TestEpochStartRequiresDurableTransitionBinding(t *testing.T) {
+	configPath, config, _, newKey := rotationFixture(t)
+	options := append(
+		fixedRotationOptions(newKey),
+		WithRotationStopAfter("prepared"),
+	)
+	if err := RotateKeys(configPath, options...); !errors.Is(
+		err,
+		ErrInjectedRotationStop,
+	) {
+		t.Fatalf("got %v, want injected stop", err)
+	}
+	marker, err := loadRotationMarker(config.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := LoadPublicKeyMetadata(config.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := metadata.Keyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPublic, err := hex.DecodeString(marker.Transition.NewPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keys.Add(marker.Transition.NewEpoch, ed25519.PublicKey(newPublic)); err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(
+		filepath.Join(config.StateDir, "observer-state.json"),
+		StateIdentity{
+			HostID:   testHostID,
+			BootID:   testBootID,
+			KeyID:    marker.Transition.OldKeyID,
+			KeyEpoch: marker.Transition.OldEpoch,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spool, err := NewSpool(
+		SpoolConfig{
+			StateDir:             config.StateDir,
+			MaxBytes:             config.SpoolMaxBytes,
+			PriorityReserveBytes: config.SpoolPriorityReserveBytes,
+			rotation:             &marker,
+		},
+		state,
+		keys,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+	startSigner := &EnvelopeSigner{
+		config: SignerConfig{
+			HostID:        testHostID,
+			BootID:        testBootID,
+			KeyEpoch:      marker.Transition.NewEpoch,
+			SourceID:      "agmind-observerd",
+			SourceVersion: "0.1.0",
+			Now:           time.Now,
+		},
+		state:      state,
+		spool:      spool,
+		privateKey: append(ed25519.PrivateKey(nil), newKey...),
+		keyID:      marker.Transition.NewKeyID,
+	}
+	fields := map[string]any{
+		"kind":      "observer_key_epoch_start",
+		"key_id":    marker.Transition.NewKeyID,
+		"key_epoch": marker.Transition.NewEpoch,
+	}
+	eventMetadata, err := rotationMetadata(time.Now(), fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := state.Snapshot()
+	if _, err := startSigner.wrapAuthorizedRotation(
+		context.Background(),
+		marker,
+		rotationEpochStartPublication,
+		"observer_key_epoch_start",
+		fields,
+		eventMetadata,
+	); !errors.Is(err, ErrRotationPublicationMismatch) {
+		t.Fatalf("fabricated epoch-start authority err=%v", err)
+	}
+	after := state.Snapshot()
+	if after.LastSequence != before.LastSequence ||
+		spool.containsRotationEvent(
+			"observer_key_epoch_start",
+			marker.Transition.NewKeyID,
+			fields,
+		) {
+		t.Fatalf("epoch start published without transition: %+v", after)
 	}
 }
 

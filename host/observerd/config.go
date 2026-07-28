@@ -354,6 +354,39 @@ func Bootstrap(
 	} else if !errors.Is(stateErr, os.ErrNotExist) {
 		return fail(stateErr, nil)
 	}
+	if existing, stateErr := loadObserverState(statePath); stateErr == nil &&
+		existing.BootID != bootID &&
+		existing.BootBoundaryState == bootBoundaryPending &&
+		len(existing.BootHistory) > 0 &&
+		existing.PublicationHeadSequence >=
+			existing.BootHistory[len(existing.BootHistory)-1].FirstSequence {
+		metadata, metadataErr := LoadPublicKeyMetadata(config.StateDir)
+		if metadataErr != nil {
+			return fail(metadataErr, nil)
+		}
+		keyring, keyringErr := metadata.Keyring()
+		if keyringErr != nil {
+			return fail(keyringErr, nil)
+		}
+		if recoverErr := recoverPendingBootBoundaryBeforeBootChange(
+			statePath,
+			StateIdentity{
+				HostID:   hostID,
+				BootID:   bootID,
+				KeyID:    keyID,
+				KeyEpoch: epoch,
+			},
+			SpoolConfig{
+				StateDir:             config.StateDir,
+				MaxBytes:             config.SpoolMaxBytes,
+				PriorityReserveBytes: config.SpoolPriorityReserveBytes,
+				Now:                  options.now,
+			},
+			keyring,
+		); recoverErr != nil {
+			return fail(recoverErr, nil)
+		}
+	}
 	state, err := OpenStateStore(
 		statePath,
 		StateIdentity{

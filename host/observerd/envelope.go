@@ -558,6 +558,57 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 	}, nil
 }
 
+func recoverPendingBootBoundaryBeforeBootChange(
+	path string,
+	identity StateIdentity,
+	config SpoolConfig,
+	keys *Keyring,
+) error {
+	persisted, err := loadObserverState(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if persisted.BootID == identity.BootID ||
+		persisted.BootBoundaryState != bootBoundaryPending {
+		return nil
+	}
+	if persisted.HostID != identity.HostID ||
+		persisted.KeyID != identity.KeyID ||
+		persisted.KeyEpoch != identity.KeyEpoch ||
+		len(persisted.BootHistory) == 0 {
+		return fmt.Errorf("observer state identity mismatch")
+	}
+	firstSequence := persisted.BootHistory[len(persisted.BootHistory)-1].FirstSequence
+	if persisted.PublicationHeadSequence < firstSequence {
+		return nil
+	}
+	previous, err := OpenStateStore(path, StateIdentity{
+		HostID:   persisted.HostID,
+		BootID:   persisted.BootID,
+		KeyID:    persisted.KeyID,
+		KeyEpoch: persisted.KeyEpoch,
+	})
+	if err != nil {
+		return err
+	}
+	spool, err := NewSpool(config, previous, keys)
+	if err != nil {
+		return err
+	}
+	if closeErr := spool.Close(); closeErr != nil {
+		return closeErr
+	}
+	recovered := previous.Snapshot()
+	if recovered.BootBoundaryState != bootBoundaryCommitted ||
+		recovered.PendingBootBoundary != nil {
+		return ErrBootBoundaryRecoveryUnproven
+	}
+	return nil
+}
+
 func (store *StateStore) Snapshot() ObserverState {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -1021,9 +1072,17 @@ const (
 )
 
 type rotationPublicationAuthorization struct {
-	marker          rotationMarker
-	role            rotationPublicationRole
-	transitionEvent *contracts.EventEnvelopeV1
+	marker            rotationMarker
+	role              rotationPublicationRole
+	transitionBinding *rotationTransitionBinding
+}
+
+type rotationTransitionBinding struct {
+	event               contracts.EventEnvelopeV1
+	contentSHA256       string
+	frameIdentity       durablefile.FileIdentity
+	publicationIdentity durablefile.FileIdentity
+	publicationHash     string
 }
 
 func exactFlags(actual []string, expected ...string) bool {
@@ -1253,11 +1312,16 @@ func (signer *EnvelopeSigner) wrapAuthorizedBootBoundary(
 
 func (signer *EnvelopeSigner) wrapAuthorizedRotation(
 	ctx context.Context,
-	authorization rotationPublicationAuthorization,
+	marker rotationMarker,
+	role rotationPublicationRole,
 	eventType string,
 	normalizedFields map[string]any,
 	metadata EventMetadata,
 ) (contracts.EventEnvelopeV1, error) {
+	authorization := rotationPublicationAuthorization{
+		marker: marker,
+		role:   role,
+	}
 	return signer.wrap(
 		ctx,
 		noBootBoundaryPublication,
@@ -1294,6 +1358,16 @@ func (signer *EnvelopeSigner) wrap(
 	default:
 	}
 	snapshot := signer.state.Snapshot()
+	if rotationAuthorization != nil &&
+		rotationAuthorization.role == rotationEpochStartPublication {
+		binding, err := signer.spool.bindRotationTransition(
+			rotationAuthorization.marker,
+		)
+		if err != nil {
+			return contracts.EventEnvelopeV1{}, err
+		}
+		rotationAuthorization.transitionBinding = &binding
+	}
 	boundaryPending := snapshot.BootBoundaryState == bootBoundaryPending
 	rotationAuthorized := rotationAuthorization != nil &&
 		rotationAuthorization.matchesRequest(
@@ -1809,6 +1883,7 @@ type rotationOptions struct {
 	generate              func() (ed25519.PublicKey, ed25519.PrivateKey, error)
 	saveMetadata          func(string, PublicKeyMetadata) error
 	syncMetadataDirectory func(string) error
+	persist               func(string, ObserverState) error
 	stopAfter             string
 }
 
@@ -1834,6 +1909,12 @@ func WithRotationKeyGenerator(
 
 func WithRotationStopAfter(stage string) RotationOption {
 	return func(options *rotationOptions) { options.stopAfter = stage }
+}
+
+func withRotationPersist(
+	value func(string, ObserverState) error,
+) RotationOption {
+	return func(options *rotationOptions) { options.persist = value }
 }
 
 func readKernelBootID() (string, error) {
@@ -1984,7 +2065,7 @@ func rotationModeForState(
 	lastBoundary := state.BootHistory[len(state.BootHistory)-1]
 	switch authorization.role {
 	case rotationTransitionPublication:
-		if authorization.transitionEvent != nil ||
+		if authorization.transitionBinding != nil ||
 			state.LastSequence < marker.TransitionSequence-1 ||
 			state.LastSequence > marker.TransitionSequence {
 			return rotationBoundaryInvalid
@@ -2000,12 +2081,12 @@ func rotationModeForState(
 			return rotationBoundarySameBoot
 		}
 	case rotationEpochStartPublication:
-		if authorization.transitionEvent == nil ||
+		if authorization.transitionBinding == nil ||
 			state.LastSequence < marker.StartSequence-1 ||
 			state.LastSequence > marker.StartSequence {
 			return rotationBoundaryInvalid
 		}
-		transition := *authorization.transitionEvent
+		transition := authorization.transitionBinding.event
 		if state.BootBoundaryState == bootBoundaryPending &&
 			state.PendingBootBoundary != nil &&
 			state.PendingBootBoundary.PreviousBootID != nil &&
@@ -2022,6 +2103,20 @@ func rotationModeForState(
 		}
 	}
 	return rotationBoundaryInvalid
+}
+
+func rotationEpochStartMode(
+	state ObserverState,
+	marker rotationMarker,
+	transition contracts.EventEnvelopeV1,
+) rotationBoundaryMode {
+	return rotationModeForState(state, rotationPublicationAuthorization{
+		marker: marker,
+		role:   rotationEpochStartPublication,
+		transitionBinding: &rotationTransitionBinding{
+			event: transition,
+		},
+	})
 }
 
 func rotationCoverageFlags(
@@ -2146,18 +2241,18 @@ func rotationEnvelopeMatches(
 			event.KeyEpoch == marker.Transition.OldEpoch &&
 			event.SourceSequence == marker.TransitionSequence
 	case rotationEpochStartPublication:
-		if authorization.transitionEvent == nil ||
+		if authorization.transitionBinding == nil ||
 			!transitionEnvelopeMatchesMarker(
-				*authorization.transitionEvent,
+				authorization.transitionBinding.event,
 				marker,
 			) ||
-			authorization.transitionEvent.SourceSequence+1 !=
+			authorization.transitionBinding.event.SourceSequence+1 !=
 				event.SourceSequence {
 			return false
 		}
 		return rotationTransitionCoverageMatches(
 			state,
-			*authorization.transitionEvent,
+			authorization.transitionBinding.event,
 			mode,
 		) &&
 			event.EventType == "observer_key_epoch_start" &&
@@ -2214,14 +2309,14 @@ func (authorization rotationPublicationAuthorization) matchesRequest(
 				signer.privateKey.Public().(ed25519.PublicKey),
 				publicKey,
 			) ||
-			authorization.transitionEvent == nil ||
+			authorization.transitionBinding == nil ||
 			!transitionEnvelopeMatchesMarker(
-				*authorization.transitionEvent,
+				authorization.transitionBinding.event,
 				marker,
 			) ||
 			!rotationTransitionCoverageMatches(
 				state,
-				*authorization.transitionEvent,
+				authorization.transitionBinding.event,
 				mode,
 			) {
 			return false
@@ -2289,6 +2384,62 @@ func (spool *Spool) findRotationEvent(
 		}
 	}
 	return contracts.EventEnvelopeV1{}, false, ErrSpoolCorrupt
+}
+
+func (spool *Spool) bindRotationTransition(
+	marker rotationMarker,
+) (rotationTransitionBinding, error) {
+	spool.mutex.Lock()
+	defer spool.mutex.Unlock()
+	snapshot := spool.state.Snapshot()
+	item, exists := spool.items[marker.TransitionSequence]
+	if !exists ||
+		item.Tier != PriorityTier ||
+		item.Sequence != marker.TransitionSequence ||
+		item.Sequence > snapshot.PublicationHeadSequence ||
+		validatePublicationItem(item) != nil {
+		return rotationTransitionBinding{}, ErrRotationPublicationMismatch
+	}
+	event, canonical, contentHash, frameBytes, identity, err :=
+		readStandaloneFrame(item.path, spool.keys)
+	if err != nil ||
+		!transitionEnvelopeMatchesMarker(event, marker) ||
+		event.EventID != item.EventID ||
+		contentHash != item.ContentSHA256 ||
+		frameBytes != item.frameBytes ||
+		identity != item.identity ||
+		!bytes.Equal(canonical, item.Canonical) {
+		return rotationTransitionBinding{}, ErrRotationPublicationMismatch
+	}
+	return rotationTransitionBinding{
+		event:               event,
+		contentSHA256:       contentHash,
+		frameIdentity:       identity,
+		publicationIdentity: item.publicationIdentity,
+		publicationHash:     item.publicationHash,
+	}, nil
+}
+
+func rotationBindingMatchesItem(
+	binding rotationTransitionBinding,
+	item SpoolItem,
+	keys *Keyring,
+) bool {
+	event, canonical, contentHash, frameBytes, identity, err :=
+		readStandaloneFrame(item.path, keys)
+	return err == nil &&
+		event.EventID == binding.event.EventID &&
+		event.SourceSequence == binding.event.SourceSequence &&
+		bytes.Equal(canonical, item.Canonical) &&
+		contentHash == binding.contentSHA256 &&
+		frameBytes == item.frameBytes &&
+		identity == binding.frameIdentity &&
+		binding.event.EventID == item.EventID &&
+		binding.event.SourceSequence == item.Sequence &&
+		binding.contentSHA256 == item.ContentSHA256 &&
+		binding.frameIdentity == item.identity &&
+		binding.publicationIdentity == item.publicationIdentity &&
+		binding.publicationHash == item.publicationHash
 }
 
 func (spool *Spool) containsRotationEvent(
@@ -2370,6 +2521,7 @@ func defaultRotationOptions() rotationOptions {
 		now:                   time.Now,
 		saveMetadata:          savePublicKeyMetadata,
 		syncMetadataDirectory: durablefile.SyncDirectory,
+		persist:               persistState,
 		generate: func() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 			return ed25519.GenerateKey(rand.Reader)
 		},
@@ -2433,6 +2585,67 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 
 	var marker rotationMarker
 	marker, err = loadRotationMarker(config.StateDir)
+	markerExists := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		markExistingStateReadOnly(statePath, "observer_rotation_marker_invalid")
+		return err
+	}
+	if stateExists &&
+		preflightState.BootID != bootID &&
+		preflightState.BootBoundaryState == bootBoundaryPending &&
+		len(preflightState.BootHistory) > 0 &&
+		preflightState.PublicationHeadSequence >=
+			preflightState.BootHistory[len(preflightState.BootHistory)-1].FirstSequence {
+		metadata, metadataErr := LoadPublicKeyMetadata(config.StateDir)
+		if metadataErr != nil {
+			return metadataErr
+		}
+		keyring, keyringErr := metadata.Keyring()
+		if keyringErr != nil {
+			return keyringErr
+		}
+		recoveryConfig := SpoolConfig{
+			StateDir:             config.StateDir,
+			MaxBytes:             config.SpoolMaxBytes,
+			PriorityReserveBytes: config.SpoolPriorityReserveBytes,
+			Now:                  options.now,
+		}
+		if markerExists {
+			if validateErr := marker.Validate(); validateErr != nil {
+				return validateErr
+			}
+			newPublic, decodeErr := hex.DecodeString(
+				marker.Transition.NewPublicKey,
+			)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			if addErr := keyring.Add(
+				marker.Transition.NewEpoch,
+				ed25519.PublicKey(newPublic),
+			); addErr != nil {
+				return addErr
+			}
+			recoveryConfig.rotation = &marker
+		}
+		if recoverErr := recoverPendingBootBoundaryBeforeBootChange(
+			statePath,
+			StateIdentity{
+				HostID:   hostID,
+				BootID:   bootID,
+				KeyID:    preflightState.KeyID,
+				KeyEpoch: preflightState.KeyEpoch,
+			},
+			recoveryConfig,
+			keyring,
+		); recoverErr != nil {
+			return recoverErr
+		}
+		preflightState, preflightErr = loadObserverState(statePath)
+		if preflightErr != nil {
+			return preflightErr
+		}
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		identity := StateIdentity{
 			HostID:   hostID,
@@ -2461,6 +2674,7 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		if stateErr != nil {
 			return stateErr
 		}
+		state.persist = options.persist
 		snapshot := state.Snapshot()
 		if snapshot.KeyEpoch == math.MaxUint64 ||
 			snapshot.LastSequence >= math.MaxUint64-1 {
@@ -2578,9 +2792,6 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		if options.stopAfter == "prepared" {
 			return ErrInjectedRotationStop
 		}
-	} else if err != nil {
-		markExistingStateReadOnly(statePath, "observer_rotation_marker_invalid")
-		return err
 	}
 	if marker.HostID != hostID {
 		markExistingStateReadOnly(statePath, "observer_rotation_host_mismatch")
@@ -2654,6 +2865,7 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 	if err != nil {
 		return err
 	}
+	state.persist = options.persist
 	if err := state.clearRotationFence(); err != nil {
 		return err
 	}
@@ -2764,7 +2976,8 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		}
 		transitionEvent, err = signer.wrapAuthorizedRotation(
 			context.Background(),
-			transitionAuthorization,
+			marker,
+			rotationTransitionPublication,
 			"observer_key_transition",
 			transitionFields,
 			eventMetadata,
@@ -2837,14 +3050,10 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 			privateKey: append(ed25519.PrivateKey(nil), newPrivate...),
 			keyID:      marker.Transition.NewKeyID,
 		}
-		startAuthorization := rotationPublicationAuthorization{
-			marker:          marker,
-			role:            rotationEpochStartPublication,
-			transitionEvent: &transitionEvent,
-		}
-		mode := rotationModeForState(
+		mode := rotationEpochStartMode(
 			state.Snapshot(),
-			startAuthorization,
+			marker,
+			transitionEvent,
 		)
 		if mode == rotationBoundaryInvalid {
 			_ = state.PersistReadOnly(
@@ -2865,7 +3074,8 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		}
 		startEvent, err = startSigner.wrapAuthorizedRotation(
 			context.Background(),
-			startAuthorization,
+			marker,
+			rotationEpochStartPublication,
 			"observer_key_epoch_start",
 			startFields,
 			eventMetadata,
@@ -2898,6 +3108,32 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 			"observer_rotation_epoch_start_activation_missing",
 		)
 		return ErrRotationPublicationMismatch
+	}
+	if state.Snapshot().BootBoundaryState == bootBoundaryPending {
+		currentSigner, signerErr := NewEnvelopeSigner(
+			SignerConfig{
+				HostID:        hostID,
+				BootID:        bootID,
+				KeyEpoch:      marker.Transition.NewEpoch,
+				SourceID:      "agmind-observerd",
+				SourceVersion: "0.1.0",
+				Now:           options.now,
+			},
+			state,
+			spool,
+			newPrivate,
+		)
+		if signerErr != nil {
+			return signerErr
+		}
+		if boundaryErr := ensureDedicatedBootBoundary(
+			context.Background(),
+			state,
+			currentSigner,
+			options.now(),
+		); boundaryErr != nil {
+			return boundaryErr
+		}
 	}
 	if err := durablefile.AtomicWrite(config.PrivateKeyFile, newPrivate); err != nil {
 		return err

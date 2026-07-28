@@ -18,6 +18,7 @@ const (
 	testHostID  = "123e4567-e89b-42d3-a456-426614174000"
 	testBootID  = "123e4567-e89b-42d3-b456-426614174001"
 	testBootID2 = "123e4567-e89b-42d3-8456-426614174002"
+	testBootID3 = "123e4567-e89b-42d3-9456-426614174003"
 )
 
 func testKey(t *testing.T, fill byte) ed25519.PrivateKey {

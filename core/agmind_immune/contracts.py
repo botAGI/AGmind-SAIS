@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import hashlib
 import ipaddress
 import json
 import re
@@ -618,6 +619,42 @@ class ObserverBootBoundaryV1(ContractModel):
                 raise ValueError("observer genesis cannot name a predecessor")
         elif self.previous_boot_id is None or self.previous_source_sequence == 0:
             raise ValueError("changed boot requires a valid predecessor")
+        return self
+
+
+class ObserverTrustRootV1(ContractModel):
+    schema_version: Literal["agmind.observer-trust-root.v1"]
+    host_id: str
+    key_id: str
+    key_epoch: Literal[1]
+    public_key: str
+
+    @field_validator("host_id")
+    @classmethod
+    def host_is_valid(cls, value: str) -> str:
+        if not UUID4.fullmatch(value):
+            raise ValueError("host_id must be a lowercase UUIDv4")
+        return value
+
+    @field_validator("key_id")
+    @classmethod
+    def key_id_is_valid(cls, value: str) -> str:
+        if not HEX32.fullmatch(value):
+            raise ValueError("key_id must be 32 lowercase hex")
+        return value
+
+    @field_validator("public_key")
+    @classmethod
+    def public_key_is_valid(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("public_key must be an exact 32-byte lowercase hex key")
+        return value
+
+    @model_validator(mode="after")
+    def key_id_matches_public_key(self) -> ObserverTrustRootV1:
+        derived = hashlib.sha256(bytes.fromhex(self.public_key)).hexdigest()[:32]
+        if self.key_id != derived:
+            raise ValueError("observer trust-root key_id mismatch")
         return self
 
 

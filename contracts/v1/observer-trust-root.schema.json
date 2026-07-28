@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agmind.local/contracts/v1/observer-trust-root.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "host_id",
+    "key_id",
+    "key_epoch",
+    "public_key"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "agmind.observer-trust-root.v1"
+    },
+    "host_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "key_epoch": {
+      "type": "integer",
+      "const": 1
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "uuid4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}

@@ -464,6 +464,25 @@ func (boundary ObserverBootBoundaryV1) Validate() error {
 	return nil
 }
 
+func (root ObserverTrustRootV1) Validate() error {
+	if root.SchemaVersion != "agmind.observer-trust-root.v1" ||
+		!uuid4.MatchString(root.HostID) ||
+		!hex32.MatchString(root.KeyID) ||
+		root.KeyEpoch != 1 ||
+		!hex64.MatchString(root.PublicKey) {
+		return fmt.Errorf("invalid observer trust root")
+	}
+	publicKey, err := hex.DecodeString(root.PublicKey)
+	if err != nil {
+		return fmt.Errorf("invalid observer trust-root public key")
+	}
+	derived, err := KeyID(publicKey)
+	if err != nil || derived != root.KeyID {
+		return fmt.Errorf("observer trust-root key ID mismatch")
+	}
+	return nil
+}
+
 func (intent TemporaryEgressDenyIntentV1) Validate() error {
 	return validateEgress(intent.EgressDenyFields, "agmind.temporary-egress-deny-intent.v1")
 }

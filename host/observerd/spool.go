@@ -359,9 +359,11 @@ func eventAllowedByState(
 		SourcePayloadHash:      event.NormalizedFieldsSHA256,
 	}
 	authorization := rotationPublicationAuthorization{
-		marker:          *rotation,
-		role:            rotationEpochStartPublication,
-		transitionEvent: &transition,
+		marker: *rotation,
+		role:   rotationEpochStartPublication,
+		transitionBinding: &rotationTransitionBinding{
+			event: transition,
+		},
 	}
 	mode := rotationModeForState(snapshot, authorization)
 	expectedFields, err := rotationFieldsForAuthorization(authorization)
@@ -520,10 +522,20 @@ func recoverRotationPublication(
 			keys.Verify(start) != nil {
 			return ErrSpoolCorrupt
 		}
+		transitionItem := items[rotation.TransitionSequence]
+		if err := validatePublicationItem(transitionItem); err != nil {
+			return ErrSpoolCorrupt
+		}
 		authorization := rotationPublicationAuthorization{
-			marker:          *rotation,
-			role:            rotationEpochStartPublication,
-			transitionEvent: &transition,
+			marker: *rotation,
+			role:   rotationEpochStartPublication,
+			transitionBinding: &rotationTransitionBinding{
+				event:               transition,
+				contentSHA256:       transitionItem.ContentSHA256,
+				frameIdentity:       transitionItem.identity,
+				publicationIdentity: transitionItem.publicationIdentity,
+				publicationHash:     transitionItem.publicationHash,
+			},
 		}
 		mode := rotationModeForState(snapshot, authorization)
 		if mode == rotationBoundaryInvalid ||
@@ -1748,8 +1760,19 @@ func (spool *Spool) append(
 	rotationCandidate := false
 	if rotationAuthorization != nil {
 		mode := rotationModeForState(snapshot, *rotationAuthorization)
+		transitionItem, transitionExists :=
+			spool.items[rotationAuthorization.marker.TransitionSequence]
+		bindingValid := rotationAuthorization.transitionBinding != nil &&
+			transitionExists &&
+			rotationBindingMatchesItem(
+				*rotationAuthorization.transitionBinding,
+				transitionItem,
+				spool.keys,
+			) &&
+			validatePublicationItem(transitionItem) == nil
 		rotationCandidate =
 			rotationAuthorization.role == rotationEpochStartPublication &&
+				bindingValid &&
 				mode != rotationBoundaryInvalid &&
 				rotationEnvelopeMatches(
 					validated,

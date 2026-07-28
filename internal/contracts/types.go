@@ -88,6 +88,16 @@ type ObserverBootBoundaryV1 struct {
 	PreviousSourceSequence uint64  `json:"previous_source_sequence"`
 }
 
+// ObserverTrustRootV1 is the immutable installation pin independently loaded
+// by Core before observer key-transition metadata is considered.
+type ObserverTrustRootV1 struct {
+	SchemaVersion string `json:"schema_version"`
+	HostID        string `json:"host_id"`
+	KeyID         string `json:"key_id"`
+	KeyEpoch      uint64 `json:"key_epoch"`
+	PublicKey     string `json:"public_key"`
+}
+
 // EgressDenyFields are shared fields, not a standalone wire contract.
 type EgressDenyFields struct {
 	SchemaVersion          string   `json:"schema_version"`
