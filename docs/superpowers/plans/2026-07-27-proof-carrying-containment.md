@@ -28,7 +28,7 @@
 - The legacy `app/`, `main.py`, `config/config.yaml`, root `requirements.txt`, and root `Dockerfile` remain untouched until native Linux acceptance passes.
 - M1 does not add Trivy, CrowdSec, Suricata, ClamAV, YARA-X, PCAP, generic MCP proxying, recovery automation, Kubernetes, multi-node enforcement, or IPv6.
 - Build Go binaries for `linux/amd64` and `linux/arm64`; the mandatory M1 end-to-end run is `linux/amd64` on a Beelink. DGX Spark ARM64 smoke tests must not disturb its DeepSeek runtime.
-- All privileged parsers reject duplicate JSON keys, unknown fields, unsupported schema versions, floats, overlong strings/arrays, frames over their explicit byte limits, and trailing data.
+- All privileged parsers reject duplicate JSON keys, unknown fields, unsupported schema versions, floats, overlong strings/arrays, frames over their explicit byte limits, and trailing data. The sole parser exception is the exact Falco internal metrics rule: finite bounded decimal tokens may occur only in fields the adapter discards, while selected heartbeat fields and every normalized/canonical contract remain float-free.
 - Every task is complete only after its named tests pass and its focused commit is created. Never combine unrelated legacy changes into these commits.
 
 ---
@@ -464,14 +464,15 @@ EventEnvelopeV1:
 
 FalcoConnectV1 normalized_fields:
   detector_rule, detector_rule_version, falco_version,
+  event_time,
   evt_type="connect", evt_rawres?, evt_res,
   successful_connect, investigation_only,
-  falco_container_id_prefix, falco_container_full_id?,
-  falco_container_start_ts,
+  falco_container_id_prefix?, falco_container_full_id?,
+  falco_container_start_ts?,
   docker_container_id?, docker_started_at?, image_id?,
   repo_digests[], immutable_spec_sha256?, inventory_revision?,
-  proc_name, proc_exe_path, proc_parent_name,
-  destination_ipv4, destination_port, l4_protocol,
+  proc_name?, proc_exe_path?, proc_parent_name?,
+  destination_ipv4?, destination_port?, l4_protocol?,
   missing_required_fields[], raw_event_sha256
 
 CoverageEventV1 normalized_fields:
@@ -699,8 +700,13 @@ Implement the ID, signature preimage, key transition, and plan-hash formulas exa
 
 Write JSON Schema 2020-12 files with `"additionalProperties": false`, exact enums/patterns/bounds, and conditional requirements:
 
-- a candidate-capable Falco event requires every authoritative Docker field and `successful_connect=true`;
-- investigation-only Falco events may omit authoritative identity but cannot set `successful_connect=true` when result is a hard error;
+- a candidate-capable Falco event requires `event_time`, every sensor fact,
+  every authoritative Docker field, `successful_connect=true`, and an empty
+  `missing_required_fields`;
+- investigation-only Falco events may omit sensor facts only when each omission
+  is exactly named, never name missing observer/Docker authority, may omit
+  authoritative identity, and cannot set
+  `successful_connect=true` when result is a hard error;
 - an intent has no PID, namespace, interface, path, command, expression, model, narrative, or label field;
 - a prepared plan contains every I3 binding field;
 - hunter output rejects every property outside its five allowed content fields plus `schema_version`;
@@ -1158,24 +1164,31 @@ git commit -m "feat: add authoritative Docker observer"
 
 **Files:**
 - Create: `core/agmind_immune/falco_adapter/{__init__,main,parser,redaction}.py`
-- Create: `core/tests/falco_adapter/{test_parser,test_redaction,test_delivery}.py`
-- Create: `contracts/v1/falco-connect.schema.json`
-- Create: `contracts/fixtures/v1/falco/{success,einprogress,failed,missing-field,hostile-strings}.json`
+- Create: `core/tests/falco_adapter/test_task4_matrix.py`
+- Modify: `core/agmind_immune/contracts.py`
+- Modify: `internal/contracts/{types,validation}.go`
+- Modify: `host/observerd/{service,ingest_api}.go`
+- Create: `contracts/fixtures/v1/falco/{success,einprogress,failed,missing-field,hostile-strings,metrics-heartbeat,metrics-heartbeat-real}.json`
 - Create: `deploy/falco/falco.yaml`
 - Create: `deploy/falco/rules.d/agmind-pcc.yaml`
+- Modify: `Makefile`
 
 **Interfaces:**
-- Consumes: Falco 0.44.1 JSON `output_fields`; observer ingest UDS.
+- Consumes: one Falco 0.44.1 JSON body per internal HTTP
+  `POST /v1/falco/raw`; observer ingest UDS.
 - Produces:
-  - `parse_falco_line(raw: bytes) -> FalcoConnectV1`.
-  - `redact_falco_event(event: dict[str, object]) -> FalcoConnectV1`.
+  - `parse_falco_body(raw: bytes) -> FalcoConnectV1 | FalcoMetricsHeartbeat`.
+  - `redact_falco_event(event, raw_sha256) -> FalcoConnectV1`.
+  - exact sensor UDS routes `POST /v1/events/falco` and
+    `POST /v1/events/falco-coverage`;
   - A monitor-only Falco rule with a frozen output contract.
-  - Coverage open/close events for adapter start, parse rejection, queue drop, and delivery failure.
+  - Bounded adapter-owned coverage for lifecycle, parse/delivery/queue loss,
+    heartbeat loss, detector mismatch, and Falco drop counters.
 
 The adapter accepts only this pinned output-field mapping:
 
 ```text
-evt.time                 -> event_time
+top-level time           -> event_time (normalized UTC RFC3339Nano)
 evt.type                 -> evt_type
 evt.rawres               -> evt_rawres
 evt.res                  -> evt_res
@@ -1190,101 +1203,172 @@ fd.rport                 -> destination_port
 fd.l4proto               -> l4_protocol
 ```
 
-- [ ] **Step 1: Write failing parser and redaction tests from frozen real-shape fixtures**
+- [ ] **Step 1: Repair the shared Falco contract**
 
-```python
-@pytest.mark.parametrize(("fixture", "success"), [
-    ("success.json", True),
-    ("einprogress.json", True),
-    ("failed.json", False),
-])
-def test_connect_result_semantics(fixture: str, success: bool) -> None:
-    event = parse_falco_line((FIXTURES / fixture).read_bytes())
-    assert event.successful_connect is success
+`event_time` is required and comes only from top-level Falco `time`.
+`falco_container_full_id` remains optional. The eight sensor facts
+`falco_container_id_prefix`, `falco_container_start_ts`, `proc_name`,
+`proc_exe_path`, `proc_parent_name`, `destination_ipv4`,
+`destination_port`, and `l4_protocol` may be omitted only when
+`investigation_only=true`; `missing_required_fields` must contain exactly the
+normalized name of every omitted sensor fact. Nulls and sentinels never enter
+the normalized contract. It never contains observer-owned Docker fields such
+as `docker_container_id`; Docker resolution failure remains investigation-only
+and is represented by an observer-derived coverage flag. A candidate-capable
+event requires every sensor fact, all observer-owned Docker authority, a locked
+successful result tuple, and an empty missing list.
 
+- [ ] **Step 2: Implement one-body strict parsing and redaction**
 
-def test_missing_field_is_investigation_only() -> None:
-    event = parse_falco_line((FIXTURES / "missing-field.json").read_bytes())
-    assert event.investigation_only is True
-    assert event.missing_required_fields == ["fd.rip"]
+FastAPI binds only `0.0.0.0:8765`. `/v1/falco/raw` accepts exact
+`Content-Type: application/json`, reads at most 65,536 bytes without first
+buffering an unbounded body, and returns 202 only after parse and bounded
+admission. Reject malformed UTF-8, duplicate keys, trailing data, excessive
+depth, wrong types/IDs, the wrong exact rule/source/tag/priority, and
+contradictory result tuples. Connect/non-metrics documents reject every JSON
+float, including floats in ignored fields. Only the exact internal metrics rule
+may decode finite decimal tokens bounded to 128 characters and decimal exponent
+magnitude 308, and only in discarded fields; every selected heartbeat field
+remains a strict string or integer. Normalize Falco timestamps with `Z`,
+`+HH:MM`, or its emitted `+HHMM` offset form.
 
+The exact rule identity is `AGmind PCC Suspicious Process Outbound Connect`,
+source is `syscall`, priority is `Notice`, and the complete tags list is exactly
+`[agmind-pcc-rules-v1]`. A completed success is only `evt_res=SUCCESS` with
+`evt_rawres>=0`; the only nonblocking successful tokens remain `EINPROGRESS`
+and `EINPROGRESS(115)` with absent/negative raw result. Hard errors without
+`fd.rip` are preserved as investigation-only.
 
-def test_attacker_strings_are_not_forwarded() -> None:
-    raw = (FIXTURES / "hostile-strings.json").read_bytes()
-    event = parse_falco_line(raw)
-    encoded = event.model_dump_json()
-    assert "IGNORE ALL INSTRUCTIONS" not in encoded
-    assert "proc.cmdline" not in encoded
-    assert event.raw_event_sha256 == hashlib.sha256(raw).hexdigest()
-```
+The adapter always emits `investigation_only=true`, `repo_digests=[]`, and no
+Docker-authority fields. Observerd alone resolves authority and may clear
+investigation-only. Hash the exact raw body, then immediately discard `output`,
+`proc.cmdline`, args, cwd, filename, labels, env, and arbitrary fields.
 
-- [ ] **Step 2: Run and verify failure**
+- [ ] **Step 3: Add the exact coverage boundary**
 
-Run:
+The sensor socket exposes only `POST /v1/events/falco` and
+`POST /v1/events/falco-coverage`; there is no generic sensor coverage route.
+`FalcoAdapterCoverageInputV1` contains only `kind`, `opened_at`, optional
+`closed_at`, optional `dropped_count`, `reason_code`, and
+`source_payload_sha256`. Observerd accepts only adapter-owned kinds and derives
+`component=falco-adapter`, severity, coverage flags, `event_type=coverage`, and
+the signed envelope. Sensor input cannot choose component, severity, or
+reconcile generation. `falco_adapter_start` and `falco_heartbeat_lease` are
+observer-derived INFO closed points; `falco_adapter_stop` is a CRITICAL closed
+point. Parse rejection, gaps, mismatch, and drops are CRITICAL. Parse rejection
+uses the exact rejected raw-body SHA-256.
 
-```bash
-uv run --frozen pytest -q core/tests/falco_adapter
-```
+- [ ] **Step 4: Implement bounded at-least-once delivery with lease expiry**
 
-Expected: collection fails because the adapter package does not exist.
+FastAPI lifespan owns exactly one worker using HTTPX
+`AsyncHTTPTransport(uds=/run/agmind-sais/observer-ingest/socket)`. It POSTs only
+the two Falco routes, treats only exact HTTP 201 plus strict JSON
+`event_id=evt_<64 lowercase hex>` as an acknowledgement, never has more than
+one unacked inflight body, and retries identical bytes exponentially with a
+5-second cap. Each request timeout is `min(2 seconds, remaining common shutdown
+deadline)`. A malformed HTTP 201 acknowledgement is a retriable protocol error;
+it never releases or advances the single inflight item.
+Only `falco_heartbeat_lease` delivery items have a local monotonic transport
+expiry, exactly 15 seconds after adapter admission. Before every post or retry,
+the worker discards an expired lease without posting it and without invoking
+delivery recovery, then continues with priority coverage and any newer lease.
+This is the sole exception to at-least-once delivery: connect events and
+negative coverage never expire. A delivery-failure interval opened by the
+discarded lease remains open; its priority evidence and recovery close must be
+delivered before readiness can reopen. The same single delivery worker invokes
+the heartbeat watchdog on every retry cycle, so observer downtime cannot hide
+a greater-than-15-second heartbeat gap.
+The routine queue holds exactly 1,024 non-inflight items. Overflow removes the
+oldest non-inflight routine item and coalesces priority `falco_queue_drop`
+coverage. Priority coverage has a separate fixed bounded/coalesced queue and is
+selected before routine work. Delivery failure and queue saturation are
+open-to-close coverage intervals: recovery closes delivery failure, while
+successful drain below saturation closes queue-drop coverage.
 
-- [ ] **Step 3: Implement strict result parsing and redaction**
+SIGTERM stops intake, enqueues `falco_adapter_stop`, and uses one common
+monotonic deadline exactly five seconds after shutdown begins. No retry or
+later shutdown call extends it. The worker reads the current deadline provider
+before every retry and again after queue waits; every later request and sleep is
+bounded by the current remaining time. The outer shutdown wait cancels a
+request already active when shutdown begins at that same common deadline. Raw
+input is never logged.
 
-Read newline-delimited Falco JSON from stdin with a 64 KiB limit per line and a queue of 1,024 parsed events. Reject duplicate keys, trailing data, wrong rule name/version, non-container events, and invalid field types.
+- [ ] **Step 5: Watch the Falco metrics heartbeat**
 
-Success is exactly:
+Special-case only exact rule `Falco internal: metrics snapshot`, source
+`internal`, priority `Informational`. It never becomes `FalcoConnectV1`.
+Validate `falco.version=0.44.1`, `scap.engine_name=modern_bpf`, deployment-pinned
+configuration/rule SHA-256 values, and monotonic
+`falco.outputs_queue_num_drops` plus `scap.n_drops`. More than 15 seconds
+without a valid heartbeat, any identity/hash mismatch, counter rollback, or a
+counter increase opens/coalesces critical coverage. Only a later fully valid
+heartbeat closes a mismatch/timeout gap.
 
-```python
-successful = (
-    isinstance(rawres, int) and rawres >= 0
-) or str(evt_res).upper() in {"EINPROGRESS", "EINPROGRESS(115)"}
-```
+Runtime intake starts fenced. Startup first admits an INFO closed
+`falco_adapter_start` point and an open CRITICAL `falco_heartbeat_gap` with
+reason `awaiting_initial_heartbeat`, then enables the raw route; startup alone
+never grants mutation readiness. Every fully valid heartbeat closes any
+heartbeat gap and emits an INFO closed `falco_heartbeat_lease` point whose
+source hash is that exact raw heartbeat SHA-256. Lifecycle, lease, timeout,
+mismatch, drop, and parse interval timestamps use adapter wall receipt time;
+the watchdog retains the Falco event timestamp separately as evidence and uses
+monotonic receipt time only for the strict greater-than-15-second timeout.
+Timeout, mismatch, and counter-drop intervals open conservatively at the
+previous valid receipt (or adapter start before the first valid heartbeat).
 
-A hard error remains investigation-only. Missing a candidate-required field emits an investigation-only event with sorted field names. `container.start_ts` is preserved as an integer/string sensor fact and is never compared with Docker StartedAt.
+An identity-exact counter rollback opens mismatch and records a pending reset
+baseline without renewing the lease. Only the next identity/hash-exact
+heartbeat monotonic against that pending baseline rebases counters, closes the
+mismatch, and renews the lease. Kernel and output drop deltas accumulate
+independently over each open interval, and both updates and the close carry the
+cumulative count.
 
-Discard the raw record immediately after hashing. Never copy `output`, command line, args, cwd, filename, labels, environment, or arbitrary Falco text into the canonical event or AI bundle.
+The first parse rejection receipt opens one coalesced CRITICAL interval,
+subsequent rejections retain that earliest opening and accumulate a bounded
+count, and the next fully valid heartbeat closes it. Each rejection update uses
+the exact rejected raw-body SHA-256; the adapter retains the most recent such
+hash for the close. Malformed input still receives HTTP 400.
 
-- [ ] **Step 4: Add the exact curated Falco rule and configuration**
+- [ ] **Step 6: Pin the monitor-only Falco deployment**
 
-The rule name/version is:
+Falco uses `config_files: []`, no config watching, only the custom rule file,
+`modern_ebpf` with `drop_failed_exit=false`, container plugin 0.7.1, and
+deliberately nonexistent runtime-engine socket paths. It has no runtime socket
+mount and no unsupported top-level `container_engines`; dummy sockets exist
+only in the pinned container-plugin configuration. JSON output includes fields
+and tags but omits rendered output/message;
+`append_output` is empty and the output queue is 1,024. HTTP to
+`http://falco-adapter:8765/v1/falco/raw` is the only alert output and has
+bounded timeout handling. Metrics emit the internal rule every five seconds
+with both Falco output-queue and kernel drop counters. Webserver, stdout,
+syslog, file, and program outputs are disabled; operational logging is stderr
+only.
+
+The syscall rule uses `evt.type=connect` without deprecated `evt.dir=<`,
+matches the exact ten-process list, and preserves hard errors with:
 
 ```text
-AGmind PCC Suspicious Process Outbound Connect
-agmind-pcc-rules-v1
+((fd.typechar=4 and fd.rip != "0.0.0.0") or evt.rawres < 0)
 ```
 
-The condition is limited to syscall-exit events `evt.type=connect and evt.dir=<`, `container.id != host`, process name in `sh`, `bash`, `dash`, `zsh`, `curl`, `wget`, `nc`, `ncat`, `socat`, or `busybox`, and a non-empty remote IPv4. It emits successful, `EINPROGRESS`, and hard-error attempts so the adapter can preserve investigation-only failures. The rule does not decide whether the address is permitted; deterministic Core and actuator checks do.
+It requires engine 0.62.0 and container plugin 0.7.1, has NOTICE priority, emits
+the exact twelve pinned output fields, and carries only the pinned tag.
 
-Configure Falco 0.44.1 JSON output with the exact fields above, modern eBPF, no response plugin, no Docker socket, read-only root filesystem, bounded output, and the dedicated adapter pipe/socket unavailable to protected workloads. Rule/config updates are manual and digest-pinned.
-
-- [ ] **Step 5: Implement bounded delivery and coverage**
-
-The adapter POSTs `/v1/events/falco` only over `/run/agmind-sais/observer-ingest/socket`. Use one in-flight request, a 2-second timeout, exponential retry capped at 5 seconds, and never overwrite the local bounded queue. Queue overflow drops the oldest routine observation, increments a counter, and sends one coalesced priority coverage event when connectivity returns.
-
-SIGTERM drains for at most 5 seconds and emits `falco_adapter_stop`. Startup emits `falco_adapter_start`; parse rejection records the raw hash and reason code, not raw data.
-
-- [ ] **Step 6: Run adapter tests and the pinned rule syntax test**
-
-Run:
+- [ ] **Step 7: Run the focused gate**
 
 ```bash
-uv run --frozen pytest -q core/tests/falco_adapter
-docker run --rm \
-  -v "$PWD/deploy/falco:/etc/falco:ro" \
-  falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b \
-  falco --validate /etc/falco/rules.d/agmind-pcc.yaml
+make sensor
 ```
 
-Expected: Python tests pass and Falco prints successful rule validation. This validates syntax only; Task 15 validates real Linux output fields.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add core/agmind_immune/falco_adapter core/tests/falco_adapter \
-  contracts/v1/falco-connect.schema.json contracts/fixtures/v1/falco \
-  deploy/falco
-git commit -m "feat: add pinned Falco event pipeline"
-```
+The target checks formatting/lint/types, focused Python and Go Task 4
+contracts/routes/runtime plus the narrow shared-contract regression, and cached
+pinned Falco syntax with `--pull=never`, `--network none`,
+`-o json_output=false`, and the exact mounted config. The gate rejects emitted
+configuration-schema failures even when Falco returns zero, requires the fixed
+positive `/etc/falco/falco.yaml | schema validation: ok` marker, and requires
+the exact custom-rule `: Ok` result. A nonzero Falco process status is
+propagated explicitly before output checks. Task 15 validates real Linux field
+values.
 
 ### Task 5: Tamper-Evident Evidence Segments and Rebuildable Projection
 
@@ -1412,6 +1496,32 @@ Never acknowledge observer delivery before step 9. Projection failure after the 
 
 A lower sequence is accepted only when it is an identical already-indexed event. A different payload for an existing ID, broken key transition, or unexplained epoch/sequence rollback persists mutation read-only state.
 
+Falco adapter delivery is at-least-once except for a positive heartbeat lease
+discarded locally after its 15-second monotonic transport expiry. For every
+non-expired item, an observer response timeout can occur after durable append,
+and the retry can therefore receive a new signed envelope sequence. After
+signature/sequence verification and durable evidence append, but before
+projection or candidate creation, deduplicate `falco_connect` by the
+exact tuple `(source_id,event_type,source_payload_hash)`. The payload hash
+remains the exact Falco raw-body SHA-256. Deduplicate coverage transitions by
+`(source_id,event_type,normalized_fields_sha256,source_payload_hash)`, so an
+identical transport retry is idempotent while recurring transitions with
+different timestamps/counts do not collide. Retain all signed envelopes as
+evidence, project an identical observation/transition once, and never create a
+second candidate for a duplicate connect payload.
+
+Coverage state is externally fail-closed. For the latest signed
+`falco_heartbeat_lease`, let `opened_at` be its signed normalized coverage
+field and `ingest_time` its signed observer-envelope receipt. No mutation is
+ready unless both `0 <= ingest_time - opened_at <= 15 seconds` and
+`0 <= decision_time - opened_at <= 15 seconds`, and that lease `opened_at` is
+strictly newer than the latest signed `falco_adapter_stop.opened_at`. Any
+future-dated or late lease blocks readiness. Use both signed times for these
+checks, never the Falco sensor event timestamp. A stale lease covers an adapter
+crash; a stop blocks immediately until a later fully valid heartbeat lease.
+`falco_adapter_start` alone never grants readiness, and the ordinary
+no-open-critical-gap gates still apply.
+
 - [ ] **Step 4: Implement segment rotation, manifests, and chain verification**
 
 Manifest fields are:
@@ -1456,6 +1566,14 @@ PRAGMA busy_timeout=5000;
 
 All projection reducers are pure functions of the ordered verified evidence stream. Order by `(ingest_time, host_id, boot_id, source_sequence, event_id)` only after signature/sequence validation; never order action TTL by wall clock. Rebuild creates a new database, validates its snapshot hash/counts, then atomically swaps it into place.
 
+The projection stores separate unique sensor-source keys: `falco_connect` uses
+`(source_id,event_type,source_payload_hash)`, while coverage uses
+`(source_id,event_type,normalized_fields_sha256,source_payload_hash)`. Check
+the applicable key before any reducer or candidate builder. Rebuild applies
+the identical event-type-specific rule, so retries with distinct envelope
+IDs/sequences reproduce one projection transition and at most one candidate,
+without collapsing recurring coverage transitions.
+
 `python -m agmind_immune.replay verify <evidence-dir>` returns non-zero for a bad segment/signature/manifest/action-chain reference. `rebuild` creates only SQLite and never mutates source segments.
 
 - [ ] **Step 6: Implement retention with signed tombstone before deletion**
@@ -1471,6 +1589,18 @@ Tests must establish:
 - valid signature before append;
 - invalid signature leaves no record;
 - identical duplicate is idempotent;
+- distinct signed `falco_connect` envelopes with the same
+  `(source_id,event_type,source_payload_hash)` remain in evidence but are
+  deduplicated before projection/candidate creation;
+- coverage transport retries with the same
+  `(source_id,event_type,normalized_fields_sha256,source_payload_hash)` are
+  idempotent, while recurring transitions with changed normalized timestamps or
+  counts remain distinct;
+- startup without a lease; negative or greater-than-15-second
+  `ingest_time - opened_at`; negative or greater-than-15-second
+  `decision_time - opened_at`; and a lease whose `opened_at` is not strictly
+  newer than the latest adapter-stop `opened_at` all keep mutation readiness
+  false;
 - conflicting duplicate is corruption/read-only;
 - torn final frame repairs with explicit record;
 - middle corruption blocks mutation;

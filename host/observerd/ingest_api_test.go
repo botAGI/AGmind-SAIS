@@ -21,16 +21,24 @@ func falcoIngestFixture() contracts.FalcoConnectV1 {
 	untrustedImageID := "sha256:" + strings.Repeat("9", 64)
 	untrustedSpec := strings.Repeat("8", 64)
 	untrustedRevision := uint64(999)
+	prefix := inventoryTestIDOne[:12]
+	procName := "curl"
+	procExePath := "/usr/bin/curl"
+	procParentName := "sh"
+	destinationIPv4 := "1.1.1.1"
+	destinationPort := uint16(443)
+	l4Protocol := "tcp"
 	return contracts.FalcoConnectV1{
 		DetectorRule:           "AGmind PCC Suspicious Process Outbound Connect",
 		DetectorRuleVersion:    "agmind-pcc-rules-v1",
 		FalcoVersion:           "0.44.1",
+		EventTime:              "2026-07-27T12:00:00.123456789Z",
 		EvtType:                "connect",
 		EvtRawres:              &rawres,
 		EvtRes:                 "SUCCESS",
 		SuccessfulConnect:      true,
 		InvestigationOnly:      true,
-		FalcoContainerIDPrefix: inventoryTestIDOne[:12],
+		FalcoContainerIDPrefix: &prefix,
 		FalcoContainerFullID:   &suppliedFullID,
 		FalcoContainerStartTS:  "2026-07-27T12:00:00.123456789Z",
 		DockerContainerID:      &untrustedDockerID,
@@ -41,12 +49,12 @@ func falcoIngestFixture() contracts.FalcoConnectV1 {
 		},
 		ImmutableSpecSHA256:   &untrustedSpec,
 		InventoryRevision:     &untrustedRevision,
-		ProcName:              "curl",
-		ProcExePath:           "/usr/bin/curl",
-		ProcParentName:        "sh",
-		DestinationIPv4:       "1.1.1.1",
-		DestinationPort:       443,
-		L4Protocol:            "tcp",
+		ProcName:              &procName,
+		ProcExePath:           &procExePath,
+		ProcParentName:        &procParentName,
+		DestinationIPv4:       &destinationIPv4,
+		DestinationPort:       &destinationPort,
+		L4Protocol:            &l4Protocol,
 		MissingRequiredFields: []string{},
 		RawEventSHA256:        strings.Repeat("d", 64),
 	}
@@ -157,7 +165,7 @@ func TestIngestFalcoFullIDMismatchIsSignedInvestigationOnlyWithoutAuthority(
 		[]string{"docker_identity_mismatch"},
 	) || !reflect.DeepEqual(
 		got.MissingRequiredFields,
-		[]string{"docker_container_id"},
+		[]string{},
 	) {
 		t.Fatalf(
 			"mismatch evidence flags=%v missing=%v",

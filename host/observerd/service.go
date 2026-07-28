@@ -215,28 +215,6 @@ func falcoResolutionCoverage(err error) string {
 	}
 }
 
-func falcoMissingWithoutDockerAuthority(fields []string) []string {
-	result := make([]string, 0, len(fields))
-	for _, field := range fields {
-		switch field {
-		case "docker_container_id",
-			"docker_started_at",
-			"image_id",
-			"immutable_spec_sha256",
-			"inventory_revision":
-			continue
-		default:
-			result = append(result, field)
-		}
-	}
-	return normalizeSortedUnique(result)
-}
-
-func falcoAddMissing(fields []string, field string) []string {
-	result := append(append([]string{}, fields...), field)
-	return normalizeSortedUnique(result)
-}
-
 func falcoNormalizedFields(
 	event contracts.FalcoConnectV1,
 ) (map[string]any, error) {
@@ -279,18 +257,20 @@ func (service *Service) IngestFalco(
 	normalized.RepoDigests = []string{}
 	normalized.ImmutableSpecSHA256 = nil
 	normalized.InventoryRevision = nil
-	normalized.MissingRequiredFields = falcoMissingWithoutDockerAuthority(
+	normalized.MissingRequiredFields = normalizeSortedUnique(
 		input.MissingRequiredFields,
 	)
 
 	var identity ContainerIdentityV1
 	var resolutionErr error
-	if service.daemon.state == nil ||
+	if input.FalcoContainerIDPrefix == nil {
+		resolutionErr = ErrContainerNotFound
+	} else if service.daemon.state == nil ||
 		service.daemon.state.Snapshot().ReconcileRequired {
 		resolutionErr = ErrInventoryReconcileRequired
 	} else {
 		identity, resolutionErr = service.inventory.ResolvePrefix(
-			input.FalcoContainerIDPrefix,
+			*input.FalcoContainerIDPrefix,
 		)
 	}
 	if resolutionErr == nil &&
@@ -301,8 +281,12 @@ func (service *Service) IngestFalco(
 
 	generation := service.inventory.Generation()
 	coverageFlags := []string{}
+	eventTime, err := time.Parse(time.RFC3339Nano, input.EventTime)
+	if err != nil {
+		return contracts.EventEnvelopeV1{}, err
+	}
 	metadata := EventMetadata{
-		EventTime:           service.now().UTC(),
+		EventTime:           eventTime.UTC(),
 		InventoryGeneration: generation,
 		RedactionFlags:      []string{},
 		SourcePayloadHash:   input.RawEventSHA256,
@@ -327,10 +311,6 @@ func (service *Service) IngestFalco(
 		metadata.InventoryGeneration = identity.InventoryGeneration
 		metadata.InventoryRevision = &revision
 	} else {
-		normalized.MissingRequiredFields = falcoAddMissing(
-			normalized.MissingRequiredFields,
-			"docker_container_id",
-		)
 		coverageFlags = []string{falcoResolutionCoverage(resolutionErr)}
 	}
 	normalized.InvestigationOnly = !normalized.SuccessfulConnect ||

@@ -7,19 +7,12 @@
     "detector_rule",
     "detector_rule_version",
     "falco_version",
+    "event_time",
     "evt_type",
     "evt_res",
     "successful_connect",
     "investigation_only",
-    "falco_container_id_prefix",
-    "falco_container_start_ts",
     "repo_digests",
-    "proc_name",
-    "proc_exe_path",
-    "proc_parent_name",
-    "destination_ipv4",
-    "destination_port",
-    "l4_protocol",
     "missing_required_fields",
     "raw_event_sha256"
   ],
@@ -32,6 +25,9 @@
     },
     "falco_version": {
       "$ref": "#/$defs/ascii64"
+    },
+    "event_time": {
+      "$ref": "#/$defs/timestamp"
     },
     "evt_type": {
       "type": "string",
@@ -111,10 +107,19 @@
     },
     "missing_required_fields": {
       "type": "array",
-      "maxItems": 32,
+      "maxItems": 8,
       "uniqueItems": true,
       "items": {
-        "$ref": "#/$defs/ascii64"
+        "enum": [
+          "destination_ipv4",
+          "destination_port",
+          "falco_container_id_prefix",
+          "falco_container_start_ts",
+          "l4_protocol",
+          "proc_exe_path",
+          "proc_name",
+          "proc_parent_name"
+        ]
       }
     },
     "raw_event_sha256": {
@@ -135,11 +140,19 @@
       },
       "then": {
         "required": [
+          "destination_ipv4",
+          "destination_port",
           "docker_container_id",
           "docker_started_at",
+          "falco_container_id_prefix",
+          "falco_container_start_ts",
           "image_id",
           "immutable_spec_sha256",
-          "inventory_revision"
+          "inventory_revision",
+          "l4_protocol",
+          "proc_exe_path",
+          "proc_name",
+          "proc_parent_name"
         ],
         "properties": {
           "successful_connect": {
@@ -208,9 +221,313 @@
           }
         }
       ]
+    },
+    {
+      "$ref": "#/$defs/accountDestinationIPv4"
+    },
+    {
+      "$ref": "#/$defs/accountDestinationPort"
+    },
+    {
+      "$ref": "#/$defs/accountFalcoContainerIDPrefix"
+    },
+    {
+      "$ref": "#/$defs/accountFalcoContainerStartTS"
+    },
+    {
+      "$ref": "#/$defs/accountL4Protocol"
+    },
+    {
+      "$ref": "#/$defs/accountProcExePath"
+    },
+    {
+      "$ref": "#/$defs/accountProcName"
+    },
+    {
+      "$ref": "#/$defs/accountProcParentName"
     }
   ],
   "$defs": {
+    "accountDestinationIPv4": {
+      "oneOf": [
+        {
+          "required": [
+            "destination_ipv4"
+          ],
+          "properties": {
+            "missing_required_fields": {
+              "not": {
+                "contains": {
+                  "const": "destination_ipv4"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "destination_ipv4"
+            ]
+          },
+          "properties": {
+            "investigation_only": {
+              "const": true
+            },
+            "missing_required_fields": {
+              "contains": {
+                "const": "destination_ipv4"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "accountDestinationPort": {
+      "oneOf": [
+        {
+          "required": [
+            "destination_port"
+          ],
+          "properties": {
+            "missing_required_fields": {
+              "not": {
+                "contains": {
+                  "const": "destination_port"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "destination_port"
+            ]
+          },
+          "properties": {
+            "investigation_only": {
+              "const": true
+            },
+            "missing_required_fields": {
+              "contains": {
+                "const": "destination_port"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "accountFalcoContainerIDPrefix": {
+      "oneOf": [
+        {
+          "required": [
+            "falco_container_id_prefix"
+          ],
+          "properties": {
+            "missing_required_fields": {
+              "not": {
+                "contains": {
+                  "const": "falco_container_id_prefix"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "falco_container_id_prefix"
+            ]
+          },
+          "properties": {
+            "investigation_only": {
+              "const": true
+            },
+            "missing_required_fields": {
+              "contains": {
+                "const": "falco_container_id_prefix"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "accountFalcoContainerStartTS": {
+      "oneOf": [
+        {
+          "required": [
+            "falco_container_start_ts"
+          ],
+          "properties": {
+            "missing_required_fields": {
+              "not": {
+                "contains": {
+                  "const": "falco_container_start_ts"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "falco_container_start_ts"
+            ]
+          },
+          "properties": {
+            "investigation_only": {
+              "const": true
+            },
+            "missing_required_fields": {
+              "contains": {
+                "const": "falco_container_start_ts"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "accountL4Protocol": {
+      "oneOf": [
+        {
+          "required": [
+            "l4_protocol"
+          ],
+          "properties": {
+            "missing_required_fields": {
+              "not": {
+                "contains": {
+                  "const": "l4_protocol"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "l4_protocol"
+            ]
+          },
+          "properties": {
+            "investigation_only": {
+              "const": true
+            },
+            "missing_required_fields": {
+              "contains": {
+                "const": "l4_protocol"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "accountProcExePath": {
+      "oneOf": [
+        {
+          "required": [
+            "proc_exe_path"
+          ],
+          "properties": {
+            "missing_required_fields": {
+              "not": {
+                "contains": {
+                  "const": "proc_exe_path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "proc_exe_path"
+            ]
+          },
+          "properties": {
+            "investigation_only": {
+              "const": true
+            },
+            "missing_required_fields": {
+              "contains": {
+                "const": "proc_exe_path"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "accountProcName": {
+      "oneOf": [
+        {
+          "required": [
+            "proc_name"
+          ],
+          "properties": {
+            "missing_required_fields": {
+              "not": {
+                "contains": {
+                  "const": "proc_name"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "proc_name"
+            ]
+          },
+          "properties": {
+            "investigation_only": {
+              "const": true
+            },
+            "missing_required_fields": {
+              "contains": {
+                "const": "proc_name"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "accountProcParentName": {
+      "oneOf": [
+        {
+          "required": [
+            "proc_parent_name"
+          ],
+          "properties": {
+            "missing_required_fields": {
+              "not": {
+                "contains": {
+                  "const": "proc_parent_name"
+                }
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "proc_parent_name"
+            ]
+          },
+          "properties": {
+            "investigation_only": {
+              "const": true
+            },
+            "missing_required_fields": {
+              "contains": {
+                "const": "proc_parent_name"
+              }
+            }
+          }
+        }
+      ]
+    },
     "ascii64": {
       "type": "string",
       "minLength": 1,

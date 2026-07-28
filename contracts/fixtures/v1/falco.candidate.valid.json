@@ -2,6 +2,7 @@
   "detector_rule": "AGmind PCC Suspicious Process Outbound Connect",
   "detector_rule_version": "agmind-pcc-rules-v1",
   "falco_version": "0.44.1",
+  "event_time": "2026-07-27T12:00:00.123456789Z",
   "evt_type": "connect",
   "evt_rawres": 0,
   "evt_res": "SUCCESS",

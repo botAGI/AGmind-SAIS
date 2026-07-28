@@ -257,7 +257,12 @@ Deployment requirements:
 - read-only root filesystem except bounded runtime/output storage;
 - explicit CPU, memory, and output-rate limits.
 
-Falco sends JSON only to `falco-adapter` over a dedicated internal sensor channel unavailable to protected workloads. Loss, backpressure, restart, or parse rejection on this channel creates a coverage-gap event and disables M1 candidate admission for the affected interval.
+Falco sends one JSON body per internal HTTP POST to exact adapter route
+`/v1/falco/raw` over a dedicated sensor network unavailable to protected
+workloads. The adapter binds `0.0.0.0:8765` only. Loss, backpressure, restart,
+parse rejection, heartbeat timeout, detector hash mismatch, or increasing Falco
+drop counters creates bounded adapter-owned coverage and disables M1 candidate
+admission for the affected interval.
 
 ### 6.3 `falco-adapter`
 
@@ -265,13 +270,30 @@ Implementation target: unprivileged process/container.
 
 Responsibilities:
 
-- consume version-pinned Falco JSON output;
+- consume version-pinned Falco JSON output as one bounded HTTP body;
 - accept only selected stable rule/event fields;
-- require `container.id`, `container.start_ts`, `fd.rip`, `fd.rport`, `fd.l4proto`, `evt.type`, result fields, and process identity fields for the M1 candidate rule;
+- preserve top-level Falco `time` as normalized UTC `event_time`;
+- require `container.id`, `container.start_ts`, `fd.rip`, `fd.rport`,
+  `fd.l4proto`, `evt.type`, result fields, and process identity fields only for
+  candidate capability; null/`<NA>` sensor facts become omitted
+  investigation-only fields with exact normalized missing names;
 - include `container.full_id` when Falco enrichment provides it;
 - map events to the canonical schema;
 - redact command arguments and other attacker-controlled strings before AI use;
-- submit bounded canonical payloads to `agmind-observerd` for source wrapping.
+- submit bounded canonical payloads to `agmind-observerd` for source wrapping;
+- deliver every non-expired item at least once through one HTTPX UDS worker
+  with exactly one inflight request, a 1,024-item routine queue, separate
+  coalesced priority coverage, two-second requests, and retry backoff capped at
+  five seconds;
+- validate the exact five-second Falco metrics heartbeat, pinned version,
+  modern-bpf engine, config/rule hashes, and monotonic output/kernel drop
+  counters.
+
+Connect documents reject every float, including ignored fields. The exact
+internal metrics rule alone may contain finite bounded decimal tokens in
+discarded fields; selected heartbeat identity, hashes, and counters remain
+strict strings and integers. A connect is accepted only with top-level
+priority `Notice` and the exact sole tag `agmind-pcc-rules-v1`.
 
 M1 uses a curated minimal Falco rule subset. Rule updates are pinned and never automatic.
 
@@ -286,7 +308,53 @@ Falco `container.start_ts` is retained only as sensor metadata; it is not compar
 - `proc.name`, executable path, and parent;
 - `fd.rip`, `fd.rport`, and `fd.l4proto`.
 
-Missing fields create an investigation-only event. Falco and its adapter do not receive the Docker socket.
+The adapter always submits investigation-only events without Docker authority;
+only observerd may resolve authority and clear the flag. Missing fields create
+an investigation-only event. `missing_required_fields` contains only omitted
+sensor facts; failed Docker resolution is represented by observer coverage
+flags, never by adding `docker_container_id` to that list. Falco and its adapter
+do not receive the Docker socket. The sensor UDS exposes exact Falco and
+Falco-coverage POST routes, never a generic coverage route; observerd derives
+coverage component/severity/flags.
+
+The adapter is externally fail-closed across process lifecycle. Before
+enabling intake it emits a closed INFO start point and opens a CRITICAL
+awaiting-initial-heartbeat gap. Every fully valid heartbeat emits a closed INFO
+`falco_heartbeat_lease`; stop is a closed CRITICAL point. Coverage/lease
+timestamps use adapter wall receipt time, while a monotonic receipt clock alone
+detects silence beyond 15 seconds. Counter rollback requires a second
+identity/hash-exact sample monotonic against a pending reset baseline before
+the mismatch closes or a lease renews. Parse rejection and each Falco drop
+counter form cumulative open-to-close CRITICAL intervals.
+
+Adapter transport is at-least-once except for expired positive heartbeat
+leases. Only `falco_heartbeat_lease` delivery items expire locally, exactly 15
+monotonic seconds after admission; the single worker checks before every post
+or retry, discards an expired lease without recovery, and ticks the watchdog
+on every retry cycle. Connect events and negative coverage never expire. Any
+delivery-failure interval remains open and its priority open/close evidence is
+delivered before readiness can reopen. The worker reads the common shutdown
+deadline dynamically on every retry and after queue waits, while the outer
+shutdown wait cancels an already-active request at that same deadline.
+
+For non-expired items, if an observer response times out after durable append,
+retry can create a second signed envelope sequence for the same raw payload.
+Core retains both envelopes as evidence. It deduplicates
+`falco_connect` by `(source_id,event_type,source_payload_hash)` and coverage by
+`(source_id,event_type,normalized_fields_sha256,source_payload_hash)` before
+projection/candidate creation. The exact raw payload hash remains in both
+keys; the normalized hash prevents recurring coverage transitions from
+colliding while identical transport retries remain idempotent.
+
+Mutation readiness additionally requires the latest signed
+`falco_heartbeat_lease` normalized `opened_at` and signed observer-envelope
+`ingest_time` to satisfy both
+`0 <= ingest_time - opened_at <= 15 seconds` and
+`0 <= decision_time - opened_at <= 15 seconds`. Its `opened_at` must be
+strictly newer than the latest signed `falco_adapter_stop.opened_at`; any
+future-dated or late timestamp blocks readiness. Start alone never grants
+readiness, stop blocks immediately, and a stale lease fails closed after an
+unclean adapter exit.
 
 ### 6.4 `agmind-core`
 

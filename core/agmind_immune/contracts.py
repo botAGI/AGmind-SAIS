@@ -28,6 +28,16 @@ MAX_UINT64 = 2**64 - 1
 MIN_INT64 = -(2**63)
 MAX_INT64 = 2**63 - 1
 SUCCESS_RESULTS = {"EINPROGRESS", "EINPROGRESS(115)"}
+FALCO_SENSOR_REQUIRED_FIELDS = {
+    "destination_ipv4",
+    "destination_port",
+    "falco_container_id_prefix",
+    "falco_container_start_ts",
+    "l4_protocol",
+    "proc_exe_path",
+    "proc_name",
+    "proc_parent_name",
+}
 MAX_JSON_NESTING_DEPTH = 64
 ACTION_STATES = {
     "PROPOSED",
@@ -397,42 +407,45 @@ class FalcoConnectV1(ContractModel):
     detector_rule: str
     detector_rule_version: str
     falco_version: str
+    event_time: str
     evt_type: Literal["connect"]
     evt_rawres: int | None = Field(default=None, ge=MIN_INT64, le=MAX_INT64)
     evt_res: str
     successful_connect: bool
     investigation_only: bool
-    falco_container_id_prefix: str
+    falco_container_id_prefix: str | None = None
     falco_container_full_id: str | None = None
-    falco_container_start_ts: int | str
+    falco_container_start_ts: int | str | None = None
     docker_container_id: str | None = None
     docker_started_at: str | None = None
     image_id: str | None = None
     repo_digests: list[str] = Field(max_length=16)
     immutable_spec_sha256: str | None = None
     inventory_revision: int | None = Field(default=None, ge=0, le=MAX_UINT64)
-    proc_name: str
-    proc_exe_path: str
-    proc_parent_name: str
-    destination_ipv4: str
-    destination_port: int = Field(ge=1, le=65_535)
-    l4_protocol: str
+    proc_name: str | None = None
+    proc_exe_path: str | None = None
+    proc_parent_name: str | None = None
+    destination_ipv4: str | None = None
+    destination_port: int | None = Field(default=None, ge=1, le=65_535)
+    l4_protocol: str | None = None
     missing_required_fields: list[str] = Field(max_length=32)
     raw_event_sha256: str
 
     @field_validator("detector_rule", "proc_name", "proc_exe_path", "proc_parent_name")
     @classmethod
-    def safe_fragment(cls, value: str, info: Any) -> str:
-        return _utf8(value, info.field_name, 512)
+    def safe_fragment(cls, value: str | None, info: Any) -> str | None:
+        return None if value is None else _utf8(value, info.field_name, 512)
 
     @field_validator("detector_rule_version", "falco_version", "evt_res", "l4_protocol")
     @classmethod
-    def enum_ascii(cls, value: str, info: Any) -> str:
-        return _ascii(value, info.field_name)
+    def enum_ascii(cls, value: str | None, info: Any) -> str | None:
+        return None if value is None else _ascii(value, info.field_name)
 
     @field_validator("falco_container_id_prefix")
     @classmethod
-    def prefix_is_valid(cls, value: str) -> str:
+    def prefix_is_valid(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not re.fullmatch(r"[0-9a-f]{12,64}", value):
             raise ValueError("invalid Falco container ID prefix")
         return value
@@ -448,6 +461,11 @@ class FalcoConnectV1(ContractModel):
     @classmethod
     def docker_time_is_valid(cls, value: str | None) -> str | None:
         return None if value is None else _valid_timestamp(value)
+
+    @field_validator("event_time")
+    @classmethod
+    def event_time_is_valid(cls, value: str) -> str:
+        return _valid_timestamp(value)
 
     @field_validator("image_id")
     @classmethod
@@ -465,8 +483,8 @@ class FalcoConnectV1(ContractModel):
 
     @field_validator("destination_ipv4")
     @classmethod
-    def destination_is_valid(cls, value: str) -> str:
-        return _valid_ipv4(value)
+    def destination_is_valid(cls, value: str | None) -> str | None:
+        return None if value is None else _valid_ipv4(value)
 
     @field_validator("repo_digests")
     @classmethod
@@ -486,7 +504,7 @@ class FalcoConnectV1(ContractModel):
         if isinstance(self.falco_container_start_ts, int):
             if not MIN_INT64 <= self.falco_container_start_ts <= MAX_INT64:
                 raise ValueError("falco_container_start_ts integer exceeds int64")
-        else:
+        elif isinstance(self.falco_container_start_ts, str):
             _ascii(self.falco_container_start_ts, "falco_container_start_ts")
         completed_success = (
             self.evt_res == "SUCCESS"
@@ -507,6 +525,24 @@ class FalcoConnectV1(ContractModel):
         computed_success = completed_success or nonblocking_success
         if self.successful_connect != computed_success:
             raise ValueError("successful_connect contradicts Falco result")
+        sensor_facts = {
+            "falco_container_id_prefix": self.falco_container_id_prefix,
+            "falco_container_start_ts": self.falco_container_start_ts,
+            "proc_name": self.proc_name,
+            "proc_exe_path": self.proc_exe_path,
+            "proc_parent_name": self.proc_parent_name,
+            "destination_ipv4": self.destination_ipv4,
+            "destination_port": self.destination_port,
+            "l4_protocol": self.l4_protocol,
+        }
+        omitted_sensor = {name for name, value in sensor_facts.items() if value is None}
+        reported_missing = set(self.missing_required_fields)
+        if reported_missing - FALCO_SENSOR_REQUIRED_FIELDS:
+            raise ValueError("unknown missing_required_fields entry")
+        if reported_missing & FALCO_SENSOR_REQUIRED_FIELDS != omitted_sensor:
+            raise ValueError("missing_required_fields does not match sensor omissions")
+        if omitted_sensor and not self.investigation_only:
+            raise ValueError("sensor omissions must be investigation-only")
         authoritative = (
             self.docker_container_id,
             self.docker_started_at,
@@ -515,7 +551,11 @@ class FalcoConnectV1(ContractModel):
             self.inventory_revision,
         )
         if not self.investigation_only:
-            if not self.successful_connect or any(item is None for item in authoritative):
+            if (
+                not self.successful_connect
+                or omitted_sensor
+                or any(item is None for item in authoritative)
+            ):
                 raise ValueError("candidate-capable event lacks authoritative identity")
             if self.missing_required_fields:
                 raise ValueError("candidate-capable event cannot report missing fields")

@@ -39,26 +39,27 @@ type FalcoConnectV1 struct {
 	DetectorRule           string   `json:"detector_rule"`
 	DetectorRuleVersion    string   `json:"detector_rule_version"`
 	FalcoVersion           string   `json:"falco_version"`
+	EventTime              string   `json:"event_time"`
 	EvtType                string   `json:"evt_type"`
 	EvtRawres              *int64   `json:"evt_rawres,omitempty"`
 	EvtRes                 string   `json:"evt_res"`
 	SuccessfulConnect      bool     `json:"successful_connect"`
 	InvestigationOnly      bool     `json:"investigation_only"`
-	FalcoContainerIDPrefix string   `json:"falco_container_id_prefix"`
+	FalcoContainerIDPrefix *string  `json:"falco_container_id_prefix,omitempty"`
 	FalcoContainerFullID   *string  `json:"falco_container_full_id,omitempty"`
-	FalcoContainerStartTS  any      `json:"falco_container_start_ts"`
+	FalcoContainerStartTS  any      `json:"falco_container_start_ts,omitempty"`
 	DockerContainerID      *string  `json:"docker_container_id,omitempty"`
 	DockerStartedAt        *string  `json:"docker_started_at,omitempty"`
 	ImageID                *string  `json:"image_id,omitempty"`
 	RepoDigests            []string `json:"repo_digests"`
 	ImmutableSpecSHA256    *string  `json:"immutable_spec_sha256,omitempty"`
 	InventoryRevision      *uint64  `json:"inventory_revision,omitempty"`
-	ProcName               string   `json:"proc_name"`
-	ProcExePath            string   `json:"proc_exe_path"`
-	ProcParentName         string   `json:"proc_parent_name"`
-	DestinationIPv4        string   `json:"destination_ipv4"`
-	DestinationPort        uint16   `json:"destination_port"`
-	L4Protocol             string   `json:"l4_protocol"`
+	ProcName               *string  `json:"proc_name,omitempty"`
+	ProcExePath            *string  `json:"proc_exe_path,omitempty"`
+	ProcParentName         *string  `json:"proc_parent_name,omitempty"`
+	DestinationIPv4        *string  `json:"destination_ipv4,omitempty"`
+	DestinationPort        *uint16  `json:"destination_port,omitempty"`
+	L4Protocol             *string  `json:"l4_protocol,omitempty"`
 	MissingRequiredFields  []string `json:"missing_required_fields"`
 	RawEventSHA256         string   `json:"raw_event_sha256"`
 }

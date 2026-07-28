@@ -1,0 +1,43 @@
+- required_engine_version: 0.62.0
+
+- required_plugin_versions:
+    - name: container
+      version: 0.7.1
+
+- list: agmind_pcc_suspicious_processes
+  items:
+    - sh
+    - bash
+    - dash
+    - zsh
+    - curl
+    - wget
+    - nc
+    - ncat
+    - socat
+    - busybox
+
+- rule: AGmind PCC Suspicious Process Outbound Connect
+  desc: Observe selected container processes attempting an outbound IPv4 connect
+  condition: >-
+    evt.type=connect
+    and container.id != host
+    and proc.name in (agmind_pcc_suspicious_processes)
+    and ((fd.typechar=4 and fd.rip != "0.0.0.0") or evt.rawres < 0)
+  output: >-
+    evt.type=%evt.type
+    evt.rawres=%evt.rawres
+    evt.res=%evt.res
+    container.id=%container.id
+    container.full_id=%container.full_id
+    container.start_ts=%container.start_ts
+    proc.name=%proc.name
+    proc.exepath=%proc.exepath
+    proc.pname=%proc.pname
+    fd.rip=%fd.rip
+    fd.rport=%fd.rport
+    fd.l4proto=%fd.l4proto
+  priority: NOTICE
+  source: syscall
+  tags:
+    - agmind-pcc-rules-v1

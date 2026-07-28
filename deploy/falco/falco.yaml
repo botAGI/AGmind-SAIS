@@ -1,0 +1,106 @@
+config_files: []
+watch_config_files: false
+
+rules_files:
+  - /etc/falco/rules.d/agmind-pcc.yaml
+
+engine:
+  kind: modern_ebpf
+  modern_ebpf:
+    cpus_for_each_buffer: 2
+    buf_size_preset: 4
+    drop_failed_exit: false
+    disable_iterators: false
+
+load_plugins:
+  - container
+
+plugins:
+  - name: container
+    library_path: /usr/share/falco/plugins/libcontainer.so
+    init_config:
+      label_max_len: 100
+      with_size: false
+      engines:
+        docker:
+          enabled: true
+          sockets:
+            - /run/agmind-sais/no-container-runtime/docker.sock
+        podman:
+          enabled: true
+          sockets:
+            - /run/agmind-sais/no-container-runtime/podman.sock
+        containerd:
+          enabled: true
+          sockets:
+            - /run/agmind-sais/no-container-runtime/containerd.sock
+        cri:
+          enabled: true
+          sockets:
+            - /run/agmind-sais/no-container-runtime/cri.sock
+        lxc:
+          enabled: false
+        libvirt_lxc:
+          enabled: false
+        bpm:
+          enabled: false
+        static:
+          enabled: false
+
+time_format_iso_8601: true
+priority: informational
+json_output: true
+json_include_output_property: false
+json_include_message_property: false
+json_include_output_fields_property: true
+json_include_tags_property: true
+buffered_outputs: false
+output_timeout: 2000
+outputs_queue:
+  capacity: 1024
+append_output: []
+
+stdout_output:
+  enabled: false
+syslog_output:
+  enabled: false
+file_output:
+  enabled: false
+program_output:
+  enabled: false
+  keep_alive: false
+  program: /bin/false
+http_output:
+  enabled: true
+  url: http://falco-adapter:8765/v1/falco/raw
+  user_agent: agmind-sais-falco/0.44.1
+  insecure: false
+  keep_alive: true
+  max_consecutive_timeouts: 5
+
+metrics:
+  enabled: true
+  interval: 5s
+  output_rule: true
+  output_file: ""
+  rules_counters_enabled: false
+  resource_utilization_enabled: false
+  state_counters_enabled: false
+  kernel_event_counters_enabled: true
+  kernel_event_counters_per_cpu_enabled: false
+  kernel_iter_event_counters_enabled: false
+  libbpf_stats_enabled: false
+  plugins_metrics_enabled: false
+  jemalloc_stats_enabled: false
+  convert_memory_to_mb: true
+  include_empty_values: true
+
+webserver:
+  enabled: false
+
+log_stderr: true
+log_syslog: false
+log_level: info
+libs_logger:
+  enabled: true
+  severity: warning

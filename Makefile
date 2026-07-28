@@ -1,6 +1,6 @@
 include deploy/versions.env
 
-.PHONY: contracts observer fmt iana-check
+.PHONY: contracts observer sensor fmt iana-check
 
 UV_RUN = docker run --rm --mount "type=image,src=$(UV_IMAGE),dst=/uv-image" -v "$(PWD):/src" -w /src "$(PYTHON_IMAGE)" /uv-image/uv
 GO_RUN = docker run --rm -v "$(PWD):/src" -w /src -e GOFLAGS=-mod=readonly "$(GO_IMAGE)"
@@ -31,6 +31,23 @@ observer:
 	$(GO_RUN) sh -c 'CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go test -c -o /tmp/observerd-darwin.test ./host/observerd'
 	$(GO_RUN) sh -c 'CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/agmind-observerd-linux-amd64 ./host/observerd/cmd/agmind-observerd'
 	$(GO_RUN) sh -c 'CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/agmind-observerd-linux-arm64 ./host/observerd/cmd/agmind-observerd'
+
+sensor:
+	$(UV_RUN) lock --check --python "$(PYTHON_VERSION)"
+	$(UV_RUN) run --frozen ruff format --check core/agmind_immune/falco_adapter core/tests/falco_adapter
+	$(UV_RUN) run --frozen ruff check core/agmind_immune/falco_adapter core/tests/falco_adapter
+	$(UV_RUN) run --frozen mypy core/agmind_immune/falco_adapter
+	$(UV_RUN) run --frozen pytest -q core/tests/falco_adapter core/tests/test_contract_regressions.py::test_falco_schema_and_runtime_cover_candidate_investigation_and_hard_error
+	$(GO_RUN) go test ./internal/contracts ./host/observerd -run '^(TestTask4|TestIngestFalco|TestFalcoIngestHTTP|TestSharedContradictoryFalcoResultIsRejected|TestFalcoResultTupleMatrixIsExact|TestRetentionTombstoneRouteExistsOnlyOnPhysicalCoreSocket)'
+	@validation_log="$$(mktemp)"; \
+	trap 'rm -f "$$validation_log"' 0; \
+	validation_status=0; \
+	docker run --rm --pull=never --network none -v "$(PWD)/deploy/falco:/etc/falco:ro" --entrypoint /usr/bin/falco "$(FALCO_IMAGE)" -c /etc/falco/falco.yaml -o json_output=false --validate /etc/falco/rules.d/agmind-pcc.yaml >"$$validation_log" 2>&1 || validation_status=$$?; \
+	cat "$$validation_log"; \
+	if test "$$validation_status" -ne 0; then exit "$$validation_status"; fi; \
+	if grep -Eiq 'schema validation:[[:space:]]*failed|Validation of .* failed|Missing required property|Schema validation failed|\[FAILED\]' "$$validation_log"; then exit 1; fi; \
+	if ! sed 's/^[^[:space:]]*:[[:space:]]*//' "$$validation_log" | grep -Fxq '/etc/falco/falco.yaml | schema validation: ok'; then exit 1; fi; \
+	grep -Fxq '/etc/falco/rules.d/agmind-pcc.yaml: Ok' "$$validation_log"
 
 iana-check:
 	test "$$(shasum -a 256 contracts/v1/ipv4-special-use.csv | awk '{print $$1}')" = "e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73"

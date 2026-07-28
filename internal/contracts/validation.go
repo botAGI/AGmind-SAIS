@@ -237,15 +237,18 @@ func (event FalcoConnectV1) Validate() error {
 	if event.RepoDigests == nil || event.MissingRequiredFields == nil {
 		return fmt.Errorf("required Falco collections must not be nil")
 	}
-	if event.EvtType != "connect" ||
+	if !validUTC(event.EventTime) ||
+		event.EvtType != "connect" ||
 		!boundedUTF8(event.DetectorRule, 1, 512) ||
 		!boundedASCII(event.DetectorRuleVersion, 1, 64) ||
 		!boundedASCII(event.FalcoVersion, 1, 64) ||
-		!boundedASCII(event.EvtRes, 1, 64) ||
-		!boundedASCII(event.L4Protocol, 1, 64) {
+		!boundedASCII(event.EvtRes, 1, 64) {
 		return fmt.Errorf("invalid Falco identity or enum")
 	}
-	if !regexp.MustCompile(`^[0-9a-f]{12,64}$`).MatchString(event.FalcoContainerIDPrefix) {
+	if event.FalcoContainerIDPrefix != nil &&
+		!regexp.MustCompile(`^[0-9a-f]{12,64}$`).MatchString(
+			*event.FalcoContainerIDPrefix,
+		) {
 		return fmt.Errorf("invalid Falco container prefix")
 	}
 	for _, id := range []*string{event.FalcoContainerFullID, event.DockerContainerID} {
@@ -254,6 +257,7 @@ func (event FalcoConnectV1) Validate() error {
 		}
 	}
 	switch value := event.FalcoContainerStartTS.(type) {
+	case nil:
 	case string:
 		if !boundedASCII(value, 1, 64) {
 			return fmt.Errorf("invalid falco_container_start_ts")
@@ -278,14 +282,24 @@ func (event FalcoConnectV1) Validate() error {
 	if event.ImmutableSpecSHA256 != nil && !hex64.MatchString(*event.ImmutableSpecSHA256) {
 		return fmt.Errorf("invalid immutable_spec_sha256")
 	}
-	if !hex64.MatchString(event.RawEventSHA256) || !canonicalIPv4(event.DestinationIPv4) ||
-		event.DestinationPort == 0 || !validRepoDigests(event.RepoDigests) {
+	if !hex64.MatchString(event.RawEventSHA256) ||
+		event.DestinationIPv4 != nil && !canonicalIPv4(*event.DestinationIPv4) ||
+		event.DestinationPort != nil && *event.DestinationPort == 0 ||
+		!validRepoDigests(event.RepoDigests) {
 		return fmt.Errorf("invalid Falco destination or digest")
 	}
-	for _, value := range []string{event.ProcName, event.ProcExePath, event.ProcParentName} {
-		if !boundedUTF8(value, 1, 512) {
+	for _, value := range []*string{
+		event.ProcName,
+		event.ProcExePath,
+		event.ProcParentName,
+	} {
+		if value != nil && !boundedUTF8(*value, 1, 512) {
 			return fmt.Errorf("invalid process identity")
 		}
+	}
+	if event.L4Protocol != nil &&
+		!boundedASCII(*event.L4Protocol, 1, 64) {
+		return fmt.Errorf("invalid Falco protocol")
 	}
 	if len(event.MissingRequiredFields) > 32 || !sortedUnique(event.MissingRequiredFields) {
 		return fmt.Errorf("missing_required_fields must be bounded, unique, and sorted")
@@ -294,6 +308,36 @@ func (event FalcoConnectV1) Validate() error {
 		if !boundedASCII(field, 1, 64) {
 			return fmt.Errorf("invalid missing field")
 		}
+	}
+	sensorFacts := map[string]bool{
+		"falco_container_id_prefix": event.FalcoContainerIDPrefix != nil,
+		"falco_container_start_ts":  event.FalcoContainerStartTS != nil,
+		"proc_name":                 event.ProcName != nil,
+		"proc_exe_path":             event.ProcExePath != nil,
+		"proc_parent_name":          event.ProcParentName != nil,
+		"destination_ipv4":          event.DestinationIPv4 != nil,
+		"destination_port":          event.DestinationPort != nil,
+		"l4_protocol":               event.L4Protocol != nil,
+	}
+	missing := make(map[string]struct{}, len(event.MissingRequiredFields))
+	for _, field := range event.MissingRequiredFields {
+		if _, known := sensorFacts[field]; !known {
+			return fmt.Errorf("unknown missing_required_fields entry")
+		}
+		missing[field] = struct{}{}
+	}
+	sensorOmitted := false
+	for field, present := range sensorFacts {
+		_, reported := missing[field]
+		if present == reported {
+			return fmt.Errorf(
+				"missing_required_fields does not match sensor omissions",
+			)
+		}
+		sensorOmitted = sensorOmitted || !present
+	}
+	if sensorOmitted && !event.InvestigationOnly {
+		return fmt.Errorf("sensor omissions must be investigation-only")
 	}
 	completedSuccess := event.EvtRes == "SUCCESS" &&
 		event.EvtRawres != nil && *event.EvtRawres >= 0
@@ -318,7 +362,8 @@ func (event FalcoConnectV1) Validate() error {
 		return fmt.Errorf("successful_connect contradicts Falco result")
 	}
 	if !event.InvestigationOnly {
-		if !event.SuccessfulConnect || event.DockerContainerID == nil ||
+		if !event.SuccessfulConnect || sensorOmitted ||
+			event.DockerContainerID == nil ||
 			event.DockerStartedAt == nil || event.ImageID == nil ||
 			event.ImmutableSpecSHA256 == nil || event.InventoryRevision == nil ||
 			len(event.MissingRequiredFields) != 0 {

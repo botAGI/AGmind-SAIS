@@ -1,0 +1,24 @@
+{
+  "hostname": "sensor-host",
+  "output_fields": {
+    "container.full_id": "<NA>",
+    "container.id": null,
+    "container.start_ts": "<NA>",
+    "evt.rawres": -111,
+    "evt.res": "ECONNREFUSED",
+    "evt.type": "connect",
+    "fd.l4proto": "<NA>",
+    "fd.rip": null,
+    "fd.rport": null,
+    "proc.exepath": "<NA>",
+    "proc.name": null,
+    "proc.pname": "sh"
+  },
+  "priority": "Notice",
+  "rule": "AGmind PCC Suspicious Process Outbound Connect",
+  "source": "syscall",
+  "tags": [
+    "agmind-pcc-rules-v1"
+  ],
+  "time": "2026-07-27T12:00:03Z"
+}

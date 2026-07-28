@@ -1,0 +1,18 @@
+{
+  "hostname": "sensor-host",
+  "output": "Falco metrics snapshot",
+  "output_fields": {
+    "evt.source": "syscall",
+    "evt.time": 1785153605000000000,
+    "falco.outputs_queue_num_drops": 0,
+    "falco.sha256_config_file.falco_yaml": "1111111111111111111111111111111111111111111111111111111111111111",
+    "falco.sha256_rules_file.agmind_pcc_yaml": "2222222222222222222222222222222222222222222222222222222222222222",
+    "falco.version": "0.44.1",
+    "scap.engine_name": "modern_bpf",
+    "scap.n_drops": 0
+  },
+  "priority": "Informational",
+  "rule": "Falco internal: metrics snapshot",
+  "source": "internal",
+  "time": "2026-07-27T12:00:05Z"
+}
