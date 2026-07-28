@@ -1,0 +1,38 @@
+{
+  "full_container_id": "aaaaaaaaaaaa1111111111111111111111111111111111111111111111111111",
+  "docker_started_at": "2026-07-27T12:00:00Z",
+  "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "repo_digests": [
+    "example.invalid/app@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "example.invalid/app@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  ],
+  "immutable_spec_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "init_pid": 4242,
+  "network_mode": "bridge",
+  "network_driver": "bridge",
+  "privileged": false,
+  "configured_cap_add": [
+    "CHOWN",
+    "SETUID"
+  ],
+  "configured_cap_drop": [
+    "NET_RAW"
+  ],
+  "effective_cap_net_admin": false,
+  "running": true,
+  "inventory_generation": 1,
+  "inventory_revision": 1,
+  "observed_at": "2026-07-27T12:00:05Z",
+  "attached_networks": [
+    {
+      "network_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "driver": "bridge",
+      "subnet_cidrs": [
+        "172.18.0.0/16"
+      ],
+      "gateway_addresses": [
+        "172.18.0.1"
+      ]
+    }
+  ]
+}

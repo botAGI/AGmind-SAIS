@@ -499,6 +499,34 @@ func (store *StateStore) markAckRepair(reason string) error {
 	return store.replaceLocked(next)
 }
 
+func (store *StateStore) requireDockerReconcile() error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.state.ReconcileRequired {
+		return nil
+	}
+	next := cloneObserverState(store.state)
+	next.ReconcileRequired = true
+	// Readiness is a live-process safety fence first and a durability record
+	// second. A pre-rename persistence failure must never leave candidate
+	// admission open until the next monitor retry.
+	store.state = cloneObserverState(next)
+	return store.persistLocked(next)
+}
+
+func (store *StateStore) completeDockerReconcile() error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	next := cloneObserverState(store.state)
+	next.ReconcileRequired = next.MutationReadOnly ||
+		next.AckRepairPending ||
+		next.DropEventPending
+	if next.ReconcileRequired == store.state.ReconcileRequired {
+		return nil
+	}
+	return store.replaceLocked(next)
+}
+
 func (store *StateStore) clearRotationFence() error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()

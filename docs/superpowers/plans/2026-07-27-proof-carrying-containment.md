@@ -1063,9 +1063,11 @@ type DockerReader interface {
     ContainerInspect(context.Context, string, client.ContainerInspectOptions) (client.ContainerInspectResult, error)
     ImageInspect(context.Context, string, ...client.ImageInspectOption) (client.ImageInspectResult, error)
     NetworkInspect(context.Context, string, client.NetworkInspectOptions) (client.NetworkInspectResult, error)
-    Events(context.Context, client.EventsListOptions) client.EventsResult
+    Events(context.Context, client.EventsListOptions) (DockerEventStream, error)
 }
 ```
+
+`DockerEventStream` exposes only message and terminal-error channels, never a raw Moby client or generic response surface. The pinned Moby adapter uses a private request-context token plus `client.WithResponseHook`; only an exact HTTP 200 response to `GET /events` (including its exact versioned API path) completes subscription readiness. A failed request is synchronously returned as an error before reconciliation begins.
 
 At startup and after EOF/error/daemon ID change:
 
@@ -1076,6 +1078,8 @@ At startup and after EOF/error/daemon ID change:
 5. increment `inventory_generation`;
 6. close the signed gap with a successful reconcile record;
 7. resume event processing.
+
+The event stream is subscribed before the full snapshot. A dedicated pump continuously drains event messages into one coalesced dirty signal and records terminal state without blocking under event floods. Terminal detection and the final signed recovered/fence-close commit are linearized under one session mutex: a terminal stream either prevents the close, or immediately reopens the reconcile fence after a close that won the ordering.
 
 Increment a container revision when any selected field changes. Persist the redacted snapshot and counters so observer process restart does not reset them.
 
@@ -1091,19 +1095,21 @@ On Linux, parse `/proc/<init_pid>/status` `CapEff` as hexadecimal and test bit 1
 
 ```text
 POST /v1/events/falco
-POST /v1/events/retention-tombstone
 ```
 
-The first accepts only `FalcoConnectV1`, uniquely resolves the prefix among running containers, requires supplied full ID to match if present, enriches with authoritative fields, wraps/signs/spools, and returns only `event_id`. Zero/ambiguous/stale resolution produces an investigation-only signed event and no candidate-capable identity. The second accepts only a bounded tombstone schema from the Core UID and signs it before Core deletion.
+The route accepts only `FalcoConnectV1`, uniquely resolves the prefix among running containers, requires supplied full ID to match if present, enriches with authoritative fields, wraps/signs/spools, and returns only `event_id`. Zero/ambiguous/stale resolution produces an investigation-only signed event and no candidate-capable identity.
 
 `observer-core.sock`:
 
 ```text
 GET  /v1/events?after=<sequence>&limit=1..100
 POST /v1/events/ack
+POST /v1/events/retention-tombstone
 GET  /v1/inventory/{full_id}
 GET  /v1/coverage
 ```
+
+The tombstone route accepts only a bounded tombstone schema from UID 0 or the exact Core UID, not merely a member of the Core group, and signs it before Core deletion. It is physically absent from the sensor-owned ingest socket so Core never needs access to a Falco route.
 
 `observer-actuator.sock`:
 

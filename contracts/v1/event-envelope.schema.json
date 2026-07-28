@@ -82,20 +82,24 @@
     },
     "container_id": {
       "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Observer-authoritative full Docker container ID after exact running-container resolution."
     },
     "container_start_time": {
-      "$ref": "#/$defs/timestamp"
+      "$ref": "#/$defs/timestamp",
+      "description": "Observer-authoritative Docker State.StartedAt value, never the Falco sensor timestamp."
     },
     "release_id": {
       "type": "string",
       "pattern": "^rel_[0-9a-f]{32}$"
     },
     "inventory_generation": {
-      "$ref": "#/$defs/uint64"
+      "$ref": "#/$defs/uint64",
+      "description": "Durable observer-wide generation of the full redacted Docker inventory."
     },
     "inventory_revision": {
-      "$ref": "#/$defs/uint64"
+      "$ref": "#/$defs/uint64",
+      "description": "Durable per-container revision of the selected authoritative identity fields."
     },
     "normalized_fields": {
       "$ref": "#/$defs/boundedObject"

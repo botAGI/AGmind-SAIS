@@ -59,8 +59,7 @@ func run(arguments []string) error {
 		return err
 	}
 	defer daemon.Close()
-	<-ctx.Done()
-	return nil
+	return daemon.Run(ctx)
 }
 
 func main() {

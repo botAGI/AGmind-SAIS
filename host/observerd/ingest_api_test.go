@@ -1,0 +1,347 @@
+package observerd
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"testing"
+
+	"agmind.local/sais/internal/contracts"
+)
+
+func falcoIngestFixture() contracts.FalcoConnectV1 {
+	rawres := int64(0)
+	suppliedFullID := inventoryTestIDOne
+	untrustedDockerID := inventoryTestIDTwo
+	untrustedStartedAt := "2026-07-27T11:00:00Z"
+	untrustedImageID := "sha256:" + strings.Repeat("9", 64)
+	untrustedSpec := strings.Repeat("8", 64)
+	untrustedRevision := uint64(999)
+	return contracts.FalcoConnectV1{
+		DetectorRule:           "AGmind PCC Suspicious Process Outbound Connect",
+		DetectorRuleVersion:    "agmind-pcc-rules-v1",
+		FalcoVersion:           "0.44.1",
+		EvtType:                "connect",
+		EvtRawres:              &rawres,
+		EvtRes:                 "SUCCESS",
+		SuccessfulConnect:      true,
+		InvestigationOnly:      true,
+		FalcoContainerIDPrefix: inventoryTestIDOne[:12],
+		FalcoContainerFullID:   &suppliedFullID,
+		FalcoContainerStartTS:  "2026-07-27T12:00:00.123456789Z",
+		DockerContainerID:      &untrustedDockerID,
+		DockerStartedAt:        &untrustedStartedAt,
+		ImageID:                &untrustedImageID,
+		RepoDigests: []string{
+			"untrusted.invalid/app@sha256:" + strings.Repeat("7", 64),
+		},
+		ImmutableSpecSHA256:   &untrustedSpec,
+		InventoryRevision:     &untrustedRevision,
+		ProcName:              "curl",
+		ProcExePath:           "/usr/bin/curl",
+		ProcParentName:        "sh",
+		DestinationIPv4:       "1.1.1.1",
+		DestinationPort:       443,
+		L4Protocol:            "tcp",
+		MissingRequiredFields: []string{},
+		RawEventSHA256:        strings.Repeat("d", 64),
+	}
+}
+
+func decodeFalcoEnvelope(
+	t *testing.T,
+	event contracts.EventEnvelopeV1,
+) contracts.FalcoConnectV1 {
+	t.Helper()
+	raw, err := contracts.CanonicalJSON(event.NormalizedFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	falco, err := contracts.DecodeStrict[contracts.FalcoConnectV1](
+		bytes.NewReader(raw),
+		65_536,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return falco
+}
+
+func TestIngestFalcoReplacesUntrustedDockerFieldsWithAuthoritativeIdentity(
+	t *testing.T,
+) {
+	service, _, _, inventory, _ := observerServiceFixture(t)
+	if err := service.ReconcileDocker(
+		context.Background(),
+		"observer_startup",
+	); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := inventory.LookupFullID(inventoryTestIDOne)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	event, err := service.IngestFalco(
+		context.Background(),
+		falcoIngestFixture(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeFalcoEnvelope(t, event)
+	if got.InvestigationOnly ||
+		got.DockerContainerID == nil ||
+		*got.DockerContainerID != identity.FullContainerID ||
+		got.DockerStartedAt == nil ||
+		*got.DockerStartedAt != identity.DockerStartedAt ||
+		got.ImageID == nil ||
+		*got.ImageID != identity.ImageID ||
+		got.ImmutableSpecSHA256 == nil ||
+		*got.ImmutableSpecSHA256 != identity.ImmutableSpecSHA256 ||
+		got.InventoryRevision == nil ||
+		*got.InventoryRevision != identity.InventoryRevision ||
+		!reflect.DeepEqual(got.RepoDigests, identity.RepoDigests) {
+		t.Fatalf("Falco authority was not replaced: %+v", got)
+	}
+	if event.ContainerID == nil ||
+		*event.ContainerID != identity.FullContainerID ||
+		event.ContainerStartTime == nil ||
+		*event.ContainerStartTime != identity.DockerStartedAt ||
+		event.InventoryGeneration != identity.InventoryGeneration ||
+		event.InventoryRevision == nil ||
+		*event.InventoryRevision != identity.InventoryRevision ||
+		event.SourcePayloadHash != got.RawEventSHA256 ||
+		len(event.CoverageFlags) != 0 {
+		t.Fatalf("envelope identity=%+v", event)
+	}
+}
+
+func TestIngestFalcoFullIDMismatchIsSignedInvestigationOnlyWithoutAuthority(
+	t *testing.T,
+) {
+	service, _, _, _, _ := observerServiceFixture(t)
+	if err := service.ReconcileDocker(
+		context.Background(),
+		"observer_startup",
+	); err != nil {
+		t.Fatal(err)
+	}
+	input := falcoIngestFixture()
+	mismatch := inventoryTestIDTwo
+	input.FalcoContainerFullID = &mismatch
+
+	event, err := service.IngestFalco(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeFalcoEnvelope(t, event)
+	if !got.InvestigationOnly ||
+		got.DockerContainerID != nil ||
+		got.DockerStartedAt != nil ||
+		got.ImageID != nil ||
+		got.ImmutableSpecSHA256 != nil ||
+		got.InventoryRevision != nil ||
+		len(got.RepoDigests) != 0 ||
+		event.ContainerID != nil ||
+		event.ContainerStartTime != nil ||
+		event.InventoryRevision != nil {
+		t.Fatalf("mismatch retained candidate authority: event=%+v falco=%+v", event, got)
+	}
+	if !reflect.DeepEqual(
+		event.CoverageFlags,
+		[]string{"docker_identity_mismatch"},
+	) || !reflect.DeepEqual(
+		got.MissingRequiredFields,
+		[]string{"docker_container_id"},
+	) {
+		t.Fatalf(
+			"mismatch evidence flags=%v missing=%v",
+			event.CoverageFlags,
+			got.MissingRequiredFields,
+		)
+	}
+}
+
+func TestFalcoIngestHTTPRejectsNonExactOrOversizeJSONWithoutSequence(
+	t *testing.T,
+) {
+	service, state, _, _, _ := observerServiceFixture(t)
+	valid, err := contracts.CanonicalJSON(falcoIngestFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := bytes.Replace(
+		valid,
+		[]byte(`"detector_rule":`),
+		[]byte(`"detector_rule":"duplicate","detector_rule":`),
+		1,
+	)
+	unknown := append([]byte{}, valid[:len(valid)-1]...)
+	unknown = append(unknown, []byte(`,"unknown":true}`)...)
+	for name, testCase := range map[string]struct {
+		raw    []byte
+		status int
+	}{
+		"duplicate": {raw: duplicate, status: http.StatusBadRequest},
+		"unknown":   {raw: unknown, status: http.StatusBadRequest},
+		"trailing": {
+			raw:    append(append([]byte{}, valid...), []byte(` {}`)...),
+			status: http.StatusBadRequest,
+		},
+		"oversize": {
+			raw: bytes.Repeat(
+				[]byte("x"),
+				int(falcoIngestMaxBytes+1),
+			),
+			status: http.StatusRequestEntityTooLarge,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			before := state.Snapshot().LastSequence
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"http://unix/v1/events/falco",
+				bytes.NewReader(testCase.raw),
+			)
+			response := httptest.NewRecorder()
+			falcoIngestHandler(service).ServeHTTP(response, request)
+			if response.Code != testCase.status {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body)
+			}
+			if got := state.Snapshot().LastSequence; got != before {
+				t.Fatalf("invalid input reserved sequence %d -> %d", before, got)
+			}
+		})
+	}
+}
+
+func TestFalcoIngestHTTPReturnsOnlyEventID(t *testing.T) {
+	service, _, _, _, _ := observerServiceFixture(t)
+	if err := service.ReconcileDocker(
+		context.Background(),
+		"observer_startup",
+	); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := contracts.CanonicalJSON(falcoIngestFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://unix/v1/events/falco",
+		bytes.NewReader(raw),
+	)
+	response := httptest.NewRecorder()
+	falcoIngestHandler(service).ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body)
+	}
+	var result map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 1 ||
+		!strings.HasPrefix(result["event_id"], "evt_") {
+		t.Fatalf("response=%v", result)
+	}
+}
+
+func retentionTombstoneFixture() RetentionTombstoneV1 {
+	return RetentionTombstoneV1{
+		SchemaVersion: "agmind.retention-tombstone.v1",
+		RemovedManifestHashes: []string{
+			strings.Repeat("1", 64),
+			strings.Repeat("2", 64),
+		},
+		LastRemovedManifestSHA256:   strings.Repeat("2", 64),
+		FirstRetainedManifestSHA256: strings.Repeat("3", 64),
+		RemovedBytes:                1_048_576,
+		Reason:                      "retention_age_limit",
+		PolicyVersion:               "agmind-retention-v1",
+		CurrentChainHeadSHA256:      strings.Repeat("4", 64),
+	}
+}
+
+func TestRetentionTombstoneIsStrictSignedPriorityBeforeResponse(t *testing.T) {
+	service, _, spool, _, _ := observerServiceFixture(t)
+	raw, err := contracts.CanonicalJSON(retentionTombstoneFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	retentionTombstoneHandler(service).ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodPost,
+			"http://unix/v1/events/retention-tombstone",
+			bytes.NewReader(raw),
+		),
+	)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body)
+	}
+	items, err := spool.Fetch(0, 100, 4*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Tier != PriorityTier {
+		t.Fatalf("tombstone spool=%+v", items)
+	}
+	event, err := contracts.DecodeStrict[contracts.EventEnvelopeV1](
+		bytes.NewReader(items[0].Canonical),
+		65_536,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.EventType != "retention_tombstone" ||
+		event.EventID == "" ||
+		!bytes.Contains(
+			response.Body.Bytes(),
+			[]byte(event.EventID),
+		) {
+		t.Fatalf("event=%+v response=%s", event, response.Body)
+	}
+}
+
+func TestRetentionTombstoneRejectsUnknownOrInconsistentBodyBeforeSequence(
+	t *testing.T,
+) {
+	service, state, _, _, _ := observerServiceFixture(t)
+	valid, err := contracts.CanonicalJSON(retentionTombstoneFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := append([]byte{}, valid[:len(valid)-1]...)
+	unknown = append(unknown, []byte(`,"unknown":true}`)...)
+	inconsistent := bytes.Replace(
+		valid,
+		[]byte(`"last_removed_manifest_sha256":"`+strings.Repeat("2", 64)+`"`),
+		[]byte(`"last_removed_manifest_sha256":"`+strings.Repeat("9", 64)+`"`),
+		1,
+	)
+	for _, raw := range [][]byte{unknown, inconsistent} {
+		before := state.Snapshot().LastSequence
+		response := httptest.NewRecorder()
+		retentionTombstoneHandler(service).ServeHTTP(
+			response,
+			httptest.NewRequest(
+				http.MethodPost,
+				"http://unix/v1/events/retention-tombstone",
+				bytes.NewReader(raw),
+			),
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body)
+		}
+		if state.Snapshot().LastSequence != before {
+			t.Fatal("invalid tombstone reserved a sequence")
+		}
+	}
+}

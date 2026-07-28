@@ -101,6 +101,7 @@ type Daemon struct {
 	signer   *EnvelopeSigner
 	coverage *Coverage
 	degraded error
+	config   Config
 }
 
 func requireLinuxPlatform(goos string) error {
@@ -244,6 +245,7 @@ func Bootstrap(
 			lock:     lock,
 			state:    state,
 			degraded: degraded,
+			config:   config,
 		}, nil
 	}
 	bootID, err := options.bootID()
@@ -273,6 +275,7 @@ func Bootstrap(
 			lock:     lock,
 			state:    state,
 			degraded: errors.Join(err, persistErr),
+			config:   config,
 		}, nil
 	}
 	publicKey := privateKey.Public().(ed25519.PublicKey)
@@ -295,8 +298,9 @@ func Bootstrap(
 				"observer_private_key_mismatch",
 			)
 			return &Daemon{
-				lock:  lock,
-				state: state,
+				lock:   lock,
+				state:  state,
+				config: config,
 				degraded: errors.Join(
 					fmt.Errorf("observer private key mismatch"),
 					persistErr,
@@ -369,9 +373,10 @@ func Bootstrap(
 	}
 	if snapshot := state.Snapshot(); snapshot.MutationReadOnly {
 		return &Daemon{
-			lock:  lock,
-			state: state,
-			spool: spool,
+			lock:   lock,
+			state:  state,
+			spool:  spool,
+			config: config,
 			degraded: fmt.Errorf(
 				"observer mutation is read-only: %s",
 				snapshot.ReadOnlyReason,
@@ -456,5 +461,6 @@ func Bootstrap(
 		spool:    spool,
 		signer:   signer,
 		coverage: NewCoverage(state, signer),
+		config:   config,
 	}, nil
 }
