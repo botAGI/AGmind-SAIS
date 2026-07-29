@@ -4,14 +4,14 @@ import copy
 import hashlib
 import os
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
 import pytest
-from agmind_immune.canonicaljson import canonical_json
+from agmind_immune.canonicaljson import canonical_json, release_id
 from agmind_immune.clock import CoreClockSample
 from agmind_immune.contracts import (
     MAX_UINT64,
@@ -19,6 +19,7 @@ from agmind_immune.contracts import (
     RetentionBlockedV1,
     RetentionTombstoneV2,
 )
+from agmind_immune.coverage import CoverageState
 from agmind_immune.evidence import retention as retention_module
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.manifest import (
@@ -40,8 +41,18 @@ from agmind_immune.evidence.retention import (
 )
 from agmind_immune.evidence.segments import (
     EvidenceCorrupt,
+    EvidenceRef,
     EvidenceSealError,
     SegmentStore,
+)
+from agmind_immune.ingest.service import AcceptanceCoordinator
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from tests.evidence.test_projection import _falco_fields
+from tests.ingest.test_retention_delivery import _bound_verifier, _item
+from tests.phase5b_helpers import (
+    NOW,
+    envelope_value,
+    private_key,
 )
 
 REQUEST_ID = "11111111-1111-4111-8111-111111111111"
@@ -51,6 +62,7 @@ DECISION_UTC = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 EXPIRED = "2026-07-22T11:59:59.999999999Z"
 BOUNDARY = "2026-07-22T12:00:00Z"
 FRESH = "2026-07-23T12:00:00Z"
+PROOF_DECISION_UTC = datetime(2036, 7, 29, 12, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,16 @@ def _clock(
         healthy=healthy,
         uncertainty_seconds=uncertainty,
         max_uncertainty_seconds=maximum,
+    )
+
+
+def _proof_clock(*, seconds: int = 0) -> CoreClockSample:
+    return CoreClockSample(
+        decision_utc=PROOF_DECISION_UTC + timedelta(seconds=seconds),
+        decision_monotonic=100.0 + seconds,
+        healthy=True,
+        uncertainty_seconds=Decimal(0),
+        max_uncertainty_seconds=Decimal(2),
     )
 
 
@@ -214,6 +236,103 @@ def _selected_state(
     )
     assert decision.request is not None
     return retention_module.selected_retention_state(decision)
+
+
+def _live_store_with_active_routine(
+    path: Path,
+) -> tuple[
+    Ed25519PrivateKey,
+    AcceptanceCoordinator,
+    SegmentStore,
+    CoverageState,
+]:
+    key = private_key(11)
+    acceptance, store, _verifier = _bound_verifier(path)
+    coverage = CoverageState.open_and_recover(store)
+    store.flush_security_boundary()
+    raw_hash = hashlib.sha256(b"retention proof routine").hexdigest()
+    routine_ref = acceptance.accept(
+        _item(
+            envelope_value(
+                key,
+                sequence=2,
+                event_type="falco_connect",
+                normalized_fields=_falco_fields(raw_hash),
+                source_payload_hash=raw_hash,
+                container_id="a" * 64,
+                container_start_time=NOW,
+                release_id=release_id(
+                    f"sha256:{'b' * 64}",
+                    "d" * 64,
+                ),
+                inventory_revision=2**63,
+            )
+        )
+    )
+    coverage._apply_live_accepted(store, routine_ref, None)
+    return key, acceptance, store, coverage
+
+
+@dataclass(frozen=True)
+class _RetentionProofCase:
+    store: SegmentStore
+    coverage: CoverageState
+    selected_snapshot: RetentionSnapshot
+    final_snapshot: RetentionSnapshot
+    journal: retention_module.RetentionStateJournal
+    target_ref: EvidenceRef
+    request: RetentionTombstoneV2
+
+
+def _retention_proof_case(path: Path) -> _RetentionProofCase:
+    key, acceptance, store, coverage = _live_store_with_active_routine(path)
+    try:
+        selected_snapshot = store._freeze_retention_snapshot(
+            _proof_clock(),
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        decision = select_retention(
+            selected_snapshot,
+            request_id=REQUEST_ID,
+        )
+        assert type(decision.request) is RetentionTombstoneV2
+        request = decision.request
+        journal = retention_module._open_retention_state_journal(store)
+        journal.prepare_publication(decision)
+        target_item = _item(
+            envelope_value(
+                key,
+                sequence=3,
+                event_type="retention_tombstone",
+                normalized_fields=request.model_dump(mode="python"),
+            )
+        )
+        target_ref = acceptance.accept(target_item)
+        coverage._apply_live_accepted(store, target_ref, None)
+        target = retention_module.RetentionTargetV1(
+            sequence=target_item.sequence,
+            event_id=target_item.event_id,
+            content_sha256=target_item.content_sha256,
+        )
+        journal.bind_target(target)
+        journal.advance_evidence_appended(target)
+        final_snapshot = store._freeze_retention_snapshot(
+            _proof_clock(seconds=1),
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        return _RetentionProofCase(
+            store=store,
+            coverage=coverage,
+            selected_snapshot=selected_snapshot,
+            final_snapshot=final_snapshot,
+            journal=journal,
+            target_ref=target_ref,
+            request=request,
+        )
+    except BaseException:
+        coverage.close()
+        store.close(flush=False)
+        raise
 
 
 def test_selection_seven_day_nanosecond_boundary_is_strict() -> None:
@@ -1127,3 +1246,218 @@ def test_state_root_fsync_ambiguity_fences_authority(
 
     monkeypatch.setattr(segments_module.os, "fsync", original_fsync)
     store.close(flush=False)
+
+
+@pytest.mark.parametrize("attack", ["none", "manifest", "payload"])
+def test_retention_proof_snapshot_is_factory_only_and_jit_reverifies(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(
+        tmp_path
+    )
+    try:
+        active_before = store.active_path
+        manifests_before = store.manifests
+        assert active_before is not None
+        with pytest.raises(TypeError, match="factory"):
+            store._freeze_retention_snapshot(
+                _proof_clock(),
+                _factory=object(),
+            )
+        assert store.active_path == active_before
+        assert store.manifests == manifests_before
+        if attack == "none":
+            snapshot = store._freeze_retention_snapshot(
+                _proof_clock(),
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+            assert store.active_path is None
+            assert tuple(
+                fact.manifest_sha256 for fact in snapshot.facts
+            ) == tuple(
+                manifest.manifest_sha256 for manifest in store.manifests
+            )
+            assert tuple(
+                record.event_type for record in snapshot.facts[-1].records
+            ) == ("falco_connect",)
+            return
+
+        store.flush_security_boundary()
+        manifest = store.manifests[-1]
+        if attack == "manifest":
+            manifest_path = (
+                tmp_path / "manifests" / f"{manifest.segment_id}.json"
+            )
+            manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+        else:
+            payload_path = tmp_path / manifest.segment_relative_path
+            raw = payload_path.read_bytes()
+            payload_path.write_bytes(bytes([raw[0] ^ 1]) + raw[1:])
+
+        with pytest.raises(EvidenceCorrupt, match="manifest|segment|payload"):
+            store._freeze_retention_snapshot(
+                _proof_clock(),
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        coverage.close()
+        store.close(flush=False)
+
+
+def test_retention_proof_accepts_h0_extension_and_exact_target(
+    tmp_path: Path,
+) -> None:
+    case = _retention_proof_case(tmp_path)
+    try:
+        assert (
+            case.request.current_chain_head_sha256
+            == case.selected_snapshot.current_chain_head_sha256
+        )
+        assert (
+            case.final_snapshot.current_chain_head_sha256
+            != case.request.current_chain_head_sha256
+        )
+        assert (
+            case.final_snapshot.facts[1].prefix_chain_head_sha256
+            == case.request.current_chain_head_sha256
+        )
+        with pytest.raises(TypeError, match="snapshot"):
+            case.store._authenticate_retention_tombstone(
+                case.journal,
+                case.store.manifests,
+                case.target_ref,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+        with pytest.raises(EvidenceSealError, match="target|authenticated"):
+            case.store._authenticate_retention_tombstone(
+                case.journal,
+                case.final_snapshot,
+                replace(case.target_ref, content_sha256="0" * 64),
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+
+        capability = case.store._authenticate_retention_tombstone(
+            case.journal,
+            case.final_snapshot,
+            case.target_ref,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+
+        assert type(capability).__name__ == "AuthenticatedRetentionTombstone"
+        assert (
+            case.store.resolve_authenticated_ref(case.target_ref).ref
+            == case.target_ref
+        )
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ["stale_snapshot", "mutated_fact", "selector_witness"],
+)
+def test_retention_proof_rejects_stale_or_mutated_authority(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    case = _retention_proof_case(tmp_path)
+    candidate = case.final_snapshot
+    try:
+        if attack == "stale_snapshot":
+            candidate = case.selected_snapshot
+        elif attack == "mutated_fact":
+            fact = candidate.facts[1]
+            object.__setattr__(
+                fact,
+                "original_inode",
+                fact.original_inode + 1,
+            )
+        else:
+            state = case.journal.state
+            assert state is not None
+            document = state.model_dump(exclude_none=False)
+            witness = document["selection_witness"]
+            assert isinstance(witness, dict)
+            witness["decision_utc"] = "2026-07-20T12:00:00Z"
+            mutated = retention_module.RetentionStateV1.model_validate(
+                document,
+                strict=True,
+            )
+            expected = case.journal._raw
+            assert expected is not None
+            mutated_raw = retention_module.encode_retention_state(mutated)
+            case.journal._authority.replace_retention_state_bytes(
+                expected,
+                mutated_raw,
+            )
+            case.journal._state = mutated
+            case.journal._raw = mutated_raw
+
+        with pytest.raises(
+            (EvidenceSealError, RetentionCorruption),
+            match="snapshot|stale|generation|authority|selector|witness",
+        ):
+            case.store._authenticate_retention_tombstone(
+                case.journal,
+                candidate,
+                case.target_ref,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_authenticated_retention_tombstone_is_registered_and_one_use(
+    tmp_path: Path,
+) -> None:
+    case = _retention_proof_case(tmp_path / "owner")
+    foreign = SegmentStore(tmp_path / "foreign")
+    try:
+        capability = case.store._authenticate_retention_tombstone(
+            case.journal,
+            case.final_snapshot,
+            case.target_ref,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        with pytest.raises(TypeError, match="cop"):
+            copy.copy(capability)
+        with pytest.raises(TypeError, match="cop"):
+            copy.deepcopy(capability)
+        with pytest.raises(TypeError, match="serial"):
+            pickle.dumps(capability)
+        lookalike = object.__new__(type(capability))
+        with pytest.raises(EvidenceSealError, match="issued|registered|exact"):
+            case.store._consume_authenticated_retention_tombstone(
+                lookalike,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+        with pytest.raises(EvidenceSealError, match="store|lifecycle|registered"):
+            foreign._consume_authenticated_retention_tombstone(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+        with pytest.raises(TypeError, match="factory"):
+            case.store._consume_authenticated_retention_tombstone(
+                capability,
+                _factory=object(),
+            )
+
+        assert (
+            case.store._consume_authenticated_retention_tombstone(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+            is None
+        )
+        with pytest.raises(EvidenceSealError, match="used|registered|exact"):
+            case.store._consume_authenticated_retention_tombstone(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        foreign.close(flush=False)
+        case.coverage.close()
+        case.store.close(flush=False)

@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 from threading import Lock
-from typing import Literal, Never, Protocol, SupportsIndex, cast, final
+from typing import Any, Literal, Never, Protocol, SupportsIndex, cast, final
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
@@ -79,6 +79,7 @@ _ACCEPTED_FACTORY = object()
 _SNAPSHOT_FACTORY = object()
 _RUN_FACTORY = object()
 _DECISION_FACTORY = object()
+_AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY = object()
 
 
 class RetentionError(RuntimeError):
@@ -99,6 +100,126 @@ class RetentionStateConflict(RetentionError):
 
 class RetentionProtocolError(RetentionError):
     """A requested retention-state transition is outside the frozen graph."""
+
+
+@final
+class AuthenticatedRetentionTombstone:
+    """One-use store-registered final proof; never path or unlink authority."""
+
+    _coverage: object
+    _coverage_snapshot: object
+    _coverage_token: object
+    _factory_marker: object
+    _journal: object
+    _journal_identity: object
+    _snapshot: RetentionSnapshot
+    _state_raw: bytes
+    _status: object
+    _store: object
+    _target_ref: object
+    _transient_generation: int
+    _used: bool
+    _verifier: object
+    _verifier_authority: object
+    _verifier_generation: int
+
+    __slots__ = (
+        "_coverage",
+        "_coverage_snapshot",
+        "_coverage_token",
+        "_factory_marker",
+        "_journal",
+        "_journal_identity",
+        "_snapshot",
+        "_state_raw",
+        "_status",
+        "_store",
+        "_target_ref",
+        "_transient_generation",
+        "_used",
+        "_verifier",
+        "_verifier_authority",
+        "_verifier_generation",
+    )
+
+    def __init__(
+        self,
+        *,
+        store: object,
+        journal: object,
+        journal_identity: object,
+        state_raw: bytes,
+        snapshot: RetentionSnapshot,
+        target_ref: object,
+        coverage: object,
+        coverage_snapshot: object,
+        coverage_token: object,
+        verifier: object,
+        verifier_authority: object,
+        verifier_generation: int,
+        transient_generation: int,
+        status: object,
+        _factory: object,
+    ) -> None:
+        if _factory is not _AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY:
+            raise TypeError(
+                "AuthenticatedRetentionTombstone is factory-only"
+            )
+        values = {
+            "_factory_marker": _factory,
+            "_store": store,
+            "_journal": journal,
+            "_journal_identity": journal_identity,
+            "_state_raw": state_raw,
+            "_snapshot": snapshot,
+            "_target_ref": target_ref,
+            "_coverage": coverage,
+            "_coverage_snapshot": coverage_snapshot,
+            "_coverage_token": coverage_token,
+            "_verifier": verifier,
+            "_verifier_authority": verifier_authority,
+            "_verifier_generation": verifier_generation,
+            "_transient_generation": transient_generation,
+            "_status": status,
+            "_used": False,
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("AuthenticatedRetentionTombstone is final")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError(
+            "authenticated retention tombstones are immutable"
+        )
+
+    def __copy__(self) -> AuthenticatedRetentionTombstone:
+        raise TypeError(
+            "authenticated retention tombstones cannot be copied"
+        )
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> AuthenticatedRetentionTombstone:
+        del memo
+        raise TypeError(
+            "authenticated retention tombstones cannot be copied"
+        )
+
+    def __reduce__(self) -> Never:
+        raise TypeError(
+            "authenticated retention tombstones cannot be serialized"
+        )
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError(
+            "authenticated retention tombstones cannot be serialized"
+        )
 
 
 def _identity_registry() -> tuple[
@@ -3021,3 +3142,513 @@ def _open_retention_state_journal(store: object) -> RetentionStateJournal:
         _factory=_RETENTION_STATE_AUTHORITY_FACTORY,
     )
     return journal
+
+
+def _decimal_nanoseconds(value: int) -> Decimal:
+    if type(value) is not int or not 0 <= value <= MAX_UINT64:
+        raise RetentionCorruption(
+            "retention witness uncertainty is not exact uint64"
+        )
+    if value == 0:
+        return Decimal(0)
+    return Decimal((0, tuple(int(digit) for digit in str(value)), -9))
+
+
+def _selection_clock_from_witness(
+    witness: RetentionSelectionWitnessV1,
+) -> CoreClockSample:
+    try:
+        decision_utc = datetime.fromisoformat(witness.decision_utc)
+        if _decision_utc_text(decision_utc) != witness.decision_utc:
+            raise ValueError("decision UTC is not canonical")
+        uncertainty = (
+            None
+            if witness.uncertainty_ns is None
+            else _decimal_nanoseconds(witness.uncertainty_ns)
+        )
+        maximum = Decimal(0) if uncertainty is None else uncertainty
+        clock = CoreClockSample(
+            decision_utc=decision_utc,
+            decision_monotonic=0.0,
+            healthy=witness.clock_healthy,
+            uncertainty_seconds=uncertainty,
+            max_uncertainty_seconds=maximum,
+        )
+    except (
+        CoreClockValidationError,
+        RetentionCorruption,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise RetentionCorruption(
+            "retention selector witness clock is invalid"
+        ) from error
+    _decision_ns, enabled, uncertainty_ns = _clock_selection(clock)
+    if (
+        enabled != witness.age_selection_enabled
+        or uncertainty_ns != witness.uncertainty_ns
+    ):
+        raise RetentionCorruption(
+            "retention selector witness clock cannot be reconstructed"
+        )
+    return clock
+
+
+def _final_retention_invariant(
+    store: Any,
+    journal: RetentionStateJournal,
+    snapshot: RetentionSnapshot,
+    target_ref: object,
+) -> tuple[object, ...]:
+    verifier = store._bound_verifier
+    authority = None if verifier is None else verifier._authority
+    accepted = (
+        ()
+        if authority is None
+        else tuple(
+            (
+                sequence,
+                id(value),
+                value.canonical,
+                id(value.evidence_ref),
+                value.evidence_ref,
+                value.evidence_priority,
+                value.key_epoch,
+                value.key_id,
+            )
+            for sequence, value in sorted(authority.accepted.items())
+        )
+    )
+    coverage = store._coverage_state_owner
+    coverage_snapshot = (
+        None if coverage is None else coverage._snapshot
+    )
+    return (
+        id(store),
+        store._closed,
+        store._authority_state,
+        id(store._lifecycle_identity),
+        id(store._bound_verifier),
+        store.status(),
+        id(verifier),
+        None if verifier is None else id(verifier.root),
+        None if verifier is None else id(verifier.key_chain),
+        id(authority),
+        None if authority is None else authority.generation,
+        None if authority is None else id(authority.fsm),
+        accepted,
+        () if verifier is None else tuple(verifier._staged.items()),
+        () if verifier is None else tuple(verifier._authorizations.items()),
+        (
+            None
+            if verifier is None
+            else verifier._repair_transient_generation
+        ),
+        None if verifier is None else id(verifier._bound_lifecycle),
+        (
+            None
+            if verifier is None
+            else id(verifier._repair_lifecycle_identity)
+        ),
+        (
+            None
+            if verifier is None
+            else id(verifier._repair_owner_identity)
+        ),
+        id(journal),
+        id(journal._identity),
+        id(journal._authority),
+        journal._raw,
+        journal._state,
+        id(snapshot),
+        _snapshot_binding(snapshot),
+        id(target_ref),
+        target_ref,
+        id(coverage),
+        id(coverage_snapshot),
+        coverage_snapshot,
+        None if coverage is None else id(coverage._evidence),
+        (
+            None
+            if coverage is None
+            else id(coverage._lifecycle_identity)
+        ),
+        None if coverage is None else id(coverage._capability_token),
+        None if coverage is None else coverage._healthy,
+        None if coverage is None else coverage._closed,
+    )
+
+
+def _authenticate_store_retention_tombstone(
+    store: object,
+    journal: RetentionStateJournal,
+    snapshot: RetentionSnapshot,
+    target_ref: object,
+    *,
+    _factory: object,
+) -> AuthenticatedRetentionTombstone:
+    from agmind_immune.coverage import CoverageState
+    from agmind_immune.evidence.segments import (
+        _RETENTION_PROOF_FACTORY,
+        EvidencePriority,
+        EvidenceRef,
+        EvidenceSealError,
+        SegmentStore,
+    )
+    from agmind_immune.ingest.envelope import (
+        CoreEventV1,
+        EnvelopeVerifier,
+        RetentionSimulationError,
+        VerifierCommitError,
+    )
+
+    if _factory is not _RETENTION_PROOF_FACTORY:
+        raise TypeError("final retention proof requires its exact factory")
+    if type(store) is not SegmentStore:
+        raise TypeError("final retention proof requires the exact SegmentStore")
+    if type(journal) is not RetentionStateJournal:
+        raise TypeError("final retention proof requires the exact journal")
+    if type(snapshot) is not RetentionSnapshot:
+        raise TypeError("final retention proof requires an exact snapshot")
+    if type(target_ref) is not EvidenceRef:
+        raise TypeError("final retention proof requires an exact target ref")
+
+    exact_store: Any = store
+    exact_store._require_retention_snapshot(snapshot)
+    authority = journal._authority
+    if (
+        getattr(authority, "_store", None) is not store
+        or getattr(authority, "_lifecycle_identity", None)
+        is not exact_store._lifecycle_identity
+        or getattr(authority, "_retention_journal", None) is not journal
+        or exact_store._retention_state_authority is not authority
+    ):
+        raise EvidenceSealError(
+            "final retention proof journal is outside the exact store"
+        )
+    journal._assert_consistent()
+    state = journal._state
+    state_raw = journal._raw
+    if (
+        type(state) is not RetentionStateV1
+        or type(state_raw) is not bytes
+        or state.operation != "tombstone"
+        or state.phase != "evidence_appended"
+        or type(state.request) is not RetentionTombstoneV2
+        or type(state.target) is not RetentionTargetV1
+        or encode_retention_state(state) != state_raw
+    ):
+        raise EvidenceSealError(
+            "final retention proof requires exact evidence-appended state"
+        )
+    journal._prove_publication(state_raw)
+    target = state.target
+    if (
+        target.sequence != target_ref.source_sequence
+        or target.event_id != target_ref.event_id
+        or target.content_sha256 != target_ref.content_sha256
+    ):
+        raise EvidenceSealError(
+            "final retention proof target differs from durable authority"
+        )
+
+    verifier = exact_store._bound_verifier
+    status = exact_store.status()
+    if (
+        type(verifier) is not EnvelopeVerifier
+        or verifier._bound_lifecycle is not exact_store._lifecycle_identity
+        or status.healthy is not True
+        or status.key_healthy is not True
+        or status.repair_pending is not False
+        or verifier._staged
+        or verifier._authorizations
+    ):
+        raise EvidenceSealError(
+            "final retention proof requires one healthy verifier lifecycle"
+        )
+    coverage = exact_store._coverage_state_owner
+    if (
+        type(coverage) is not CoverageState
+        or coverage._evidence is not store
+        or coverage._lifecycle_identity is not exact_store._lifecycle_identity
+        or coverage._capability_token is None
+        or coverage._healthy is not True
+        or coverage._closed is not False
+    ):
+        raise EvidenceSealError(
+            "final retention proof requires exact live coverage authority"
+        )
+    exact_coverage: Any = coverage
+    coverage_snapshot = exact_coverage._snapshot
+    coverage_head = exact_store._validate_coverage_state_owner(
+        exact_coverage,
+        exact_coverage._lifecycle_identity,
+        reducer_head=coverage_snapshot.head_ref,
+    )
+    if (
+        coverage_head != coverage_snapshot.head_ref
+        or coverage_snapshot.head_sequence != status.evidence_head
+        or coverage_snapshot.head_sequence < target.sequence
+    ):
+        raise EvidenceSealError(
+            "final retention proof coverage does not include the target"
+        )
+
+    try:
+        record = exact_store.resolve_authenticated_ref(target_ref)
+    except Exception as error:
+        raise EvidenceSealError(
+            "final retention proof target is not authenticated"
+        ) from error
+    if (
+        record.ref != target_ref
+        or record.priority is not EvidencePriority.PROTECTED
+        or type(record.envelope) is not dict
+        or type(record.canonical_envelope) is not bytes
+        or canonical_json(record.envelope) != record.canonical_envelope
+        or hashlib.sha256(record.canonical_envelope).hexdigest()
+        != target_ref.content_sha256
+    ):
+        raise EvidenceSealError(
+            "final retention proof target record is not exact protected evidence"
+        )
+    try:
+        item = CoreEventV1.model_validate(
+            {
+                "sequence": target_ref.source_sequence,
+                "event_id": target_ref.event_id,
+                "content_sha256": target_ref.content_sha256,
+                "envelope": record.envelope,
+            },
+            strict=True,
+        )
+    except ValidationError as error:
+        raise EvidenceSealError(
+            "final retention proof target envelope is invalid"
+        ) from error
+
+    facts, final_clock, current_prior = _validate_snapshot(
+        snapshot,
+        removable_event_types=frozenset({"falco_connect"}),
+        genesis_manifest_sha256="0" * 64,
+    )
+    h0_matches = tuple(
+        index
+        for index, fact in enumerate(facts)
+        if fact.prefix_chain_head_sha256 == state.h0
+    )
+    if len(h0_matches) != 1:
+        raise RetentionCorruption(
+            "final retention proof H0 is not one exact historical prefix"
+        )
+    h0_tip = h0_matches[0]
+    request = state.request
+    request_raw = canonical_json(request.model_dump(mode="python"))
+    request_hashes = frozenset(request.removed_manifest_hashes)
+    positions = {
+        fact.manifest_sha256: index for index, fact in enumerate(facts)
+    }
+    try:
+        current_positions = tuple(
+            positions[manifest_hash]
+            for manifest_hash in request.removed_manifest_hashes
+        )
+    except KeyError as error:
+        raise RetentionCorruption(
+            "final retention proof target run is absent from H0"
+        ) from error
+    if (
+        not current_positions
+        or max(current_positions) > h0_tip
+        or any(
+            right != left + 1
+            for left, right in pairwise(sorted(current_positions))
+        )
+    ):
+        raise RetentionCorruption(
+            "final retention proof target run is not H0-adjacent"
+        )
+    current_start = min(current_positions)
+    current_end = max(current_positions)
+    selector_prior: list[AcceptedRetentionTombstone] = []
+    other_prior: list[AcceptedRetentionTombstone] = []
+    self_matches = 0
+    through = state.selection_witness.prior_index_through_sequence
+    if (
+        through > snapshot.prior_index_through_sequence
+        or through >= target_ref.source_sequence
+        or through > status.evidence_head
+        or (
+            through != 0
+            and verifier.accepted_ref(through) is None
+        )
+    ):
+        raise RetentionCorruption(
+            "retention prior-index sequence is not an authenticated prefix"
+        )
+    for accepted in current_prior:
+        prior_request, prior_raw, outer = _validated_prior(accepted)
+        exact_self = (
+            outer
+            == (
+                target_ref.source_sequence,
+                target_ref.event_id,
+                target_ref.content_sha256,
+            )
+            and prior_raw == request_raw
+        )
+        if exact_self:
+            self_matches += 1
+            if accepted.sequence <= through:
+                raise RetentionCorruption(
+                    "retention target appears inside its prior-index witness"
+                )
+            continue
+        if (
+            prior_request.tombstone_id == request.tombstone_id
+            or prior_raw == request_raw
+        ):
+            raise RetentionCorruption(
+                "final retention proof has a conflicting tombstone identity"
+            )
+        prior_hashes = frozenset(
+            prior_request.removed_manifest_hashes
+        )
+        if prior_hashes.intersection(request_hashes):
+            raise RetentionCorruption(
+                "final retention proof overlaps another tombstone"
+            )
+        try:
+            prior_positions = tuple(
+                positions[manifest_hash]
+                for manifest_hash in prior_request.removed_manifest_hashes
+            )
+        except KeyError as error:
+            raise RetentionCorruption(
+                "final retention proof prior run is outside the chain"
+            ) from error
+        if (
+            accepted.sequence < target_ref.source_sequence
+            and max(prior_positions, default=-1) >= current_start
+            or accepted.sequence > target_ref.source_sequence
+            and min(prior_positions, default=len(facts)) <= current_end
+        ):
+            raise RetentionCorruption(
+                "final retention proof tombstone runs are out of order"
+            )
+        other_prior.append(accepted)
+        if accepted.sequence <= through:
+            selector_prior.append(accepted)
+    if self_matches != 1:
+        raise EvidenceSealError(
+            "final retention proof target lacks one authenticated tombstone"
+        )
+    _prior_coverage(
+        facts,
+        tuple(other_prior),
+        zero_sha256="0" * 64,
+    )
+    prior_count, _prior_last, prior_sha256 = _prior_index_commitment(
+        tuple(selector_prior)
+    )
+    witness = state.selection_witness
+    if (
+        prior_count != witness.prior_index_count
+        or prior_sha256 != witness.prior_index_sha256
+    ):
+        raise RetentionCorruption(
+            "final retention selector prior-index witness changed"
+        )
+    persisted_clock = _selection_clock_from_witness(witness)
+    if _datetime_ns(final_clock.decision_utc) < _datetime_ns(
+        persisted_clock.decision_utc
+    ):
+        raise RetentionCorruption(
+            "final retention proof clock regressed before selection"
+        )
+    selector_snapshot = _freeze_retention_snapshot(
+        facts=tuple(snapshot.facts[: h0_tip + 1]),
+        clock=persisted_clock,
+        prior_tombstones=tuple(selector_prior),
+        prior_index_through_sequence=through,
+    )
+    rerun = _select_retention(
+        selector_snapshot,
+        request_id=request.tombstone_id,
+        target_bytes=5 * 1024**3,
+        maximum_age_ns=7 * 24 * 60 * 60 * 1_000_000_000,
+        maximum_run_manifests=128,
+        removable_event_types=frozenset({"falco_connect"}),
+        policy_version="agmind-retention-v1",
+        run_domain=b"AGMIND_RETENTION_RUN_V2\x00",
+        zero_sha256="0" * 64,
+    )
+    try:
+        rerun_state = selected_retention_state(rerun)
+        _validate_retention_transition(rerun_state, state)
+    except RetentionError as error:
+        raise RetentionCorruption(
+            "final retention selector witness does not reproduce state"
+        ) from error
+    if rerun.request != request:
+        raise RetentionCorruption(
+            "final retention selector request changed"
+        )
+
+    invariant = _final_retention_invariant(
+        exact_store,
+        journal,
+        snapshot,
+        target_ref,
+    )
+    try:
+        replayed = verifier._restricted_historical_retention_replay(
+            (item, target_ref),
+            request,
+        )
+    except (RetentionSimulationError, VerifierCommitError) as error:
+        raise EvidenceSealError(
+            "final retention target historical replay failed"
+        ) from error
+    if (
+        replayed.event_type != "retention_tombstone"
+        or replayed.evidence_priority != "protected"
+        or replayed.is_retry is not True
+        or replayed.sequence != target_ref.source_sequence
+        or replayed.event_id != target_ref.event_id
+        or replayed.content_sha256 != target_ref.content_sha256
+        or _final_retention_invariant(
+            exact_store,
+            journal,
+            snapshot,
+            target_ref,
+        )
+        != invariant
+    ):
+        raise EvidenceSealError(
+            "final retention proof changed live authenticated authority"
+        )
+    exact_store._require_retention_snapshot(snapshot)
+    journal._prove_publication(state_raw)
+    capability = AuthenticatedRetentionTombstone(
+        store=exact_store,
+        journal=journal,
+        journal_identity=journal._identity,
+        state_raw=state_raw,
+        snapshot=snapshot,
+        target_ref=target_ref,
+        coverage=exact_coverage,
+        coverage_snapshot=coverage_snapshot,
+        coverage_token=exact_coverage._capability_token,
+        verifier=verifier,
+        verifier_authority=verifier._authority,
+        verifier_generation=verifier._authority.generation,
+        transient_generation=verifier._repair_transient_generation,
+        status=status,
+        _factory=_AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY,
+    )
+    exact_store._register_authenticated_retention_tombstone(
+        capability,
+        _factory=_factory,
+    )
+    return capability
