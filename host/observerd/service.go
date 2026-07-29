@@ -507,6 +507,12 @@ func (service *Service) finishDockerReconcileLockedReceipt(
 		}
 	}
 	closedAt := service.now().UTC()
+	if closedAt.Before(openedAt) {
+		return dockerReconcileReceipt{}, errors.Join(
+			fmt.Errorf("Docker recovery closed_at precedes opened_at"),
+			service.openDockerReconcileFences(),
+		)
+	}
 	var receipt dockerReconcileReceipt
 	commit := func() error {
 		event, err := service.signDockerCoverageEnvelope(

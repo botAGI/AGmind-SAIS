@@ -262,6 +262,8 @@ func classifyDockerRecovery(
 	closedAt, closedOK := stringField(fields, "closed_at")
 	reason, reasonOK := stringField(fields, "reason_code")
 	generation, generationOK := uint64Field(fields, "reconcile_generation")
+	openedTime, openedTimeErr := time.Parse(time.RFC3339Nano, openedAt)
+	closedTime, closedTimeErr := time.Parse(time.RFC3339Nano, closedAt)
 	if !exactKeys(
 		fields,
 		"component",
@@ -276,6 +278,8 @@ func classifyDockerRecovery(
 		!severityOK || severity != "INFO" ||
 		!openedOK || !canonicalUTCTimestamp(openedAt) ||
 		!closedOK || !canonicalUTCTimestamp(closedAt) || !reasonOK ||
+		openedTimeErr != nil || closedTimeErr != nil ||
+		closedTime.Before(openedTime) ||
 		reason != "docker_full_reconcile_succeeded" ||
 		!generationOK || generation == 0 ||
 		event.EventTime != closedAt ||

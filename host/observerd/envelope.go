@@ -25,7 +25,10 @@ import (
 )
 
 const observerStateSchemaV1 = "agmind.observer-state.v1"
-const observerStateSchema = "agmind.observer-state.v2"
+const observerStateSchemaV2 = "agmind.observer-state.v2"
+const observerStateSchema = "agmind.observer-state.v3"
+const sequenceGapProtocolC8 = "proof_carrying_containment_c8"
+const sequenceGapProtocolLegacyUnproven = "legacy_unproven"
 const zeroPublicationHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
 const (
@@ -65,6 +68,7 @@ type ObserverState struct {
 	AckRecordHash           string               `json:"ack_record_hash"`
 	AckPayloadSHA256        string               `json:"ack_payload_sha256"`
 	LastCoveredGapEnd       uint64               `json:"last_covered_gap_end"`
+	SequenceGapProtocol     string               `json:"sequence_gap_protocol"`
 	BootHistory             []BootBoundary       `json:"boot_history,omitempty"`
 	AckRepairPending        bool                 `json:"ack_repair_pending"`
 	AckRepairReason         string               `json:"ack_repair_reason"`
@@ -74,6 +78,89 @@ type ObserverState struct {
 	PublicationHeadHash     string               `json:"publication_head_hash"`
 	BootBoundaryState       string               `json:"boot_boundary_state"`
 	PendingBootBoundary     *PendingBootBoundary `json:"pending_boot_boundary,omitempty"`
+}
+
+// observerStateV2 is the pre-C8 state contract. It is migrated only when no
+// sequence-gap marker exists; marker-bearing V2 state is one-way fenced in V3.
+type observerStateV2 struct {
+	SchemaVersion           string               `json:"schema_version"`
+	HostID                  string               `json:"host_id"`
+	BootID                  string               `json:"boot_id"`
+	KeyID                   string               `json:"key_id"`
+	KeyEpoch                uint64               `json:"key_epoch"`
+	LastSequence            uint64               `json:"last_sequence"`
+	MutationReadOnly        bool                 `json:"mutation_read_only"`
+	ReadOnlyReason          string               `json:"read_only_reason"`
+	ReconcileRequired       bool                 `json:"reconcile_required"`
+	RoutineDropped          uint64               `json:"routine_dropped"`
+	DropEventPending        bool                 `json:"drop_event_pending"`
+	AckSequence             uint64               `json:"ack_sequence"`
+	AckEventID              string               `json:"ack_event_id"`
+	AckContentSHA256        string               `json:"ack_content_sha256"`
+	AckRecordHash           string               `json:"ack_record_hash"`
+	AckPayloadSHA256        string               `json:"ack_payload_sha256"`
+	LastCoveredGapEnd       uint64               `json:"last_covered_gap_end"`
+	BootHistory             []BootBoundary       `json:"boot_history,omitempty"`
+	AckRepairPending        bool                 `json:"ack_repair_pending"`
+	AckRepairReason         string               `json:"ack_repair_reason"`
+	PublicationBaseSequence uint64               `json:"publication_base_sequence"`
+	PublicationBaseHash     string               `json:"publication_base_hash"`
+	PublicationHeadSequence uint64               `json:"publication_head_sequence"`
+	PublicationHeadHash     string               `json:"publication_head_hash"`
+	BootBoundaryState       string               `json:"boot_boundary_state"`
+	PendingBootBoundary     *PendingBootBoundary `json:"pending_boot_boundary,omitempty"`
+}
+
+func observerStateFromV2(legacy observerStateV2) ObserverState {
+	return ObserverState{
+		SchemaVersion:           observerStateSchema,
+		HostID:                  legacy.HostID,
+		BootID:                  legacy.BootID,
+		KeyID:                   legacy.KeyID,
+		KeyEpoch:                legacy.KeyEpoch,
+		LastSequence:            legacy.LastSequence,
+		MutationReadOnly:        legacy.MutationReadOnly,
+		ReadOnlyReason:          legacy.ReadOnlyReason,
+		ReconcileRequired:       legacy.ReconcileRequired,
+		RoutineDropped:          legacy.RoutineDropped,
+		DropEventPending:        legacy.DropEventPending,
+		AckSequence:             legacy.AckSequence,
+		AckEventID:              legacy.AckEventID,
+		AckContentSHA256:        legacy.AckContentSHA256,
+		AckRecordHash:           legacy.AckRecordHash,
+		AckPayloadSHA256:        legacy.AckPayloadSHA256,
+		LastCoveredGapEnd:       legacy.LastCoveredGapEnd,
+		SequenceGapProtocol:     sequenceGapProtocolC8,
+		BootHistory:             append([]BootBoundary(nil), legacy.BootHistory...),
+		AckRepairPending:        legacy.AckRepairPending,
+		AckRepairReason:         legacy.AckRepairReason,
+		PublicationBaseSequence: legacy.PublicationBaseSequence,
+		PublicationBaseHash:     legacy.PublicationBaseHash,
+		PublicationHeadSequence: legacy.PublicationHeadSequence,
+		PublicationHeadHash:     legacy.PublicationHeadHash,
+		BootBoundaryState:       legacy.BootBoundaryState,
+		PendingBootBoundary:     legacy.PendingBootBoundary,
+	}
+}
+
+func (legacy observerStateV2) Validate() error {
+	if legacy.SchemaVersion != observerStateSchemaV2 {
+		return fmt.Errorf("invalid V2 observer state")
+	}
+	return observerStateFromV2(legacy).Validate()
+}
+
+func migrateObserverStateV2(legacy observerStateV2) ObserverState {
+	state := observerStateFromV2(legacy)
+	if legacy.LastCoveredGapEnd > 0 {
+		state.SequenceGapProtocol = sequenceGapProtocolLegacyUnproven
+		if !state.MutationReadOnly {
+			state.MutationReadOnly = true
+			state.ReadOnlyReason = "observer_sequence_gap_enrollment_required"
+		}
+		state.ReconcileRequired = true
+	}
+	return state
 }
 
 // observerStateV1 exists only to make the one-way migration strict. It is
@@ -124,6 +211,7 @@ func observerStateFromV1(legacy observerStateV1) ObserverState {
 		AckRecordHash:           legacy.AckRecordHash,
 		AckPayloadSHA256:        legacy.AckPayloadSHA256,
 		LastCoveredGapEnd:       legacy.LastCoveredGapEnd,
+		SequenceGapProtocol:     sequenceGapProtocolC8,
 		BootHistory:             append([]BootBoundary(nil), legacy.BootHistory...),
 		AckRepairPending:        legacy.AckRepairPending,
 		AckRepairReason:         legacy.AckRepairReason,
@@ -186,6 +274,9 @@ func migrateObserverStateV1(legacy observerStateV1) ObserverState {
 	state.ReconcileRequired = true
 	state.BootBoundaryState = bootBoundaryLegacyUnproven
 	state.PendingBootBoundary = nil
+	if legacy.LastCoveredGapEnd > 0 {
+		state.SequenceGapProtocol = sequenceGapProtocolLegacyUnproven
+	}
 	return state
 }
 
@@ -203,12 +294,31 @@ func decodeObserverState(raw []byte) (ObserverState, bool, error) {
 			65_536,
 		)
 		return state, false, err
+	case observerStateSchemaV2:
+		legacy, err := contracts.DecodeStrict[observerStateV2](
+			bytes.NewReader(raw),
+			65_536,
+		)
+		if err != nil {
+			return ObserverState{}, false, err
+		}
+		if err := legacy.Validate(); err != nil {
+			return ObserverState{}, false, err
+		}
+		state := migrateObserverStateV2(legacy)
+		if err := state.Validate(); err != nil {
+			return ObserverState{}, false, err
+		}
+		return state, true, nil
 	case observerStateSchemaV1:
 		legacy, err := contracts.DecodeStrict[observerStateV1](
 			bytes.NewReader(raw),
 			65_536,
 		)
 		if err != nil {
+			return ObserverState{}, false, err
+		}
+		if err := legacy.Validate(); err != nil {
 			return ObserverState{}, false, err
 		}
 		state := migrateObserverStateV1(legacy)
@@ -234,11 +344,20 @@ var (
 
 func (state ObserverState) Validate() error {
 	if state.SchemaVersion != observerStateSchema ||
+		state.SequenceGapProtocol != sequenceGapProtocolC8 &&
+			state.SequenceGapProtocol !=
+				sequenceGapProtocolLegacyUnproven ||
 		!uuid4Pattern.MatchString(state.HostID) ||
 		!uuid4Pattern.MatchString(state.BootID) ||
 		!hex32Pattern.MatchString(state.KeyID) ||
 		state.KeyEpoch == 0 {
 		return fmt.Errorf("invalid observer state identity")
+	}
+	if state.SequenceGapProtocol == sequenceGapProtocolLegacyUnproven &&
+		(state.LastCoveredGapEnd == 0 ||
+			!state.MutationReadOnly ||
+			!state.ReconcileRequired) {
+		return fmt.Errorf("legacy sequence-gap protocol state must remain fenced")
 	}
 	if state.MutationReadOnly && state.ReadOnlyReason == "" {
 		return fmt.Errorf("read-only state requires a reason")
@@ -440,6 +559,7 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 	}
 	initial := ObserverState{
 		SchemaVersion:       observerStateSchema,
+		SequenceGapProtocol: sequenceGapProtocolC8,
 		HostID:              identity.HostID,
 		BootID:              identity.BootID,
 		KeyID:               identity.KeyID,
@@ -681,7 +801,8 @@ func (store *StateStore) persistRotationIncomplete() error {
 func (store *StateStore) reserve(identity StateIdentity) (uint64, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
-	if store.state.MutationReadOnly {
+	if store.state.MutationReadOnly ||
+		store.state.SequenceGapProtocol != sequenceGapProtocolC8 {
 		return 0, fmt.Errorf("observer state is mutation read-only")
 	}
 	if store.state.HostID != identity.HostID ||
@@ -716,6 +837,7 @@ func (store *StateStore) commitPendingBootBoundary(
 	if store.state.BootBoundaryState != bootBoundaryPending ||
 		store.state.PendingBootBoundary == nil ||
 		store.state.MutationReadOnly ||
+		store.state.SequenceGapProtocol != sequenceGapProtocolC8 ||
 		len(store.state.BootHistory) == 0 ||
 		event.SourceSequence > store.state.LastSequence ||
 		event.SourceSequence <
@@ -741,6 +863,7 @@ func (store *StateStore) reserveRotationEpochStart(
 	marker := authorization.marker
 	if authorization.role != rotationEpochStartPublication ||
 		store.state.MutationReadOnly ||
+		store.state.SequenceGapProtocol != sequenceGapProtocolC8 ||
 		store.state.HostID != identity.HostID ||
 		store.state.BootID != identity.BootID ||
 		store.state.KeyID != marker.Transition.OldKeyID ||
@@ -769,6 +892,7 @@ func (store *StateStore) commitRotationPublication(
 	defer store.mutex.Unlock()
 	mode := rotationModeForState(store.state, authorization)
 	if store.state.MutationReadOnly ||
+		store.state.SequenceGapProtocol != sequenceGapProtocolC8 ||
 		mode == rotationBoundaryInvalid ||
 		event.SourceSequence > store.state.LastSequence ||
 		!rotationEnvelopeMatches(
@@ -847,6 +971,7 @@ func (store *StateStore) anchorPublication(
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 	if store.state.MutationReadOnly ||
+		store.state.SequenceGapProtocol != sequenceGapProtocolC8 ||
 		store.state.PublicationHeadHash != expectedPreviousHash ||
 		sequence <= store.state.PublicationHeadSequence ||
 		sequence > store.state.LastSequence ||
@@ -913,7 +1038,9 @@ func (store *StateStore) incrementRoutineDrop() (bool, error) {
 func (store *StateStore) markGapCovered(sequence uint64) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
-	if sequence > store.state.LastSequence ||
+	if store.state.MutationReadOnly ||
+		store.state.SequenceGapProtocol != sequenceGapProtocolC8 ||
+		sequence > store.state.LastSequence ||
 		sequence < store.state.LastCoveredGapEnd {
 		return fmt.Errorf("invalid covered gap sequence")
 	}
