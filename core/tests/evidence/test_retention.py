@@ -1635,6 +1635,33 @@ def test_retention_proof_rejects_equal_distinct_accepted_ref_substitution(
         case.store.close(flush=False)
 
 
+def test_retention_proof_snapshot_rejects_preissuance_equal_distinct_ref(
+    tmp_path: Path,
+) -> None:
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(
+        tmp_path
+    )
+    verifier = store._bound_verifier
+    assert verifier is not None
+    accepted = verifier._authority.accepted[2]
+    original_ref = accepted.evidence_ref
+    assert type(original_ref) is EvidenceRef
+    substitute = replace(original_ref)
+    assert substitute == original_ref
+    assert substitute is not original_ref
+    object.__setattr__(accepted, "evidence_ref", substitute)
+    try:
+        with pytest.raises(EvidenceCorrupt, match="verifier authority"):
+            store._freeze_retention_snapshot(
+                _proof_clock(),
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        object.__setattr__(accepted, "evidence_ref", original_ref)
+        coverage.close()
+        store.close(flush=False)
+
+
 def test_retention_proof_chain_length_race_is_typed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

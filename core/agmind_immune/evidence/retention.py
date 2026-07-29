@@ -3336,7 +3336,7 @@ def _authenticate_store_retention_tombstone(
             "final retention proof target is not authenticated"
         ) from error
     if (
-        record.ref != target_ref
+        record.ref is not target_ref
         or record.priority is not EvidencePriority.PROTECTED
         or type(record.envelope) is not dict
         or type(record.canonical_envelope) is not bytes

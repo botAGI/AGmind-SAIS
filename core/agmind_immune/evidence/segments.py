@@ -2480,9 +2480,10 @@ class SegmentStore:
             or accepted is None
             or accepted.canonical != record.canonical_envelope
             or accepted.evidence_priority != record.priority.value
-            or accepted.evidence_ref != record.ref
+            or record.ref != resolved.ref
+            or accepted.evidence_ref is not resolved.ref
             or verifier.accepted_ref(record.ref.source_sequence)
-            != record.ref
+            is not resolved.ref
         ):
             raise EvidenceCorrupt(
                 "retention payload record differs from verifier authority"
