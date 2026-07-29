@@ -38,7 +38,7 @@ sensor:
 	$(UV_RUN) run --frozen ruff check core/agmind_immune/falco_adapter core/tests/falco_adapter
 	$(UV_RUN) run --frozen mypy core/agmind_immune/falco_adapter
 	$(UV_RUN) run --frozen pytest -q core/tests/falco_adapter core/tests/test_contract_regressions.py::test_falco_schema_and_runtime_cover_candidate_investigation_and_hard_error
-	$(GO_RUN) go test ./internal/contracts ./host/observerd -run '^(TestTask4|TestIngestFalco|TestFalcoIngestHTTP|TestSharedContradictoryFalcoResultIsRejected|TestFalcoResultTupleMatrixIsExact|TestRetentionTombstoneRouteExistsOnlyOnPhysicalCoreSocket)'
+	$(GO_RUN) go test ./internal/contracts ./host/observerd -run '^(TestTask4|TestIngestFalco|TestFalcoIngestHTTP|TestSharedContradictoryFalcoResultIsRejected|TestFalcoResultTupleMatrixIsExact|TestC2AControlRoutesExistOnlyOnPhysicalCoreSocket)'
 	@validation_log="$$(mktemp)"; \
 	trap 'rm -f "$$validation_log"' 0; \
 	validation_status=0; \

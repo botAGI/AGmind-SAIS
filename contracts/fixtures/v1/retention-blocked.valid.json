@@ -1,0 +1,10 @@
+{
+  "schema_version": "agmind.retention-blocked.v1",
+  "blocked_id": "44444444-4444-4444-8444-444444444444",
+  "target_bytes": 100,
+  "routine_bytes": 40,
+  "protected_bytes": 75,
+  "blocked_bytes": 15,
+  "reason": "protected_evidence",
+  "current_chain_head_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+}

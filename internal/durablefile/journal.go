@@ -68,6 +68,15 @@ type Recovery struct {
 	VerifiedBytes int64
 }
 
+// TornTailIntent contains the verified prefix and exact unverified suffix
+// presented while the journal inode is exclusively locked and before any
+// destructive truncation. Records are caller-owned copies.
+type TornTailIntent struct {
+	VerifiedBytes int64
+	Records       []Record
+	Tail          []byte
+}
+
 // Journal is an exclusively locked append-only AGF1 stream.
 type Journal struct {
 	mutex        sync.Mutex
@@ -182,7 +191,7 @@ func unlockAndClose(file *os.File) error {
 func recoverLocked(
 	file *os.File,
 	maxFrame uint32,
-	beforeTailRepair func() error,
+	beforeTailRepair func(TornTailIntent) error,
 ) (Recovery, error) {
 	if maxFrame == 0 {
 		return Recovery{}, fmt.Errorf("maxFrame must be positive")
@@ -246,7 +255,23 @@ func recoverLocked(
 	recovery.VerifiedBytes = offset
 	if recovery.TailRepaired {
 		if beforeTailRepair != nil {
-			if err := beforeTailRepair(); err != nil {
+			tail := make([]byte, size-offset)
+			if _, err := file.ReadAt(tail, offset); err != nil {
+				return Recovery{}, err
+			}
+			records := make([]Record, len(recovery.Records))
+			for index, record := range recovery.Records {
+				records[index] = record
+				records[index].Payload = append(
+					[]byte(nil),
+					record.Payload...,
+				)
+			}
+			if err := beforeTailRepair(TornTailIntent{
+				VerifiedBytes: offset,
+				Records:       records,
+				Tail:          tail,
+			}); err != nil {
 				return Recovery{}, err
 			}
 		}
@@ -285,11 +310,40 @@ func RecoverWithTailIntent(
 	if err := file.Sync(); err != nil {
 		return Recovery{}, err
 	}
-	return recoverLocked(file, maxFrame, beforeTailRepair)
+	var intent func(TornTailIntent) error
+	if beforeTailRepair != nil {
+		intent = func(TornTailIntent) error {
+			return beforeTailRepair()
+		}
+	}
+	return recoverLocked(file, maxFrame, intent)
 }
 
 // NewJournal recovers, exclusively locks, and opens a journal for append.
 func NewJournal(path string, options ...Option) (*Journal, error) {
+	journal, _, err := newJournal(path, nil, options...)
+	return journal, err
+}
+
+// NewJournalWithTailIntent opens and locks a journal like NewJournal, but a
+// torn final frame is truncated only after the callback accepts the exact
+// locked suffix. The returned Recovery describes the pre-append journal.
+func NewJournalWithTailIntent(
+	path string,
+	beforeTailRepair func(TornTailIntent) error,
+	options ...Option,
+) (*Journal, Recovery, error) {
+	if beforeTailRepair == nil {
+		return nil, Recovery{}, fmt.Errorf("nil tail-repair intent")
+	}
+	return newJournal(path, beforeTailRepair, options...)
+}
+
+func newJournal(
+	path string,
+	beforeTailRepair func(TornTailIntent) error,
+	options ...Option,
+) (*Journal, Recovery, error) {
 	config := journalOptions{
 		maxFrame: defaultMaxFrameSize,
 		sync:     func(file *os.File) error { return file.Sync() },
@@ -301,31 +355,35 @@ func NewJournal(path string, options ...Option) (*Journal, error) {
 	}
 	if config.maxFrame == 0 || config.sync == nil ||
 		config.syncDir == nil || config.write == nil {
-		return nil, fmt.Errorf("invalid journal option")
+		return nil, Recovery{}, fmt.Errorf("invalid journal option")
 	}
 	file, _, err := openLockedRegular(path, true, config.beforeFlock)
 	if err != nil {
-		return nil, err
+		return nil, Recovery{}, err
 	}
 	if err := file.Sync(); err != nil {
 		_ = unlockAndClose(file)
-		return nil, err
+		return nil, Recovery{}, err
 	}
 	parent, parentErr := openSecureParent(path)
 	if parentErr != nil {
 		_ = unlockAndClose(file)
-		return nil, parentErr
+		return nil, Recovery{}, parentErr
 	}
 	syncErr := config.syncDir(parent.fd)
 	_ = unix.Close(parent.fd)
 	if syncErr != nil {
 		_ = unlockAndClose(file)
-		return nil, errors.Join(ErrCommitUncertain, syncErr)
+		return nil, Recovery{}, errors.Join(ErrCommitUncertain, syncErr)
 	}
-	recovery, err := recoverLocked(file, config.maxFrame, nil)
+	recovery, err := recoverLocked(
+		file,
+		config.maxFrame,
+		beforeTailRepair,
+	)
 	if err != nil {
 		_ = unlockAndClose(file)
-		return nil, err
+		return nil, Recovery{}, err
 	}
 	journal := &Journal{
 		path:     path,
@@ -339,7 +397,7 @@ func NewJournal(path string, options ...Option) (*Journal, error) {
 	if len(recovery.Records) > 0 {
 		journal.previousHash = recovery.Records[len(recovery.Records)-1].Hash
 	}
-	return journal, nil
+	return journal, recovery, nil
 }
 
 // Checkpoint atomically replaces the journal with one fully synced frame while

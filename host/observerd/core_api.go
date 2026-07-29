@@ -3,6 +3,8 @@ package observerd
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -26,6 +28,20 @@ type CoreEventV1 struct {
 	Envelope      contracts.EventEnvelopeV1 `json:"envelope"`
 }
 
+func (event CoreEventV1) Validate() error {
+	canonical, err := contracts.CanonicalJSON(event.Envelope)
+	if err != nil {
+		return err
+	}
+	_, err = coreEventFromSpoolItem(SpoolItem{
+		Sequence:      event.Sequence,
+		EventID:       event.EventID,
+		ContentSHA256: event.ContentSHA256,
+		Canonical:     canonical,
+	})
+	return err
+}
+
 type CoreSequenceGapV1 struct {
 	Start uint64 `json:"start"`
 	End   uint64 `json:"end"`
@@ -45,6 +61,36 @@ type CoreAckV1 struct {
 	Sequence      uint64 `json:"sequence"`
 	EventID       string `json:"event_id"`
 	ContentSHA256 string `json:"content_sha256"`
+}
+
+func coreEventFromSpoolItem(item SpoolItem) (CoreEventV1, error) {
+	envelope, err := contracts.DecodeStrict[contracts.EventEnvelopeV1](
+		bytes.NewReader(item.Canonical),
+		65_536,
+	)
+	if err != nil {
+		return CoreEventV1{}, errors.Join(ErrSpoolCorrupt, err)
+	}
+	if item.Sequence == 0 ||
+		item.Sequence != envelope.SourceSequence ||
+		item.EventID != envelope.EventID ||
+		!hex64Pattern.MatchString(item.ContentSHA256) {
+		return CoreEventV1{}, ErrSpoolCorrupt
+	}
+	canonical, err := contracts.CanonicalJSON(envelope)
+	if err != nil || !bytes.Equal(canonical, item.Canonical) {
+		return CoreEventV1{}, ErrSpoolCorrupt
+	}
+	sum := sha256.Sum256(canonical)
+	if item.ContentSHA256 != hex.EncodeToString(sum[:]) {
+		return CoreEventV1{}, ErrSpoolCorrupt
+	}
+	return CoreEventV1{
+		Sequence:      item.Sequence,
+		EventID:       item.EventID,
+		ContentSHA256: item.ContentSHA256,
+		Envelope:      envelope,
+	}, nil
 }
 
 func (ack CoreAckV1) Validate() error {
@@ -76,14 +122,11 @@ type CoreCoverageV1 struct {
 }
 
 type coreAPIBackend interface {
+	coreControlPublisher
 	FetchCoreEvents(context.Context, uint64, int) (CoreEventsPageV1, error)
 	AckCoreEvent(context.Context, CoreAckV1) error
 	LookupCoreInventory(context.Context, string) (ContainerIdentityV1, error)
 	CoreCoverage(context.Context) (CoreCoverageV1, error)
-	IngestRetentionTombstone(
-		context.Context,
-		RetentionTombstoneV1,
-	) (contracts.EventEnvelopeV1, error)
 }
 
 func (service *Service) FetchCoreEvents(
@@ -109,19 +152,11 @@ func (service *Service) FetchCoreEvents(
 	}
 	events := make([]CoreEventV1, 0, len(items))
 	for _, item := range items {
-		envelope, err := contracts.DecodeStrict[contracts.EventEnvelopeV1](
-			bytes.NewReader(item.Canonical),
-			65_536,
-		)
+		event, err := coreEventFromSpoolItem(item)
 		if err != nil {
-			return CoreEventsPageV1{}, errors.Join(ErrSpoolCorrupt, err)
+			return CoreEventsPageV1{}, err
 		}
-		events = append(events, CoreEventV1{
-			Sequence:      item.Sequence,
-			EventID:       item.EventID,
-			ContentSHA256: item.ContentSHA256,
-			Envelope:      envelope,
-		})
+		events = append(events, event)
 	}
 	allGaps := service.daemon.spool.UncoveredGaps(after)
 	gapCount := min(len(allGaps), coreMaxReportedGaps)
@@ -358,14 +393,7 @@ func coreCoverageHandler(backend coreAPIBackend) http.Handler {
 	})
 }
 
-func retentionTombstonePeerAuthorized(
-	peer uds.Peer,
-	coreUID uint32,
-) bool {
-	return peer.UID == 0 || peer.UID == coreUID
-}
-
-func coreAckPeerAuthorized(peer uds.Peer, coreUID uint32) bool {
+func coreMutationPeerAuthorized(peer uds.Peer, coreUID uint32) bool {
 	return peer.UID == 0 || peer.UID == coreUID
 }
 
@@ -383,7 +411,7 @@ func newCoreAPI(
 	mux.Handle(
 		"POST /v1/events/ack",
 		uds.RequirePeer(func(peer uds.Peer) bool {
-			return coreAckPeerAuthorized(peer, coreUID)
+			return coreMutationPeerAuthorized(peer, coreUID)
 		})(coreAckHandler(backend)),
 	)
 	mux.Handle(
@@ -397,8 +425,26 @@ func newCoreAPI(
 	mux.Handle(
 		"POST /v1/events/retention-tombstone",
 		uds.RequirePeer(func(peer uds.Peer) bool {
-			return retentionTombstonePeerAuthorized(peer, coreUID)
-		})(retentionTombstoneHandler(backend)),
+			return coreMutationPeerAuthorized(peer, coreUID)
+		})(coreControlHandler[RetentionTombstoneV2](backend)),
+	)
+	mux.Handle(
+		"POST /v1/events/evidence-repair-authorize",
+		uds.RequirePeer(func(peer uds.Peer) bool {
+			return coreMutationPeerAuthorized(peer, coreUID)
+		})(coreControlHandler[EvidenceRepairAuthorizeV1](backend)),
+	)
+	mux.Handle(
+		"POST /v1/events/evidence-repair-complete",
+		uds.RequirePeer(func(peer uds.Peer) bool {
+			return coreMutationPeerAuthorized(peer, coreUID)
+		})(coreControlHandler[EvidenceRepairCompleteV1](backend)),
+	)
+	mux.Handle(
+		"POST /v1/events/retention-blocked",
+		uds.RequirePeer(func(peer uds.Peer) bool {
+			return coreMutationPeerAuthorized(peer, coreUID)
+		})(coreControlHandler[RetentionBlockedV1](backend)),
 	)
 	return mux
 }

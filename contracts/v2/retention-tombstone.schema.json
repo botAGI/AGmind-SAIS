@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agmind.local/contracts/v2/retention-tombstone.schema.json",
+  "$comment": "Authoritative validation MUST enforce x-agmind-semantic and fail closed if unsupported; see contracts/README.md.",
+  "x-agmind-semantic": "RetentionTombstoneV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "tombstone_id",
+    "removed_manifest_hashes",
+    "first_removed_manifest_sha256",
+    "last_removed_manifest_sha256",
+    "first_retained_manifest_sha256",
+    "removed_bytes",
+    "reason",
+    "policy_version",
+    "current_chain_head_sha256",
+    "manifest_run_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "agmind.retention-tombstone.v2"
+    },
+    "tombstone_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "removed_manifest_hashes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/sha256"
+      }
+    },
+    "first_removed_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "last_removed_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "first_retained_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "removed_bytes": {
+      "$ref": "#/$defs/positiveUint64"
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "retention_age_limit",
+        "retention_size_limit",
+        "retention_age_and_size_limit"
+      ]
+    },
+    "policy_version": {
+      "type": "string",
+      "const": "agmind-retention-v1"
+    },
+    "current_chain_head_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "manifest_run_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "positiveUint64": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}

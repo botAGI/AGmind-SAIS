@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agmind.local/contracts/v1/retention-blocked.schema.json",
+  "$comment": "Authoritative validation MUST enforce x-agmind-semantic and fail closed if unsupported; see contracts/README.md.",
+  "x-agmind-semantic": "RetentionBlockedV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "blocked_id",
+    "target_bytes",
+    "routine_bytes",
+    "protected_bytes",
+    "blocked_bytes",
+    "reason",
+    "current_chain_head_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "agmind.retention-blocked.v1"
+    },
+    "blocked_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "target_bytes": {
+      "$ref": "#/$defs/positiveUint64"
+    },
+    "routine_bytes": {
+      "$ref": "#/$defs/uint64"
+    },
+    "protected_bytes": {
+      "$ref": "#/$defs/uint64"
+    },
+    "blocked_bytes": {
+      "$ref": "#/$defs/positiveUint64"
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "protected_evidence",
+        "required_key_proof"
+      ]
+    },
+    "current_chain_head_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "positiveUint64": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}

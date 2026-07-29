@@ -28,6 +28,9 @@ IPV4 = re.compile(
 MAX_UINT64 = 2**64 - 1
 MIN_INT64 = -(2**63)
 MAX_INT64 = 2**63 - 1
+MAX_EVIDENCE_SEGMENT_BYTES = 64 * 1024 * 1024
+ZERO_SHA256 = "0" * 64
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 SUCCESS_RESULTS = {"EINPROGRESS", "EINPROGRESS(115)"}
 FALCO_SENSOR_REQUIRED_FIELDS = {
     "destination_ipv4",
@@ -595,6 +598,196 @@ class CoverageEventV1(ContractModel):
             and self.affected_source_sequence_end < self.affected_source_sequence_start
         ):
             raise ValueError("coverage sequence interval is reversed")
+        return self
+
+
+class EvidenceRepairAuthorizeV1(ContractModel):
+    schema_version: Literal["agmind.evidence-repair-authorize.v1"]
+    repair_id: str
+    segment_id: str
+    verified_bytes: int = Field(ge=0, le=MAX_EVIDENCE_SEGMENT_BYTES)
+    discarded_bytes: int = Field(gt=0, le=MAX_EVIDENCE_SEGMENT_BYTES)
+    discarded_sha256: str
+    last_verified_frame_sha256: str
+    current_chain_head_sha256: str
+    reason: Literal["torn_open_tail"]
+
+    @field_validator("repair_id", "segment_id")
+    @classmethod
+    def identifier_is_uuid4(cls, value: str, info: Any) -> str:
+        if not UUID4.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be a lowercase UUIDv4")
+        return value
+
+    @field_validator(
+        "discarded_sha256",
+        "last_verified_frame_sha256",
+        "current_chain_head_sha256",
+    )
+    @classmethod
+    def digest_is_lowercase_sha256(cls, value: str, info: Any) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be 64 lowercase hex")
+        return value
+
+    @model_validator(mode="after")
+    def byte_range_and_last_frame_are_exact(self) -> EvidenceRepairAuthorizeV1:
+        if self.verified_bytes + self.discarded_bytes > MAX_EVIDENCE_SEGMENT_BYTES:
+            raise ValueError("repair byte range exceeds evidence segment maximum")
+        no_verified_frame = self.last_verified_frame_sha256 == ZERO_SHA256
+        if (self.verified_bytes == 0) != no_verified_frame:
+            raise ValueError(
+                "last_verified_frame_sha256 must be zero iff verified_bytes is zero"
+            )
+        return self
+
+
+class EvidenceRepairCompleteV1(ContractModel):
+    schema_version: Literal["agmind.evidence-repair-complete.v1"]
+    repair_id: str
+    authorization_event_id: str
+    authorization_content_sha256: str
+    segment_id: str
+    verified_bytes: int = Field(ge=0, le=MAX_EVIDENCE_SEGMENT_BYTES)
+    post_repair_prefix_sha256: str
+    last_verified_frame_sha256: str
+    current_chain_head_sha256: str
+    reason: Literal["torn_open_tail_completed"]
+
+    @field_validator("repair_id", "segment_id")
+    @classmethod
+    def identifier_is_uuid4(cls, value: str, info: Any) -> str:
+        if not UUID4.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be a lowercase UUIDv4")
+        return value
+
+    @field_validator("authorization_event_id")
+    @classmethod
+    def authorization_event_is_exact(cls, value: str) -> str:
+        if not re.fullmatch(r"evt_[0-9a-f]{64}", value):
+            raise ValueError("authorization_event_id must be an exact event ID")
+        return value
+
+    @field_validator(
+        "authorization_content_sha256",
+        "post_repair_prefix_sha256",
+        "last_verified_frame_sha256",
+        "current_chain_head_sha256",
+    )
+    @classmethod
+    def digest_is_lowercase_sha256(cls, value: str, info: Any) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be 64 lowercase hex")
+        return value
+
+    @model_validator(mode="after")
+    def repaired_prefix_and_last_frame_are_exact(self) -> EvidenceRepairCompleteV1:
+        no_verified_frame = self.last_verified_frame_sha256 == ZERO_SHA256
+        if (self.verified_bytes == 0) != no_verified_frame:
+            raise ValueError(
+                "last_verified_frame_sha256 must be zero iff verified_bytes is zero"
+            )
+        if self.verified_bytes == 0 and self.post_repair_prefix_sha256 != EMPTY_SHA256:
+            raise ValueError("zero-byte repair prefix must hash the empty byte string")
+        return self
+
+
+class RetentionTombstoneV2(ContractModel):
+    schema_version: Literal["agmind.retention-tombstone.v2"]
+    tombstone_id: str
+    removed_manifest_hashes: list[str] = Field(min_length=1, max_length=128)
+    first_removed_manifest_sha256: str
+    last_removed_manifest_sha256: str
+    first_retained_manifest_sha256: str
+    removed_bytes: int = Field(gt=0, le=MAX_UINT64)
+    reason: Literal[
+        "retention_age_limit",
+        "retention_size_limit",
+        "retention_age_and_size_limit",
+    ]
+    policy_version: Literal["agmind-retention-v1"]
+    current_chain_head_sha256: str
+    manifest_run_sha256: str
+
+    @field_validator("tombstone_id")
+    @classmethod
+    def tombstone_id_is_uuid4(cls, value: str) -> str:
+        if not UUID4.fullmatch(value):
+            raise ValueError("tombstone_id must be a lowercase UUIDv4")
+        return value
+
+    @field_validator(
+        "first_removed_manifest_sha256",
+        "last_removed_manifest_sha256",
+        "first_retained_manifest_sha256",
+        "current_chain_head_sha256",
+        "manifest_run_sha256",
+    )
+    @classmethod
+    def digest_is_lowercase_sha256(cls, value: str, info: Any) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be 64 lowercase hex")
+        return value
+
+    @field_validator("removed_manifest_hashes")
+    @classmethod
+    def manifest_hashes_are_ordered_unique_digests(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("removed_manifest_hashes must be unique")
+        if any(not HEX64.fullmatch(value) for value in values):
+            raise ValueError("removed_manifest_hashes must contain lowercase sha256 digests")
+        return values
+
+    @model_validator(mode="after")
+    def manifest_run_binding_is_exact(self) -> RetentionTombstoneV2:
+        from .canonicaljson import canonical_json
+
+        if self.first_removed_manifest_sha256 != self.removed_manifest_hashes[0]:
+            raise ValueError("first_removed_manifest_sha256 does not match list head")
+        if self.last_removed_manifest_sha256 != self.removed_manifest_hashes[-1]:
+            raise ValueError("last_removed_manifest_sha256 does not match list tail")
+        expected = hashlib.sha256(
+            b"AGMIND_RETENTION_RUN_V2\x00"
+            + canonical_json(self.removed_manifest_hashes)
+        ).hexdigest()
+        if self.manifest_run_sha256 != expected:
+            raise ValueError("manifest_run_sha256 does not match the ordered manifest run")
+        return self
+
+
+class RetentionBlockedV1(ContractModel):
+    schema_version: Literal["agmind.retention-blocked.v1"]
+    blocked_id: str
+    target_bytes: int = Field(gt=0, le=MAX_UINT64)
+    routine_bytes: int = Field(ge=0, le=MAX_UINT64)
+    protected_bytes: int = Field(ge=0, le=MAX_UINT64)
+    blocked_bytes: int = Field(gt=0, le=MAX_UINT64)
+    reason: Literal["protected_evidence", "required_key_proof"]
+    current_chain_head_sha256: str
+
+    @field_validator("blocked_id")
+    @classmethod
+    def blocked_id_is_uuid4(cls, value: str) -> str:
+        if not UUID4.fullmatch(value):
+            raise ValueError("blocked_id must be a lowercase UUIDv4")
+        return value
+
+    @field_validator("current_chain_head_sha256")
+    @classmethod
+    def chain_head_is_lowercase_sha256(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("current_chain_head_sha256 must be 64 lowercase hex")
+        return value
+
+    @model_validator(mode="after")
+    def blocked_byte_arithmetic_is_exact(self) -> RetentionBlockedV1:
+        if self.routine_bytes > MAX_UINT64 - self.protected_bytes:
+            raise ValueError("retained byte sum would overflow uint64")
+        retained_bytes = self.routine_bytes + self.protected_bytes
+        if retained_bytes <= self.target_bytes:
+            raise ValueError("retained bytes must exceed target_bytes")
+        if self.blocked_bytes != retained_bytes - self.target_bytes:
+            raise ValueError("blocked_bytes must equal retained bytes minus target_bytes")
         return self
 
 

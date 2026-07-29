@@ -59,27 +59,35 @@ type SpoolItem struct {
 	publicationHash     string
 }
 
+func cloneSpoolItem(item SpoolItem) SpoolItem {
+	item.Canonical = bytes.Clone(item.Canonical)
+	item.publicationRaw = bytes.Clone(item.publicationRaw)
+	return item
+}
+
 type SequenceGap struct {
 	Start uint64
 	End   uint64
 }
 
 type Spool struct {
-	mutex             sync.Mutex
-	config            SpoolConfig
-	state             *StateStore
-	keys              *Keyring
-	items             map[uint64]SpoolItem
-	routineBytes      uint64
-	totalBytes        uint64
-	ackBytes          uint64
-	ackJournal        *durablefile.Journal
-	closed            bool
-	remove            func(string, durablefile.FileIdentity) error
-	removePublication func(string, durablefile.FileIdentity) error
-	syncDirectory     func(string) error
-	publish           func(string, []byte) error
-	beforeRemove      func(SpoolItem)
+	mutex               sync.Mutex
+	config              SpoolConfig
+	state               *StateStore
+	keys                *Keyring
+	items               map[uint64]SpoolItem
+	routineBytes        uint64
+	totalBytes          uint64
+	ackBytes            uint64
+	ackJournal          *durablefile.Journal
+	controlReceipts     *ControlReceiptJournal
+	controlReceiptBytes uint64
+	closed              bool
+	remove              func(string, durablefile.FileIdentity) error
+	removePublication   func(string, durablefile.FileIdentity) error
+	syncDirectory       func(string) error
+	publish             func(string, []byte) error
+	beforeRemove        func(SpoolItem)
 }
 
 type ackRecord struct {
@@ -1230,7 +1238,10 @@ func NewSpool(
 	tempPaths := make([]string, 0)
 	for _, entry := range rootEntries {
 		switch entry {
-		case string(RoutineTier), string(PriorityTier), "publications":
+		case string(RoutineTier),
+			string(PriorityTier),
+			"publications",
+			"control-receipts.agf":
 		case "acked.agf":
 			ackExists = true
 		default:
@@ -1546,23 +1557,51 @@ func NewSpool(
 		_ = state.PersistReadOnly("observer_ack_journal_corrupt")
 		return nil, err
 	}
+	controlReceipts, err := recoverControlReceiptJournal(
+		config.StateDir,
+		state,
+		items,
+		keys,
+		config.MaxBytes-totalBytes,
+	)
+	if err != nil {
+		_ = ackJournal.Close()
+		_ = state.PersistReadOnly("observer_control_receipt_corrupt")
+		return nil, err
+	}
+	controlReceiptBytes := controlReceipts.Anchor().Bytes
+	if !receiptBytesFitGlobal(
+		totalBytes,
+		0,
+		controlReceiptBytes,
+		config.MaxBytes,
+	) {
+		_ = controlReceipts.Close()
+		_ = ackJournal.Close()
+		_ = state.PersistReadOnly("observer_spool_quota_invalid")
+		return nil, ErrSpoolCorrupt
+	}
+	totalBytes += controlReceiptBytes
 	spool := &Spool{
-		config:            config,
-		state:             state,
-		keys:              keys,
-		items:             items,
-		routineBytes:      routineBytes,
-		totalBytes:        totalBytes,
-		ackBytes:          ackBytes,
-		ackJournal:        ackJournal,
-		remove:            durablefile.RemoveIfIdentity,
-		removePublication: durablefile.RemoveIfIdentity,
-		syncDirectory:     durablefile.SyncDirectory,
+		config:              config,
+		state:               state,
+		keys:                keys,
+		items:               items,
+		routineBytes:        routineBytes,
+		totalBytes:          totalBytes,
+		ackBytes:            ackBytes,
+		ackJournal:          ackJournal,
+		controlReceipts:     controlReceipts,
+		controlReceiptBytes: controlReceiptBytes,
+		remove:              durablefile.RemoveIfIdentity,
+		removePublication:   durablefile.RemoveIfIdentity,
+		syncDirectory:       durablefile.SyncDirectory,
 		publish: func(path string, payload []byte) error {
 			return durablefile.CreateOnly(path, payload)
 		},
 	}
 	if err := spool.cleanupAckedLocked(state.Snapshot().AckSequence); err != nil {
+		_ = controlReceipts.Close()
 		_ = ackJournal.Close()
 		_ = state.PersistReadOnly("observer_spool_acked_cleanup_failed")
 		return nil, err
@@ -1720,7 +1759,267 @@ func (spool *Spool) Append(
 	event contracts.EventEnvelopeV1,
 	tier Tier,
 ) (SpoolItem, error) {
-	return spool.append(event, tier, nil)
+	return spool.append(event, tier, nil, nil)
+}
+
+type controlReceiptAppend struct {
+	key           string
+	requestSHA256 string
+}
+
+func validateControlReceiptAppend(
+	event contracts.EventEnvelopeV1,
+	control *controlReceiptAppend,
+) error {
+	request, err := coreControlRequestFromEnvelope(event)
+	if err != nil {
+		return errors.Join(ErrSpoolCorrupt, err)
+	}
+	if request == nil {
+		if control != nil {
+			return ErrSpoolCorrupt
+		}
+		return nil
+	}
+	if control == nil {
+		return ErrCoreControlReceiptRequired
+	}
+	requestSHA256, err := CoreControlRequestSHA256(request)
+	if err != nil ||
+		control.key != request.OperationKey() ||
+		control.requestSHA256 != requestSHA256 {
+		return ErrSpoolCorrupt
+	}
+	return nil
+}
+
+func (spool *Spool) LookupControl(
+	key string,
+	requestSHA256 string,
+) (CoreEventV1, error) {
+	spool.mutex.Lock()
+	defer spool.mutex.Unlock()
+	if spool.closed || spool.controlReceipts == nil {
+		return CoreEventV1{}, ErrControlReceiptCorrupt
+	}
+	return spool.controlReceipts.Lookup(key, requestSHA256)
+}
+
+func (spool *Spool) FindControl(
+	key string,
+) (ControlReceipt, bool, error) {
+	spool.mutex.Lock()
+	defer spool.mutex.Unlock()
+	if spool.closed || spool.controlReceipts == nil {
+		return ControlReceipt{}, false, ErrControlReceiptCorrupt
+	}
+	return spool.controlReceipts.Find(key)
+}
+
+func (spool *Spool) previewControlReceiptLocked(
+	event contracts.EventEnvelopeV1,
+	canonical []byte,
+	contentHash string,
+	control controlReceiptAppend,
+) (uint64, error) {
+	if spool.controlReceipts == nil {
+		return 0, ErrControlReceiptCorrupt
+	}
+	item, err := coreEventFromSpoolItem(SpoolItem{
+		Sequence:      event.SourceSequence,
+		EventID:       event.EventID,
+		ContentSHA256: contentHash,
+		Canonical:     canonical,
+	})
+	if err != nil {
+		return 0, err
+	}
+	previewed, created, receiptBytes, err := spool.controlReceipts.Preview(
+		control.key,
+		control.requestSHA256,
+		item,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if !created || !coreControlEventsEqual(previewed, item) ||
+		receiptBytes == 0 {
+		return 0, ErrControlReceiptConflict
+	}
+	return receiptBytes, nil
+}
+
+func (spool *Spool) ensureControlCapacityLocked(
+	itemBytes uint64,
+	receiptBytes uint64,
+) error {
+	if spool.totalBytes > spool.config.MaxBytes ||
+		ackJournalMaxFrameBytes > spool.config.MaxBytes-spool.totalBytes {
+		_ = spool.state.PersistReadOnly(
+			"observer_priority_spool_exhausted",
+		)
+		return ErrPriorityQuota
+	}
+	available := spool.config.MaxBytes - ackJournalMaxFrameBytes
+	if !receiptBytesFitGlobal(
+		spool.totalBytes,
+		itemBytes,
+		receiptBytes,
+		available,
+	) {
+		_ = spool.state.PersistReadOnly(
+			"observer_priority_spool_exhausted",
+		)
+		return ErrPriorityQuota
+	}
+	return nil
+}
+
+func (spool *Spool) PreflightControl(
+	event contracts.EventEnvelopeV1,
+	control controlReceiptAppend,
+) error {
+	spool.mutex.Lock()
+	defer spool.mutex.Unlock()
+	return spool.preflightControlLocked(event, control)
+}
+
+func (spool *Spool) preflightControlLocked(
+	event contracts.EventEnvelopeV1,
+	control controlReceiptAppend,
+) error {
+	if spool.closed || spool.controlReceipts == nil {
+		return ErrControlReceiptCorrupt
+	}
+	canonical, err := contracts.CanonicalJSON(event)
+	if err != nil {
+		return err
+	}
+	validated, contentHash, err := validateSpoolPayload(canonical, spool.keys)
+	if err != nil || validated.SourceSequence != event.SourceSequence {
+		return ErrSpoolCorrupt
+	}
+	if err := validateControlReceiptAppend(validated, &control); err != nil {
+		return err
+	}
+	snapshot := spool.state.Snapshot()
+	if snapshot.MutationReadOnly ||
+		snapshot.LastSequence == math.MaxUint64 ||
+		event.SourceSequence != snapshot.LastSequence+1 ||
+		event.HostID != snapshot.HostID ||
+		event.BootID != snapshot.BootID ||
+		event.KeyID != snapshot.KeyID ||
+		event.KeyEpoch != snapshot.KeyEpoch ||
+		tierForEvent(event) != PriorityTier {
+		return ErrSpoolCorrupt
+	}
+	if _, exists := spool.items[event.SourceSequence]; exists {
+		return ErrSpoolCorrupt
+	}
+	frame, _, err := durablefile.EncodeFrame(canonical, [32]byte{}, 65_536)
+	if err != nil {
+		return err
+	}
+	publication := publicationFor(
+		event,
+		PriorityTier,
+		contentHash,
+		snapshot.PublicationHeadHash,
+	)
+	publicationRaw, _, err := publicationNodeHash(publication)
+	if err != nil {
+		return err
+	}
+	frameBytes := uint64(len(frame))
+	publicationBytes := uint64(len(publicationRaw))
+	if frameBytes > math.MaxUint64-publicationBytes {
+		return ErrSpoolCorrupt
+	}
+	receiptBytes, err := spool.previewControlReceiptLocked(
+		event,
+		canonical,
+		contentHash,
+		control,
+	)
+	if err != nil {
+		return err
+	}
+	return spool.ensureControlCapacityLocked(
+		frameBytes+publicationBytes,
+		receiptBytes,
+	)
+}
+
+func (spool *Spool) storeControlReceiptLocked(
+	item SpoolItem,
+	control controlReceiptAppend,
+	expectedBytes uint64,
+) error {
+	if spool.controlReceipts == nil || expectedBytes == 0 {
+		return ErrControlReceiptCorrupt
+	}
+	event, err := coreEventFromSpoolItem(item)
+	if err != nil {
+		return err
+	}
+	previous := spool.controlReceipts.Anchor()
+	if previous.Bytes != spool.controlReceiptBytes {
+		return ErrControlReceiptCorrupt
+	}
+	stored, created, err := spool.controlReceipts.Store(
+		control.key,
+		control.requestSHA256,
+		event,
+		func(before, next ControlReceiptAnchor) error {
+			return spool.state.anchorControlReceipt(
+				before.Count,
+				before.Bytes,
+				before.HeadHash,
+				next.Count,
+				next.Bytes,
+				next.HeadHash,
+			)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	next := spool.controlReceipts.Anchor()
+	if !created ||
+		!coreControlEventsEqual(stored, event) ||
+		next.Bytes < previous.Bytes ||
+		next.Bytes-previous.Bytes != expectedBytes {
+		return ErrControlReceiptCorrupt
+	}
+	spool.controlReceiptBytes = next.Bytes
+	return nil
+}
+
+func (spool *Spool) appendControl(
+	event contracts.EventEnvelopeV1,
+	tier Tier,
+	control controlReceiptAppend,
+) (SpoolItem, error) {
+	return spool.append(event, tier, nil, &control)
+}
+
+func (spool *Spool) publishControl(
+	event contracts.EventEnvelopeV1,
+	control controlReceiptAppend,
+	reserve func() error,
+) (SpoolItem, error) {
+	if reserve == nil {
+		return SpoolItem{}, fmt.Errorf("nil control sequence reservation")
+	}
+	spool.mutex.Lock()
+	defer spool.mutex.Unlock()
+	if err := spool.preflightControlLocked(event, control); err != nil {
+		return SpoolItem{}, err
+	}
+	if err := reserve(); err != nil {
+		return SpoolItem{}, err
+	}
+	return spool.appendLocked(event, PriorityTier, nil, &control)
 }
 
 func (spool *Spool) appendRotationEpochStart(
@@ -1728,21 +2027,39 @@ func (spool *Spool) appendRotationEpochStart(
 	tier Tier,
 	authorization rotationPublicationAuthorization,
 ) (SpoolItem, error) {
-	return spool.append(event, tier, &authorization)
+	return spool.append(event, tier, &authorization, nil)
 }
 
 func (spool *Spool) append(
 	event contracts.EventEnvelopeV1,
 	tier Tier,
 	rotationAuthorization *rotationPublicationAuthorization,
+	control *controlReceiptAppend,
 ) (SpoolItem, error) {
 	spool.mutex.Lock()
 	defer spool.mutex.Unlock()
+	return spool.appendLocked(
+		event,
+		tier,
+		rotationAuthorization,
+		control,
+	)
+}
+
+func (spool *Spool) appendLocked(
+	event contracts.EventEnvelopeV1,
+	tier Tier,
+	rotationAuthorization *rotationPublicationAuthorization,
+	control *controlReceiptAppend,
+) (SpoolItem, error) {
 	if spool.closed {
 		return SpoolItem{}, fmt.Errorf("spool closed")
 	}
 	if tier != RoutineTier && tier != PriorityTier {
 		return SpoolItem{}, fmt.Errorf("invalid spool tier")
+	}
+	if control != nil && (rotationAuthorization != nil || tier != PriorityTier) {
+		return SpoolItem{}, fmt.Errorf("invalid control receipt publication")
 	}
 	if tierForEvent(event) != tier {
 		_ = spool.state.PersistReadOnly("observer_spool_tier_mismatch")
@@ -1755,6 +2072,9 @@ func (spool *Spool) append(
 	validated, contentHash, err := validateSpoolPayload(canonical, spool.keys)
 	if err != nil || validated.SourceSequence != event.SourceSequence {
 		return SpoolItem{}, ErrSpoolCorrupt
+	}
+	if err := validateControlReceiptAppend(validated, control); err != nil {
+		return SpoolItem{}, err
 	}
 	snapshot := spool.state.Snapshot()
 	rotationCandidate := false
@@ -1795,6 +2115,18 @@ func (spool *Spool) append(
 	if err != nil {
 		return SpoolItem{}, err
 	}
+	var receiptBytes uint64
+	if control != nil {
+		receiptBytes, err = spool.previewControlReceiptLocked(
+			event,
+			canonical,
+			contentHash,
+			*control,
+		)
+		if err != nil {
+			return SpoolItem{}, err
+		}
+	}
 	if existing, ok := spool.items[event.SourceSequence]; ok {
 		if existing.ContentSHA256 == contentHash &&
 			bytes.Equal(existing.Canonical, canonical) {
@@ -1814,7 +2146,7 @@ func (spool *Spool) append(
 				)
 				return SpoolItem{}, ErrSpoolCorrupt
 			}
-			return existing, nil
+			return cloneSpoolItem(existing), nil
 		}
 		_ = spool.state.PersistReadOnly("observer_spool_sequence_conflict")
 		return SpoolItem{}, ErrSpoolCorrupt
@@ -1885,7 +2217,16 @@ func (spool *Spool) append(
 			publicationHash:     nodeHash,
 		}
 		itemBytes := item.frameBytes + item.publicationBytes
+		if control != nil {
+			if err := spool.ensureControlCapacityLocked(
+				itemBytes,
+				receiptBytes,
+			); err != nil {
+				return SpoolItem{}, err
+			}
+		}
 		if spool.totalBytes > math.MaxUint64-itemBytes ||
+			receiptBytes > math.MaxUint64-spool.totalBytes-itemBytes ||
 			tier == RoutineTier &&
 				spool.routineBytes > math.MaxUint64-itemBytes {
 			_ = spool.state.PersistReadOnly(
@@ -1893,7 +2234,7 @@ func (spool *Spool) append(
 			)
 			return SpoolItem{}, ErrSpoolCorrupt
 		}
-		if spool.totalBytes+itemBytes >
+		if spool.totalBytes+itemBytes+receiptBytes >
 			spool.config.MaxBytes-ackJournalMaxFrameBytes {
 			return SpoolItem{}, ErrPriorityQuota
 		}
@@ -1903,8 +2244,20 @@ func (spool *Spool) append(
 					spool.config.PriorityReserveBytes {
 			return SpoolItem{}, ErrRoutineQuota
 		}
-		spool.items[event.SourceSequence] = item
-		spool.totalBytes += itemBytes
+		if control != nil {
+			if err := spool.storeControlReceiptLocked(
+				item,
+				*control,
+				receiptBytes,
+			); err != nil {
+				_ = spool.state.PersistReadOnly(
+					"observer_control_receipt_commit_failed",
+				)
+				return SpoolItem{}, err
+			}
+		}
+		spool.items[event.SourceSequence] = cloneSpoolItem(item)
+		spool.totalBytes += itemBytes + receiptBytes
 		if tier == RoutineTier {
 			spool.routineBytes += itemBytes
 		}
@@ -1927,11 +2280,12 @@ func (spool *Spool) append(
 		return SpoolItem{}, ErrSpoolCorrupt
 	}
 	itemBytes := frameBytes + publicationBytes
-	if ^uint64(0)-spool.totalBytes < itemBytes {
+	if ^uint64(0)-spool.totalBytes < itemBytes ||
+		receiptBytes > ^uint64(0)-spool.totalBytes-itemBytes {
 		_ = spool.state.PersistReadOnly("observer_spool_size_overflow")
 		return SpoolItem{}, ErrSpoolCorrupt
 	}
-	nextTotal := spool.totalBytes + itemBytes
+	nextTotal := spool.totalBytes + itemBytes + receiptBytes
 	nextRoutine := spool.routineBytes
 	if tier == RoutineTier {
 		if ^uint64(0)-spool.routineBytes < itemBytes {
@@ -2031,7 +2385,19 @@ func (spool *Spool) append(
 			)
 			return SpoolItem{}, err
 		}
-		spool.items[event.SourceSequence] = item
+		if control != nil {
+			if err := spool.storeControlReceiptLocked(
+				item,
+				*control,
+				receiptBytes,
+			); err != nil {
+				_ = spool.state.PersistReadOnly(
+					"observer_control_receipt_commit_failed",
+				)
+				return SpoolItem{}, err
+			}
+		}
+		spool.items[event.SourceSequence] = cloneSpoolItem(item)
 		spool.totalBytes = nextTotal
 		spool.routineBytes = nextRoutine
 		return item, nil
@@ -2130,7 +2496,19 @@ func (spool *Spool) append(
 		)
 		return SpoolItem{}, err
 	}
-	spool.items[event.SourceSequence] = item
+	if control != nil {
+		if err := spool.storeControlReceiptLocked(
+			item,
+			*control,
+			receiptBytes,
+		); err != nil {
+			_ = spool.state.PersistReadOnly(
+				"observer_control_receipt_commit_failed",
+			)
+			return SpoolItem{}, err
+		}
+	}
+	spool.items[event.SourceSequence] = cloneSpoolItem(item)
 	spool.totalBytes = nextTotal
 	spool.routineBytes = nextRoutine
 	return item, nil
@@ -2183,7 +2561,7 @@ func (spool *Spool) Fetch(
 			break
 		}
 		item.Canonical = canonical
-		result = append(result, item)
+		result = append(result, cloneSpoolItem(item))
 		used += uint64(len(canonical))
 	}
 	return result, nil
@@ -2245,6 +2623,9 @@ func (spool *Spool) cleanupAckedLocked(sequence uint64) error {
 	})
 	for _, itemSequence := range sequences {
 		item := spool.items[itemSequence]
+		if err := spool.requireControlReceiptLocked(item); err != nil {
+			return err
+		}
 		publicationErr := validatePublicationItem(item)
 		if errors.Is(publicationErr, os.ErrNotExist) {
 			_, _, frameErr := durablefile.ReadRegularIdentity(
@@ -2281,7 +2662,7 @@ func (spool *Spool) cleanupAckedLocked(sequence uint64) error {
 			return ErrSpoolCorrupt
 		}
 		if spool.beforeRemove != nil {
-			spool.beforeRemove(item)
+			spool.beforeRemove(cloneSpoolItem(item))
 		}
 		event, canonical, contentHash, frameBytes, identity, readErr :=
 			readStandaloneFrame(item.path, spool.keys)
@@ -2546,5 +2927,13 @@ func (spool *Spool) Close() error {
 		return nil
 	}
 	spool.closed = true
-	return spool.ackJournal.Close()
+	var receiptErr error
+	if spool.controlReceipts != nil {
+		receiptErr = spool.controlReceipts.Close()
+	}
+	var ackErr error
+	if spool.ackJournal != nil {
+		ackErr = spool.ackJournal.Close()
+	}
+	return errors.Join(receiptErr, ackErr)
 }

@@ -1,0 +1,16 @@
+{
+  "schema_version": "agmind.retention-tombstone.v2",
+  "tombstone_id": "33333333-3333-4333-8333-333333333333",
+  "removed_manifest_hashes": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ],
+  "first_removed_manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "last_removed_manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "first_retained_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "removed_bytes": 8192,
+  "reason": "retention_size_limit",
+  "policy_version": "agmind-retention-v1",
+  "current_chain_head_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "manifest_run_sha256": "7e0afece42c9fc551689444dec3b51439fa84bc50fe06cecfc5677174e8ec165"
+}

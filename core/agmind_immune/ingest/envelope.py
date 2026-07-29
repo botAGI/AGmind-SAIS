@@ -27,16 +27,21 @@ from agmind_immune.contracts import (
     ContractModel,
     CoverageEventV1,
     EventEnvelopeV1,
+    EvidenceRepairAuthorizeV1,
+    EvidenceRepairCompleteV1,
     FalcoConnectV1,
     KeyTransitionV1,
     ObserverBootBoundaryV1,
     ObserverTrustRootV1,
+    RetentionBlockedV1,
+    RetentionTombstoneV2,
     decode_strict,
 )
 
 MAX_EVENTS_PAGE_BYTES = 4 * 1024 * 1024
 MAX_CANONICAL_ENVELOPE_BYTES = 64 * 1024
 MAX_PUBLIC_KEY_METADATA_BYTES = 64 * 1024
+MAX_CORE_EVENT_RESPONSE_BYTES = 128 * 1024
 MAX_PAGE_EVENTS = 100
 MAX_PAGE_GAPS = 100
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -120,6 +125,23 @@ class CoreEventV1(ContractModel):
         if len(canonical_json(value)) > MAX_CANONICAL_ENVELOPE_BYTES:
             raise ValueError("canonical envelope exceeds 64 KiB")
         return value
+
+
+def decode_core_event(raw: bytes) -> CoreEventV1:
+    """Decode one bounded direct observer response and bind its complete outer item."""
+    item = decode_strict(raw, CoreEventV1, MAX_CORE_EVENT_RESPONSE_BYTES)
+    envelope_sequence = item.envelope.get("source_sequence")
+    envelope_event_id = item.envelope.get("event_id")
+    canonical_envelope = canonical_json(item.envelope)
+    if (
+        type(envelope_sequence) is not int
+        or envelope_sequence != item.sequence
+        or type(envelope_event_id) is not str
+        or envelope_event_id != item.event_id
+        or hashlib.sha256(canonical_envelope).hexdigest() != item.content_sha256
+    ):
+        raise OuterBindingError("direct observer item does not bind its canonical envelope")
+    return item
 
 
 class CoreEventsPageV1(ContractModel):
@@ -865,6 +887,9 @@ _PROTECTED_EVENT_TYPES = frozenset(
         "observer_key_epoch_start",
         "observer_key_transition",
         "observer_start",
+        "evidence_repair_authorized",
+        "evidence_repair_completed",
+        "retention_blocked_priority_evidence",
         "retention_tombstone",
     }
 )
@@ -1123,9 +1148,53 @@ class EnvelopeVerifier:
         )
 
     @classmethod
+    def _empty_core_operation_context(cls, envelope: EventEnvelopeV1) -> bool:
+        return (
+            envelope.source_id == "agmind-observerd"
+            and envelope.clock_uncertainty_ms == 0
+            and envelope.coverage_flags == []
+            and not {
+                "container_id",
+                "container_start_time",
+                "release_id",
+                "inventory_revision",
+            }
+            & envelope.model_fields_set
+            and cls._empty_security_context(envelope)
+        )
+
+    @classmethod
     def _validate_special_semantics(cls, envelope: EventEnvelopeV1) -> None:
         try:
-            if envelope.event_type == "observer_boot_boundary":
+            if envelope.event_type == "evidence_repair_authorized":
+                EvidenceRepairAuthorizeV1.model_validate(
+                    envelope.normalized_fields,
+                    strict=True,
+                )
+                if not cls._empty_core_operation_context(envelope):
+                    raise ValueError("invalid evidence-repair authorization context")
+            elif envelope.event_type == "evidence_repair_completed":
+                EvidenceRepairCompleteV1.model_validate(
+                    envelope.normalized_fields,
+                    strict=True,
+                )
+                if not cls._empty_core_operation_context(envelope):
+                    raise ValueError("invalid evidence-repair completion context")
+            elif envelope.event_type == "retention_tombstone":
+                RetentionTombstoneV2.model_validate(
+                    envelope.normalized_fields,
+                    strict=True,
+                )
+                if not cls._empty_core_operation_context(envelope):
+                    raise ValueError("invalid retention-tombstone context")
+            elif envelope.event_type == "retention_blocked_priority_evidence":
+                RetentionBlockedV1.model_validate(
+                    envelope.normalized_fields,
+                    strict=True,
+                )
+                if not cls._empty_core_operation_context(envelope):
+                    raise ValueError("invalid retention-blocked context")
+            elif envelope.event_type == "observer_boot_boundary":
                 ObserverBootBoundaryV1.model_validate(envelope.normalized_fields, strict=True)
                 if not cls._empty_security_context(envelope) or envelope.coverage_flags != [
                     "boot_transition",

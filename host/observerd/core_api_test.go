@@ -35,6 +35,46 @@ func coreAPIEventFixture(
 	return service, spool, event
 }
 
+func TestC2AFullCoreEventUsesExactDurableSpoolItem(t *testing.T) {
+	_, spool, _ := coreAPIEventFixture(t)
+	items, err := spool.Fetch(0, 1, 4*1024*1024)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("spool items=%d err=%v", len(items), err)
+	}
+	item := items[0]
+	event, err := coreEventFromSpoolItem(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Sequence != item.Sequence ||
+		event.EventID != item.EventID ||
+		event.ContentSHA256 != item.ContentSHA256 ||
+		event.Envelope.SourceSequence != item.Sequence ||
+		event.Envelope.EventID != item.EventID {
+		t.Fatalf("outer=%+v item=%+v", event, item)
+	}
+
+	for name, mutate := range map[string]func(*SpoolItem){
+		"sequence": func(value *SpoolItem) { value.Sequence++ },
+		"event ID": func(value *SpoolItem) { value.EventID = "evt_" + strings.Repeat("f", 64) },
+		"content hash": func(value *SpoolItem) {
+			value.ContentSHA256 = strings.Repeat("f", 64)
+		},
+		"noncanonical envelope": func(value *SpoolItem) {
+			value.Canonical = append(value.Canonical, '\n')
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := item
+			changed.Canonical = append([]byte(nil), item.Canonical...)
+			mutate(&changed)
+			if _, err := coreEventFromSpoolItem(changed); err == nil {
+				t.Fatal("mismatched durable item accepted")
+			}
+		})
+	}
+}
+
 func TestCoreEventsFetchIsBoundedOrderedAndAckDeletesOnlyExactEvent(
 	t *testing.T,
 ) {
@@ -253,30 +293,24 @@ func TestCoreAckRejectsUnknownFieldsWithoutChangingAck(t *testing.T) {
 	}
 }
 
-func TestRetentionTombstoneRouteExistsOnlyOnPhysicalCoreSocket(
+func TestC2AControlRoutesExistOnlyOnPhysicalCoreSocket(
 	t *testing.T,
 ) {
 	service, _, _, _, _ := observerServiceFixture(t)
 	ingest := newIngestAPI(service, 2001)
 	core := newCoreAPI(service, 2002, 1002)
+	controlPaths := []string{
+		"/v1/events/evidence-repair-authorize",
+		"/v1/events/evidence-repair-complete",
+		"/v1/events/retention-tombstone",
+		"/v1/events/retention-blocked",
+	}
 	for _, testCase := range []struct {
 		name       string
 		handler    http.Handler
 		path       string
 		wantStatus int
 	}{
-		{
-			name:       "tombstone absent from sensor-owned ingest",
-			handler:    ingest,
-			path:       "/v1/events/retention-tombstone",
-			wantStatus: http.StatusNotFound,
-		},
-		{
-			name:       "tombstone registered on core",
-			handler:    core,
-			path:       "/v1/events/retention-tombstone",
-			wantStatus: http.StatusForbidden,
-		},
 		{
 			name:       "Falco absent from core",
 			handler:    core,
@@ -308,14 +342,36 @@ func TestRetentionTombstoneRouteExistsOnlyOnPhysicalCoreSocket(
 			}
 		})
 	}
+	for _, path := range controlPaths {
+		t.Run("sensor absent "+path, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			ingest.ServeHTTP(
+				response,
+				httptest.NewRequest(http.MethodPost, "http://unix"+path, nil),
+			)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("path=%s status=%d body=%s", path, response.Code, response.Body)
+			}
+		})
+		t.Run("core registered "+path, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			core.ServeHTTP(
+				response,
+				httptest.NewRequest(http.MethodPost, "http://unix"+path, nil),
+			)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("path=%s status=%d body=%s", path, response.Code, response.Body)
+			}
+		})
+	}
 }
 
-func TestRetentionTombstoneAuthorizationUsesExactCoreUID(t *testing.T) {
+func TestCoreMutationAuthorizationUsesExactCoreUID(t *testing.T) {
 	for _, peer := range []uds.Peer{
 		{UID: 0, GID: 9999},
 		{UID: 1002, GID: 9999},
 	} {
-		if !retentionTombstonePeerAuthorized(peer, 1002) {
+		if !coreMutationPeerAuthorized(peer, 1002) {
 			t.Fatalf("authorized exact UID rejected: %+v", peer)
 		}
 	}
@@ -323,7 +379,7 @@ func TestRetentionTombstoneAuthorizationUsesExactCoreUID(t *testing.T) {
 		{UID: 1003, GID: 0},
 		{UID: 1003, GID: 2002},
 	} {
-		if retentionTombstonePeerAuthorized(peer, 1002) {
+		if coreMutationPeerAuthorized(peer, 1002) {
 			t.Fatalf("group-only peer authorized: %+v", peer)
 		}
 	}
@@ -334,7 +390,7 @@ func TestAckAuthorizationUsesExactCoreUID(t *testing.T) {
 		{UID: 0, GID: 9999},
 		{UID: 1002, GID: 9999},
 	} {
-		if !coreAckPeerAuthorized(peer, 1002) {
+		if !coreMutationPeerAuthorized(peer, 1002) {
 			t.Fatalf("authorized exact UID rejected: %+v", peer)
 		}
 	}
@@ -342,7 +398,7 @@ func TestAckAuthorizationUsesExactCoreUID(t *testing.T) {
 		{UID: 1003, GID: 0},
 		{UID: 1003, GID: 2002},
 	} {
-		if coreAckPeerAuthorized(peer, 1002) {
+		if coreMutationPeerAuthorized(peer, 1002) {
 			t.Fatalf("group-only peer authorized: %+v", peer)
 		}
 	}

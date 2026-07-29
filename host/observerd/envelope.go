@@ -26,10 +26,17 @@ import (
 
 const observerStateSchemaV1 = "agmind.observer-state.v1"
 const observerStateSchemaV2 = "agmind.observer-state.v2"
-const observerStateSchema = "agmind.observer-state.v3"
+const observerStateSchemaV3 = "agmind.observer-state.v3"
+const observerStateSchema = "agmind.observer-state.v4"
 const sequenceGapProtocolC8 = "proof_carrying_containment_c8"
 const sequenceGapProtocolLegacyUnproven = "legacy_unproven"
 const zeroPublicationHash = "0000000000000000000000000000000000000000000000000000000000000000"
+const zeroControlReceiptHash = "0000000000000000000000000000000000000000000000000000000000000000"
+
+const (
+	controlReceiptMaxCount uint64 = 4_096
+	controlReceiptMaxBytes uint64 = 64 * 1024 * 1024
+)
 
 const (
 	bootBoundaryPending        = "pending"
@@ -76,8 +83,85 @@ type ObserverState struct {
 	PublicationBaseHash     string               `json:"publication_base_hash"`
 	PublicationHeadSequence uint64               `json:"publication_head_sequence"`
 	PublicationHeadHash     string               `json:"publication_head_hash"`
+	ControlReceiptCount     uint64               `json:"control_receipt_count"`
+	ControlReceiptBytes     uint64               `json:"control_receipt_bytes"`
+	ControlReceiptHeadHash  string               `json:"control_receipt_head_sha256"`
 	BootBoundaryState       string               `json:"boot_boundary_state"`
 	PendingBootBoundary     *PendingBootBoundary `json:"pending_boot_boundary,omitempty"`
+}
+
+// observerStateV3 is the pre-control-receipt state contract. C2A is a
+// fresh-state producer boundary, so migration is valid only with an empty
+// receipt anchor; OpenStateStore rejects any pre-existing receipt journal
+// before persisting the V4 migration.
+type observerStateV3 struct {
+	SchemaVersion           string               `json:"schema_version"`
+	HostID                  string               `json:"host_id"`
+	BootID                  string               `json:"boot_id"`
+	KeyID                   string               `json:"key_id"`
+	KeyEpoch                uint64               `json:"key_epoch"`
+	LastSequence            uint64               `json:"last_sequence"`
+	MutationReadOnly        bool                 `json:"mutation_read_only"`
+	ReadOnlyReason          string               `json:"read_only_reason"`
+	ReconcileRequired       bool                 `json:"reconcile_required"`
+	RoutineDropped          uint64               `json:"routine_dropped"`
+	DropEventPending        bool                 `json:"drop_event_pending"`
+	AckSequence             uint64               `json:"ack_sequence"`
+	AckEventID              string               `json:"ack_event_id"`
+	AckContentSHA256        string               `json:"ack_content_sha256"`
+	AckRecordHash           string               `json:"ack_record_hash"`
+	AckPayloadSHA256        string               `json:"ack_payload_sha256"`
+	LastCoveredGapEnd       uint64               `json:"last_covered_gap_end"`
+	SequenceGapProtocol     string               `json:"sequence_gap_protocol"`
+	BootHistory             []BootBoundary       `json:"boot_history,omitempty"`
+	AckRepairPending        bool                 `json:"ack_repair_pending"`
+	AckRepairReason         string               `json:"ack_repair_reason"`
+	PublicationBaseSequence uint64               `json:"publication_base_sequence"`
+	PublicationBaseHash     string               `json:"publication_base_hash"`
+	PublicationHeadSequence uint64               `json:"publication_head_sequence"`
+	PublicationHeadHash     string               `json:"publication_head_hash"`
+	BootBoundaryState       string               `json:"boot_boundary_state"`
+	PendingBootBoundary     *PendingBootBoundary `json:"pending_boot_boundary,omitempty"`
+}
+
+func observerStateFromV3(legacy observerStateV3) ObserverState {
+	return ObserverState{
+		SchemaVersion:           observerStateSchema,
+		HostID:                  legacy.HostID,
+		BootID:                  legacy.BootID,
+		KeyID:                   legacy.KeyID,
+		KeyEpoch:                legacy.KeyEpoch,
+		LastSequence:            legacy.LastSequence,
+		MutationReadOnly:        legacy.MutationReadOnly,
+		ReadOnlyReason:          legacy.ReadOnlyReason,
+		ReconcileRequired:       legacy.ReconcileRequired,
+		RoutineDropped:          legacy.RoutineDropped,
+		DropEventPending:        legacy.DropEventPending,
+		AckSequence:             legacy.AckSequence,
+		AckEventID:              legacy.AckEventID,
+		AckContentSHA256:        legacy.AckContentSHA256,
+		AckRecordHash:           legacy.AckRecordHash,
+		AckPayloadSHA256:        legacy.AckPayloadSHA256,
+		LastCoveredGapEnd:       legacy.LastCoveredGapEnd,
+		SequenceGapProtocol:     legacy.SequenceGapProtocol,
+		BootHistory:             append([]BootBoundary(nil), legacy.BootHistory...),
+		AckRepairPending:        legacy.AckRepairPending,
+		AckRepairReason:         legacy.AckRepairReason,
+		PublicationBaseSequence: legacy.PublicationBaseSequence,
+		PublicationBaseHash:     legacy.PublicationBaseHash,
+		PublicationHeadSequence: legacy.PublicationHeadSequence,
+		PublicationHeadHash:     legacy.PublicationHeadHash,
+		ControlReceiptHeadHash:  zeroControlReceiptHash,
+		BootBoundaryState:       legacy.BootBoundaryState,
+		PendingBootBoundary:     legacy.PendingBootBoundary,
+	}
+}
+
+func (legacy observerStateV3) Validate() error {
+	if legacy.SchemaVersion != observerStateSchemaV3 {
+		return fmt.Errorf("invalid V3 observer state")
+	}
+	return observerStateFromV3(legacy).Validate()
 }
 
 // observerStateV2 is the pre-C8 state contract. It is migrated only when no
@@ -138,6 +222,7 @@ func observerStateFromV2(legacy observerStateV2) ObserverState {
 		PublicationBaseHash:     legacy.PublicationBaseHash,
 		PublicationHeadSequence: legacy.PublicationHeadSequence,
 		PublicationHeadHash:     legacy.PublicationHeadHash,
+		ControlReceiptHeadHash:  zeroControlReceiptHash,
 		BootBoundaryState:       legacy.BootBoundaryState,
 		PendingBootBoundary:     legacy.PendingBootBoundary,
 	}
@@ -219,6 +304,7 @@ func observerStateFromV1(legacy observerStateV1) ObserverState {
 		PublicationBaseHash:     legacy.PublicationBaseHash,
 		PublicationHeadSequence: legacy.PublicationHeadSequence,
 		PublicationHeadHash:     legacy.PublicationHeadHash,
+		ControlReceiptHeadHash:  zeroControlReceiptHash,
 	}
 }
 
@@ -284,20 +370,40 @@ func migrateObserverStateV1(legacy observerStateV1) ObserverState {
 	return state
 }
 
-func decodeObserverState(raw []byte) (ObserverState, bool, error) {
+func observerStateSchemaVersion(raw []byte) (string, error) {
 	var header struct {
 		SchemaVersion string `json:"schema_version"`
 	}
 	if err := json.Unmarshal(raw, &header); err != nil {
+		return "", err
+	}
+	return header.SchemaVersion, nil
+}
+
+func decodeObserverState(raw []byte) (ObserverState, bool, error) {
+	schemaVersion, err := observerStateSchemaVersion(raw)
+	if err != nil {
 		return ObserverState{}, false, err
 	}
-	switch header.SchemaVersion {
+	switch schemaVersion {
 	case observerStateSchema:
 		state, err := contracts.DecodeStrict[ObserverState](
 			bytes.NewReader(raw),
 			65_536,
 		)
 		return state, false, err
+	case observerStateSchemaV3:
+		legacy, err := contracts.DecodeStrict[observerStateV3](
+			bytes.NewReader(raw),
+			65_536,
+		)
+		if err != nil {
+			return ObserverState{}, false, err
+		}
+		if err := legacy.Validate(); err != nil {
+			return ObserverState{}, false, err
+		}
+		return observerStateFromV3(legacy), true, nil
 	case observerStateSchemaV2:
 		legacy, err := contracts.DecodeStrict[observerStateV2](
 			bytes.NewReader(raw),
@@ -334,6 +440,52 @@ func decodeObserverState(raw []byte) (ObserverState, bool, error) {
 		return ObserverState{}, false, fmt.Errorf(
 			"unsupported observer state schema version",
 		)
+	}
+}
+
+// V1-V3 state predates control receipts, so no receipt journal can be
+// authenticated during migration. The normal bootstrap holds the state lock
+// across this check and the subsequent V4 state write.
+func requireLegacyControlReceiptJournalAbsent(statePath string) error {
+	spoolRoot := filepath.Join(filepath.Dir(statePath), "spool")
+	info, err := os.Lstat(spoolRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.Join(ErrControlReceiptCorrupt, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.Join(
+			ErrControlReceiptCorrupt,
+			durablefile.ErrUnsafePath,
+		)
+	}
+	if err := durablefile.EnsurePrivateDirectory(spoolRoot); err != nil {
+		return errors.Join(ErrControlReceiptCorrupt, err)
+	}
+	_, err = durablefile.ReadRegular(
+		filepath.Join(spoolRoot, "control-receipts.agf"),
+		1,
+	)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.Join(ErrControlReceiptCorrupt, err)
+	}
+	return ErrControlReceiptCorrupt
+}
+
+func requireControlReceiptMigrationBoundary(
+	statePath string,
+	sourceSchema string,
+) error {
+	switch sourceSchema {
+	case observerStateSchemaV1, observerStateSchemaV2, observerStateSchemaV3:
+		return requireLegacyControlReceiptJournalAbsent(statePath)
+	default:
+		return nil
 	}
 }
 
@@ -407,6 +559,15 @@ func (state ObserverState) Validate() error {
 		state.PublicationBaseSequence == state.PublicationHeadSequence &&
 			state.PublicationBaseHash != state.PublicationHeadHash {
 		return fmt.Errorf("invalid observer publication anchor")
+	}
+	if !hex64Pattern.MatchString(state.ControlReceiptHeadHash) ||
+		state.ControlReceiptCount > controlReceiptMaxCount ||
+		state.ControlReceiptBytes > controlReceiptMaxBytes ||
+		(state.ControlReceiptCount == 0) !=
+			(state.ControlReceiptBytes == 0) ||
+		(state.ControlReceiptCount == 0) !=
+			(state.ControlReceiptHeadHash == zeroControlReceiptHash) {
+		return fmt.Errorf("invalid control receipt anchor")
 	}
 	if len(state.BootHistory) == 0 ||
 		len(state.BootHistory) > 1_024 ||
@@ -560,15 +721,16 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 		return nil, err
 	}
 	initial := ObserverState{
-		SchemaVersion:       observerStateSchema,
-		SequenceGapProtocol: sequenceGapProtocolC8,
-		HostID:              identity.HostID,
-		BootID:              identity.BootID,
-		KeyID:               identity.KeyID,
-		KeyEpoch:            identity.KeyEpoch,
-		ReconcileRequired:   true,
-		PublicationBaseHash: zeroPublicationHash,
-		PublicationHeadHash: zeroPublicationHash,
+		SchemaVersion:          observerStateSchema,
+		SequenceGapProtocol:    sequenceGapProtocolC8,
+		HostID:                 identity.HostID,
+		BootID:                 identity.BootID,
+		KeyID:                  identity.KeyID,
+		KeyEpoch:               identity.KeyEpoch,
+		ReconcileRequired:      true,
+		PublicationBaseHash:    zeroPublicationHash,
+		PublicationHeadHash:    zeroPublicationHash,
+		ControlReceiptHeadHash: zeroControlReceiptHash,
 		BootHistory: []BootBoundary{{
 			BootID:        identity.BootID,
 			FirstSequence: 1,
@@ -592,6 +754,10 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	sourceSchema, err := observerStateSchemaVersion(raw)
+	if err != nil {
+		return nil, err
+	}
 	state, migrated, err := decodeObserverState(raw)
 	if err != nil {
 		return nil, err
@@ -600,6 +766,12 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 		state.KeyID != identity.KeyID ||
 		state.KeyEpoch != identity.KeyEpoch {
 		return nil, fmt.Errorf("observer state identity mismatch")
+	}
+	if err := requireControlReceiptMigrationBoundary(
+		path,
+		sourceSchema,
+	); err != nil {
+		return nil, err
 	}
 	needsPersist := migrated
 	if state.BootBoundaryState == bootBoundaryLegacyUnproven {
@@ -831,6 +1003,46 @@ func (store *StateStore) reserve(identity StateIdentity) (uint64, error) {
 	return next.LastSequence, nil
 }
 
+func (store *StateStore) reserveExpected(
+	identity StateIdentity,
+	expected uint64,
+) (uint64, error) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if expected == 0 ||
+		store.state.MutationReadOnly ||
+		store.state.SequenceGapProtocol != sequenceGapProtocolC8 {
+		return 0, fmt.Errorf("observer state is mutation read-only")
+	}
+	if store.state.HostID != identity.HostID ||
+		store.state.BootID != identity.BootID ||
+		store.state.KeyID != identity.KeyID ||
+		store.state.KeyEpoch != identity.KeyEpoch {
+		return 0, fmt.Errorf("observer signing identity mismatch")
+	}
+	if store.state.LastSequence == math.MaxUint64 {
+		next := cloneObserverState(store.state)
+		next.MutationReadOnly = true
+		next.ReadOnlyReason = "observer_sequence_exhausted"
+		next.ReconcileRequired = true
+		store.state = cloneObserverState(next)
+		persistErr := store.persistLocked(next)
+		return 0, errors.Join(
+			fmt.Errorf("observer sequence exhausted"),
+			persistErr,
+		)
+	}
+	if expected != store.state.LastSequence+1 {
+		return 0, fmt.Errorf("observer expected sequence changed")
+	}
+	next := cloneObserverState(store.state)
+	next.LastSequence = expected
+	if err := store.replaceLocked(next); err != nil {
+		return 0, err
+	}
+	return expected, nil
+}
+
 func (store *StateStore) commitPendingBootBoundary(
 	event contracts.EventEnvelopeV1,
 ) error {
@@ -1006,6 +1218,67 @@ func (store *StateStore) recoverPublicationHead(
 	next.PublicationHeadHash = publicationHash
 	// Startup recovery may make the immutable publication anchor more exact,
 	// but it must never clear or replace an existing mutation fence.
+	return store.replaceLocked(next)
+}
+
+func (store *StateStore) anchorControlReceipt(
+	expectedCount uint64,
+	expectedBytes uint64,
+	expectedHeadHash string,
+	count uint64,
+	bytes uint64,
+	headHash string,
+) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.state.MutationReadOnly ||
+		store.state.ControlReceiptCount != expectedCount ||
+		store.state.ControlReceiptBytes != expectedBytes ||
+		store.state.ControlReceiptHeadHash != expectedHeadHash ||
+		expectedCount >= controlReceiptMaxCount ||
+		count != expectedCount+1 ||
+		bytes <= expectedBytes ||
+		count > controlReceiptMaxCount ||
+		bytes > controlReceiptMaxBytes ||
+		!hex64Pattern.MatchString(headHash) ||
+		headHash == zeroControlReceiptHash {
+		return fmt.Errorf("invalid control receipt head transition")
+	}
+	next := cloneObserverState(store.state)
+	next.ControlReceiptCount = count
+	next.ControlReceiptBytes = bytes
+	next.ControlReceiptHeadHash = headHash
+	return store.replaceLocked(next)
+}
+
+func (store *StateStore) recoverControlReceipt(
+	expectedCount uint64,
+	expectedBytes uint64,
+	expectedHeadHash string,
+	count uint64,
+	bytes uint64,
+	headHash string,
+) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.state.ControlReceiptCount != expectedCount ||
+		store.state.ControlReceiptBytes != expectedBytes ||
+		store.state.ControlReceiptHeadHash != expectedHeadHash ||
+		expectedCount >= controlReceiptMaxCount ||
+		count != expectedCount+1 ||
+		bytes <= expectedBytes ||
+		count > controlReceiptMaxCount ||
+		bytes > controlReceiptMaxBytes ||
+		!hex64Pattern.MatchString(headHash) ||
+		headHash == zeroControlReceiptHash {
+		return fmt.Errorf("invalid control receipt recovery transition")
+	}
+	next := cloneObserverState(store.state)
+	next.ControlReceiptCount = count
+	next.ControlReceiptBytes = bytes
+	next.ControlReceiptHeadHash = headHash
+	// Recovery can make the redundant state anchor exact, but it never clears
+	// an existing mutation fence.
 	return store.replaceLocked(next)
 }
 
@@ -1397,7 +1670,10 @@ func priorityEventType(eventType string) bool {
 		"observer_start",
 		"observer_key_transition",
 		"observer_key_epoch_start",
+		"evidence_repair_authorized",
+		"evidence_repair_completed",
 		"retention_tombstone",
+		"retention_blocked_priority_evidence",
 		"incident_action_mirror",
 		"corruption":
 		return true
@@ -1412,6 +1688,9 @@ func (signer *EnvelopeSigner) Wrap(
 	normalizedFields map[string]any,
 	metadata EventMetadata,
 ) (contracts.EventEnvelopeV1, error) {
+	if coreControlEventType(eventType) {
+		return contracts.EventEnvelopeV1{}, ErrCoreControlReceiptRequired
+	}
 	return signer.wrap(
 		ctx,
 		noBootBoundaryPublication,
@@ -2143,11 +2422,21 @@ func loadObserverState(path string) (ObserverState, error) {
 	if err != nil {
 		return ObserverState{}, err
 	}
+	sourceSchema, err := observerStateSchemaVersion(raw)
+	if err != nil {
+		return ObserverState{}, err
+	}
 	state, migrated, err := decodeObserverState(raw)
 	if err != nil {
 		return ObserverState{}, err
 	}
 	if migrated {
+		if err := requireControlReceiptMigrationBoundary(
+			path,
+			sourceSchema,
+		); err != nil {
+			return ObserverState{}, err
+		}
 		if err := persistState(path, state); err != nil {
 			return ObserverState{}, err
 		}

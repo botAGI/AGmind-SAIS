@@ -41,26 +41,36 @@ func TestCoreAPIRouteGroupOnlyChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = getResponse.Body.Close()
-	ackResponse, err := client.Post(
-		"http://unix/v1/events/ack",
-		"application/json",
-		nil,
-	)
-	if err != nil {
-		t.Fatal(err)
+	if getResponse.StatusCode != http.StatusOK {
+		t.Fatalf("group-only GET status=%d", getResponse.StatusCode)
 	}
-	_ = ackResponse.Body.Close()
-	if getResponse.StatusCode != http.StatusOK ||
-		ackResponse.StatusCode != http.StatusForbidden {
-		t.Fatalf(
-			"group-only route status GET=%d ACK=%d",
-			getResponse.StatusCode,
-			ackResponse.StatusCode,
+	for _, route := range []string{
+		"/v1/events/ack",
+		"/v1/events/evidence-repair-authorize",
+		"/v1/events/evidence-repair-complete",
+		"/v1/events/retention-tombstone",
+		"/v1/events/retention-blocked",
+	} {
+		response, err := client.Post(
+			"http://unix"+route,
+			"application/json",
+			nil,
 		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusForbidden {
+			t.Fatalf(
+				"group-only mutation route %s status=%d",
+				route,
+				response.StatusCode,
+			)
+		}
 	}
 }
 
-func TestCoreAPIRoutesAllowGroupGETButForbidGroupOnlyACK(t *testing.T) {
+func TestCoreAPIRoutesAllowGroupGETButForbidGroupOnlyMutations(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("credential-switch route test requires root")
 	}
