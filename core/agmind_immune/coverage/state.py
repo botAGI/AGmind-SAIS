@@ -25,6 +25,8 @@ from agmind_immune.evidence.segments import (
     EvidenceStoreError,
     SegmentStore,
     StoredEvidenceRecord,
+    _exact_coverage_ref_key,
+    _same_exact_coverage_ref,
 )
 
 _MAX_CANONICAL_ENVELOPE_BYTES = 64 * 1024
@@ -74,6 +76,8 @@ class _CriticalInterval:
     kind: str
     opened_at: str
     source_sequence: int
+    normalized_fields_sha256: str
+    source_payload_hash: str
 
 
 @dataclass(frozen=True)
@@ -136,6 +140,10 @@ def _prepare(record: StoredEvidenceRecord) -> _PreparedRecord:
     if type(record.priority) is not EvidencePriority:
         raise CoverageValidationError("stored coverage priority is not exact")
     try:
+        _exact_coverage_ref_key(record.ref)
+    except ValueError as error:
+        raise CoverageValidationError("stored coverage ref is invalid") from error
+    try:
         envelope = decode_strict(
             record.canonical_envelope,
             EventEnvelopeV1,
@@ -153,11 +161,13 @@ def _prepare(record: StoredEvidenceRecord) -> _PreparedRecord:
             "stored coverage envelope is not exact canonical evidence"
         ) from error
     digest = hashlib.sha256(record.canonical_envelope).hexdigest()
-    if (
-        record.ref.source_sequence != envelope.source_sequence
-        or record.ref.event_id != envelope.event_id
-        or record.ref.content_sha256 != digest
-    ):
+    expected_ref = replace(
+        record.ref,
+        source_sequence=envelope.source_sequence,
+        event_id=envelope.event_id,
+        content_sha256=digest,
+    )
+    if not _same_exact_coverage_ref(record.ref, expected_ref):
         raise CoverageValidationError("stored coverage ref does not bind its envelope")
     coverage: CoverageEventV1 | None = None
     if envelope.event_type == "coverage":
@@ -541,8 +551,23 @@ def _apply_generic_critical(
     key = (coverage.component, coverage.kind, coverage.opened_at)
     intervals = snapshot.open_critical_intervals
     if coverage.closed_at is None:
-        if any((item.component, item.kind, item.opened_at) == key for item in intervals):
+        matching = tuple(
+            item for item in intervals if (item.component, item.kind, item.opened_at) == key
+        )
+        if len(matching) > 1:
             raise CoverageConflict("generic critical interval is duplicated")
+        if matching:
+            opened = matching[0]
+            logical_identity = (
+                prepared.envelope.normalized_fields_sha256,
+                prepared.envelope.source_payload_hash,
+            )
+            if (
+                opened.normalized_fields_sha256,
+                opened.source_payload_hash,
+            ) == logical_identity:
+                return snapshot
+            raise CoverageConflict("generic critical interval identity changed")
         return replace(
             snapshot,
             open_critical_intervals=(
@@ -552,6 +577,8 @@ def _apply_generic_critical(
                     kind=coverage.kind,
                     opened_at=coverage.opened_at,
                     source_sequence=prepared.envelope.source_sequence,
+                    normalized_fields_sha256=(prepared.envelope.normalized_fields_sha256),
+                    source_payload_hash=prepared.envelope.source_payload_hash,
                 ),
             ),
         )

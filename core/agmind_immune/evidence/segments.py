@@ -74,6 +74,11 @@ _UUID4_TEXT = (
     r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 )
+_EVIDENCE_REF_SEGMENT_ID = re.compile(rf"^{_UUID4_TEXT}$")
+_EVIDENCE_REF_SEGMENT_PATH = re.compile(
+    rf"^segments/(?P<date>[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})/"
+    rf"(?P<first_sequence>[0-9]{{20}})-(?P<segment>{_UUID4_TEXT})\.agseg$"
+)
 _MANIFEST_NAME = re.compile(rf"^(?P<segment>{_UUID4_TEXT})\.json$")
 _MANIFEST_TEMP_NAME = re.compile(
     rf"^\.(?P<segment>{_UUID4_TEXT})\.json\.{_UUID4_TEXT}\.tmp$"
@@ -183,6 +188,67 @@ class EvidenceRef:
     content_sha256: str
 
 
+def _exact_coverage_ref_key(
+    value: object,
+) -> tuple[str, str, int, int, str, str, int, str]:
+    if type(value) is not EvidenceRef:
+        raise ValueError("coverage evidence ref must use the exact runtime type")
+    if (
+        type(value.segment_id) is not str
+        or _EVIDENCE_REF_SEGMENT_ID.fullmatch(value.segment_id) is None
+    ):
+        raise ValueError("coverage evidence ref segment_id is invalid")
+    if type(value.segment_relative_path) is not str:
+        raise ValueError("coverage evidence ref path is not an exact string")
+    path_match = _EVIDENCE_REF_SEGMENT_PATH.fullmatch(value.segment_relative_path)
+    if path_match is None or path_match.group("segment") != value.segment_id:
+        raise ValueError("coverage evidence ref path is invalid")
+    date_text = path_match.group("date")
+    try:
+        path_date = date.fromisoformat(date_text)
+    except ValueError as error:
+        raise ValueError("coverage evidence ref path date is invalid") from error
+    if path_date.isoformat() != date_text:
+        raise ValueError("coverage evidence ref path date is not canonical")
+    if (
+        type(value.frame_offset) is not int
+        or type(value.frame_size) is not int
+        or type(value.source_sequence) is not int
+    ):
+        raise ValueError("coverage evidence ref numeric fields are not exact integers")
+    first_sequence = int(path_match.group("first_sequence"))
+    if (
+        not 1 <= first_sequence <= value.source_sequence <= MAX_UINT64
+        or value.frame_offset < 0
+        or not 76 < value.frame_size <= MAX_EVIDENCE_RECORD_BYTES + 76
+        or value.frame_offset + value.frame_size > MAX_SEGMENT_BYTES
+    ):
+        raise ValueError("coverage evidence ref numeric bounds are invalid")
+    if (
+        type(value.frame_sha256) is not str
+        or _HEX64.fullmatch(value.frame_sha256) is None
+        or type(value.event_id) is not str
+        or _EVENT.fullmatch(value.event_id) is None
+        or type(value.content_sha256) is not str
+        or _HEX64.fullmatch(value.content_sha256) is None
+    ):
+        raise ValueError("coverage evidence ref identity fields are invalid")
+    return (
+        value.segment_id,
+        value.segment_relative_path,
+        value.frame_offset,
+        value.frame_size,
+        value.frame_sha256,
+        value.event_id,
+        value.source_sequence,
+        value.content_sha256,
+    )
+
+
+def _same_exact_coverage_ref(left: object, right: object) -> bool:
+    return _exact_coverage_ref_key(left) == _exact_coverage_ref_key(right)
+
+
 @dataclass(frozen=True)
 class StoredEvidenceRecord:
     envelope: dict[str, Any]
@@ -190,6 +256,41 @@ class StoredEvidenceRecord:
     priority: EvidencePriority
     accepted_at: str
     ref: EvidenceRef
+
+
+def _exact_coverage_record_key(
+    value: object,
+) -> tuple[
+    bytes,
+    EvidencePriority,
+    str,
+    tuple[str, str, int, int, str, str, int, str],
+]:
+    if type(value) is not StoredEvidenceRecord:
+        raise ValueError("coverage record must use the exact runtime type")
+    if (
+        type(value.envelope) is not dict
+        or type(value.canonical_envelope) is not bytes
+        or type(value.priority) is not EvidencePriority
+        or type(value.accepted_at) is not str
+    ):
+        raise ValueError("coverage record fields do not use exact runtime types")
+    try:
+        encoded_envelope = canonical_json(value.envelope)
+    except (TypeError, ValueError) as error:
+        raise ValueError("coverage record envelope is not canonicalizable") from error
+    if encoded_envelope != value.canonical_envelope:
+        raise ValueError("coverage record envelope differs from its canonical bytes")
+    return (
+        value.canonical_envelope,
+        value.priority,
+        value.accepted_at,
+        _exact_coverage_ref_key(value.ref),
+    )
+
+
+def _same_exact_coverage_record(left: object, right: object) -> bool:
+    return _exact_coverage_record_key(left) == _exact_coverage_record_key(right)
 
 
 class _AcceptedOuterV1(ContractModel):
@@ -1311,6 +1412,12 @@ class SegmentStore:
             or lifecycle_identity is not self._lifecycle_identity
         ):
             raise EvidenceSealError("coverage state is outside this evidence lifecycle")
+        try:
+            _exact_coverage_record_key(record)
+            if after_ref is not None:
+                _exact_coverage_ref_key(after_ref)
+        except ValueError as error:
+            raise EvidenceSealError("coverage apply record is not exact") from error
         host_id = verifier.fsm.host_id
         sequences = self._sequences_by_host.get(host_id, [])
         if after_ref is None:
@@ -1323,12 +1430,24 @@ class SegmentStore:
                 "coverage apply has no next authenticated real evidence ref"
             )
         next_ref = self._index[(host_id, sequences[position])][1]
-        if record.ref != next_ref:
+        try:
+            _exact_coverage_ref_key(next_ref)
+        except ValueError as error:
+            raise EvidenceCorrupt(
+                "next authenticated coverage ref is invalid"
+            ) from error
+        if not _same_exact_coverage_ref(record.ref, next_ref):
             raise EvidenceSealError(
                 "coverage apply skipped the next authenticated real evidence ref"
             )
         resolved = self.resolve_authenticated_ref(next_ref)
-        if resolved != record:
+        try:
+            same_resolved_record = _same_exact_coverage_record(resolved, record)
+        except ValueError as error:
+            raise EvidenceCorrupt(
+                "resolved authenticated coverage record is invalid"
+            ) from error
+        if not same_resolved_record:
             raise EvidenceSealError(
                 "coverage apply record differs from authenticated evidence"
             )
@@ -1349,13 +1468,29 @@ class SegmentStore:
             raise EvidenceSealError("coverage state is outside this evidence lifecycle")
         sequence = verifier.fsm.last_sequence
         authenticated_head: EvidenceRef | None = None
+        if reducer_head is not None:
+            try:
+                _exact_coverage_ref_key(reducer_head)
+            except ValueError as error:
+                raise EvidenceSealError("coverage reducer head is invalid") from error
         if sequence != 0:
             ref = verifier.accepted_ref(sequence)
             if type(ref) is not EvidenceRef:
-                raise EvidenceCorrupt("authenticated evidence head has no exact ref")
+                raise EvidenceCorrupt(
+                    "authenticated evidence head has no exact ref"
+                )
+            try:
+                _exact_coverage_ref_key(ref)
+            except ValueError as error:
+                raise EvidenceCorrupt(
+                    "authenticated evidence head has no exact ref"
+                ) from error
             self.resolve_authenticated_ref(ref)
             authenticated_head = ref
-        if authenticated_head != reducer_head:
+        same_head = authenticated_head is reducer_head
+        if authenticated_head is not None and reducer_head is not None:
+            same_head = _same_exact_coverage_ref(authenticated_head, reducer_head)
+        if not same_head:
             raise EvidenceSealError(
                 "coverage reducer head differs from authenticated evidence head"
             )
@@ -3816,22 +3951,22 @@ class SegmentStore:
                     coverage_close_error: BaseException | None = None
                     coverage_owner = self._coverage_state_owner
                     if coverage_owner is not None:
-                        close_from_store = getattr(
-                            coverage_owner,
-                            "_close_from_segment_store",
-                            None,
-                        )
-                        if not callable(close_from_store):
-                            coverage_close_error = EvidenceStoreError(
-                                "coverage-state owner cannot close before evidence unlock"
+                        try:
+                            close_from_store = getattr(
+                                coverage_owner,
+                                "_close_from_segment_store",
+                                None,
                             )
-                        else:
-                            try:
-                                cast(Callable[[object], None], close_from_store)(
-                                    self._lifecycle_identity
+                            if not callable(close_from_store):
+                                raise EvidenceStoreError(
+                                    "coverage-state owner cannot close "
+                                    "before evidence unlock"
                                 )
-                            except BaseException as error:  # noqa: BLE001
-                                coverage_close_error = error
+                            cast(Callable[[object], None], close_from_store)(
+                                self._lifecycle_identity
+                            )
+                        except BaseException as error:  # noqa: BLE001
+                            coverage_close_error = error
                     if self._coverage_state_owner is not None:
                         self._coverage_state_owner = None
                         survivor_error = EvidenceStoreError(

@@ -183,6 +183,17 @@ def _stored(value: dict[str, object]) -> StoredEvidenceRecord:
     )
 
 
+def _numeric_ref_type_mutations(ref: EvidenceRef) -> tuple[EvidenceRef, ...]:
+    return (
+        replace(ref, source_sequence=True),
+        replace(ref, source_sequence=float(ref.source_sequence)),
+        replace(ref, frame_offset=bool(ref.frame_offset)),
+        replace(ref, frame_offset=float(ref.frame_offset)),
+        replace(ref, frame_size=True),
+        replace(ref, frame_size=float(ref.frame_size)),
+    )
+
+
 def _docker_open(
     key: Ed25519PrivateKey,
     sequence: int,
@@ -342,6 +353,25 @@ def test_input_order_atomicity_and_unhealthy_latch(tmp_path: Path) -> None:
     for records in invalid_inputs:
         with pytest.raises((coverage.CoverageValidationError, coverage.CoverageConflict)):
             coverage.CoverageState.rebuild(records)
+    for malformed_ref in _numeric_ref_type_mutations(oldest.ref):
+        with pytest.raises(coverage.CoverageValidationError):
+            coverage.CoverageState.rebuild([replace(oldest, ref=malformed_ref)])
+
+    for index in range(6):
+        strict_coordinator, strict_store = _system(tmp_path / f"strict-ref-{index}")
+        strict_state = coverage.CoverageState.open_and_recover(strict_store)
+        accepted = _accept(strict_coordinator, strict_store, boot_boundary(key))
+        malformed_ref = _numeric_ref_type_mutations(accepted.ref)[index]
+        with pytest.raises(coverage.CoverageAuthorityError):
+            strict_state.apply(replace(accepted, ref=malformed_ref))
+        strict_store.close()
+
+    priority_coordinator, priority_store = _system(tmp_path / "strict-record")
+    priority_state = coverage.CoverageState.open_and_recover(priority_store)
+    priority_record = _accept(priority_coordinator, priority_store, boot_boundary(key))
+    with pytest.raises(coverage.CoverageAuthorityError):
+        priority_state.apply(replace(priority_record, priority="protected"))
+    priority_store.close()
 
     coordinator, store = _system(tmp_path / "skip")
     first = _accept(coordinator, store, boot_boundary(key))
@@ -522,6 +552,83 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
         [boot, start, docker_open, recovery, critical_open, critical_close, lease]
     )
     assert replay._snapshot.live_lease_deadline is None
+
+    repeat_fields = {
+        "component": "falco-adapter",
+        "kind": "falco_heartbeat_gap",
+        "severity": "CRITICAL",
+        "opened_at": T1,
+        "reason_code": "heartbeat_missing",
+    }
+    repeat_open = _stored(
+        _coverage(
+            key,
+            2,
+            repeat_fields,
+            source_payload_hash="e" * 64,
+        )
+    )
+    exact_repeat = _stored(
+        _coverage(
+            key,
+            3,
+            repeat_fields,
+            source_payload_hash="e" * 64,
+        )
+    )
+    repeat_close = _stored(
+        _coverage(
+            key,
+            4,
+            {
+                **repeat_fields,
+                "closed_at": T2,
+                "dropped_count": 1,
+                "reason_code": "valid_heartbeat_recovered",
+            },
+            source_payload_hash="f" * 64,
+        )
+    )
+    repeat_coordinator, repeat_store = _system(tmp_path / "generic-repeat")
+    _accept(repeat_coordinator, repeat_store, boot.envelope)
+    repeat_state = coverage.CoverageState.open_and_recover(repeat_store)
+    accepted_open = _accept(repeat_coordinator, repeat_store, repeat_open.envelope)
+    repeat_state.apply(accepted_open)
+    original_interval = repeat_state._snapshot.open_critical_intervals[0]
+    accepted_repeat = _accept(repeat_coordinator, repeat_store, exact_repeat.envelope)
+    repeat_state.apply(accepted_repeat)
+    assert repeat_state._snapshot.head_ref == accepted_repeat.ref
+    assert repeat_state._snapshot.open_critical_intervals == (original_interval,)
+    assert repeat_state._snapshot.open_critical_intervals[0] is original_interval
+    assert original_interval.source_sequence == accepted_open.ref.source_sequence
+    accepted_close = _accept(repeat_coordinator, repeat_store, repeat_close.envelope)
+    repeat_state.apply(accepted_close)
+    assert repeat_state._snapshot.head_ref == accepted_close.ref
+    assert repeat_state._snapshot.open_critical_intervals == ()
+    repeat_store.close()
+
+    changed_payload = _stored(
+        _coverage(
+            key,
+            3,
+            repeat_fields,
+            source_payload_hash="0" * 64,
+        )
+    )
+    changed_facts = _stored(
+        _coverage(
+            key,
+            3,
+            {
+                **repeat_fields,
+                "reason_code": "different_reason",
+            },
+            source_payload_hash="e" * 64,
+        )
+    )
+    for changed_repeat in (changed_payload, changed_facts):
+        with pytest.raises(coverage.CoverageConflict):
+            coverage.CoverageState.rebuild([boot, repeat_open, changed_repeat])
 
     for index, receipt in enumerate((True, -1.0, math.inf, math.nan)):
         bad_coordinator, bad_store = _system(tmp_path / f"receipt-{index}")
@@ -873,3 +980,31 @@ def test_capability_lifecycle_same_store_head_and_restart(tmp_path: Path) -> Non
     assert failure_store._coverage_state_owner is None
     assert failure_store._ack_journal_owner is None
     assert failure_store._closed
+
+    lookup_calls: list[str] = []
+    _lookup_coordinator, lookup_store = _system(tmp_path / "close-lookup-failure")
+
+    class LookupFailingCoverageOwner:
+        def __getattribute__(self, name: str) -> object:
+            if name == "_close_from_segment_store":
+                lookup_calls.append("coverage-lookup")
+                raise SyntheticShutdownFailure("coverage callback lookup failed")
+            return object.__getattribute__(self, name)
+
+    class LookupReleasingAckOwner:
+        def _close_from_segment_store(self, lifecycle_identity: object) -> None:
+            assert lifecycle_identity is lookup_store._lifecycle_identity
+            lookup_calls.append("ack")
+            lookup_store._ack_journal_owner = None
+
+    lookup_store._coverage_state_owner = LookupFailingCoverageOwner()
+    lookup_store._ack_journal_owner = LookupReleasingAckOwner()
+    with pytest.raises(
+        EvidenceStoreError,
+        match="coverage-state owner survived evidence shutdown",
+    ):
+        lookup_store.close()
+    assert lookup_calls == ["coverage-lookup", "ack"]
+    assert lookup_store._coverage_state_owner is None
+    assert lookup_store._ack_journal_owner is None
+    assert lookup_store._closed
