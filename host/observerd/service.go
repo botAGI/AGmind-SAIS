@@ -342,10 +342,32 @@ func (service *Service) signDockerCoverage(
 	closedAt *time.Time,
 	generation uint64,
 ) error {
+	_, err := service.signDockerCoverageEnvelope(
+		ctx,
+		kind,
+		severity,
+		reason,
+		openedAt,
+		closedAt,
+		generation,
+	)
+	return err
+}
+
+func (service *Service) signDockerCoverageEnvelope(
+	ctx context.Context,
+	kind string,
+	severity string,
+	reason string,
+	openedAt time.Time,
+	closedAt *time.Time,
+	generation uint64,
+) (contracts.EventEnvelopeV1, error) {
 	if service == nil ||
 		service.daemon == nil ||
 		service.daemon.signer == nil {
-		return fmt.Errorf("observer signer unavailable")
+		return contracts.EventEnvelopeV1{},
+			fmt.Errorf("observer signer unavailable")
 	}
 	fields := map[string]any{
 		"component":            "observer",
@@ -360,15 +382,19 @@ func (service *Service) signDockerCoverage(
 	}
 	canonical, err := contracts.CanonicalJSON(fields)
 	if err != nil {
-		return err
+		return contracts.EventEnvelopeV1{}, err
 	}
 	payloadHash := sha256.Sum256(canonical)
-	_, err = service.daemon.signer.Wrap(
+	eventTime := openedAt.UTC()
+	if closedAt != nil {
+		eventTime = closedAt.UTC()
+	}
+	return service.daemon.signer.Wrap(
 		ctx,
 		"coverage",
 		fields,
 		EventMetadata{
-			EventTime:           openedAt.UTC(),
+			EventTime:           eventTime,
 			InventoryGeneration: generation,
 			RedactionFlags:      []string{},
 			CoverageFlags: []string{
@@ -378,7 +404,6 @@ func (service *Service) signDockerCoverage(
 			SourcePayloadHash: hex.EncodeToString(payloadHash[:]),
 		},
 	)
-	return err
 }
 
 func (service *Service) signDockerLoggingCoverage(
@@ -440,6 +465,19 @@ func (service *Service) finishDockerReconcileLocked(
 	reason string,
 	session *dockerEventSession,
 ) error {
+	_, err := service.finishDockerReconcileLockedReceipt(
+		ctx,
+		reason,
+		session,
+	)
+	return err
+}
+
+func (service *Service) finishDockerReconcileLockedReceipt(
+	ctx context.Context,
+	reason string,
+	session *dockerEventSession,
+) (dockerReconcileReceipt, error) {
 	openedAt := service.now().UTC()
 	targetGeneration := service.inventory.Generation()
 	if targetGeneration != ^uint64(0) {
@@ -454,10 +492,10 @@ func (service *Service) finishDockerReconcileLocked(
 		nil,
 		targetGeneration,
 	); err != nil {
-		return err
+		return dockerReconcileReceipt{}, err
 	}
 	if err := service.inventory.Reconcile(ctx); err != nil {
-		return err
+		return dockerReconcileReceipt{}, err
 	}
 	if service.inventory.LoggingUnavailable() {
 		if err := service.signDockerLoggingCoverage(
@@ -465,12 +503,13 @@ func (service *Service) finishDockerReconcileLocked(
 			service.now().UTC(),
 			service.inventory.Generation(),
 		); err != nil {
-			return err
+			return dockerReconcileReceipt{}, err
 		}
 	}
 	closedAt := service.now().UTC()
+	var receipt dockerReconcileReceipt
 	commit := func() error {
-		if err := service.signDockerCoverage(
+		event, err := service.signDockerCoverageEnvelope(
 			ctx,
 			"docker_reconcile_recovered",
 			"INFO",
@@ -478,18 +517,31 @@ func (service *Service) finishDockerReconcileLocked(
 			openedAt,
 			&closedAt,
 			service.inventory.Generation(),
-		); err != nil {
+		)
+		if err != nil {
 			return err
+		}
+		receipt = dockerReconcileReceipt{
+			SourceSequence: event.SourceSequence,
+			Generation:     event.InventoryGeneration,
+			ClosedAt:       event.EventTime,
+			openedAt:       openedAt.Format(time.RFC3339Nano),
 		}
 		return service.daemon.state.completeDockerReconcile()
 	}
 	if session == nil {
-		return commit()
+		if err := commit(); err != nil {
+			return dockerReconcileReceipt{}, err
+		}
+		return receipt, nil
 	}
 	if err := session.CommitIfLive(commit); err != nil {
-		return errors.Join(err, service.openDockerReconcileFences())
+		return dockerReconcileReceipt{}, errors.Join(
+			err,
+			service.openDockerReconcileFences(),
+		)
 	}
-	return nil
+	return receipt, nil
 }
 
 func (service *Service) reconcileDockerLocked(
@@ -510,16 +562,30 @@ func (service *Service) reconcileDockerWithSessionLocked(
 	reason string,
 	session *dockerEventSession,
 ) error {
+	_, err := service.reconcileDockerWithSessionLockedReceipt(
+		ctx,
+		reason,
+		session,
+	)
+	return err
+}
+
+func (service *Service) reconcileDockerWithSessionLockedReceipt(
+	ctx context.Context,
+	reason string,
+	session *dockerEventSession,
+) (dockerReconcileReceipt, error) {
 	if err := service.validateDockerReconcile(reason); err != nil {
-		return err
+		return dockerReconcileReceipt{}, err
 	}
 	if session == nil {
-		return fmt.Errorf("Docker reconcile lacks subscribed event session")
+		return dockerReconcileReceipt{},
+			fmt.Errorf("Docker reconcile lacks subscribed event session")
 	}
 	if err := service.openDockerReconcileFences(); err != nil {
-		return err
+		return dockerReconcileReceipt{}, err
 	}
-	return service.finishDockerReconcileLocked(ctx, reason, session)
+	return service.finishDockerReconcileLockedReceipt(ctx, reason, session)
 }
 
 func (service *Service) ReconcileDocker(
@@ -579,11 +645,20 @@ func (service *Service) recoverDockerWithSubscribedSession(
 	ctx context.Context,
 	reason string,
 ) error {
+	_, err := service.recoverDockerWithSubscribedSessionReceipt(ctx, reason)
+	return err
+}
+
+func (service *Service) recoverDockerWithSubscribedSessionReceipt(
+	ctx context.Context,
+	reason string,
+) (dockerReconcileReceipt, error) {
 	// Recovery may arrive here after replacement subscription setup failed.
 	// Never run the snapshot first: the gap remains open until a session is
 	// active for the complete reconcile and its signed close.
 	if service == nil || service.docker == nil {
-		return fmt.Errorf("Docker event service unavailable")
+		return dockerReconcileReceipt{},
+			fmt.Errorf("Docker event service unavailable")
 	}
 	service.eventMutex.Lock()
 	defer service.eventMutex.Unlock()
@@ -593,11 +668,11 @@ func (service *Service) recoverDockerWithSubscribedSession(
 		service.eventSession = nil
 	}
 	if err := service.prepareDockerEventSessionLocked(ctx); err != nil {
-		return err
+		return dockerReconcileReceipt{}, err
 	}
 	service.reconcileMutex.Lock()
 	defer service.reconcileMutex.Unlock()
-	return service.reconcileDockerWithSessionLocked(
+	return service.reconcileDockerWithSessionLockedReceipt(
 		ctx,
 		reason,
 		service.eventSession,
@@ -875,9 +950,18 @@ func (daemon *Daemon) runWithOptions(
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer service.closeDockerEventSession()
-	if err := service.recoverDockerWithSubscribedSession(
+	baselineGeneration := inventory.Generation()
+	receipt, err := service.recoverDockerWithSubscribedSessionReceipt(
 		runCtx,
 		"observer_startup",
+	)
+	if err != nil {
+		return err
+	}
+	if err := service.closeOutstandingSequenceGaps(
+		runCtx,
+		baselineGeneration,
+		receipt,
 	); err != nil {
 		return err
 	}

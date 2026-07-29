@@ -328,3 +328,22 @@ func TestRetentionTombstoneAuthorizationUsesExactCoreUID(t *testing.T) {
 		}
 	}
 }
+
+func TestAckAuthorizationUsesExactCoreUID(t *testing.T) {
+	for _, peer := range []uds.Peer{
+		{UID: 0, GID: 9999},
+		{UID: 1002, GID: 9999},
+	} {
+		if !coreAckPeerAuthorized(peer, 1002) {
+			t.Fatalf("authorized exact UID rejected: %+v", peer)
+		}
+	}
+	for _, peer := range []uds.Peer{
+		{UID: 1003, GID: 0},
+		{UID: 1003, GID: 2002},
+	} {
+		if coreAckPeerAuthorized(peer, 1002) {
+			t.Fatalf("group-only peer authorized: %+v", peer)
+		}
+	}
+}

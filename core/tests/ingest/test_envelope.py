@@ -317,10 +317,151 @@ def test_hole_requires_signed_exact_gap_and_retry_conflict_is_persistent(
         normalized_fields={"kind": "valid-signed-conflict"},
     )
     with pytest.raises(EnvelopeConflict):
-        coordinator.accept(
-            decode_events_page(canonical_json(page_value(conflict))).events[0]
-        )
+        coordinator.accept(decode_events_page(canonical_json(page_value(conflict))).events[0])
     assert verifier.fsm.mutation_read_only is True
+    coordinator.segment_store.close(flush=False)
+
+
+def test_sequence_gap_open_and_close_have_disjoint_exact_semantics(
+    tmp_path: Path,
+) -> None:
+    key = private_key(11)
+    root, chain = _identity()
+    coordinator = _coordinator(tmp_path / "sequence-gap-close", root, chain)
+    verifier = coordinator.verifier
+    _accept(coordinator, boot_boundary(key))
+    _accept(
+        coordinator,
+        envelope_value(key, sequence=4, normalized_fields={"kind": "later"}),
+    )
+    assert verifier.fsm.unresolved_holes == ((2, 3),)
+
+    opened_at = NOW
+    open_fields = {
+        "component": "observer",
+        "kind": "observer_sequence_gap",
+        "severity": "CRITICAL",
+        "opened_at": opened_at,
+        "affected_source_sequence_start": 2,
+        "affected_source_sequence_end": 3,
+        "reason_code": "reserved_sequence_not_published",
+    }
+    _accept(
+        coordinator,
+        envelope_value(
+            key,
+            sequence=5,
+            event_type="coverage",
+            normalized_fields=open_fields,
+            coverage_flags=["reconcile_required", "sequence_gap"],
+        ),
+    )
+    assert verifier.fsm.unresolved_holes == ()
+
+    close_fields = {
+        "component": "observer",
+        "kind": "observer_sequence_gap",
+        "severity": "INFO",
+        "opened_at": opened_at,
+        "closed_at": NOW,
+        "affected_source_sequence_start": 2,
+        "affected_source_sequence_end": 3,
+        "reason_code": "reserved_sequence_reconciled",
+        "reconcile_generation": 1,
+    }
+    _accept(
+        coordinator,
+        envelope_value(
+            key,
+            sequence=6,
+            event_type="coverage",
+            normalized_fields=close_fields,
+            coverage_flags=["reconcile_required", "sequence_gap"],
+            inventory_generation=1,
+        ),
+    )
+    assert verifier.fsm.unresolved_holes == ()
+    coordinator.segment_store.close()
+
+
+@pytest.mark.parametrize(
+    ("mutate_fields", "envelope_kwargs"),
+    [
+        (
+            lambda fields: {**fields, "severity": "WARNING"},
+            {},
+        ),
+        (
+            lambda fields: {**fields, "extra": "forbidden"},
+            {},
+        ),
+        (
+            lambda fields: {
+                **fields,
+                "reason_code": "reserved_sequence_not_published",
+            },
+            {},
+        ),
+        (
+            lambda fields: fields,
+            {"inventory_generation": 0},
+        ),
+        (
+            lambda fields: {**fields, "reconcile_generation": 0},
+            {"inventory_generation": 0},
+        ),
+        (
+            lambda fields: fields,
+            {"coverage_flags": ["sequence_gap"]},
+        ),
+        (
+            lambda fields: fields,
+            {"container_id": "a" * 64},
+        ),
+        (
+            lambda fields: {**fields, "closed_at": "2026-07-28T10:00:01Z"},
+            {},
+        ),
+    ],
+)
+def test_sequence_gap_close_rejects_inexact_form(
+    tmp_path: Path,
+    mutate_fields: object,
+    envelope_kwargs: dict[str, object],
+) -> None:
+    key = private_key(11)
+    root, chain = _identity()
+    coordinator = _coordinator(tmp_path, root, chain)
+    _accept(coordinator, boot_boundary(key))
+    close_fields = mutate_fields(
+        {
+            "component": "observer",
+            "kind": "observer_sequence_gap",
+            "severity": "INFO",
+            "opened_at": NOW,
+            "closed_at": NOW,
+            "affected_source_sequence_start": 2,
+            "affected_source_sequence_end": 3,
+            "reason_code": "reserved_sequence_reconciled",
+            "reconcile_generation": 1,
+        }
+    )
+    with pytest.raises(OuterBindingError):
+        close_kwargs = {
+            "coverage_flags": ["reconcile_required", "sequence_gap"],
+            "inventory_generation": 1,
+            **envelope_kwargs,
+        }
+        _accept(
+            coordinator,
+            envelope_value(
+                key,
+                sequence=2,
+                event_type="coverage",
+                normalized_fields=close_fields,
+                **close_kwargs,
+            ),
+        )
     coordinator.segment_store.close(flush=False)
 
 

@@ -370,20 +370,15 @@ class AnchoredPublicKeyChain:
                     )
                 )
                 if (
-                    len(canonical_json(transition_envelope))
-                    > MAX_CANONICAL_ENVELOPE_BYTES
-                    or len(canonical_json(start_envelope))
-                    > MAX_CANONICAL_ENVELOPE_BYTES
+                    len(canonical_json(transition_envelope)) > MAX_CANONICAL_ENVELOPE_BYTES
+                    or len(canonical_json(start_envelope)) > MAX_CANONICAL_ENVELOPE_BYTES
                 ):
                     raise KeyMetadataError("metadata proof envelope exceeds 64 KiB")
             keys.append((entry.epoch, entry.key_id, public_key))
             prior_entry = entry
             prior_public = public_key
         final = metadata.keys[-1]
-        if (
-            metadata.current_epoch != final.epoch
-            or metadata.current_key_id != final.key_id
-        ):
+        if metadata.current_epoch != final.epoch or metadata.current_key_id != final.key_id:
             raise KeyMetadataError("metadata current key is not its final proven epoch")
         if minimum_epoch < 1 or metadata.current_epoch < minimum_epoch:
             raise KeyMetadataError("metadata rolled back behind accepted evidence")
@@ -463,8 +458,7 @@ class AnchoredPublicKeyChain:
         )
         boundary_b = (
             same_boot
-            and transition_envelope.coverage_flags
-            == ["boot_transition", "key_rotation"]
+            and transition_envelope.coverage_flags == ["boot_transition", "key_rotation"]
             and start.coverage_flags == ["key_rotation"]
         )
         boundary_c = (
@@ -529,13 +523,10 @@ class ObserverStreamFSM:
         if self.current_boot_id is None:
             if self.seen_boot_ids:
                 raise ValueError("observer FSM has history without a current boot")
-        elif (
-            self.current_boot_id not in self.seen_boot_ids
-            or not re.fullmatch(
-                r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
-                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-                self.current_boot_id,
-            )
+        elif self.current_boot_id not in self.seen_boot_ids or not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            self.current_boot_id,
         ):
             raise ValueError("observer FSM current boot is not in history")
         prior_end = 0
@@ -673,10 +664,9 @@ class ObserverStreamFSM:
         current_boot = self.current_boot_id
         seen = list(self.seen_boot_ids)
         if pending.mode == "b":
-            if (
-                envelope.boot_id != pending.transition_boot_id
-                or envelope.coverage_flags != ["key_rotation"]
-            ):
+            if envelope.boot_id != pending.transition_boot_id or envelope.coverage_flags != [
+                "key_rotation"
+            ]:
                 raise BootBoundaryError("B epoch start must remain adjacent in its new boot")
         elif envelope.boot_id == pending.transition_boot_id:
             if envelope.coverage_flags != ["key_rotation"]:
@@ -708,6 +698,27 @@ class ObserverStreamFSM:
         if (
             envelope.event_type == "coverage"
             and fields.get("kind") == "observer_sequence_gap"
+            and fields.get("severity") == "CRITICAL"
+            and fields.get("reason_code") == "reserved_sequence_not_published"
+            and set(fields)
+            == {
+                "component",
+                "kind",
+                "severity",
+                "opened_at",
+                "affected_source_sequence_start",
+                "affected_source_sequence_end",
+                "reason_code",
+            }
+            and envelope.event_time == fields.get("opened_at")
+            and envelope.inventory_generation == 0
+            and envelope.container_id is None
+            and envelope.container_start_time is None
+            and envelope.release_id is None
+            and envelope.inventory_revision is None
+            and envelope.redaction_flags == []
+            and envelope.coverage_flags == ["reconcile_required", "sequence_gap"]
+            and envelope.source_payload_hash == envelope.normalized_fields_sha256
         ):
             candidate = (
                 fields.get("affected_source_sequence_start"),
@@ -985,14 +996,10 @@ class EnvelopeVerifier:
         self._validate_special_semantics(envelope)
 
         if accepted is not None:
-            raise EnvelopeConflict(
-                f"valid signed conflict at ({self.root.host_id}, {sequence})"
-            )
+            raise EnvelopeConflict(f"valid signed conflict at ({self.root.host_id}, {sequence})")
         next_fsm = self._authority.fsm.advance(envelope, canonical, self.key_chain)
         evidence_priority: Literal["routine", "protected"] = (
-            "protected"
-            if envelope.event_type in _PROTECTED_EVENT_TYPES
-            else "routine"
+            "protected" if envelope.event_type in _PROTECTED_EVENT_TYPES else "routine"
         )
         return self._stage(
             canonical=canonical,
@@ -1045,10 +1052,7 @@ class EnvelopeVerifier:
         dead = [
             stage_id
             for stage_id, stage in self._staged.items()
-            if (
-                stage.owner() is None
-                or stage.base_generation != self._authority.generation
-            )
+            if (stage.owner() is None or stage.base_generation != self._authority.generation)
         ]
         for stage_id in dead:
             self._staged.pop(stage_id, None)
@@ -1060,9 +1064,7 @@ class EnvelopeVerifier:
     def _precheck_signed_content(envelope_value: dict[str, Any]) -> None:
         allowed = set(EventEnvelopeV1.model_fields)
         required = {
-            name
-            for name, field in EventEnvelopeV1.model_fields.items()
-            if field.is_required()
+            name for name, field in EventEnvelopeV1.model_fields.items() if field.is_required()
         }
         actual = set(envelope_value)
         if actual - allowed or required - actual:
@@ -1125,11 +1127,10 @@ class EnvelopeVerifier:
         try:
             if envelope.event_type == "observer_boot_boundary":
                 ObserverBootBoundaryV1.model_validate(envelope.normalized_fields, strict=True)
-                if (
-                    not cls._empty_security_context(envelope)
-                    or envelope.coverage_flags
-                    != ["boot_transition", "reconcile_required"]
-                ):
+                if not cls._empty_security_context(envelope) or envelope.coverage_flags != [
+                    "boot_transition",
+                    "reconcile_required",
+                ]:
                     raise ValueError("invalid dedicated boot-boundary context")
             elif envelope.event_type == "observer_key_transition":
                 KeyTransitionV1.model_validate(envelope.normalized_fields, strict=True)
@@ -1137,10 +1138,8 @@ class EnvelopeVerifier:
                     raise ValueError("invalid key-transition context")
             elif envelope.event_type == "observer_key_epoch_start":
                 if (
-                    set(envelope.normalized_fields)
-                    != {"kind", "key_id", "key_epoch"}
-                    or envelope.normalized_fields.get("kind")
-                    != "observer_key_epoch_start"
+                    set(envelope.normalized_fields) != {"kind", "key_id", "key_epoch"}
+                    or envelope.normalized_fields.get("kind") != "observer_key_epoch_start"
                     or envelope.normalized_fields.get("key_id") != envelope.key_id
                     or envelope.normalized_fields.get("key_epoch") != envelope.key_epoch
                     or not cls._empty_security_context(envelope)
@@ -1152,7 +1151,7 @@ class EnvelopeVerifier:
                     strict=True,
                 )
                 if coverage.kind == "observer_sequence_gap":
-                    required = {
+                    open_required = {
                         "component",
                         "kind",
                         "severity",
@@ -1161,17 +1160,42 @@ class EnvelopeVerifier:
                         "affected_source_sequence_end",
                         "reason_code",
                     }
-                    if (
-                        set(envelope.normalized_fields) != required
-                        or coverage.component != "observer"
-                        or coverage.severity != "CRITICAL"
-                        or coverage.reason_code != "reserved_sequence_not_published"
-                        or coverage.affected_source_sequence_start is None
-                        or coverage.affected_source_sequence_end is None
-                        or envelope.coverage_flags
-                        != ["reconcile_required", "sequence_gap"]
-                        or not cls._empty_security_context(envelope)
-                    ):
+                    close_required = open_required | {
+                        "closed_at",
+                        "reconcile_generation",
+                    }
+                    common = (
+                        coverage.component == "observer"
+                        and coverage.affected_source_sequence_start is not None
+                        and coverage.affected_source_sequence_end is not None
+                        and envelope.container_id is None
+                        and envelope.container_start_time is None
+                        and envelope.release_id is None
+                        and envelope.inventory_revision is None
+                        and envelope.redaction_flags == []
+                        and envelope.coverage_flags == ["reconcile_required", "sequence_gap"]
+                        and envelope.source_payload_hash == envelope.normalized_fields_sha256
+                    )
+                    exact_open = (
+                        set(envelope.normalized_fields) == open_required
+                        and coverage.severity == "CRITICAL"
+                        and coverage.reason_code == "reserved_sequence_not_published"
+                        and coverage.closed_at is None
+                        and coverage.reconcile_generation is None
+                        and envelope.event_time == coverage.opened_at
+                        and envelope.inventory_generation == 0
+                    )
+                    exact_close = (
+                        set(envelope.normalized_fields) == close_required
+                        and coverage.severity == "INFO"
+                        and coverage.reason_code == "reserved_sequence_reconciled"
+                        and coverage.closed_at is not None
+                        and coverage.reconcile_generation is not None
+                        and coverage.reconcile_generation > 0
+                        and envelope.event_time == coverage.closed_at
+                        and envelope.inventory_generation == coverage.reconcile_generation
+                    )
+                    if not common or not (exact_open or exact_close):
                         raise ValueError("invalid signed sequence-gap proof")
             elif envelope.event_type == "observer_start":
                 if (
@@ -1194,10 +1218,7 @@ class EnvelopeVerifier:
                     raise ValueError("Falco container start is not bound to envelope")
                 if falco.inventory_revision != envelope.inventory_revision:
                     raise ValueError("Falco inventory revision is not bound to envelope")
-                if (
-                    falco.image_id is not None
-                    and falco.immutable_spec_sha256 is not None
-                ):
+                if falco.image_id is not None and falco.immutable_spec_sha256 is not None:
                     if envelope.release_id != derive_release_id(
                         falco.image_id,
                         falco.immutable_spec_sha256,
@@ -1299,9 +1320,7 @@ class EnvelopeVerifier:
                 or accepted != expected_accepted
                 or stage.next_fsm != authority.fsm
             ):
-                raise VerifierCommitError(
-                    "retry does not exactly match committed verifier history"
-                )
+                raise VerifierCommitError("retry does not exactly match committed verifier history")
             next_staged = {
                 stage_id: candidate
                 for stage_id, candidate in self._staged.items()
@@ -1314,10 +1333,7 @@ class EnvelopeVerifier:
             next_authorizations = {
                 authorization_id: candidate
                 for authorization_id, candidate in self._authorizations.items()
-                if (
-                    authorization_id != id(authorization)
-                    and candidate.stage_id in next_staged
-                )
+                if (authorization_id != id(authorization) and candidate.stage_id in next_staged)
             }
             self._staged = next_staged
             self._authorizations = next_authorizations

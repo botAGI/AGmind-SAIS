@@ -484,6 +484,9 @@ func Bootstrap(
 	); err != nil {
 		return fail(err, spool)
 	}
+	if err := spool.recoverSequenceGapMarkers(); err != nil {
+		return fail(err, spool)
+	}
 	for _, gap := range spool.UncoveredGaps(state.Snapshot().LastCoveredGapEnd) {
 		now := options.now().UTC()
 		fields := map[string]any{

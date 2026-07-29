@@ -365,6 +365,10 @@ func retentionTombstonePeerAuthorized(
 	return peer.UID == 0 || peer.UID == coreUID
 }
 
+func coreAckPeerAuthorized(peer uds.Peer, coreUID uint32) bool {
+	return peer.UID == 0 || peer.UID == coreUID
+}
+
 func newCoreAPI(
 	backend coreAPIBackend,
 	coreGID uint32,
@@ -378,7 +382,9 @@ func newCoreAPI(
 	)
 	mux.Handle(
 		"POST /v1/events/ack",
-		authorize(coreAckHandler(backend)),
+		uds.RequirePeer(func(peer uds.Peer) bool {
+			return coreAckPeerAuthorized(peer, coreUID)
+		})(coreAckHandler(backend)),
 	)
 	mux.Handle(
 		"GET /v1/inventory/{full_id}",

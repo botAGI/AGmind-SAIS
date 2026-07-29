@@ -826,6 +826,21 @@ func TestDaemonRunReconcilesAndOwnsThreeSeparatedUDSServers(t *testing.T) {
 		SpoolMaxBytes:             4 * 1024 * 1024,
 		SpoolPriorityReserveBytes: 1024 * 1024,
 	}
+	reserveUnpublishedSequenceForTest(t, service.daemon.signer)
+	signSequenceGapProofForTest(
+		t,
+		service.daemon.signer,
+		"CRITICAL",
+		time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+		nil,
+		1,
+		1,
+		"reserved_sequence_not_published",
+		0,
+	)
+	if err := service.daemon.state.markGapCovered(1); err != nil {
+		t.Fatal(err)
+	}
 	messages := make(chan events.Message)
 	eventErrors := make(chan error)
 	docker.eventsResult = &DockerEventStream{
@@ -841,6 +856,7 @@ func TestDaemonRunReconcilesAndOwnsThreeSeparatedUDSServers(t *testing.T) {
 	}
 	var mutex sync.Mutex
 	recorded := make([]recordedListener, 0, 3)
+	var listenerProofErr error
 	threeReady := make(chan struct{})
 	var readyOnce sync.Once
 	options := observerRuntimeOptions{
@@ -876,6 +892,15 @@ func TestDaemonRunReconcilesAndOwnsThreeSeparatedUDSServers(t *testing.T) {
 			handler http.Handler,
 		) (observerRuntimeServer, error) {
 			mutex.Lock()
+			scan, scanErr := service.daemon.spool.scanSequenceGapProofs()
+			if scanErr != nil {
+				listenerProofErr = errors.Join(listenerProofErr, scanErr)
+			} else if len(scan.Unpaired) != 0 {
+				listenerProofErr = errors.Join(
+					listenerProofErr,
+					errors.New("listener opened before sequence-gap close"),
+				)
+			}
 			recorded = append(recorded, recordedListener{
 				path:    path,
 				mode:    mode,
@@ -915,7 +940,11 @@ func TestDaemonRunReconcilesAndOwnsThreeSeparatedUDSServers(t *testing.T) {
 
 	mutex.Lock()
 	got := append([]recordedListener{}, recorded...)
+	proofErr := listenerProofErr
 	mutex.Unlock()
+	if proofErr != nil {
+		t.Fatal(proofErr)
+	}
 	sort.Slice(got, func(left, right int) bool {
 		return got[left].path < got[right].path
 	})
