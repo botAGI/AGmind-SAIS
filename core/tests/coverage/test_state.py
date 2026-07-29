@@ -436,6 +436,19 @@ def test_readiness_context_health_and_cursor_matrix(tmp_path: Path) -> None:
     state, store = _live_ready_state(coverage, tmp_path / "context")
     valid = _readiness_context(coverage, 5)
     assert state.mutation_readiness(valid).ready
+    equal_utc = replace(
+        valid,
+        decision_utc=datetime(
+            2026,
+            7,
+            28,
+            10,
+            0,
+            3,
+            tzinfo=timezone(timedelta(0), "UTC"),
+        ),
+    )
+    assert state.mutation_readiness(equal_utc).ready
 
     class DatetimeSubclass(datetime):
         pass

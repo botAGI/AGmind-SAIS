@@ -82,12 +82,18 @@ class MutationReadinessContext:
 def _validate_mutation_readiness_context(
     context: MutationReadinessContext,
 ) -> None:
-    if (
-        type(context.decision_utc) is not datetime
-        or context.decision_utc.tzinfo is not UTC
-        or context.decision_utc.utcoffset() != timedelta(0)
-        or context.decision_utc.fold != 0
-    ):
+    decision_utc = context.decision_utc
+    if type(decision_utc) is not datetime:
+        raise CoverageValidationError("decision UTC is not exact canonical UTC")
+    try:
+        canonical_utc = (
+            decision_utc.tzinfo == UTC
+            and decision_utc.utcoffset() == timedelta(0)
+            and decision_utc.fold == 0
+        )
+    except Exception as error:
+        raise CoverageValidationError("decision UTC is not exact canonical UTC") from error
+    if not canonical_utc:
         raise CoverageValidationError("decision UTC is not exact canonical UTC")
     if (
         type(context.decision_monotonic) is not float
