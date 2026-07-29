@@ -714,6 +714,17 @@ class ProjectionStore:
     def path(self) -> Path:
         return self._path
 
+    def _is_bound_to(
+        self,
+        evidence: SegmentStore,
+        acknowledgements: AckJournal,
+    ) -> bool:
+        with self._mutex:
+            return (
+                self._evidence is evidence
+                and self._acknowledgements is acknowledgements
+            )
+
     def status(self) -> ProjectionStatus:
         with self._mutex:
             if self._closed or not self._healthy or self._connection is None:

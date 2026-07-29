@@ -188,6 +188,15 @@ class EvidenceRef:
     content_sha256: str
 
 
+@dataclass(frozen=True)
+class EvidenceStatus:
+    healthy: bool
+    host_id: str | None
+    evidence_head: int
+    acceptance_cursor: int
+    key_healthy: bool
+
+
 def _exact_coverage_ref_key(
     value: object,
 ) -> tuple[str, str, int, int, str, str, int, str]:
@@ -1313,6 +1322,69 @@ class SegmentStore:
     @property
     def read_only_reason(self) -> str | None:
         return self._read_only_reason
+
+    def _is_bound_verifier(self, verifier: EnvelopeVerifier) -> bool:
+        return (
+            not self._closed
+            and self._authority_state == "ready"
+            and self._bound_verifier is verifier
+            and verifier._bound_lifecycle is self._lifecycle_identity
+        )
+
+    def status(self) -> EvidenceStatus:
+        if self._closed:
+            return EvidenceStatus(False, None, 0, 0, False)
+        verifier = self._bound_verifier
+        if verifier is None:
+            return EvidenceStatus(False, None, 0, 0, False)
+        fsm = verifier.fsm
+        evidence_head = fsm.last_sequence
+        holes = fsm.unresolved_holes
+        acceptance_cursor = holes[0][0] - 1 if holes else evidence_head
+        if (
+            type(fsm.host_id) is not str
+            or type(evidence_head) is not int
+            or type(acceptance_cursor) is not int
+            or not 0 <= acceptance_cursor <= evidence_head <= MAX_UINT64
+        ):
+            return EvidenceStatus(False, None, 0, 0, False)
+        active = self._active
+        active_descriptor = None if active is None else active.descriptor
+        base_healthy = (
+            self._read_only_reason is None
+            and not self._append_uncertain
+            and self._pending_durable_commit is None
+            and (
+                active is None
+                or (
+                    type(active_descriptor) is int
+                    and active_descriptor >= 0
+                )
+            )
+        )
+        stable = (
+            self._is_bound_verifier(verifier)
+            and self._bound_verifier is verifier
+            and verifier.fsm is fsm
+            and self._active is active
+            and (
+                active is None
+                or active.descriptor == active_descriptor
+            )
+        )
+        healthy = base_healthy and stable
+        key_healthy = (
+            type(fsm.mutation_read_only) is bool
+            and not fsm.mutation_read_only
+            and fsm.pending_rotation is None
+        )
+        return EvidenceStatus(
+            healthy,
+            fsm.host_id,
+            evidence_head,
+            acceptance_cursor,
+            key_healthy,
+        )
 
     def _require_authenticated_recovered(self) -> EnvelopeVerifier:
         if self._closed:

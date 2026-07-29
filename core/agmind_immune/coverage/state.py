@@ -1181,6 +1181,78 @@ class CoverageState:
             if not apply_complete:
                 self._healthy = False
 
+    def _apply_live_accepted(
+        self,
+        evidence: SegmentStore,
+        ref: EvidenceRef,
+        receipt_monotonic: float | None,
+    ) -> None:
+        self._require_usable()
+        preceding = self._snapshot
+        apply_complete = False
+        try:
+            if (
+                evidence is not self._evidence
+                or type(ref) is not EvidenceRef
+                or (
+                    receipt_monotonic is not None
+                    and (
+                        type(receipt_monotonic) is not float
+                        or not math.isfinite(receipt_monotonic)
+                        or receipt_monotonic < 0
+                    )
+                )
+            ):
+                raise CoverageAuthorityError(
+                    "live coverage apply is outside its exact authority"
+                )
+            lifecycle_identity = self._lifecycle_identity
+            if lifecycle_identity is None:
+                raise CoverageAuthorityError(
+                    "bound coverage state has no lifecycle token"
+                )
+            record = evidence.resolve_authenticated_ref(ref)
+            try:
+                selected = evidence._resolve_next_coverage_record(
+                    self,
+                    lifecycle_identity,
+                    record,
+                    after_ref=preceding.head_ref,
+                )
+            except EvidenceStoreError as error:
+                raise CoverageAuthorityError(
+                    "live coverage apply is not the next same-store real record"
+                ) from error
+            prepared = _prepare(selected)
+            selected_receipt = (
+                receipt_monotonic
+                if prepared.coverage is not None
+                and prepared.coverage.kind == "falco_heartbeat_lease"
+                else None
+            )
+            candidate = _transition(
+                preceding,
+                prepared,
+                live_receipt_monotonic=selected_receipt,
+                live_receipt_allowed=True,
+            )
+        except CoverageError:
+            raise
+        except EvidenceStoreError as error:
+            raise CoverageAuthorityError(
+                "live coverage apply cannot resolve authenticated evidence"
+            ) from error
+        except (TypeError, ValueError, OverflowError) as error:
+            raise CoverageValidationError(
+                "live coverage apply failed validation"
+            ) from error
+        else:
+            self._snapshot = candidate
+            apply_complete = True
+        finally:
+            if not apply_complete:
+                self._healthy = False
+
     def ack_barrier_capability(self) -> CoverageAckBarrier:
         self._require_usable()
         evidence = self._evidence

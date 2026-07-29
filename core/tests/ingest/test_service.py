@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta, tzinfo
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
@@ -11,6 +15,10 @@ import httpx
 import pytest
 from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.contracts import ObserverTrustRootV1
+from agmind_immune.coverage import (
+    CoverageAuthorityError,
+    CoverageState,
+)
 from agmind_immune.evidence.frames import decode_frames, encode_frame
 from agmind_immune.evidence.manifest import (
     SegmentManifestV1,
@@ -20,6 +28,7 @@ from agmind_immune.evidence.manifest import (
 from agmind_immune.evidence.segments import (
     EvidenceCorrupt,
     EvidenceReadOnly,
+    EvidenceStatus,
     SegmentStore,
 )
 from agmind_immune.ingest.ack_journal import (
@@ -77,6 +86,552 @@ def _recovered_coordinator(
     verifier = _verifier()
     store = SegmentStore(path)
     return AcceptanceCoordinator.open_and_recover(verifier, store), store, verifier
+
+
+def test_evidence_status_and_core_clock_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = importlib.import_module("agmind_immune.clock")
+    unbound = SegmentStore(tmp_path / "unbound")
+    assert unbound.status() == EvidenceStatus(False, None, 0, 0, False)
+    unbound.close()
+
+    coordinator, store, verifier = _coordinator(tmp_path / "status")
+    empty = store.status()
+    assert empty.healthy
+    assert empty.host_id == verifier.fsm.host_id
+    assert (empty.evidence_head, empty.acceptance_cursor, empty.key_healthy) == (
+        0,
+        0,
+        True,
+    )
+    assert store._is_bound_verifier(coordinator.verifier)
+
+    key = private_key(11)
+    coordinator.accept(
+        decode_events_page(_page_bytes(boot_boundary(key), reserved_through=1)).events[0]
+    )
+    coordinator.accept(
+        decode_events_page(
+            _page_bytes(
+                envelope_value(
+                    key,
+                    sequence=4,
+                    normalized_fields={"kind": "after-hole"},
+                ),
+                reserved_through=4,
+            )
+        ).events[0]
+    )
+    coherent = store.status()
+    assert (
+        coherent.host_id,
+        coherent.evidence_head,
+        coherent.acceptance_cursor,
+    ) == (verifier.fsm.host_id, 4, 1)
+
+    baseline_authority = verifier._authority
+    pending_fsm = replace(verifier.fsm)
+    object.__setattr__(pending_fsm, "pending_rotation", object())
+    monkeypatch.setattr(
+        verifier,
+        "_authority",
+        replace(baseline_authority, fsm=pending_fsm),
+    )
+    pending = store.status()
+    assert (pending.healthy, pending.key_healthy) == (True, False)
+    monkeypatch.setattr(verifier, "_authority", baseline_authority)
+
+    read_only_fsm = replace(verifier.fsm, mutation_read_only=True)
+    monkeypatch.setattr(
+        verifier,
+        "_authority",
+        replace(baseline_authority, fsm=read_only_fsm),
+    )
+    assert store.status().key_healthy is False
+    monkeypatch.setattr(verifier, "_authority", baseline_authority)
+
+    for attribute, unhealthy_value in (
+        ("_read_only_reason", "test_fence"),
+        ("_append_uncertain", True),
+        ("_pending_durable_commit", object()),
+    ):
+        original = getattr(store, attribute)
+        monkeypatch.setattr(store, attribute, unhealthy_value)
+        unhealthy = store.status()
+        assert (
+            unhealthy.host_id,
+            unhealthy.evidence_head,
+            unhealthy.acceptance_cursor,
+            unhealthy.healthy,
+        ) == (coherent.host_id, 4, 1, False)
+        monkeypatch.setattr(store, attribute, original)
+
+    active = store._active
+    assert active is not None
+    descriptor = active.descriptor
+    active.descriptor = -1
+    assert store.status().healthy is False
+    active.descriptor = descriptor
+
+    def swap_fsm_during_status(candidate: EnvelopeVerifier) -> bool:
+        monkeypatch.setattr(
+            verifier,
+            "_authority",
+            replace(
+                baseline_authority,
+                fsm=replace(verifier.fsm, mutation_read_only=True),
+            ),
+        )
+        return candidate is verifier
+
+    monkeypatch.setattr(store, "_is_bound_verifier", swap_fsm_during_status)
+    assert store.status().healthy is False
+    monkeypatch.undo()
+
+    sample = clock.CoreClockSample(
+        decision_utc=datetime(2026, 7, 29, tzinfo=UTC),
+        decision_monotonic=1.0,
+        healthy=True,
+        uncertainty_seconds=Decimal("0.001"),
+        max_uncertainty_seconds=Decimal("0.010"),
+    )
+    assert sample.healthy
+    assert clock.CoreClockSample(
+        decision_utc=datetime(2026, 7, 29, tzinfo=UTC),
+        decision_monotonic=0.0,
+        healthy=False,
+        uncertainty_seconds=None,
+        max_uncertainty_seconds=Decimal(0),
+    ).uncertainty_seconds is None
+
+    valid = {
+        "decision_utc": datetime(2026, 7, 29, tzinfo=UTC),
+        "decision_monotonic": 1.0,
+        "healthy": True,
+        "uncertainty_seconds": Decimal("0.001"),
+        "max_uncertainty_seconds": Decimal("0.010"),
+    }
+    invalid_values = (
+        ("decision_utc", datetime(2026, 7, 29)),  # noqa: DTZ001 - invalid case
+        ("decision_utc", datetime(2026, 7, 29, tzinfo=UTC, fold=1)),
+        ("decision_monotonic", 1),
+        ("decision_monotonic", True),
+        ("decision_monotonic", float("nan")),
+        ("decision_monotonic", -1.0),
+        ("healthy", 1),
+        ("uncertainty_seconds", 0.1),
+        ("uncertainty_seconds", Decimal("NaN")),
+        ("uncertainty_seconds", Decimal("-0.1")),
+        ("max_uncertainty_seconds", 1),
+        ("max_uncertainty_seconds", Decimal("Infinity")),
+        ("max_uncertainty_seconds", Decimal(-1)),
+    )
+    for field, value in invalid_values:
+        with pytest.raises(clock.CoreClockValidationError):
+            clock.CoreClockSample(**(valid | {field: value}))
+
+    class BrokenTimezone(tzinfo):
+        def utcoffset(self, value: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def dst(self, value: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def tzname(self, value: datetime | None) -> str:
+            return "broken"
+
+        def __eq__(self, other: object) -> bool:
+            raise RuntimeError("private timezone failure")
+
+    with pytest.raises(clock.CoreClockValidationError) as normalized:
+        clock.CoreClockSample(
+            **(valid | {"decision_utc": datetime(2026, 7, 29, tzinfo=BrokenTimezone())})
+        )
+    assert "private" not in str(normalized.value)
+
+    class InterruptingTimezone(BrokenTimezone):
+        def __eq__(self, other: object) -> bool:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        clock.CoreClockSample(
+            **(
+                valid
+                | {
+                    "decision_utc": datetime(
+                        2026,
+                        7,
+                        29,
+                        tzinfo=InterruptingTimezone(),
+                    )
+                }
+            )
+        )
+
+    store.close()
+    assert store.status() == type(empty)(False, None, 0, 0, False)
+
+
+@pytest.mark.asyncio
+async def test_delivery_factory_updates_coverage_before_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = importlib.import_module("agmind_immune.ingest.service")
+    coordinator, store, verifier = _coordinator(tmp_path / "delivery-factory")
+    journal = AckJournal.create_new(store)
+    coverage = CoverageState.open_and_recover(store)
+    clock = _DeliveryClock()
+    transport = _ScriptedTransport()
+
+    with pytest.raises(TypeError):
+        type("DeliverySubclass", (DeliveryCoordinator,), {})
+    lease = journal.claim_delivery(store)
+    with pytest.raises(TypeError):
+        DeliveryCoordinator(
+            coordinator,
+            store,
+            verifier,
+            journal,
+            lease,
+            transport,
+            coverage_adapter=lambda: None,
+            clock=clock,
+            _factory=service._DELIVERY_FACTORY,
+        )
+    lease.release()
+    with pytest.raises(ValueError):
+        DeliveryCoordinator.create(
+            coordinator,
+            journal,
+            transport,
+            coverage=coverage,
+            clock=clock,
+            ack_budget=0,
+        )
+
+    _other, other_store, _ = _coordinator(tmp_path / "foreign")
+    other_journal = AckJournal.create_new(other_store)
+    with pytest.raises(AckJournalAuthorityError):
+        DeliveryCoordinator.create(
+            coordinator,
+            other_journal,
+            transport,
+            coverage=coverage,
+            clock=clock,
+        )
+    other_store.close()
+
+    coverage.close()
+    with pytest.raises(CoverageAuthorityError):
+        DeliveryCoordinator.create(
+            coordinator,
+            journal,
+            transport,
+            coverage=coverage,
+            clock=clock,
+        )
+    coverage = CoverageState.open_and_recover(store)
+
+    key = private_key(11)
+    transport = _ScriptedTransport(
+        [
+            _page_bytes(
+                boot_boundary(key),
+                envelope_value(
+                    key,
+                    sequence=2,
+                    normalized_fields={"kind": "second-valid-item"},
+                ),
+                reserved_through=2,
+            )
+        ],
+        [None, None],
+    )
+    timeline: list[str] = []
+    append = store.append
+    apply_live = coverage._apply_live_accepted
+    barrier = coverage._first_unclosed_sequence_gap
+    pending = journal.record_pending
+
+    def traced_append(*args: object, **kwargs: object) -> object:
+        result = append(*args, **kwargs)
+        timeline.append("evidence")
+        return result
+
+    def traced_apply(
+        evidence: SegmentStore,
+        ref: object,
+        receipt: float | None,
+    ) -> None:
+        apply_live(evidence, ref, receipt)
+        timeline.append("coverage")
+
+    def traced_barrier(
+        evidence: SegmentStore,
+        *,
+        lifecycle_identity: object,
+        capability_token: object,
+    ) -> int | None:
+        timeline.append("barrier")
+        return barrier(
+            evidence,
+            lifecycle_identity=lifecycle_identity,
+            capability_token=capability_token,
+        )
+
+    def traced_pending(ref: object) -> None:
+        first = journal.snapshot().pending is None
+        pending(ref)
+        if first:
+            timeline.append("pending")
+
+    store.append = traced_append  # type: ignore[method-assign]
+    coverage._apply_live_accepted = traced_apply  # type: ignore[method-assign]
+    coverage._first_unclosed_sequence_gap = traced_barrier  # type: ignore[method-assign]
+    journal.record_pending = traced_pending  # type: ignore[method-assign]
+    delivery = DeliveryCoordinator.create(
+        coordinator,
+        journal,
+        transport,
+        coverage=coverage,
+        clock=clock,
+    )
+    timeline.clear()
+    result = await delivery.poll_once()
+    assert (result.accepted, result.confirmed) == (2, 2)
+    assert timeline[:5] == [
+        "evidence",
+        "coverage",
+        "evidence",
+        "coverage",
+        "barrier",
+    ]
+    assert timeline.index("pending") > 4
+    await delivery.close()
+    store.close()
+
+    failed, failed_store, _ = _coordinator(tmp_path / "coverage-failure")
+    failed_journal = AckJournal.create_new(failed_store)
+    failed_coverage = CoverageState.open_and_recover(failed_store)
+    failed_transport = _ScriptedTransport(
+        [
+            _page_bytes(
+                boot_boundary(key),
+                envelope_value(
+                    key,
+                    sequence=2,
+                    event_type="coverage",
+                    normalized_fields={
+                        "component": "falco-adapter",
+                        "kind": "falco_heartbeat_lease",
+                        "severity": "INFO",
+                        "opened_at": NOW,
+                        "closed_at": NOW,
+                        "reason_code": "not_a_valid_live_lease",
+                    },
+                    source_payload_hash="a" * 64,
+                ),
+                reserved_through=2,
+            )
+        ]
+    )
+    failed_delivery = DeliveryCoordinator.create(
+        failed,
+        failed_journal,
+        failed_transport,
+        coverage=failed_coverage,
+        clock=_DeliveryClock(),
+    )
+
+    with pytest.raises(DeliveryFatalError):
+        await failed_delivery.poll_once()
+    assert [record.ref.source_sequence for record in failed_store.iter_records()] == [1, 2]
+    assert failed_coverage._healthy is False
+    assert failed_coverage._snapshot.head_sequence == 1
+    assert failed_journal.snapshot().pending is None
+    assert _ack_sequences(failed_transport) == []
+    await failed_delivery.close()
+    failed_store.close()
+
+    for attribute in ("_segment_store", "_verifier"):
+        label = attribute.removeprefix("_")
+        substituted, retained_store, retained_verifier = _coordinator(
+            tmp_path / f"substitution-{label}"
+        )
+        substituted_journal = AckJournal.create_new(retained_store)
+        substituted_coverage = CoverageState.open_and_recover(retained_store)
+        substituted_delivery = DeliveryCoordinator.create(
+            substituted,
+            substituted_journal,
+            _ScriptedTransport(
+                [_page_bytes(boot_boundary(key), reserved_through=1)]
+            ),
+            coverage=substituted_coverage,
+            clock=_DeliveryClock(),
+        )
+        _foreign, foreign_store, foreign_verifier = _coordinator(
+            tmp_path / f"substituted-{label}-foreign"
+        )
+        replacement = (
+            foreign_store if attribute == "_segment_store" else foreign_verifier
+        )
+        object.__setattr__(substituted, attribute, replacement)
+        with pytest.raises(DeliveryFatalError):
+            await substituted_delivery.poll_once()
+        assert tuple(retained_store.iter_records()) == ()
+        original = (
+            retained_store if attribute == "_segment_store" else retained_verifier
+        )
+        object.__setattr__(substituted, attribute, original)
+        await substituted_delivery.close()
+        foreign_store.close()
+        retained_store.close()
+
+    for attribute in ("_segment_store", "_verifier"):
+        label = attribute.removeprefix("_")
+        post, post_store, post_verifier = _coordinator(
+            tmp_path / f"post-accept-{label}"
+        )
+        post_journal = AckJournal.create_new(post_store)
+        post_coverage = CoverageState.open_and_recover(post_store)
+        post_transport = _ScriptedTransport(
+            [_page_bytes(boot_boundary(key), reserved_through=1)]
+        )
+        post_delivery = DeliveryCoordinator.create(
+            post,
+            post_journal,
+            post_transport,
+            coverage=post_coverage,
+            clock=_DeliveryClock(),
+        )
+        _unused, swap_store, swap_verifier = _coordinator(
+            tmp_path / f"post-accept-{label}-foreign"
+        )
+        replacement = (
+            swap_store if attribute == "_segment_store" else swap_verifier
+        )
+        original_accept = AcceptanceCoordinator.accept
+
+        def swap_after_accept(
+            selected: AcceptanceCoordinator,
+            item: object,
+            *,
+            accept: object = original_accept,
+            target: AcceptanceCoordinator = post,
+            target_attribute: str = attribute,
+            target_replacement: object = replacement,
+        ) -> object:
+            assert callable(accept)
+            ref = accept(selected, item)
+            if selected is target:
+                object.__setattr__(
+                    selected,
+                    target_attribute,
+                    target_replacement,
+                )
+            return ref
+
+        with monkeypatch.context() as patch:
+            patch.setattr(AcceptanceCoordinator, "accept", swap_after_accept)
+            with pytest.raises(DeliveryFatalError):
+                await post_delivery.poll_once()
+        assert [record.ref.source_sequence for record in post_store.iter_records()] == [1]
+        assert post_journal.snapshot().pending is None
+        assert post_coverage._snapshot.head_sequence == 0
+        original = post_store if attribute == "_segment_store" else post_verifier
+        object.__setattr__(post, attribute, original)
+        await post_delivery.close()
+        swap_store.close()
+        post_store.close()
+
+    lease_fields = {
+        "component": "falco-adapter",
+        "kind": "falco_heartbeat_lease",
+        "severity": "INFO",
+        "opened_at": NOW,
+        "closed_at": NOW,
+        "reason_code": "valid_heartbeat",
+    }
+    for label, receipt, expected_deadline in (
+        ("live-lease", 7.0, 22.0),
+        ("missing-receipt", None, None),
+        ("receipt-provider-error", RuntimeError("private receipt failure"), None),
+    ):
+        lease_coordinator, lease_store, _ = _coordinator(tmp_path / label)
+        lease_journal = AckJournal.create_new(lease_store)
+        lease_coverage = CoverageState.open_and_recover(lease_store)
+        lease_clock = _DeliveryClock([None, receipt])
+        lease_transport = _ScriptedTransport(
+            [
+                _page_bytes(
+                    boot_boundary(key),
+                    envelope_value(
+                        key,
+                        sequence=2,
+                        event_type="coverage",
+                        normalized_fields=lease_fields,
+                        source_payload_hash="a" * 64,
+                    ),
+                    reserved_through=2,
+                )
+            ],
+            [None, None],
+        )
+        lease_delivery = DeliveryCoordinator.create(
+            lease_coordinator,
+            lease_journal,
+            lease_transport,
+            coverage=lease_coverage,
+            clock=lease_clock,
+        )
+        lease_result = await lease_delivery.poll_once()
+        assert (lease_result.accepted, lease_result.confirmed) == (2, 2)
+        assert lease_coverage._snapshot.live_lease_deadline == expected_deadline
+        calls = lease_clock.calls
+        lease_transport.pages.append(
+            _page_bytes(
+                envelope_value(
+                    key,
+                    sequence=2,
+                    event_type="coverage",
+                    normalized_fields=lease_fields,
+                    source_payload_hash="a" * 64,
+                ),
+                acked_through=2,
+                reserved_through=2,
+            )
+        )
+        with pytest.raises(DeliveryFatalError):
+            await lease_delivery.poll_once()
+        assert lease_clock.calls == calls
+        await lease_delivery.close()
+        lease_store.close()
+
+    interrupt_coordinator, interrupt_store, _ = _coordinator(tmp_path / "interrupt")
+    interrupt_journal = AckJournal.create_new(interrupt_store)
+    interrupt_coverage = CoverageState.open_and_recover(interrupt_store)
+
+    class InterruptClock(_DeliveryClock):
+        def live_receipt_monotonic(self) -> float | None:
+            raise KeyboardInterrupt
+
+    interrupt_delivery = DeliveryCoordinator.create(
+        interrupt_coordinator,
+        interrupt_journal,
+        _ScriptedTransport(
+            [_page_bytes(boot_boundary(key), reserved_through=1)]
+        ),
+        coverage=interrupt_coverage,
+        clock=InterruptClock(),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        await interrupt_delivery.poll_once()
+    assert tuple(interrupt_store.iter_records()) == ()
+    await interrupt_delivery.close()
+    interrupt_store.close()
 
 
 def test_factories_enforce_replay_and_single_store_lifecycle(tmp_path: Path) -> None:
@@ -427,29 +982,25 @@ class _OneChunkStream(httpx.AsyncByteStream):
         yield self.body
 
 
-class _StrictEvidenceBarrier:
-    """Test capability whose answer is derived only from authenticated refs."""
-
+class _DeliveryClock:
     def __init__(
         self,
-        store: SegmentStore,
-        open_sequence: int | None = None,
-        close_sequence: int | None = None,
+        receipts: list[float | None | BaseException] | None = None,
     ) -> None:
-        self.store = store
-        self.open_sequence = open_sequence
-        self.close_sequence = close_sequence
+        self.receipts = receipts or []
+        self.calls = 0
 
-    def __call__(self) -> int | None:
-        sequences = {
-            record.ref.source_sequence
-            for record in self.store.iter_authenticated_records()
-        }
-        if self.open_sequence not in sequences:
+    def live_receipt_monotonic(self) -> float | None:
+        self.calls += 1
+        if not self.receipts:
             return None
-        if self.close_sequence in sequences:
-            return None
-        return self.open_sequence
+        result = self.receipts.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def decision_sample(self) -> object:
+        raise AssertionError("delivery must not sample the decision clock")
 
 
 def _test_delivery(
@@ -457,14 +1008,23 @@ def _test_delivery(
     journal: AckJournal,
     transport: _ScriptedTransport,
     *,
-    barrier: _StrictEvidenceBarrier | None = None,
+    clock: object | None = None,
     budget: int = 100,
 ) -> DeliveryCoordinator:
-    return DeliveryCoordinator._create_unsafe_for_test(
+    store = acceptance.segment_store
+    existing = store._coverage_state_owner
+    coverage = (
+        existing
+        if type(existing) is CoverageState
+        else CoverageState.open_and_recover(store)
+    )
+    assert type(coverage) is CoverageState
+    return DeliveryCoordinator.create(
         acceptance,
         journal,
         transport,
-        ack_barrier=barrier or _StrictEvidenceBarrier(acceptance.segment_store),
+        coverage=coverage,
+        clock=clock or _DeliveryClock(),
         ack_budget=budget,
     )
 
@@ -602,7 +1162,7 @@ async def test_delivery_commit_timeline_and_exact_pending_replay(
     monkeypatch: pytest.MonkeyPatch,
     ack_outcome: str,
 ) -> None:
-    coordinator, store, _verifier = _coordinator(tmp_path / ack_outcome)
+    coordinator, store, verifier = _coordinator(tmp_path / ack_outcome)
     journal = AckJournal.create_new(store)
     key = private_key(11)
     if ack_outcome == "lifecycle_authority":
@@ -611,10 +1171,16 @@ async def test_delivery_commit_timeline_and_exact_pending_replay(
         with pytest.raises(TypeError):
             DeliveryCoordinator(
                 coordinator,
+                store,
+                verifier,
                 journal,
                 lease,
                 transport,
-                ack_barrier=lambda: None,
+                coverage_adapter=lambda: None,
+                clock=_DeliveryClock(),
+                _factory=importlib.import_module(
+                    "agmind_immune.ingest.service"
+                )._DELIVERY_FACTORY,
             )
         lease.release()
 
@@ -657,6 +1223,8 @@ async def test_delivery_commit_timeline_and_exact_pending_replay(
     }[ack_outcome]
     transport = _ScriptedTransport([first_page], [outcome])
     delivery = _test_delivery(coordinator, journal, transport)
+    coverage = store._coverage_state_owner
+    assert type(coverage) is CoverageState
     timeline: list[str] = []
 
     def traced(label: str, function: Any) -> Any:
@@ -675,7 +1243,29 @@ async def test_delivery_commit_timeline_and_exact_pending_replay(
         timeline.append("post")
         await original_ack(body)
 
-    monkeypatch.setattr(coordinator, "accept", traced("evidence", coordinator.accept))
+    original_accept = AcceptanceCoordinator.accept
+
+    def accept_with_timeline(
+        selected: AcceptanceCoordinator,
+        item: object,
+    ) -> object:
+        result = original_accept(selected, item)
+        if selected is coordinator:
+            timeline.append("evidence")
+        return result
+
+    original_coverage_apply = coverage._apply_live_accepted
+
+    def coverage_with_timeline(
+        evidence: SegmentStore,
+        ref: object,
+        receipt: float | None,
+    ) -> None:
+        original_coverage_apply(evidence, ref, receipt)
+        timeline.append("coverage")
+
+    monkeypatch.setattr(AcceptanceCoordinator, "accept", accept_with_timeline)
+    monkeypatch.setattr(coverage, "_apply_live_accepted", coverage_with_timeline)
     monkeypatch.setattr(journal, "record_pending", traced("pending", journal.record_pending))
     monkeypatch.setattr(
         journal,
@@ -687,16 +1277,22 @@ async def test_delivery_commit_timeline_and_exact_pending_replay(
     if ack_outcome == "cancelled":
         with pytest.raises(asyncio.CancelledError):
             await delivery.poll_once()
-        assert timeline == ["evidence", "pending", "post"]
+        assert timeline == ["evidence", "coverage", "pending", "post"]
         assert journal.snapshot().pending is not None
     else:
         result = await delivery.poll_once()
         if ack_outcome == "success":
-            assert timeline == ["evidence", "pending", "post", "confirmed"]
+            assert timeline == [
+                "evidence",
+                "coverage",
+                "pending",
+                "post",
+                "confirmed",
+            ]
             assert result.confirmed_through == 1
             assert result.retry_required is False
         else:
-            assert timeline == ["evidence", "pending", "post"]
+            assert timeline == ["evidence", "coverage", "pending", "post"]
             assert result.retry_required is True
             pending_body = journal.pending_request_body()
             assert pending_body is not None
@@ -844,12 +1440,55 @@ async def test_delivery_holes_barrier_restart_and_partial_page(
             },
             coverage_flags=["reconcile_required", "sequence_gap"],
         )
-        close_surrogate = envelope_value(
+        docker_open = envelope_value(
             key,
             sequence=6,
-            normalized_fields={"kind": "authenticated-close-surrogate"},
+            event_type="coverage",
+            normalized_fields={
+                "component": "observer",
+                "kind": "docker_reconcile_gap",
+                "severity": "CRITICAL",
+                "opened_at": NOW,
+                "reason_code": "observer_startup",
+                "reconcile_generation": 1,
+            },
+            coverage_flags=["docker_event_gap", "reconcile_required"],
+            inventory_generation=1,
         )
-        barrier = _StrictEvidenceBarrier(store, 5, 6)
+        docker_recovery = envelope_value(
+            key,
+            sequence=7,
+            event_type="coverage",
+            normalized_fields={
+                "component": "observer",
+                "kind": "docker_reconcile_recovered",
+                "severity": "INFO",
+                "opened_at": NOW,
+                "closed_at": NOW,
+                "reason_code": "docker_full_reconcile_succeeded",
+                "reconcile_generation": 1,
+            },
+            coverage_flags=["docker_event_gap", "reconcile_required"],
+            inventory_generation=1,
+        )
+        gap_close = envelope_value(
+            key,
+            sequence=8,
+            event_type="coverage",
+            normalized_fields={
+                "component": "observer",
+                "kind": "observer_sequence_gap",
+                "severity": "INFO",
+                "opened_at": NOW,
+                "closed_at": NOW,
+                "affected_source_sequence_start": 2,
+                "affected_source_sequence_end": 3,
+                "reason_code": "reserved_sequence_reconciled",
+                "reconcile_generation": 1,
+            },
+            coverage_flags=["reconcile_required", "sequence_gap"],
+            inventory_generation=1,
+        )
         transport = _ScriptedTransport(
             [
                 _page_bytes(
@@ -861,19 +1500,22 @@ async def test_delivery_holes_barrier_restart_and_partial_page(
                 ),
                 _page_bytes(acked_through=1, reserved_through=5),
                 _page_bytes(
-                    close_surrogate,
+                    docker_open,
+                    docker_recovery,
+                    gap_close,
                     acked_through=4,
-                    reserved_through=6,
+                    reserved_through=8,
                 ),
-                _page_bytes(acked_through=5, reserved_through=6),
+                _page_bytes(acked_through=5, reserved_through=8),
+                _page_bytes(acked_through=6, reserved_through=8),
+                _page_bytes(acked_through=7, reserved_through=8),
             ],
-            [None, None, None, None],
+            [None, None, None, None, None, None],
         )
         delivery = _test_delivery(
             coordinator,
             journal,
             transport,
-            barrier=barrier,
             budget=1,
         )
         first = await delivery.poll_once()
@@ -884,9 +1526,12 @@ async def test_delivery_holes_barrier_restart_and_partial_page(
         assert _ack_sequences(transport) == [1, 4]
         released = await delivery.poll_once()
         assert released.confirmed_through == 5
+        assert released.evidence_head == 8
+        assert (await delivery.poll_once()).confirmed_through == 6
+        assert (await delivery.poll_once()).confirmed_through == 7
         drained = await delivery.poll_once()
-        assert drained.confirmed_through == 6
-        assert _ack_sequences(transport) == [1, 4, 5, 6]
+        assert drained.confirmed_through == 8
+        assert _ack_sequences(transport) == [1, 4, 5, 6, 7, 8]
     elif case == "hints_only":
         page = _page_bytes(
             boot_boundary(key),

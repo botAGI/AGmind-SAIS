@@ -6,20 +6,24 @@ import asyncio
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, final
 
 import httpx
 
+from agmind_immune.clock import CoreClockProvider
 from agmind_immune.contracts import MAX_UINT64
+from agmind_immune.coverage import CoverageAckBarrier, CoverageState
 from agmind_immune.evidence.segments import (
     EvidencePriority,
     EvidenceRef,
+    EvidenceStatus,
     SegmentStore,
 )
 from agmind_immune.ingest.ack_journal import (
     AckDeliveryLease,
     AckIdentity,
     AckJournal,
+    AckJournalSnapshot,
 )
 from agmind_immune.ingest.envelope import (
     MAX_EVENTS_PAGE_BYTES,
@@ -34,11 +38,18 @@ from agmind_immune.ingest.envelope import (
 
 _COORDINATOR_FACTORY = object()
 _DELIVERY_FACTORY = object()
+_COVERAGE_ADAPTER_FACTORY = object()
 _MAX_ERROR_BODY_BYTES = 4_096
 
 
+@final
 class AcceptanceCoordinator:
     """Durably append a staged envelope before committing verifier/FSM state."""
+
+    __slots__ = ("_segment_store", "_verifier")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("AcceptanceCoordinator is final")
 
     def __init__(
         self,
@@ -51,22 +62,32 @@ class AcceptanceCoordinator:
             raise TypeError(
                 "use AcceptanceCoordinator.create_empty() or open_and_recover()"
             )
-        self.verifier = verifier
-        self.segment_store = segment_store
+        self._verifier = verifier
+        self._segment_store = segment_store
+
+    @property
+    def verifier(self) -> EnvelopeVerifier:
+        return self._verifier
+
+    @property
+    def segment_store(self) -> SegmentStore:
+        return self._segment_store
 
     def accept(self, item: CoreEventV1) -> EvidenceRef:
+        verifier = self._verifier
+        segment_store = self._segment_store
         try:
-            verified = self.verifier.verify(
+            verified = verifier.verify(
                 item.envelope,
                 sequence=item.sequence,
                 event_id=item.event_id,
                 content_sha256=item.content_sha256,
             )
         except EnvelopeConflict:
-            self.segment_store.enter_read_only("evidence_conflict")
-            self.verifier._enter_read_only_after_durable_fence()
+            segment_store.enter_read_only("evidence_conflict")
+            verifier._enter_read_only_after_durable_fence()
             raise
-        return self.segment_store.append(
+        return segment_store.append(
             verified,
             EvidencePriority(verified.evidence_priority),
         )
@@ -116,12 +137,6 @@ class ObserverCoreTransport(Protocol):
     async def ack_event(self, body: bytes) -> None: ...
 
     async def close(self) -> None: ...
-
-
-class _AckBarrier(Protocol):
-    """Evidence-derived first source sequence whose ACK must be held."""
-
-    def __call__(self) -> int | None: ...
 
 
 @dataclass(frozen=True)
@@ -318,38 +333,83 @@ class _DeliveryState:
     delivery_ceiling: int
 
 
+@final
+class _CoverageDeliveryAdapter:
+    __slots__ = ("_barrier", "_coverage", "_evidence")
+
+    def __init__(
+        self,
+        factory: object,
+        coverage: CoverageState,
+        barrier: CoverageAckBarrier,
+        evidence: SegmentStore,
+    ) -> None:
+        if factory is not _COVERAGE_ADAPTER_FACTORY:
+            raise TypeError("coverage delivery adapter is factory-only")
+        self._coverage = coverage
+        self._barrier = barrier
+        self._evidence = evidence
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("coverage delivery adapter is final")
+
+    def apply_live_accepted(
+        self,
+        ref: EvidenceRef,
+        receipt_monotonic: float | None,
+    ) -> None:
+        self._coverage._apply_live_accepted(
+            self._evidence,
+            ref,
+            receipt_monotonic,
+        )
+
+    def first_unclosed_sequence_gap(self) -> int | None:
+        return self._barrier._first_unclosed_sequence_gap(self._evidence)
+
+
+@final
 class DeliveryCoordinator:
     """Serialize one evidence-first observer delivery/ACK lifecycle."""
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("DeliveryCoordinator is final")
 
     def __init__(
         self,
         acceptance: AcceptanceCoordinator,
+        store: SegmentStore,
+        verifier: EnvelopeVerifier,
         ack_journal: AckJournal,
         delivery_lease: AckDeliveryLease,
         transport: ObserverCoreTransport,
         *,
-        ack_barrier: _AckBarrier,
+        coverage_adapter: _CoverageDeliveryAdapter,
+        clock: CoreClockProvider,
         ack_budget: int = MAX_PAGE_EVENTS,
         _factory: object,
     ) -> None:
         if _factory is not _DELIVERY_FACTORY:
-            raise TypeError("DeliveryCoordinator has no production factory before 5C1D")
-        if not isinstance(delivery_lease, AckDeliveryLease):
+            raise TypeError("use DeliveryCoordinator.create()")
+        if type(delivery_lease) is not AckDeliveryLease:
             raise TypeError("delivery requires an exact ACK-journal lease")
-        if not callable(ack_barrier):
-            raise TypeError("delivery requires an ACK barrier capability")
+        if type(coverage_adapter) is not _CoverageDeliveryAdapter:
+            raise TypeError("delivery requires its exact coverage adapter")
         if (
             isinstance(ack_budget, bool)
             or not isinstance(ack_budget, int)
             or not 1 <= ack_budget <= MAX_PAGE_EVENTS
         ):
             raise ValueError("ACK budget must be in 1..100")
-        self.acceptance = acceptance
-        self.ack_journal = ack_journal
+        self._acceptance = acceptance
+        self._store = store
+        self._verifier = verifier
+        self._ack_journal = ack_journal
         self._delivery_lease = delivery_lease
-        self.transport = transport
-        self.ack_barrier = ack_barrier
-        self.ack_budget = ack_budget
+        self._transport = transport
+        self._coverage_adapter = coverage_adapter
+        self._clock = clock
+        self._ack_budget = ack_budget
         self._lock = asyncio.Lock()
         self._fatal: DeliveryFatalError | None = None
         self._closed = False
@@ -357,30 +417,134 @@ class DeliveryCoordinator:
         self._lease_released = False
 
     @classmethod
-    def _create_unsafe_for_test(
+    def create(
         cls,
         acceptance: AcceptanceCoordinator,
-        ack_journal: AckJournal,
+        acknowledgements: AckJournal,
         transport: ObserverCoreTransport,
         *,
-        ack_barrier: _AckBarrier,
+        coverage: CoverageState,
+        clock: CoreClockProvider,
         ack_budget: int = MAX_PAGE_EVENTS,
     ) -> DeliveryCoordinator:
-        """Exercise the 5C1B contract before 5C1D issues a bound barrier."""
-        lease = ack_journal.claim_delivery(acceptance.segment_store)
+        if type(acceptance) is not AcceptanceCoordinator:
+            raise TypeError("delivery requires exact acceptance authority")
+        store = acceptance.segment_store
+        verifier = acceptance.verifier
+        if type(store) is not SegmentStore or type(verifier) is not EnvelopeVerifier:
+            raise TypeError("delivery requires exact evidence authority")
+        if type(acknowledgements) is not AckJournal:
+            raise TypeError("delivery requires exact ACK authority")
+        if type(coverage) is not CoverageState:
+            raise TypeError("delivery requires exact coverage authority")
+        if (
+            acceptance.segment_store is not store
+            or acceptance.verifier is not verifier
+            or not store._is_bound_verifier(verifier)
+        ):
+            raise DeliveryFatalError("acceptance authority binding is invalid")
+        if (
+            not callable(getattr(clock, "live_receipt_monotonic", None))
+            or not callable(getattr(clock, "decision_sample", None))
+        ):
+            raise TypeError("delivery requires one typed Core clock provider")
+        barrier = coverage.ack_barrier_capability()
+        if type(barrier) is not CoverageAckBarrier:
+            raise DeliveryFatalError("coverage issued a non-exact ACK barrier")
+        barrier._first_unclosed_sequence_gap(store)
+        adapter = _CoverageDeliveryAdapter(
+            _COVERAGE_ADAPTER_FACTORY,
+            coverage,
+            barrier,
+            store,
+        )
+        lease = acknowledgements.claim_delivery(store)
         try:
-            return cls(
+            delivery = cls(
                 acceptance,
-                ack_journal,
+                store,
+                verifier,
+                acknowledgements,
                 lease,
                 transport,
-                ack_barrier=ack_barrier,
+                coverage_adapter=adapter,
+                clock=clock,
                 ack_budget=ack_budget,
                 _factory=_DELIVERY_FACTORY,
             )
-        except BaseException:
-            lease.release()
+            if (
+                acceptance.segment_store is not store
+                or acceptance.verifier is not verifier
+                or not store._is_bound_verifier(verifier)
+                or delivery._store is not store
+                or delivery._verifier is not verifier
+            ):
+                raise DeliveryFatalError(
+                    "acceptance authority changed during delivery composition"
+                )
+            return delivery
+        except BaseException as primary:
+            try:
+                lease.release()
+            except BaseException as cleanup_error:  # noqa: BLE001
+                primary.add_note(
+                    "secondary delivery composition cleanup failure "
+                    f"({type(cleanup_error).__name__})"
+                )
             raise
+
+    @property
+    def acceptance(self) -> AcceptanceCoordinator:
+        return self._acceptance
+
+    @property
+    def ack_journal(self) -> AckJournal:
+        return self._ack_journal
+
+    @property
+    def transport(self) -> ObserverCoreTransport:
+        return self._transport
+
+    @property
+    def ack_budget(self) -> int:
+        return self._ack_budget
+
+    def _is_bound_to(
+        self,
+        acceptance: AcceptanceCoordinator,
+        acknowledgements: AckJournal,
+        coverage: CoverageState,
+        clock: CoreClockProvider,
+    ) -> bool:
+        return (
+            self._acceptance is acceptance
+            and self._ack_journal is acknowledgements
+            and self._coverage_adapter._coverage is coverage
+            and self._clock is clock
+        )
+
+    def _validate_acceptance_binding(self) -> None:
+        if (
+            self._acceptance.segment_store is not self._store
+            or self._acceptance.verifier is not self._verifier
+            or not self._store._is_bound_verifier(self._verifier)
+        ):
+            raise self._latch("retained acceptance authority changed")
+
+    def _live_receipt(self) -> float | None:
+        try:
+            value = self._clock.live_receipt_monotonic()
+        except Exception:  # noqa: BLE001 - optional provider receipt boundary
+            return None
+        if value is None:
+            return None
+        if (
+            type(value) is not float
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            return None
+        return value
 
     def _raise_if_unavailable(self) -> None:
         if self._closed:
@@ -408,7 +572,7 @@ class DeliveryCoordinator:
         if through <= after or limit <= 0:
             return ()
         try:
-            return self.acceptance.segment_store.authenticated_refs(
+            return self._store.authenticated_refs(
                 after_sequence=after,
                 through_sequence=through,
                 limit=limit,
@@ -432,7 +596,7 @@ class DeliveryCoordinator:
         confirmed_through: int,
     ) -> int:
         try:
-            barrier = self.ack_barrier()
+            barrier = self._coverage_adapter.first_unclosed_sequence_gap()
         except Exception as error:  # noqa: BLE001 - fail closed at capability boundary
             raise self._latch("evidence-derived ACK barrier failed", error)
         if barrier is None:
@@ -455,15 +619,23 @@ class DeliveryCoordinator:
             )
         return min(acceptance_cursor, barrier - 1)
 
-    def _local_state(self) -> _DeliveryState:
+    def _local_state(
+        self,
+        *,
+        apply_coverage_barrier: bool,
+    ) -> _DeliveryState:
         self._raise_if_unavailable()
         try:
-            snapshot = self.ack_journal.snapshot()
-            if not snapshot.healthy:
+            self._validate_acceptance_binding()
+            snapshot = self._ack_journal.snapshot()
+            status = self._store.status()
+            if type(snapshot) is not AckJournalSnapshot or not snapshot.healthy:
                 raise self._latch("ACK journal is unhealthy")
-            pending_body = self.ack_journal.pending_request_body()
-            evidence_head = self.acceptance.verifier.fsm.last_sequence
-            acceptance_cursor = self.acceptance.segment_store.acceptance_cursor
+            if type(status) is not EvidenceStatus or not status.healthy:
+                raise self._latch("evidence status is unhealthy")
+            pending_body = self._ack_journal.pending_request_body()
+            evidence_head = status.evidence_head
+            acceptance_cursor = status.acceptance_cursor
         except DeliveryFatalError:
             raise
         except Exception as error:  # noqa: BLE001 - local authority boundary
@@ -472,17 +644,21 @@ class DeliveryCoordinator:
         if not 0 <= confirmed_through <= acceptance_cursor <= evidence_head:
             raise self._latch("local delivery cursors are inconsistent")
         try:
-            self.acceptance.segment_store.authenticated_refs(
+            self._store.authenticated_refs(
                 after_sequence=confirmed_through,
                 through_sequence=confirmed_through,
                 limit=1,
             )
         except Exception as error:  # noqa: BLE001 - store authority boundary
             raise self._latch("evidence store is unavailable for delivery", error)
-        delivery_ceiling = self._barrier_ceiling(
-            evidence_head=evidence_head,
-            acceptance_cursor=acceptance_cursor,
-            confirmed_through=confirmed_through,
+        delivery_ceiling = (
+            self._barrier_ceiling(
+                evidence_head=evidence_head,
+                acceptance_cursor=acceptance_cursor,
+                confirmed_through=confirmed_through,
+            )
+            if apply_coverage_barrier
+            else acceptance_cursor
         )
         pending_ref: EvidenceRef | None = None
         if snapshot.pending is None:
@@ -493,7 +669,10 @@ class DeliveryCoordinator:
             if (
                 pending_body is None
                 or not confirmed_through < pending.sequence <= acceptance_cursor
-                or pending.sequence > delivery_ceiling
+                or (
+                    apply_coverage_barrier
+                    and pending.sequence > delivery_ceiling
+                )
             ):
                 raise self._latch("pending ACK is outside local delivery authority")
             first = self._authenticated_refs(
@@ -506,15 +685,17 @@ class DeliveryCoordinator:
                     "pending ACK is not the next authenticated evidence ref"
                 )
             pending_ref = first[0]
-            try:
-                # The exact idempotent transition re-proves that the recovered
-                # journal and this acceptance lifecycle bind the same ref.
-                self.ack_journal.record_pending(pending_ref)
-            except Exception as error:  # noqa: BLE001 - journal authority boundary
-                raise self._latch(
-                    "pending ACK is outside this evidence lifecycle",
-                    error,
-                )
+            if apply_coverage_barrier:
+                try:
+                    # The exact idempotent transition re-proves that the
+                    # recovered journal and this acceptance lifecycle bind the
+                    # same ref only after the coverage ceiling is known.
+                    self._ack_journal.record_pending(pending_ref)
+                except Exception as error:  # noqa: BLE001 - journal authority boundary
+                    raise self._latch(
+                        "pending ACK is outside this evidence lifecycle",
+                        error,
+                    )
         return _DeliveryState(
             evidence_head=evidence_head,
             acceptance_cursor=acceptance_cursor,
@@ -533,7 +714,7 @@ class DeliveryCoordinator:
         ):
             raise self._latch("pending ACK lacks exact durable identity")
         try:
-            await self.transport.ack_event(state.pending_body)
+            await self._transport.ack_event(state.pending_body)
         except asyncio.CancelledError:
             raise
         except DeliveryAmbiguousAck:
@@ -549,7 +730,7 @@ class DeliveryCoordinator:
         except Exception as error:  # noqa: BLE001 - transport protocol boundary
             raise self._latch("observer ACK transport violated its contract", error)
         try:
-            self.ack_journal.record_confirmed(state.pending_ref)
+            self._ack_journal.record_confirmed(state.pending_ref)
         except Exception as error:  # noqa: BLE001 - journal authority boundary
             raise self._latch(
                 "ACK confirmation durability is uncertain",
@@ -558,7 +739,7 @@ class DeliveryCoordinator:
 
     async def recover_pending_ack(self) -> bool:
         async with self._lock:
-            state = self._local_state()
+            state = self._local_state(apply_coverage_barrier=True)
             if state.pending is None:
                 return False
             await self._post_pending(state)
@@ -594,7 +775,7 @@ class DeliveryCoordinator:
         confirmed_through: int,
     ) -> CoreEventsPageV1:
         try:
-            raw = await self.transport.fetch_events(after=after, limit=limit)
+            raw = await self._transport.fetch_events(after=after, limit=limit)
         except asyncio.CancelledError:
             raise
         except DeliveryRetryableError:
@@ -626,7 +807,7 @@ class DeliveryCoordinator:
         confirmed: int,
         retry_required: bool,
     ) -> PollResult:
-        state = self._local_state()
+        state = self._local_state(apply_coverage_barrier=True)
         return PollResult(
             accepted=accepted,
             confirmed=confirmed,
@@ -645,11 +826,12 @@ class DeliveryCoordinator:
         ):
             raise ValueError("poll limit must be in 1..100")
         async with self._lock:
-            state = self._local_state()
+            state = self._local_state(apply_coverage_barrier=False)
             accepted = 0
             confirmed = 0
-            remaining_budget = self.ack_budget
+            remaining_budget = self._ack_budget
             if state.pending is not None:
+                state = self._local_state(apply_coverage_barrier=True)
                 try:
                     await self._post_pending(state)
                 except DeliveryAmbiguousAck:
@@ -660,7 +842,7 @@ class DeliveryCoordinator:
                     )
                 confirmed += 1
                 remaining_budget -= 1
-                state = self._local_state()
+                state = self._local_state(apply_coverage_barrier=False)
 
             page = await self._fetch_page(
                 after=state.evidence_head,
@@ -668,16 +850,36 @@ class DeliveryCoordinator:
                 confirmed_through=state.confirmed_through,
             )
             for item in page.events:
+                receipt = self._live_receipt()
                 try:
-                    self.acceptance.accept(item)
+                    self._validate_acceptance_binding()
+                    before = self._store.status()
+                    if type(before) is not EvidenceStatus or not before.healthy:
+                        raise DeliveryFatalError(
+                            "pre-accept evidence status is unhealthy"
+                        )
+                    ref = self._acceptance.accept(item)
+                    self._validate_acceptance_binding()
+                    after = self._store.status()
+                    if (
+                        type(after) is not EvidenceStatus
+                        or not after.healthy
+                        or type(ref) is not EvidenceRef
+                        or ref.source_sequence != after.evidence_head
+                        or ref.source_sequence <= before.evidence_head
+                    ):
+                        raise DeliveryFatalError(
+                            "accepted ref did not advance the exact evidence head"
+                        )
+                    self._coverage_adapter.apply_live_accepted(ref, receipt)
                 except Exception as error:  # noqa: BLE001 - evidence boundary is fail-closed
                     raise self._latch(
-                        "observer evidence page failed durable acceptance",
+                        "observer evidence or coverage acceptance failed",
                         error,
                     )
                 accepted += 1
 
-            state = self._local_state()
+            state = self._local_state(apply_coverage_barrier=True)
             refs = self._authenticated_refs(
                 after=state.confirmed_through,
                 through=state.delivery_ceiling,
@@ -685,8 +887,10 @@ class DeliveryCoordinator:
             )
             for ref in refs:
                 try:
-                    self.ack_journal.record_pending(ref)
-                    pending_state = self._local_state()
+                    self._ack_journal.record_pending(ref)
+                    pending_state = self._local_state(
+                        apply_coverage_barrier=True,
+                    )
                 except DeliveryFatalError:
                     raise
                 except Exception as error:  # noqa: BLE001 - journal authority boundary
@@ -717,23 +921,21 @@ class DeliveryCoordinator:
             primary: BaseException | None = None
             if not self._transport_closed:
                 try:
-                    await self.transport.close()
-                except asyncio.CancelledError as error:
-                    primary = error
-                except Exception as error:  # noqa: BLE001 - cleanup boundary
+                    await self._transport.close()
+                except BaseException as error:  # noqa: BLE001 - cleanup boundary
                     primary = error
                 else:
                     self._transport_closed = True
             if not self._lease_released:
                 try:
                     self._delivery_lease.release()
-                except Exception as error:  # noqa: BLE001 - preserve close primary
+                except BaseException as error:  # noqa: BLE001 - preserve close primary
                     if primary is None:
                         primary = error
                     else:
                         primary.add_note(
-                            "secondary ACK delivery-lease release failure: "
-                            f"{type(error).__name__}: {error}"
+                            "secondary ACK delivery-lease release failure "
+                            f"({type(error).__name__})"
                         )
                 else:
                     self._lease_released = True
