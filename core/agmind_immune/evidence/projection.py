@@ -1,4 +1,11 @@
-"""Authenticated, ACK-capped SQLite projection of authoritative evidence."""
+"""Authenticated, ACK-capped SQLite projection of authoritative evidence.
+
+The Python sqlite3 API cannot bind a connection to a directory descriptor on
+both Darwin and Linux. C1C therefore combines dir-fd-relative namespace
+operations with before/after inode checks and assumes the dedicated Core UID
+does not perform adversarial rename-and-restore races inside its mode-0700
+projection directory.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +18,7 @@ import sqlite3
 import stat
 import uuid
 from _thread import RLock as RLockType
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -241,6 +248,12 @@ class _PreparedRecord:
     coverage: CoverageEventV1 | None
 
 
+@dataclass(frozen=True)
+class _FileBinding:
+    device: int
+    inode: int
+
+
 def _uint64(value: int) -> str:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**64:
         raise ProjectionValidationError("projection uint64 is out of range")
@@ -290,6 +303,52 @@ def _validate_parent(path: Path) -> int:
     return descriptor
 
 
+def _binding(info: os.stat_result) -> _FileBinding:
+    return _FileBinding(info.st_dev, info.st_ino)
+
+
+def _lstat_at(parent_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _bind_regular_at(parent_fd: int, name: str, *, label: str) -> _FileBinding:
+    before = _lstat_at(parent_fd, name)
+    if before is None:
+        raise ProjectionConflict(f"{label} disappeared")
+    _validate_regular(before, label=label)
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        _validate_regular(opened, label=label)
+        if _binding(opened) != _binding(before):
+            raise ProjectionConflict(f"{label} changed during binding")
+        return _binding(opened)
+    finally:
+        os.close(descriptor)
+
+
+def _require_entry_binding(
+    parent_fd: int,
+    name: str,
+    expected: _FileBinding,
+    *,
+    label: str,
+) -> None:
+    actual = _lstat_at(parent_fd, name)
+    if actual is None:
+        raise ProjectionConflict(f"{label} disappeared")
+    _validate_regular(actual, label=label)
+    if _binding(actual) != expected:
+        raise ProjectionConflict(f"{label} identity changed")
+
+
 def _open_stable_lock(parent_fd: int, name: str) -> int:
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
@@ -299,16 +358,24 @@ def _open_stable_lock(parent_fd: int, name: str) -> int:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ProjectionBusy("projection lock is already held") from error
+        entry = _lstat_at(parent_fd, name)
+        if entry is None or _binding(entry) != _binding(os.fstat(descriptor)):
+            raise ProjectionConflict("projection lock entry changed during open")
     except BaseException:
         os.close(descriptor)
         raise
     return descriptor
 
 
-def _precreate_file(parent_fd: int, name: str) -> None:
+def _precreate_file(parent_fd: int, name: str) -> _FileBinding:
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
-    os.close(descriptor)
+    try:
+        info = os.fstat(descriptor)
+        _validate_regular(info, label="new projection")
+        return _binding(info)
+    finally:
+        os.close(descriptor)
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -404,6 +471,29 @@ def _current_cursor(connection: sqlite3.Connection) -> ProjectionCursor | None:
     if len(rows) > 1:
         raise ProjectionConflict("single-host projection has multiple cursors")
     return _cursor_from_row(rows[0] if rows else None)
+
+
+def _current_cursor_ref(connection: sqlite3.Connection) -> EvidenceRef | None:
+    rows = connection.execute(
+        "SELECT source_sequence,event_id,content_sha256,segment_id,"
+        "segment_relative_path,frame_offset,frame_size,frame_sha256 "
+        "FROM ingest_cursors ORDER BY host_id"
+    ).fetchall()
+    if len(rows) > 1:
+        raise ProjectionConflict("single-host projection has multiple cursors")
+    if not rows:
+        return None
+    row = rows[0]
+    return EvidenceRef(
+        segment_id=str(row["segment_id"]),
+        segment_relative_path=str(row["segment_relative_path"]),
+        frame_offset=_decode_uint64(row["frame_offset"]),
+        frame_size=_decode_uint64(row["frame_size"]),
+        frame_sha256=str(row["frame_sha256"]),
+        event_id=str(row["event_id"]),
+        source_sequence=_decode_uint64(row["source_sequence"]),
+        content_sha256=str(row["content_sha256"]),
+    )
 
 
 def _event_values(prepared: _PreparedRecord, duplicate: str | None) -> tuple[object, ...]:
@@ -509,7 +599,10 @@ class ProjectionStore:
     _healthy: bool
     _closed: bool
     _parent_fd: int
+    _parent_binding: _FileBinding
     _lock_fd: int
+    _lock_name: str
+    _main_binding: _FileBinding
     _connection: sqlite3.Connection | None
 
     def __init__(self) -> None:
@@ -524,7 +617,12 @@ class ProjectionStore:
         acknowledgements: AckJournal,
         step_hook: Callable[[str], None] | None = None,
     ) -> ProjectionStore:
-        if not path.name or path.name in {".", ".."}:
+        if (
+            not path.is_absolute()
+            or Path(os.path.normpath(path)) != path
+            or not path.name
+            or path.name in {".", ".."}
+        ):
             raise ProjectionConflict("projection database name is invalid")
         store = object.__new__(cls)
         store._path = path
@@ -535,7 +633,9 @@ class ProjectionStore:
         store._healthy = True
         store._closed = False
         store._parent_fd = _validate_parent(path.parent)
+        store._parent_binding = _binding(os.fstat(store._parent_fd))
         store._lock_fd = -1
+        store._lock_name = f".{path.name}.projection.lock"
         store._connection = None
         try:
             if getattr(acknowledgements, "_store", None) is not evidence:
@@ -543,22 +643,37 @@ class ProjectionStore:
                     "ACK journal is not bound to the retained evidence store"
                 )
             _ = evidence.acceptance_cursor
-            if not acknowledgements.snapshot().healthy:
+            snapshot = acknowledgements.snapshot()
+            if not snapshot.healthy:
                 raise ProjectionAuthorityError("ACK journal is unhealthy at projection open")
-            lock_name = f".{path.name}.projection.lock"
-            store._lock_fd = _open_stable_lock(store._parent_fd, lock_name)
+            store._lock_fd = _open_stable_lock(store._parent_fd, store._lock_name)
             store._recover_temp_artifacts()
-            new = not path.exists()
+            existing = _lstat_at(store._parent_fd, path.name)
+            new = existing is None
             if new:
-                _precreate_file(store._parent_fd, path.name)
+                store._main_binding = _precreate_file(store._parent_fd, path.name)
             else:
-                _validate_regular(path.stat(follow_symlinks=False), label="projection database")
+                store._main_binding = _bind_regular_at(
+                    store._parent_fd,
+                    path.name,
+                    label="projection database",
+                )
             store._validate_sidecars(permit_nonempty=True)
+            store._verify_namespace_bindings()
             store._connection = _connect(path)
+            store._verify_connected_entry(
+                store._connection,
+                store._path.name,
+                store._main_binding,
+            )
             if new:
                 _create_schema(store._connection)
             _verify_schema(store._connection)
             store._validate_sidecars(permit_nonempty=True)
+            store._verify_namespace_bindings()
+            if not new:
+                records = store._records_for_snapshot(snapshot)
+                store._validate_logical_prefix(store._connection, records)
         except BaseException:
             store.close()
             raise
@@ -580,38 +695,126 @@ class ProjectionStore:
     def _temp_prefix(self) -> str:
         return f".{self._path.name}.projection."
 
+    def _verify_parent_path_binding(self) -> None:
+        try:
+            actual = os.stat(self._path.parent, follow_symlinks=False)
+        except OSError as error:
+            raise ProjectionConflict("projection parent path changed") from error
+        if _binding(actual) != self._parent_binding:
+            raise ProjectionConflict("projection parent path identity changed")
+
+    def _verify_namespace_bindings(self) -> None:
+        self._verify_parent_path_binding()
+        if self._lock_fd >= 0:
+            lock_info = os.fstat(self._lock_fd)
+            _validate_regular(lock_info, label="projection lock")
+            _require_entry_binding(
+                self._parent_fd,
+                self._lock_name,
+                _binding(lock_info),
+                label="projection lock",
+            )
+        _require_entry_binding(
+            self._parent_fd,
+            self._path.name,
+            self._main_binding,
+            label="projection database",
+        )
+
+    def _verify_live_connection(self, connection: sqlite3.Connection) -> None:
+        try:
+            self._verify_namespace_bindings()
+            self._verify_connected_entry(
+                connection,
+                self._path.name,
+                self._main_binding,
+            )
+        except ProjectionConflict:
+            self._healthy = False
+            raise
+
+    def _verify_connected_entry(
+        self,
+        connection: sqlite3.Connection,
+        name: str,
+        expected: _FileBinding,
+    ) -> None:
+        rows = connection.execute("PRAGMA database_list").fetchall()
+        main_rows = [row for row in rows if str(row[1]) == "main"]
+        if len(main_rows) != 1:
+            raise ProjectionConflict("SQLite main database binding is ambiguous")
+        sqlite_path = Path(str(main_rows[0][2]))
+        try:
+            sqlite_info = os.stat(sqlite_path, follow_symlinks=False)
+        except OSError as error:
+            raise ProjectionConflict("SQLite main database path is unavailable") from error
+        _validate_regular(sqlite_info, label="SQLite main database")
+        if _binding(sqlite_info) != expected:
+            raise ProjectionConflict("SQLite opened a substituted main database")
+        _require_entry_binding(
+            self._parent_fd,
+            name,
+            expected,
+            label="SQLite database",
+        )
+        self._verify_parent_path_binding()
+
     def _recover_temp_artifacts(self) -> None:
         prefix = self._temp_prefix()
         recognized = re.compile(
             rf"^{re.escape(prefix)}[0-9a-f]{{8}}-[0-9a-f]{{4}}-4[0-9a-f]{{3}}-"
             rf"[89ab][0-9a-f]{{3}}-[0-9a-f]{{12}}\.tmp(?:-(?:wal|shm))?$"
         )
-        for name in os.listdir(self._path.parent):
+        directory_fd = os.open(
+            ".",
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            dir_fd=self._parent_fd,
+        )
+        try:
+            names = os.listdir(directory_fd)
+        finally:
+            os.close(directory_fd)
+        for name in names:
             if name == f".{self._path.name}.projection.lock":
                 continue
             if not name.startswith(prefix):
                 continue
             if recognized.fullmatch(name) is None:
                 raise ProjectionConflict("unrecognised projection temp artifact")
-            artifact = self._path.parent / name
-            _validate_regular(artifact.stat(follow_symlinks=False), label="projection temp")
-            artifact.unlink()
+            info = _lstat_at(self._parent_fd, name)
+            if info is None:
+                raise ProjectionConflict("projection temp disappeared")
+            _validate_regular(info, label="projection temp")
+            os.unlink(name, dir_fd=self._parent_fd)
         os.fsync(self._parent_fd)
 
     def _validate_sidecars(
         self,
         *,
-        base: Path | None = None,
+        base_name: str | None = None,
         permit_nonempty: bool,
-    ) -> tuple[Path, ...]:
-        base = self._path if base is None else base
-        found: list[Path] = []
+    ) -> tuple[str, ...]:
+        base_name = self._path.name if base_name is None else base_name
+        found: list[str] = []
         for suffix in ("-wal", "-shm"):
-            sidecar = Path(f"{base}{suffix}")
-            if not sidecar.exists():
+            sidecar = f"{base_name}{suffix}"
+            info = _lstat_at(self._parent_fd, sidecar)
+            if info is None:
                 continue
-            _validate_regular(sidecar.stat(follow_symlinks=False), label="SQLite sidecar")
-            if not permit_nonempty and sidecar.stat().st_size != 0:
+            _validate_regular(info, label="SQLite sidecar")
+            descriptor = os.open(
+                sidecar,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._parent_fd,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                _validate_regular(opened, label="SQLite sidecar")
+                if _binding(opened) != _binding(info):
+                    raise ProjectionConflict("SQLite sidecar changed during validation")
+            finally:
+                os.close(descriptor)
+            if not permit_nonempty and info.st_size != 0:
                 raise ProjectionConflict("checkpoint left a nonempty SQLite sidecar")
             found.append(sidecar)
         return tuple(found)
@@ -639,6 +842,86 @@ class ProjectionStore:
             raise ProjectionAuthorityError("confirmed ACK identity is not authenticated")
         return record
 
+    def _records_for_snapshot(
+        self,
+        snapshot: AckJournalSnapshot,
+    ) -> tuple[StoredEvidenceRecord, ...]:
+        if not snapshot.healthy:
+            raise ProjectionAuthorityError("projection requires a healthy ACK snapshot")
+        if snapshot.confirmed is None:
+            return ()
+        self._confirmed_boundary(snapshot)
+        records = tuple(
+            self._evidence.iter_authenticated_records(
+                after=0,
+                through=snapshot.confirmed.sequence,
+            )
+        )
+        if not records or records[-1].ref.source_sequence != snapshot.confirmed.sequence:
+            raise ProjectionAuthorityError("confirmed prefix has no authenticated terminal")
+        return records
+
+    def _records_for_current_cursor(
+        self,
+        connection: sqlite3.Connection,
+        snapshot: AckJournalSnapshot,
+    ) -> tuple[StoredEvidenceRecord, ...]:
+        cursor_ref = _current_cursor_ref(connection)
+        if cursor_ref is None:
+            return ()
+        if snapshot.confirmed is None or cursor_ref.source_sequence > snapshot.confirmed.sequence:
+            raise ProjectionConflict("projection cursor exceeds frozen confirmed ACK")
+        try:
+            self._evidence.resolve_authenticated_ref(cursor_ref)
+        except Exception as error:
+            raise ProjectionConflict(
+                "projection cursor is not a complete authenticated EvidenceRef"
+            ) from error
+        records = tuple(
+            self._evidence.iter_authenticated_records(
+                after=0,
+                through=cursor_ref.source_sequence,
+            )
+        )
+        if not records or records[-1].ref != cursor_ref:
+            raise ProjectionConflict("projection cursor does not end a complete real prefix")
+        return records
+
+    def _validate_logical_prefix(
+        self,
+        connection: sqlite3.Connection,
+        records: tuple[StoredEvidenceRecord, ...],
+    ) -> None:
+        expected = sqlite3.connect(":memory:", isolation_level=None)
+        expected.row_factory = sqlite3.Row
+        try:
+            expected.execute("PRAGMA foreign_keys=ON")
+            expected.execute("PRAGMA trusted_schema=OFF")
+            _create_schema(expected)
+            for record in records:
+                self._apply_prepared(expected, _prepare(record), invoke_hook=False)
+            for table, columns, primary_key in _TABLE_LAYOUT:
+                selected = ",".join(columns)
+                order = ",".join(f"{column} COLLATE BINARY" for column in primary_key)
+                actual_rows = [
+                    tuple(row)
+                    for row in connection.execute(
+                        f"SELECT {selected} FROM {table} ORDER BY {order}"
+                    )
+                ]
+                expected_rows = [
+                    tuple(row)
+                    for row in expected.execute(
+                        f"SELECT {selected} FROM {table} ORDER BY {order}"
+                    )
+                ]
+                if actual_rows != expected_rows:
+                    raise ProjectionConflict(
+                        f"projection {table} does not match authenticated prefix"
+                    )
+        finally:
+            expected.close()
+
     def _exact_retry(
         self,
         connection: sqlite3.Connection,
@@ -647,12 +930,6 @@ class ProjectionStore:
         row = connection.execute("SELECT * FROM events WHERE event_id=?", (prepared.envelope.event_id,)).fetchone()
         if row is None:
             return None
-        expected = _event_values(prepared, row["duplicate_of_event_id"])
-        columns = _TABLE_LAYOUT[1][1]
-        actual = tuple(row[column] for column in columns)
-        if actual != expected:
-            self._healthy = False
-            raise ProjectionConflict("event ID conflicts with immutable evidence facts")
         dedup = connection.execute(
             "SELECT primary_event_id, is_primary FROM projection_dedup WHERE event_id=?",
             (prepared.envelope.event_id,),
@@ -674,8 +951,15 @@ class ProjectionStore:
     def apply(self, ref: EvidenceRef) -> ProjectionApplyResult:
         with self._mutex:
             connection = self._require_usable()
+            self._verify_live_connection(connection)
             snapshot = self._acknowledgements.snapshot()
             self._confirmed_boundary(snapshot)
+            try:
+                current_records = self._records_for_current_cursor(connection, snapshot)
+                self._validate_logical_prefix(connection, current_records)
+            except ProjectionConflict:
+                self._healthy = False
+                raise
             try:
                 record = self._evidence.resolve_authenticated_ref(ref)
             except Exception as error:
@@ -685,6 +969,7 @@ class ProjectionStore:
             prepared = _prepare(record)
             retry = self._exact_retry(connection, prepared)
             if retry is not None:
+                self._verify_live_connection(connection)
                 return retry
             cursor = _current_cursor(connection)
             after = 0 if cursor is None else cursor.source_sequence
@@ -698,7 +983,9 @@ class ProjectionStore:
             if cursor is not None and cursor.host_id != prepared.envelope.host_id:
                 self._healthy = False
                 raise ProjectionConflict("projection cursor host changed")
-            return self._apply_prepared(connection, prepared, invoke_hook=True)
+            result = self._apply_prepared(connection, prepared, invoke_hook=True)
+            self._verify_live_connection(connection)
+            return result
 
     def _apply_prepared(
         self,
@@ -709,16 +996,25 @@ class ProjectionStore:
     ) -> ProjectionApplyResult:
         envelope = prepared.envelope
         ref = prepared.record.ref
-        duplicate_row = connection.execute(
-            "SELECT primary_event_id FROM projection_dedup "
-            "WHERE dedup_kind=? AND logical_key_sha256=? AND is_primary=1",
-            (prepared.dedup_kind, prepared.logical_key_sha256),
-        ).fetchone()
-        duplicate = None if duplicate_row is None else str(duplicate_row["primary_event_id"])
-        is_primary = duplicate is None
-        primary_event_id = envelope.event_id if is_primary else duplicate
+        duplicate: str | None = None
+        is_primary = False
+        transaction_started = False
+        commit_attempted = False
         try:
             connection.execute("BEGIN IMMEDIATE")
+            transaction_started = True
+            duplicate_row = connection.execute(
+                "SELECT primary_event_id FROM projection_dedup "
+                "WHERE dedup_kind=? AND logical_key_sha256=? AND is_primary=1",
+                (prepared.dedup_kind, prepared.logical_key_sha256),
+            ).fetchone()
+            duplicate = (
+                None
+                if duplicate_row is None
+                else str(duplicate_row["primary_event_id"])
+            )
+            is_primary = duplicate is None
+            primary_event_id = envelope.event_id if is_primary else duplicate
             placeholders = ",".join("?" for _ in _TABLE_LAYOUT[1][1])
             connection.execute(
                 f"INSERT INTO events({','.join(_TABLE_LAYOUT[1][1])}) VALUES({placeholders})",
@@ -769,18 +1065,32 @@ class ProjectionStore:
             )
             if invoke_hook:
                 self._step_hook(_APPLY_STEPS[3])
+            commit_attempted = True
             connection.execute("COMMIT")
+            transaction_started = False
+            if invoke_hook:
+                self._step_hook("commit")
         except sqlite3.IntegrityError as error:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
+            self._settle_failed_transaction(
+                connection,
+                error,
+                transaction_started=transaction_started,
+                commit_attempted=commit_attempted,
+                invoke_hook=invoke_hook,
+            )
             if connection is self._connection:
                 self._healthy = False
             raise ProjectionConflict(
                 "projection facts conflict with authenticated evidence"
             ) from error
-        except BaseException:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
+        except BaseException as error:
+            self._settle_failed_transaction(
+                connection,
+                error,
+                transaction_started=transaction_started,
+                commit_attempted=commit_attempted,
+                invoke_hook=invoke_hook,
+            )
             raise
         cursor = ProjectionCursor(
             envelope.host_id,
@@ -790,6 +1100,45 @@ class ProjectionStore:
             ref.frame_sha256,
         )
         return ProjectionApplyResult(envelope.event_id, duplicate, is_primary, cursor)
+
+    def _settle_failed_transaction(
+        self,
+        connection: sqlite3.Connection,
+        primary: BaseException,
+        *,
+        transaction_started: bool,
+        commit_attempted: bool,
+        invoke_hook: bool,
+    ) -> None:
+        try:
+            in_transaction = connection.in_transaction
+        except BaseException as state_error:  # noqa: BLE001 - health ambiguity
+            if connection is self._connection:
+                self._healthy = False
+            primary.add_note(
+                f"transaction state could not be read: {state_error!r}"
+            )
+            return
+        if commit_attempted and not in_transaction:
+            if connection is self._connection:
+                self._healthy = False
+            primary.add_note("COMMIT may have completed before its failure was observed")
+            return
+        if not transaction_started and not in_transaction:
+            return
+        if not in_transaction:
+            if connection is self._connection:
+                self._healthy = False
+            primary.add_note("write transaction ended without a proven rollback")
+            return
+        try:
+            connection.execute("ROLLBACK")
+            if invoke_hook:
+                self._step_hook("rollback")
+        except BaseException as rollback_error:  # noqa: BLE001 - preserve primary
+            if connection is self._connection:
+                self._healthy = False
+            primary.add_note(f"ROLLBACK could not be proven: {rollback_error!r}")
 
     def _reduce(self, connection: sqlite3.Connection, prepared: _PreparedRecord) -> None:
         envelope = prepared.envelope
@@ -883,7 +1232,11 @@ class ProjectionStore:
 
     def snapshot_hash(self) -> str:
         with self._mutex:
-            return self._snapshot_hash(self._require_usable())
+            connection = self._require_usable()
+            self._verify_live_connection(connection)
+            snapshot = self._snapshot_hash(connection)
+            self._verify_live_connection(connection)
+            return snapshot
 
     @staticmethod
     def _snapshot_hash(connection: sqlite3.Connection) -> str:
@@ -919,34 +1272,31 @@ class ProjectionStore:
         self,
     ) -> tuple[tuple[StoredEvidenceRecord, ...], AckJournalSnapshot]:
         snapshot = self._acknowledgements.snapshot()
-        if not snapshot.healthy:
-            raise ProjectionAuthorityError("rebuild requires a healthy ACK snapshot")
-        if snapshot.confirmed is None:
-            return (), snapshot
-        self._confirmed_boundary(snapshot)
-        records = tuple(
-            self._evidence.iter_authenticated_records(
-                after=0,
-                through=snapshot.confirmed.sequence,
-            )
-        )
-        if not records or records[-1].ref.source_sequence != snapshot.confirmed.sequence:
-            raise ProjectionAuthorityError("rebuild prefix does not end at confirmed ACK")
-        return records, snapshot
+        return self._records_for_snapshot(snapshot), snapshot
 
     def rebuild(self) -> RebuildReport:
         with self._mutex:
             old_connection = self._require_usable()
-            records, _snapshot = self._rebuild_records()
+            self._verify_live_connection(old_connection)
+            records, snapshot = self._rebuild_records()
+            old_records = self._records_for_current_cursor(old_connection, snapshot)
+            self._validate_logical_prefix(old_connection, old_records)
             temp_name = f"{self._temp_prefix()}{uuid.uuid4()}.tmp"
             temp_path = self._path.parent / temp_name
             temp_connection: sqlite3.Connection | None = None
+            reopened_connection: sqlite3.Connection | None = None
             renamed = False
             report: RebuildReport | None = None
             try:
-                _precreate_file(self._parent_fd, temp_name)
+                self._verify_namespace_bindings()
+                temp_binding = _precreate_file(self._parent_fd, temp_name)
                 self._step_hook(_REBUILD_STEPS[0])
                 temp_connection = _connect(temp_path)
+                self._verify_connected_entry(
+                    temp_connection,
+                    temp_name,
+                    temp_binding,
+                )
                 _create_schema(temp_connection)
                 _verify_schema(temp_connection)
                 self._step_hook(_REBUILD_STEPS[1])
@@ -969,14 +1319,34 @@ class ProjectionStore:
                     duplicates,
                     cursor,
                 )
+                self._verify_parent_path_binding()
+                _require_entry_binding(
+                    self._parent_fd,
+                    temp_name,
+                    temp_binding,
+                    label="temporary projection",
+                )
                 checkpoint = temp_connection.execute(
                     "PRAGMA wal_checkpoint(TRUNCATE)"
                 ).fetchone()
                 if checkpoint is None or int(checkpoint[0]) != 0:
                     raise ProjectionConflict("temporary projection checkpoint is busy")
+                self._verify_parent_path_binding()
+                _require_entry_binding(
+                    self._parent_fd,
+                    temp_name,
+                    temp_binding,
+                    label="temporary projection",
+                )
                 self._step_hook(_REBUILD_STEPS[3])
                 temp_connection.close()
                 temp_connection = None
+                _require_entry_binding(
+                    self._parent_fd,
+                    temp_name,
+                    temp_binding,
+                    label="temporary projection",
+                )
                 descriptor = os.open(
                     temp_name,
                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -988,22 +1358,24 @@ class ProjectionStore:
                 finally:
                     os.close(descriptor)
                 for sidecar in self._validate_sidecars(
-                    base=temp_path,
+                    base_name=temp_name,
                     permit_nonempty=False,
                 ):
-                    sidecar.unlink()
+                    os.unlink(sidecar, dir_fd=self._parent_fd)
                 os.fsync(self._parent_fd)
                 self._step_hook(_REBUILD_STEPS[4])
 
+                self._verify_namespace_bindings()
                 checkpoint = old_connection.execute(
                     "PRAGMA wal_checkpoint(TRUNCATE)"
                 ).fetchone()
                 if checkpoint is None or int(checkpoint[0]) != 0:
                     raise ProjectionConflict("old projection checkpoint is busy")
+                self._verify_namespace_bindings()
                 old_connection.close()
                 self._connection = None
                 for sidecar in self._validate_sidecars(permit_nonempty=False):
-                    sidecar.unlink()
+                    os.unlink(sidecar, dir_fd=self._parent_fd)
                 os.fsync(self._parent_fd)
                 self._step_hook(_REBUILD_STEPS[5])
                 os.replace(
@@ -1013,46 +1385,104 @@ class ProjectionStore:
                     dst_dir_fd=self._parent_fd,
                 )
                 renamed = True
+                self._main_binding = _bind_regular_at(
+                    self._parent_fd,
+                    self._path.name,
+                    label="rebuilt projection",
+                )
                 self._step_hook(_REBUILD_STEPS[6])
                 os.fsync(self._parent_fd)
                 self._step_hook(_REBUILD_STEPS[7])
-                self._connection = _connect(self._path)
-                _verify_schema(self._connection)
+                self._verify_namespace_bindings()
+                reopened_connection = _connect(self._path)
+                self._verify_connected_entry(
+                    reopened_connection,
+                    self._path.name,
+                    self._main_binding,
+                )
+                _verify_schema(reopened_connection)
                 self._validate_sidecars(permit_nonempty=True)
-                reopened_hash = self._snapshot_hash(self._connection)
-                reopened_counts = self._counts(self._connection)
-                reopened_cursor = _current_cursor(self._connection)
+                self._validate_logical_prefix(reopened_connection, records)
+                reopened_hash = self._snapshot_hash(reopened_connection)
+                reopened_counts = self._counts(reopened_connection)
+                reopened_cursor = _current_cursor(reopened_connection)
                 if (
                     reopened_hash != report.snapshot_hash
                     or reopened_counts != report.table_counts
                     or reopened_cursor != report.cursor
                 ):
+                    reopened_connection.close()
+                    reopened_connection = None
                     raise ProjectionConflict("reopened projection differs from rebuild")
+                self._connection = reopened_connection
+                reopened_connection = None
                 self._step_hook(_REBUILD_STEPS[8])
                 return report
-            except BaseException:
+            except BaseException as primary:
                 if temp_connection is not None:
-                    temp_connection.close()
+                    try:
+                        temp_connection.close()
+                    except BaseException as close_error:  # noqa: BLE001 - preserve primary
+                        primary.add_note(
+                            f"temporary projection close failed: {close_error!r}"
+                        )
+                if reopened_connection is not None:
+                    try:
+                        reopened_connection.close()
+                    except BaseException as close_error:  # noqa: BLE001 - preserve primary
+                        primary.add_note(
+                            f"reopened projection close failed: {close_error!r}"
+                        )
                 if renamed:
                     self._healthy = False
                     if self._connection is not None:
-                        self._connection.close()
+                        try:
+                            self._connection.close()
+                        except BaseException as close_error:  # noqa: BLE001
+                            primary.add_note(
+                                f"live projection close failed: {close_error!r}"
+                            )
                         self._connection = None
                 else:
                     for suffix in ("", "-wal", "-shm"):
-                        artifact = Path(f"{temp_path}{suffix}")
-                        if artifact.exists():
+                        artifact = f"{temp_name}{suffix}"
+                        info = _lstat_at(self._parent_fd, artifact)
+                        if info is not None:
                             try:
-                                _validate_regular(
-                                    artifact.stat(follow_symlinks=False),
-                                    label="temporary projection",
+                                _validate_regular(info, label="temporary projection")
+                                os.unlink(artifact, dir_fd=self._parent_fd)
+                            except BaseException as cleanup_error:  # noqa: BLE001
+                                primary.add_note(
+                                    f"temporary cleanup failed: {cleanup_error!r}"
                                 )
-                                artifact.unlink()
-                            except OSError:
-                                pass
                     if self._connection is None:
-                        self._connection = _connect(self._path)
-                        _verify_schema(self._connection)
+                        reopened_old: sqlite3.Connection | None = None
+                        try:
+                            self._verify_namespace_bindings()
+                            reopened_old = _connect(self._path)
+                            self._verify_connected_entry(
+                                reopened_old,
+                                self._path.name,
+                                self._main_binding,
+                            )
+                            _verify_schema(reopened_old)
+                            self._validate_sidecars(permit_nonempty=True)
+                            self._validate_logical_prefix(reopened_old, old_records)
+                        except BaseException as recovery_error:  # noqa: BLE001
+                            self._healthy = False
+                            if reopened_old is not None:
+                                try:
+                                    reopened_old.close()
+                                except BaseException as close_error:  # noqa: BLE001
+                                    primary.add_note(
+                                        "failed recovered connection close: "
+                                        f"{close_error!r}"
+                                    )
+                            primary.add_note(
+                                f"old projection recovery failed: {recovery_error!r}"
+                            )
+                        else:
+                            self._connection = reopened_old
                 raise
 
     def close(self) -> None:
@@ -1073,11 +1503,3 @@ class ProjectionStore:
             if parent_fd >= 0:
                 os.close(parent_fd)
                 self._parent_fd = -1
-
-
-def _iter_authenticated_prefix(
-    evidence: SegmentStore,
-    confirmed_through: int,
-) -> Iterator[StoredEvidenceRecord]:
-    """Narrow replay helper kept ref-authenticated and explicitly bounded."""
-    yield from evidence.iter_authenticated_records(after=0, through=confirmed_through)

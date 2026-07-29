@@ -10,7 +10,12 @@ from typing import Any
 import pytest
 from agmind_immune.canonicaljson import canonical_json, release_id
 from agmind_immune.contracts import ObserverTrustRootV1
-from agmind_immune.evidence.segments import EvidenceRef, SegmentStore
+from agmind_immune.evidence.segments import (
+    EvidencePriority,
+    EvidenceRef,
+    SegmentStore,
+    StoredEvidenceRecord,
+)
 from agmind_immune.ingest.ack_journal import AckJournal
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
@@ -65,12 +70,20 @@ def _confirm(journal: AckJournal, *refs: EvidenceRef) -> None:
         journal.record_confirmed(ref)
 
 
-def _counts(path: Path) -> tuple[int, int, int, int]:
+def _counts(path: Path) -> tuple[int, ...]:
     with sqlite3.connect(path) as connection:
         return tuple(
             int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-            for table in ("events", "projection_dedup", "network_observations", "ingest_cursors")
-        )  # type: ignore[return-value]
+            for table in (
+                "events",
+                "projection_dedup",
+                "coverage_intervals",
+                "containers",
+                "process_observations",
+                "network_observations",
+                "ingest_cursors",
+            )
+        )
 
 
 def _falco_fields(raw_hash: str) -> dict[str, object]:
@@ -191,29 +204,94 @@ def test_authority_order_and_uint64_text(tmp_path: Path, case: str) -> None:
     store.close()
 
 
-@pytest.mark.parametrize("failure_step", ["event", "dedup", "reducer", "cursor"])
-def test_atomic_apply_retry_and_conflict(tmp_path: Path, failure_step: str) -> None:
+@pytest.mark.parametrize(
+    "failure_step",
+    ["event", "dedup", "reducer", "cursor", "commit", "rollback", "dedup_order"],
+)
+@pytest.mark.parametrize("reducer_kind", ["falco", "coverage"])
+def test_atomic_apply_retry_and_conflict(
+    tmp_path: Path,
+    failure_step: str,
+    reducer_kind: str,
+) -> None:
     projection = _projection()
     coordinator, store, journal = _system(tmp_path / failure_step / "evidence")
-    first = _accept(coordinator, boot_boundary(private_key(11)))
-    _confirm(journal, first)
-    injected = False
+    key = private_key(11)
+    first = _accept(coordinator, boot_boundary(key))
+    if reducer_kind == "falco":
+        raw_hash = hashlib.sha256(b"atomic reducer").hexdigest()
+        second_value = envelope_value(
+            key,
+            sequence=2,
+            event_type="falco_connect",
+            normalized_fields=_falco_fields(raw_hash),
+            source_payload_hash=raw_hash,
+            container_id="a" * 64,
+            container_start_time=NOW,
+            release_id=release_id(f"sha256:{'b' * 64}", "d" * 64),
+            inventory_revision=2**63,
+        )
+    else:
+        second_value = envelope_value(
+            key,
+            sequence=2,
+            event_type="coverage",
+            normalized_fields={
+                "component": "observer",
+                "kind": "drop",
+                "severity": "WARNING",
+                "opened_at": NOW,
+                "dropped_count": 1,
+                "reason_code": "atomic_test",
+            },
+        )
+    second = _accept(coordinator, second_value)
+    _confirm(journal, first, second)
+    injected: set[str] = set()
+    armed = False
 
     def hook(step: str) -> None:
-        nonlocal injected
-        if step == failure_step and not injected:
-            injected = True
+        if not armed:
+            return
+        if failure_step == "rollback" and step == "reducer":
+            raise OSError("injected reducer primary")
+        if step == failure_step and step not in injected:
+            injected.add(step)
             raise OSError(f"injected {step}")
 
     path = tmp_path / failure_step / "projection.sqlite3"
     cache = projection.ProjectionStore.open(
         path, evidence=store, acknowledgements=journal, step_hook=hook
     )
+    cache.apply(first)
+    armed = True
+    baseline = _counts(path)
+    if failure_step == "dedup_order":
+        statements: list[str] = []
+        assert cache._connection is not None
+        cache._connection.set_trace_callback(statements.append)
+        cache.apply(second)
+        begin = next(index for index, sql in enumerate(statements) if sql == "BEGIN IMMEDIATE")
+        lookup = next(
+            index
+            for index, sql in enumerate(statements)
+            if sql.startswith("SELECT primary_event_id FROM projection_dedup")
+        )
+        assert begin < lookup
+        cache.close()
+        store.close()
+        return
     with pytest.raises(OSError, match="injected"):
-        cache.apply(first)
-    assert _counts(path) == (0, 0, 0, 0)
-    result = cache.apply(first)
-    assert cache.apply(first) == replace(result, reducer_applied=False)
+        cache.apply(second)
+    if failure_step in {"commit", "rollback"}:
+        with pytest.raises(projection.ProjectionUnhealthy):
+            cache.snapshot_hash()
+        cache.close()
+        store.close()
+        return
+    assert _counts(path) == baseline
+    result = cache.apply(second)
+    assert cache.apply(second) == replace(result, reducer_applied=False)
     if failure_step == "cursor":
         with sqlite3.connect(path) as connection:
             connection.execute(
@@ -256,6 +334,29 @@ def test_projection_dedup_is_logical_and_provenanced(tmp_path: Path, case: str) 
         if case == "falco_hash_mismatch":
             with pytest.raises(ValueError):
                 _accept(coordinator, falco_envelope)
+            canonical = canonical_json(falco_envelope)
+            controlled_ref = EvidenceRef(
+                segment_id="00000000-0000-4000-8000-000000000001",
+                segment_relative_path="segments/controlled.open",
+                frame_offset=0,
+                frame_size=1,
+                frame_sha256="f" * 64,
+                event_id=str(falco_envelope["event_id"]),
+                source_sequence=2,
+                content_sha256=hashlib.sha256(canonical).hexdigest(),
+            )
+            controlled = StoredEvidenceRecord(
+                envelope=falco_envelope,
+                canonical_envelope=canonical,
+                priority=EvidencePriority.ROUTINE,
+                accepted_at=NOW,
+                ref=controlled_ref,
+            )
+            with pytest.raises(
+                projection.ProjectionValidationError,
+                match="raw hash",
+            ):
+                projection._prepare(controlled)
             store.close()
             return
         refs.append(_accept(coordinator, falco_envelope))
