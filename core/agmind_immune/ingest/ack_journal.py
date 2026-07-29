@@ -29,6 +29,7 @@ from agmind_immune.evidence.segments import (
     _AckAuthorityError,
     _AckCommitmentV1,
     _AckLifecycleCorrupt,
+    _AckLifecycleIoUncertain,
     _AckLifecycleStateError,
     _full_write,
 )
@@ -173,6 +174,15 @@ def _same_file(actual: os.stat_result, expected: os.stat_result) -> bool:
         and actual.st_mtime_ns == expected.st_mtime_ns
         and actual.st_ctime_ns == expected.st_ctime_ns
     )
+
+
+def _primary_io_error(error: _AckLifecycleIoUncertain) -> BaseException:
+    cause: BaseException | None = error.__cause__
+    while cause is not None:
+        if isinstance(cause, OSError):
+            return cause
+        cause = cause.__cause__
+    return error
 
 
 class _BoundedReader:
@@ -334,6 +344,11 @@ class AckJournal:
                 journal._authenticated_digest(),
             )
             return journal
+        except _AckLifecycleIoUncertain as error:
+            journal._healthy = False
+            primary = _primary_io_error(error)
+            journal._close_after_failed_open(primary)
+            raise primary from error
         except _AckLifecycleCorrupt as error:
             corrupt_error = AckJournalCorrupt(str(error))
             journal._healthy = False
@@ -798,6 +813,11 @@ class AckJournal:
                 self,
                 self._lifecycle_identity,
             )
+        except _AckLifecycleIoUncertain as error:
+            self._healthy = False
+            primary = _primary_io_error(error)
+            self._attempt_commitment_uncertain(primary)
+            raise primary from error
         except _AckLifecycleCorrupt as error:
             corrupt_error = AckJournalCorrupt(str(error))
             self._healthy = False
@@ -963,6 +983,11 @@ class AckJournal:
                 journal_prefix_sha256=next_prefix_sha256,
                 step_hook=self._step_hook,
             )
+        except _AckLifecycleIoUncertain as error:
+            self._healthy = False
+            primary = _primary_io_error(error)
+            self._attempt_commitment_uncertain(primary)
+            raise primary from error
         except _AckLifecycleCorrupt as error:
             corrupt_error = AckJournalCorrupt(str(error))
             self._healthy = False
@@ -981,6 +1006,18 @@ class AckJournal:
     def snapshot(self) -> AckJournalSnapshot:
         self._require_open()
         if self._healthy:
+            try:
+                self._store._validate_ack_commitment_binding()
+            except _AckLifecycleIoUncertain as error:
+                self._healthy = False
+                primary = _primary_io_error(error)
+                self._attempt_commitment_uncertain(primary)
+                raise primary from error
+            except _AckLifecycleCorrupt as error:
+                corrupt_error = AckJournalCorrupt(str(error))
+                self._healthy = False
+                self._attempt_corruption_fence(corrupt_error)
+                raise corrupt_error from error
             self._bind_published_or_latch()
         return AckJournalSnapshot(
             confirmed=self._confirmed,

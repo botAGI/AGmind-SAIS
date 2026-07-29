@@ -494,6 +494,8 @@ def test_ack_journal_complete_corruption_never_repairs_or_recovers(
         "commitment_publication_temp_fsync",
         "commitment_publication_replace",
         "commitment_publication_root_fsync",
+        "commitment_publication_wrapped_rebind_io",
+        "commitment_recovery_repeated_temp_fsync_crash",
         "commitment_floor_before_repair",
         "concurrent_extra_append",
         "create_file_fsync",
@@ -503,10 +505,140 @@ def test_ack_journal_complete_corruption_never_repairs_or_recovers(
 def test_ack_journal_repairs_only_torn_tail_and_latches_ambiguous_append(
     tmp_path: Path,
     cut: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / cut
     _coordinator, store, first, second = _two_refs(path)
     journal_path = path / "ack-journal.agf"
+
+    if cut == "commitment_publication_wrapped_rebind_io":
+        publication_root_synced = False
+        injected = False
+        read_regular = segments_module._read_regular_at
+
+        def publication_hook(step: str) -> None:
+            nonlocal publication_root_synced
+            if step == "commitment_directory_fsync":
+                publication_root_synced = True
+
+        def fail_published_commitment_read(
+            parent_descriptor: int,
+            name: str,
+            display_path: Path,
+            maximum: int,
+        ) -> bytes:
+            nonlocal injected
+            if (
+                publication_root_synced
+                and name == "ack-commitment.json"
+                and not injected
+            ):
+                injected = True
+                raise OSError("injected wrapped commitment rebind I/O")
+            return read_regular(parent_descriptor, name, display_path, maximum)
+
+        monkeypatch.setattr(
+            segments_module,
+            "_read_regular_at",
+            fail_published_commitment_read,
+        )
+        uncertain = AckJournal.create_new(store, step_hook=publication_hook)
+        uncertain.record_pending(first)
+        with pytest.raises(OSError, match="wrapped commitment rebind"):
+            uncertain.record_confirmed(first)
+        assert uncertain.snapshot().healthy is False
+        assert not (path / "health.json").exists()
+        with pytest.raises(AckJournalUnhealthy):
+            uncertain.record_pending(second)
+        uncertain.close()
+        store.close()
+
+        monkeypatch.setattr(segments_module, "_read_regular_at", read_regular)
+        _recovered_coordinator, recovered_store = _reopen_system(path)
+        recovered = AckJournal.open_and_recover(recovered_store)
+        assert recovered.snapshot().confirmed == ack_journal_module.AckIdentity.from_ref(
+            first
+        )
+        assert not (path / "health.json").exists()
+        recovered_store.close()
+        return
+
+    if cut == "commitment_recovery_repeated_temp_fsync_crash":
+        confirmation_cut = False
+
+        def confirmation_hook(step: str) -> None:
+            nonlocal confirmation_cut
+            if step == "commitment_temp_fsync" and not confirmation_cut:
+                confirmation_cut = True
+                raise OSError("injected initial commitment temp fsync cut")
+
+        uncertain = AckJournal.create_new(store, step_hook=confirmation_hook)
+        uncertain.record_pending(first)
+        with pytest.raises(OSError, match="initial commitment temp"):
+            uncertain.record_confirmed(first)
+        uncertain.close()
+        store.close()
+
+        stale_name = (
+            ".ack-commitment.json.12345678-1234-4234-8234-123456789abc.tmp"
+        )
+        stale_path = path / stale_name
+        stale_path.write_bytes((path / "ack-commitment.json").read_bytes())
+        stale_path.chmod(0o600)
+
+        cleanup_private_publication = (
+            segments_module._cleanup_private_publication
+        )
+
+        def preserve_crash_temporary(
+            parent_descriptor: int,
+            temporary_name: str | None,
+            display_path: Path,
+            *,
+            descriptor: int,
+            preserve_primary: bool,
+        ) -> None:
+            del parent_descriptor, temporary_name, display_path, preserve_primary
+            if descriptor >= 0:
+                os.close(descriptor)
+
+        monkeypatch.setattr(
+            segments_module,
+            "_cleanup_private_publication",
+            preserve_crash_temporary,
+        )
+        _recovered_coordinator, first_recovery_store = _reopen_system(path)
+        recovery_cut = False
+
+        def recovery_hook(step: str) -> None:
+            nonlocal recovery_cut
+            if step == "commitment_temp_fsync" and not recovery_cut:
+                recovery_cut = True
+                raise OSError("injected recovery commitment temp fsync cut")
+
+        with pytest.raises(OSError, match="recovery commitment temp"):
+            AckJournal.open_and_recover(
+                first_recovery_store,
+                step_hook=recovery_hook,
+            )
+        first_recovery_store.close()
+        durable_temporaries = tuple(path.glob(".ack-commitment.json.*.tmp"))
+        assert not stale_path.exists()
+        assert len(durable_temporaries) == 1
+
+        monkeypatch.setattr(
+            segments_module,
+            "_cleanup_private_publication",
+            cleanup_private_publication,
+        )
+        _second_coordinator, second_recovery_store = _reopen_system(path)
+        recovered = AckJournal.open_and_recover(second_recovery_store)
+        assert recovered.snapshot().confirmed == ack_journal_module.AckIdentity.from_ref(
+            first
+        )
+        assert not tuple(path.glob(".ack-commitment.json.*.tmp"))
+        second_recovery_store.close()
+        return
 
     if cut.startswith("commitment_publication_"):
         injected = False
@@ -776,6 +908,8 @@ def test_ack_journal_repairs_only_torn_tail_and_latches_ambiguous_append(
         "commitment_wrong_mode_temp",
         "commitment_wrong_mode_final",
         "commitment_journal_without_commitment",
+        "commitment_final_deleted_before_torn_repair",
+        "commitment_final_substituted_before_snapshot",
         "delivery_claim_lifecycle",
         "wrong_mode",
         "symlink",
@@ -788,6 +922,51 @@ def test_ack_journal_root_capability_and_artifact_identity_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / case
+    if case == "commitment_final_deleted_before_torn_repair":
+        _coordinator, initial_store, first, _second = _two_refs(path)
+        journal = AckJournal.create_new(initial_store)
+        journal.record_pending(first)
+        journal.close()
+        initial_store.close()
+
+        journal_path = path / "ack-journal.agf"
+        prefix = journal_path.read_bytes()
+        confirmed = encode_frame(
+            canonical_json(_record_value(first, "confirmed_ack")),
+            previous_hash=prefix[-32:],
+            max_frame=_MAX_ACK_RECORD_BYTES,
+        )
+        before = prefix + confirmed[:37]
+        journal_path.write_bytes(before)
+
+        _recovered_coordinator, recovered_store = _reopen_system(path)
+        (path / "ack-commitment.json").unlink()
+        with pytest.raises(AckJournalCorrupt):
+            AckJournal.open_and_recover(recovered_store)
+        assert journal_path.read_bytes() == before
+        assert recovered_store.read_only_reason == "segment_corrupt"
+        recovered_store.close(flush=False)
+        return
+
+    if case == "commitment_final_substituted_before_snapshot":
+        _coordinator, store, first, _second = _two_refs(path)
+        journal = AckJournal.create_new(store)
+        journal.record_pending(first)
+        journal.record_confirmed(first)
+        commitment_path = path / "ack-commitment.json"
+        replacement = path / "ack-commitment.replacement"
+        replacement.write_bytes(commitment_path.read_bytes())
+        replacement.chmod(0o600)
+        os.replace(replacement, commitment_path)
+
+        with pytest.raises(AckJournalCorrupt):
+            journal.snapshot()
+        assert json.loads((path / "health.json").read_bytes())["reason"] == (
+            "segment_corrupt"
+        )
+        store.close(flush=False)
+        return
+
     if case.startswith("commitment_bootstrap_"):
         _coordinator, initial_store = _new_system(path)
         initial_store.close()

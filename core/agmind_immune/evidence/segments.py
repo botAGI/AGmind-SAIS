@@ -138,6 +138,10 @@ class _AckLifecycleCorrupt(EvidenceStoreError):
     """An expected ACK-journal artifact disappeared or was substituted."""
 
 
+class _AckLifecycleIoUncertain(EvidenceStoreError):
+    """ACK authority I/O may have completed but could not be authenticated."""
+
+
 class TornTailRepairRequired(EvidenceStoreError):
     """An active segment ends in an incomplete frame and requires signed repair."""
 
@@ -308,6 +312,14 @@ class _AckCommitmentRecoveryView:
     commitment: _AckCommitmentV1 | None
     journal_present: bool
     temporary_name: str | None
+
+
+@dataclass(frozen=True)
+class _AckCommitmentTemporaryBinding:
+    name: str
+    commitment: _AckCommitmentV1
+    raw: bytes
+    identity: _FileIdentity
 
 
 def _canonical_ack_commitment(commitment: _AckCommitmentV1) -> bytes:
@@ -1125,7 +1137,7 @@ class SegmentStore:
         self._ack_commitment: _AckCommitmentV1 | None = None
         self._ack_commitment_raw: bytes | None = None
         self._ack_commitment_identity: _FileIdentity | None = None
-        self._ack_commitment_temporary: str | None = None
+        self._ack_commitment_temporary: _AckCommitmentTemporaryBinding | None = None
         self.fail_next_append: BaseException | None = None
         self._segments_path = root / "segments"
         self._manifests_path = root / "manifests"
@@ -1336,9 +1348,13 @@ class SegmentStore:
                     self.root / name,
                 )
             )
-        except (EvidenceCorrupt, OSError) as error:
+        except EvidenceCorrupt as error:
             raise _AckLifecycleCorrupt(
                 "ACK-journal root artifact is unsafe or unstable"
+            ) from error
+        except OSError as error:
+            raise _AckLifecycleIoUncertain(
+                "ACK-journal root artifact I/O is uncertain"
             ) from error
 
     def _ack_journal_prefix_digest(
@@ -1354,9 +1370,13 @@ class SegmentStore:
                 flags,
                 dir_fd=self._root_descriptor,
             )
-        except OSError as error:
+        except FileNotFoundError as error:
             raise _AckLifecycleCorrupt(
                 "ACK-journal authority disappeared during content binding"
+            ) from error
+        except OSError as error:
+            raise _AckLifecycleIoUncertain(
+                "ACK-journal content binding I/O is uncertain"
             ) from error
         primary_error: BaseException | None = None
         try:
@@ -1406,9 +1426,17 @@ class SegmentStore:
                         "ACK-journal identity changed during prefix hashing"
                     )
                 return opened_identity, digest.digest()
-            except (EvidenceCorrupt, OSError) as error:
+            except FileNotFoundError as error:
+                raise _AckLifecycleCorrupt(
+                    "ACK-journal prefix disappeared during binding"
+                ) from error
+            except EvidenceCorrupt as error:
                 raise _AckLifecycleCorrupt(
                     "ACK-journal prefix is unsafe or unstable"
+                ) from error
+            except OSError as error:
+                raise _AckLifecycleIoUncertain(
+                    "ACK-journal prefix I/O is uncertain"
                 ) from error
         except BaseException as error:
             primary_error = error
@@ -1418,7 +1446,7 @@ class SegmentStore:
                 os.close(descriptor)
             except OSError as close_error:
                 if primary_error is None:
-                    raise _AckLifecycleCorrupt(
+                    raise _AckLifecycleIoUncertain(
                         "ACK-journal prefix descriptor close became uncertain"
                     ) from close_error
                 primary_error.add_note(
@@ -1470,9 +1498,16 @@ class SegmentStore:
                 )
             )
             return commitment, raw, identity
+        except FileNotFoundError as error:
+            raise _AckLifecycleCorrupt(
+                "ACK commitment artifact disappeared"
+            ) from error
+        except OSError as error:
+            raise _AckLifecycleIoUncertain(
+                "ACK commitment artifact I/O is uncertain"
+            ) from error
         except (
             EvidenceCorrupt,
-            OSError,
             RecursionError,
             TypeError,
             ValueError,
@@ -1537,14 +1572,21 @@ class SegmentStore:
             raise _AckLifecycleStateError(
                 "ACK commitment recovery has the wrong lifecycle"
             )
+        commitment = (
+            None
+            if self._ack_commitment is None
+            else self._validate_ack_commitment_binding()
+        )
         return _AckCommitmentRecoveryView(
             commitment=(
-                None
-                if self._ack_commitment is None
-                else self._ack_commitment.model_copy(deep=True)
+                None if commitment is None else commitment.model_copy(deep=True)
             ),
             journal_present=self._ack_journal_identity is not None,
-            temporary_name=self._ack_commitment_temporary,
+            temporary_name=(
+                None
+                if self._ack_commitment_temporary is None
+                else self._ack_commitment_temporary.name
+            ),
         )
 
     def _remove_ack_commitment_temporary(
@@ -1566,15 +1608,54 @@ class SegmentStore:
             raise _AckLifecycleStateError(
                 "ACK commitment temporary cleanup has the wrong lifecycle"
             )
-        temporary = self._ack_commitment_temporary
-        if temporary is None:
+        binding = self._ack_commitment_temporary
+        if binding is None:
             return
         try:
-            os.unlink(temporary, dir_fd=self._root_descriptor)
+            raw = _read_regular_at(
+                self._root_descriptor,
+                binding.name,
+                self.root / binding.name,
+                _MAX_ACK_COMMITMENT_BYTES,
+            )
+            commitment = _decode_ack_commitment(raw)
+            identity = _file_identity(
+                _regular_stat_at(
+                    self._root_descriptor,
+                    binding.name,
+                    self.root / binding.name,
+                )
+            )
+            if (
+                raw != binding.raw
+                or commitment != binding.commitment
+                or identity != binding.identity
+                or raw != _canonical_ack_commitment(commitment)
+            ):
+                raise _AckLifecycleCorrupt(
+                    "ACK commitment temporary changed after startup"
+                )
+            os.unlink(binding.name, dir_fd=self._root_descriptor)
             os.fsync(self._root_descriptor)
-        except OSError as error:
+        except (_AckLifecycleCorrupt, _AckLifecycleIoUncertain):
+            raise
+        except (
+            EvidenceCorrupt,
+            RecursionError,
+            TypeError,
+            ValueError,
+            ValidationError,
+        ) as error:
             raise _AckLifecycleCorrupt(
-                "ACK commitment temporary cleanup became uncertain"
+                "ACK commitment temporary is no longer authenticated"
+            ) from error
+        except FileNotFoundError as error:
+            raise _AckLifecycleCorrupt(
+                "ACK commitment temporary disappeared after startup"
+            ) from error
+        except OSError as error:
+            raise _AckLifecycleIoUncertain(
+                "ACK commitment temporary cleanup I/O is uncertain"
             ) from error
         self._ack_commitment_temporary = None
 
@@ -1636,6 +1717,7 @@ class SegmentStore:
             raise _AckLifecycleCorrupt(
                 "ACK initializing commitment does not bind an empty journal"
             )
+        self._remove_ack_commitment_temporary(owner, lifecycle_identity)
         commitment = self._ack_genesis_commitment("ready")
         try:
             _atomic_replace_at(
@@ -1652,7 +1734,6 @@ class SegmentStore:
                 "ACK ready-genesis publication failed"
             ) from error
         self._rebind_ack_commitment(expected=commitment)
-        self._remove_ack_commitment_temporary(owner, lifecycle_identity)
 
     def _publish_ack_ready_generation(
         self,
@@ -1706,6 +1787,7 @@ class SegmentStore:
             raise _AckLifecycleCorrupt(
                 "ACK commitment prefix differs from the held journal"
             )
+        self._remove_ack_commitment_temporary(owner, lifecycle_identity)
         commitment = _AckCommitmentV1(
             schema_version="agmind.core-ack-commitment.v1",
             phase="ready",
@@ -1733,7 +1815,6 @@ class SegmentStore:
                 "ACK commitment publication failed"
             ) from error
         self._rebind_ack_commitment(expected=commitment)
-        self._remove_ack_commitment_temporary(owner, lifecycle_identity)
         rebound_identity, rebound_digest = self._ack_journal_prefix_digest(
             journal_prefix_size
         )
@@ -2391,7 +2472,7 @@ class SegmentStore:
                             expected_identity.size
                         )
                     )
-                except _AckLifecycleCorrupt:
+                except (_AckLifecycleCorrupt, _AckLifecycleIoUncertain):
                     content_changed = True
                 else:
                     content_changed = (
@@ -2406,7 +2487,7 @@ class SegmentStore:
         if state in {"present", "initialized", "append_uncertain"}:
             try:
                 self._validate_ack_commitment_binding()
-            except _AckLifecycleCorrupt:
+            except (_AckLifecycleCorrupt, _AckLifecycleIoUncertain):
                 commitment_changed = True
         elif state == "commitment_uncertain":
             expected_commitment = self._ack_commitment
@@ -2414,6 +2495,8 @@ class SegmentStore:
                 actual_commitment, _raw, _identity = self._read_ack_commitment()
             except _AckLifecycleCorrupt:
                 commitment_changed = True
+            except _AckLifecycleIoUncertain:
+                commitment_changed = False
             else:
                 commitment_changed = (
                     expected_commitment is None
@@ -2567,7 +2650,7 @@ class SegmentStore:
         ack_commitment: _AckCommitmentV1 | None = None
         ack_commitment_raw: bytes | None = None
         ack_commitment_identity: _FileIdentity | None = None
-        ack_commitment_temporaries: list[str] = []
+        ack_commitment_temporaries: list[_AckCommitmentTemporaryBinding] = []
         for name in root_entries:
             if name == "ack-journal.agf":
                 ack_journal_identity = _file_identity(
@@ -2621,7 +2704,26 @@ class SegmentStore:
                     raise EvidenceCorrupt(
                         "ACK commitment temporary is not canonical JSON"
                     )
-                ack_commitment_temporaries.append(name)
+                after = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        name,
+                        self.root / name,
+                    )
+                )
+                before = _file_identity(info)
+                if after != before:
+                    raise EvidenceCorrupt(
+                        "ACK commitment temporary changed during startup scan"
+                    )
+                ack_commitment_temporaries.append(
+                    _AckCommitmentTemporaryBinding(
+                        name=name,
+                        commitment=temporary,
+                        raw=raw,
+                        identity=after,
+                    )
+                )
                 continue
             if name in allowed_root or (
                 name.startswith(".health-intent.") and name.endswith(".pending")
