@@ -4,7 +4,7 @@ import hashlib
 import importlib
 import math
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -440,6 +440,19 @@ def test_readiness_context_health_and_cursor_matrix(tmp_path: Path) -> None:
     class DatetimeSubclass(datetime):
         pass
 
+    class RaisingUTC(tzinfo):
+        def utcoffset(self, value: datetime | None) -> timedelta:
+            raise RuntimeError("hostile UTC offset")
+
+        def dst(self, value: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def tzname(self, value: datetime | None) -> str:
+            return "UTC"
+
+        def __eq__(self, other: object) -> bool:
+            return other is UTC
+
     invalid_fields = (
         (
             "decision_utc",
@@ -451,6 +464,7 @@ def test_readiness_context_health_and_cursor_matrix(tmp_path: Path) -> None:
         ),
         ("decision_utc", datetime(2026, 7, 28, 10, 0, 3, tzinfo=UTC, fold=1)),
         ("decision_utc", DatetimeSubclass(2026, 7, 28, 10, 0, 3, tzinfo=UTC)),
+        ("decision_utc", datetime(2026, 7, 28, 10, 0, 3, tzinfo=RaisingUTC())),
         ("decision_monotonic", True),
         ("decision_monotonic", 1),
         ("decision_monotonic", -1.0),

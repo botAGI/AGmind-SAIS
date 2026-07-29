@@ -84,7 +84,7 @@ def _validate_mutation_readiness_context(
 ) -> None:
     if (
         type(context.decision_utc) is not datetime
-        or context.decision_utc.tzinfo != UTC
+        or context.decision_utc.tzinfo is not UTC
         or context.decision_utc.utcoffset() != timedelta(0)
         or context.decision_utc.fold != 0
     ):
