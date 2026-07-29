@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, final
+from typing import Any, Literal, Never, SupportsIndex, final
 
 from cryptography.exceptions import InvalidSignature
 from pydantic import Field, ValidationError, field_validator, model_validator
@@ -90,6 +90,10 @@ class VerifierCommitError(RuntimeError):
 
 class RepairSimulationError(IngestVerificationError):
     """A restricted repair proof did not bind one exact authenticated path."""
+
+
+class RetentionSimulationError(IngestVerificationError):
+    """A retention proof did not bind one exact authenticated control path."""
 
 
 class CoreSequenceGapV1(ContractModel):
@@ -902,8 +906,10 @@ class _RepairAuthoritySnapshot:
     generation: int
 
 
-_REPAIR_SIMULATION_FACTORY = object()
-_MAX_REPAIR_SIMULATION_EVENTS = 4096
+_CONTROL_SIMULATION_FACTORY = object()
+_REPAIR_SIMULATION_FACTORY = _CONTROL_SIMULATION_FACTORY
+_MAX_CONTROL_SIMULATION_EVENTS = 4096
+_MAX_REPAIR_SIMULATION_EVENTS = _MAX_CONTROL_SIMULATION_EVENTS
 
 
 @final
@@ -1015,7 +1021,25 @@ class SimulatedEvent:
         return self._sequence
 
 
-class _SimulatedRepairProof:
+def _simulated_event_binding(
+    target: SimulatedEvent,
+) -> tuple[object, ...]:
+    return (
+        target._canonical_envelope,
+        target.content_sha256,
+        target.event_id,
+        target.event_type,
+        target.evidence_priority,
+        target.is_retry,
+        target.key_epoch,
+        target.key_id,
+        target._normalized_fields_canonical,
+        target.sequence,
+        target._simulation_identity,
+    )
+
+
+class _SimulatedControlProof:
     _base_authorization_ids: tuple[int, ...]
     _base_authority: _RepairAuthoritySnapshot
     _base_generation: int
@@ -1025,6 +1049,7 @@ class _SimulatedRepairProof:
     _lifecycle_identity: object
     _owner: object
     _owner_identity: object
+    _predicted_generation: int
     _request_canonical: bytes
     _target: SimulatedEvent
     _target_binding: tuple[object, ...]
@@ -1040,13 +1065,19 @@ class _SimulatedRepairProof:
         "_lifecycle_identity",
         "_owner",
         "_owner_identity",
+        "_predicted_generation",
         "_request_canonical",
         "_target",
         "_target_binding",
         "_verifier_identity",
     )
 
-    _request_type: type[EvidenceRepairAuthorizeV1 | EvidenceRepairCompleteV1]
+    _request_type: type[
+        EvidenceRepairAuthorizeV1
+        | EvidenceRepairCompleteV1
+        | RetentionTombstoneV2
+        | RetentionBlockedV1
+    ]
 
     def __init__(
         self,
@@ -1058,6 +1089,7 @@ class _SimulatedRepairProof:
         lifecycle_identity: object,
         owner: object,
         owner_identity: object,
+        predicted_generation: int,
         request_canonical: bytes,
         target: SimulatedEvent,
         verifier_identity: object,
@@ -1082,24 +1114,17 @@ class _SimulatedRepairProof:
         object.__setattr__(self, "_lifecycle_identity", lifecycle_identity)
         object.__setattr__(self, "_owner", owner)
         object.__setattr__(self, "_owner_identity", owner_identity)
+        object.__setattr__(
+            self,
+            "_predicted_generation",
+            predicted_generation,
+        )
         object.__setattr__(self, "_request_canonical", request_canonical)
         object.__setattr__(self, "_target", target)
         object.__setattr__(
             self,
             "_target_binding",
-            (
-                target._canonical_envelope,
-                target.content_sha256,
-                target.event_id,
-                target.event_type,
-                target.evidence_priority,
-                target.is_retry,
-                target.key_epoch,
-                target.key_id,
-                target._normalized_fields_canonical,
-                target.sequence,
-                target._simulation_identity,
-            ),
+            _simulated_event_binding(target),
         )
         object.__setattr__(self, "_verifier_identity", verifier_identity)
 
@@ -1107,12 +1132,37 @@ class _SimulatedRepairProof:
         del name, value
         raise AttributeError(f"{type(self).__name__} is immutable")
 
+    def __copy__(self) -> Never:
+        raise TypeError("control simulation proofs cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        del memo
+        raise TypeError("control simulation proofs cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("control simulation proofs cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError("control simulation proofs cannot be serialized")
+
     @property
     def base_generation(self) -> int:
         return self._base_generation
 
     @property
-    def request(self) -> EvidenceRepairAuthorizeV1 | EvidenceRepairCompleteV1:
+    def predicted_generation(self) -> int:
+        return self._predicted_generation
+
+    @property
+    def request(
+        self,
+    ) -> (
+        EvidenceRepairAuthorizeV1
+        | EvidenceRepairCompleteV1
+        | RetentionTombstoneV2
+        | RetentionBlockedV1
+    ):
         return self._request_type.model_validate_json(
             self._request_canonical,
             strict=True,
@@ -1124,7 +1174,7 @@ class _SimulatedRepairProof:
 
 
 @final
-class SimulatedRepairAuthorization(_SimulatedRepairProof):
+class SimulatedRepairAuthorization(_SimulatedControlProof):
     """Exact signed authorization preview with no evidence append authority."""
 
     __slots__ = ()
@@ -1138,7 +1188,7 @@ class SimulatedRepairAuthorization(_SimulatedRepairProof):
 
 
 @final
-class SimulatedRepairCompletion(_SimulatedRepairProof):
+class SimulatedRepairCompletion(_SimulatedControlProof):
     """Exact signed completion preview with no evidence append authority."""
 
     __slots__ = ()
@@ -1149,6 +1199,54 @@ class SimulatedRepairCompletion(_SimulatedRepairProof):
         value = super().request
         assert isinstance(value, EvidenceRepairCompleteV1)
         return value
+
+
+@final
+class SimulatedRetentionTombstone(_SimulatedControlProof):
+    """Exact signed tombstone preview with no evidence append authority."""
+
+    __slots__ = ()
+    _request_type = RetentionTombstoneV2
+
+    @property
+    def request(self) -> RetentionTombstoneV2:
+        value = super().request
+        assert isinstance(value, RetentionTombstoneV2)
+        return value
+
+
+@final
+class SimulatedRetentionBlocked(_SimulatedControlProof):
+    """Exact signed blocked preview with no evidence append authority."""
+
+    __slots__ = ()
+    _request_type = RetentionBlockedV1
+
+    @property
+    def request(self) -> RetentionBlockedV1:
+        value = super().request
+        assert isinstance(value, RetentionBlockedV1)
+        return value
+
+
+@dataclass(frozen=True)
+class _IssuedControlProofBinding:
+    proof: _SimulatedControlProof
+    target: SimulatedEvent
+    factory_marker: object
+    base_authority: _RepairAuthoritySnapshot
+    base_authorization_ids: tuple[int, ...]
+    base_generation: int
+    base_stage_ids: tuple[int, ...]
+    base_transient_generation: int
+    lifecycle_identity: object
+    owner: object
+    owner_identity: object
+    predicted_generation: int
+    request_canonical: bytes
+    target_binding: tuple[object, ...]
+    target_presentation: tuple[object, ...]
+    verifier_identity: object
 
 
 _PROTECTED_EVENT_TYPES = frozenset(
@@ -1747,16 +1845,16 @@ class EnvelopeVerifier:
             generation=authority.generation,
         )
 
-    def _new_repair_simulation(self) -> EnvelopeSimulation:
+    def _new_control_simulation(self) -> EnvelopeSimulation:
         """Copy only recovered verifier authority into a private simulation."""
         lifecycle_identity = self._repair_lifecycle_identity
         if self._bound_lifecycle is None or lifecycle_identity is None:
             raise VerifierCommitError(
-                "repair simulation requires one recovered store lifecycle"
+                "control simulation requires one recovered store lifecycle"
             )
         if self._staged or self._authorizations:
             raise VerifierCommitError(
-                "repair simulation requires no live verifier transients"
+                "control simulation requires no live verifier transients"
             )
         transient_generation = self._repair_transient_generation
         authority = self._repair_authority_snapshot()
@@ -1767,7 +1865,7 @@ class EnvelopeVerifier:
             base_transient_generation=transient_generation,
             lifecycle_identity=lifecycle_identity,
             verifier_identity=self._repair_owner_identity,
-            _factory=_REPAIR_SIMULATION_FACTORY,
+            _factory=_CONTROL_SIMULATION_FACTORY,
         )
         if (
             transient_generation != self._repair_transient_generation
@@ -1777,40 +1875,63 @@ class EnvelopeVerifier:
             or lifecycle_identity is not self._repair_lifecycle_identity
         ):
             raise VerifierCommitError(
-                "live verifier changed while repair simulation was created"
+                "live verifier changed while control simulation was created"
             )
         return simulation
 
-    def _validate_simulated_repair_proof(
+    def _new_repair_simulation(self) -> EnvelopeSimulation:
+        """Compatibility wrapper for the existing repair proof flow."""
+        return self._new_control_simulation()
+
+    def _validate_simulated_control_proof(
         self,
-        proof: _SimulatedRepairProof,
+        proof: _SimulatedControlProof,
         *,
-        proof_type: type[_SimulatedRepairProof],
+        proof_type: type[_SimulatedControlProof],
         event_type: str,
     ) -> None:
         if type(proof) is not proof_type:
             raise VerifierCommitError(
-                "repair simulation proof is stale, foreign, or inexact"
+                "control simulation proof is stale, foreign, or inexact"
             )
-        owner = proof._owner
-        target = proof.target
-        target_presentation = (
-            target._canonical_envelope,
-            target.content_sha256,
-            target.event_id,
-            target.event_type,
-            target.evidence_priority,
-            target.is_retry,
-            target.key_epoch,
-            target.key_id,
-            target._normalized_fields_canonical,
-            target.sequence,
-            target._simulation_identity,
-        )
+        owner = getattr(proof, "_owner", None)
+        target = getattr(proof, "_target", None)
+        if type(owner) is not EnvelopeSimulation or type(target) is not SimulatedEvent:
+            raise VerifierCommitError(
+                "control simulation proof is stale, foreign, or inexact"
+            )
+        issued = owner._issued_proofs.get(id(proof))
         if (
-            proof._factory_marker is not _REPAIR_SIMULATION_FACTORY
+            issued is None
+            or issued.proof is not proof
+            or issued.target is not target
+        ):
+            raise VerifierCommitError(
+                "control simulation proof is stale, foreign, or inexact"
+            )
+        target_presentation = _simulated_event_binding(target)
+        if (
+            proof._factory_marker is not _CONTROL_SIMULATION_FACTORY
+            or proof._factory_marker is not issued.factory_marker
+            or proof._base_authority != issued.base_authority
+            or proof._base_authorization_ids
+            != issued.base_authorization_ids
+            or proof._base_generation != issued.base_generation
+            or proof._base_stage_ids != issued.base_stage_ids
+            or proof._base_transient_generation
+            != issued.base_transient_generation
+            or proof._lifecycle_identity
+            is not issued.lifecycle_identity
+            or proof._owner is not issued.owner
+            or proof._owner_identity is not issued.owner_identity
+            or proof._predicted_generation
+            != issued.predicted_generation
+            or proof._request_canonical != issued.request_canonical
+            or proof._target is not issued.target
+            or proof._target_binding != issued.target_binding
+            or proof._verifier_identity is not issued.verifier_identity
+            or target_presentation != issued.target_presentation
             or proof._verifier_identity is not self._repair_owner_identity
-            or type(owner) is not EnvelopeSimulation
             or owner._verifier_identity is not self._repair_owner_identity
             or self._bound_lifecycle is None
             or proof._lifecycle_identity is not self._repair_lifecycle_identity
@@ -1830,18 +1951,30 @@ class EnvelopeVerifier:
             or target.evidence_priority != "protected"
             or target_presentation != proof._target_binding
             or proof.base_generation != self._authority.generation
+            or type(proof._predicted_generation) is not int
+            or not (
+                proof.base_generation
+                <= proof.predicted_generation
+                <= MAX_UINT64
+            )
+            or proof.predicted_generation
+            != (
+                owner._base_authority.generation
+                + len(owner._accepted)
+                - len(owner._base_authority.accepted)
+            )
             or proof._base_authority != self._repair_authority_snapshot()
             or owner._base_authority != proof._base_authority
         ):
             raise VerifierCommitError(
-                "repair simulation proof is stale, foreign, or inexact"
+                "control simulation proof is stale, foreign, or inexact"
             )
         request_canonical = canonical_json(proof.request)
         if request_canonical != proof._request_canonical:
-            raise VerifierCommitError("repair simulation request binding changed")
+            raise VerifierCommitError("control simulation request binding changed")
         if target._normalized_fields_canonical != request_canonical:
             raise VerifierCommitError(
-                "repair simulation target no longer binds the exact request"
+                "control simulation target no longer binds the exact request"
             )
 
     def _validate_repair_authorization_proof(
@@ -1849,7 +1982,7 @@ class EnvelopeVerifier:
         proof: SimulatedRepairAuthorization,
     ) -> SimulatedRepairAuthorization:
         """Purely recheck an authorization preview against current authority."""
-        self._validate_simulated_repair_proof(
+        self._validate_simulated_control_proof(
             proof,
             proof_type=SimulatedRepairAuthorization,
             event_type="evidence_repair_authorized",
@@ -1861,10 +1994,34 @@ class EnvelopeVerifier:
         proof: SimulatedRepairCompletion,
     ) -> SimulatedRepairCompletion:
         """Purely recheck a completion preview against current authority."""
-        self._validate_simulated_repair_proof(
+        self._validate_simulated_control_proof(
             proof,
             proof_type=SimulatedRepairCompletion,
             event_type="evidence_repair_completed",
+        )
+        return proof
+
+    def _validate_retention_tombstone_proof(
+        self,
+        proof: SimulatedRetentionTombstone,
+    ) -> SimulatedRetentionTombstone:
+        """Purely recheck a tombstone preview against current authority."""
+        self._validate_simulated_control_proof(
+            proof,
+            proof_type=SimulatedRetentionTombstone,
+            event_type="retention_tombstone",
+        )
+        return proof
+
+    def _validate_retention_blocked_proof(
+        self,
+        proof: SimulatedRetentionBlocked,
+    ) -> SimulatedRetentionBlocked:
+        """Purely recheck a blocked preview against current authority."""
+        self._validate_simulated_control_proof(
+            proof,
+            proof_type=SimulatedRetentionBlocked,
+            event_type="retention_blocked_priority_evidence",
         )
         return proof
 
@@ -1955,6 +2112,7 @@ class EnvelopeSimulation:
     _base_transient_generation: int
     _fsm: ObserverStreamFSM
     _identity: object
+    _issued_proofs: dict[int, _IssuedControlProofBinding]
     _key_chain: AnchoredPublicKeyChain
     _lifecycle_identity: object
     _root: PinnedObserverRoot
@@ -1969,6 +2127,7 @@ class EnvelopeSimulation:
         "_base_transient_generation",
         "_fsm",
         "_identity",
+        "_issued_proofs",
         "_key_chain",
         "_lifecycle_identity",
         "_root",
@@ -1999,6 +2158,7 @@ class EnvelopeSimulation:
         self._fsm = authority.fsm
         self._accepted = dict(authority.accepted)
         self._identity = object()
+        self._issued_proofs = {}
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         del kwargs
@@ -2219,6 +2379,57 @@ class EnvelopeSimulation:
                 "completion facts differ from the simulated authorization"
             )
 
+    def _issue_proof(
+        self,
+        *,
+        proof_type: type[_SimulatedControlProof],
+        request_canonical: bytes,
+        target: SimulatedEvent,
+    ) -> _SimulatedControlProof:
+        added = len(self._accepted) - len(self._base_authority.accepted)
+        predicted_generation = self._base_authority.generation + added
+        if (
+            added < 0
+            or predicted_generation < self._base_authority.generation
+            or predicted_generation > MAX_UINT64
+        ):
+            raise VerifierCommitError(
+                "control simulation generation arithmetic is invalid"
+            )
+        proof = proof_type(
+            base_authorization_ids=self._base_authorization_ids,
+            base_authority=self._base_authority,
+            base_stage_ids=self._base_stage_ids,
+            base_transient_generation=self._base_transient_generation,
+            lifecycle_identity=self._lifecycle_identity,
+            owner=self,
+            owner_identity=self._identity,
+            predicted_generation=predicted_generation,
+            request_canonical=request_canonical,
+            target=target,
+            verifier_identity=self._verifier_identity,
+            _factory=_CONTROL_SIMULATION_FACTORY,
+        )
+        self._issued_proofs[id(proof)] = _IssuedControlProofBinding(
+            proof=proof,
+            target=target,
+            factory_marker=proof._factory_marker,
+            base_authority=proof._base_authority,
+            base_authorization_ids=tuple(proof._base_authorization_ids),
+            base_generation=proof._base_generation,
+            base_stage_ids=tuple(proof._base_stage_ids),
+            base_transient_generation=proof._base_transient_generation,
+            lifecycle_identity=proof._lifecycle_identity,
+            owner=proof._owner,
+            owner_identity=proof._owner_identity,
+            predicted_generation=proof._predicted_generation,
+            request_canonical=bytes(proof._request_canonical),
+            target_binding=tuple(proof._target_binding),
+            target_presentation=_simulated_event_binding(target),
+            verifier_identity=proof._verifier_identity,
+        )
+        return proof
+
     def _verify_exact_repair_path[
         RequestT: (EvidenceRepairAuthorizeV1, EvidenceRepairCompleteV1)
     ](
@@ -2229,8 +2440,8 @@ class EnvelopeSimulation:
         *,
         request_type: type[RequestT],
         event_type: str,
-        proof_type: type[_SimulatedRepairProof],
-    ) -> _SimulatedRepairProof:
+        proof_type: type[_SimulatedControlProof],
+    ) -> _SimulatedControlProof:
         normalized_request, request_canonical = self._normalize_request(
             request,
             request_type,
@@ -2292,18 +2503,103 @@ class EnvelopeSimulation:
             self._fsm = fsm_before
             self._accepted = accepted_before
             raise
-        return proof_type(
-            base_authorization_ids=self._base_authorization_ids,
-            base_authority=self._base_authority,
-            base_stage_ids=self._base_stage_ids,
-            base_transient_generation=self._base_transient_generation,
-            lifecycle_identity=self._lifecycle_identity,
-            owner=self,
-            owner_identity=self._identity,
+        return self._issue_proof(
+            proof_type=proof_type,
             request_canonical=request_canonical,
             target=target,
-            verifier_identity=self._verifier_identity,
-            _factory=_REPAIR_SIMULATION_FACTORY,
+        )
+
+    @staticmethod
+    def _normalize_retention_request[
+        RequestT: (RetentionTombstoneV2, RetentionBlockedV1)
+    ](
+        request: RequestT,
+        request_type: type[RequestT],
+    ) -> tuple[RequestT, bytes]:
+        if type(request) is not request_type:
+            raise RetentionSimulationError(
+                "retention simulation request has the wrong exact contract type"
+            )
+        try:
+            canonical = canonical_json(request)
+            normalized = request_type.model_validate_json(
+                canonical,
+                strict=True,
+            )
+        except (RecursionError, TypeError, ValueError, ValidationError) as error:
+            raise RetentionSimulationError(
+                "retention simulation request is not exact canonical authority"
+            ) from error
+        return normalized, canonical
+
+    def _verify_exact_retention_path[
+        RequestT: (RetentionTombstoneV2, RetentionBlockedV1)
+    ](
+        self,
+        request: RequestT,
+        direct: CoreEventV1,
+        fetched: Sequence[CoreEventV1],
+        *,
+        request_type: type[RequestT],
+        event_type: str,
+        proof_type: type[_SimulatedControlProof],
+    ) -> _SimulatedControlProof:
+        _normalized_request, request_canonical = (
+            self._normalize_retention_request(request, request_type)
+        )
+        normalized_direct, direct_canonical = self._normalize_item(direct)
+        if (
+            not isinstance(fetched, Sequence)
+            or isinstance(fetched, (bytes, bytearray, str))
+            or not 1 <= len(fetched) <= _MAX_CONTROL_SIMULATION_EVENTS
+        ):
+            raise RetentionSimulationError(
+                "retention simulation path has invalid event bounds"
+            )
+        fsm_before = self._fsm
+        accepted_before = dict(self._accepted)
+        previous = self._fsm.last_sequence
+        target: SimulatedEvent | None = None
+        try:
+            for candidate in fetched:
+                normalized, candidate_canonical = self._normalize_item(candidate)
+                if normalized.sequence <= previous:
+                    raise RetentionSimulationError(
+                        "retention simulation path is not strictly forward"
+                    )
+                if target is None:
+                    if normalized.sequence > normalized_direct.sequence:
+                        raise RetentionSimulationError(
+                            "retention simulation path overshot its exact target"
+                        )
+                    result = self.advance(normalized)
+                    if candidate_canonical == direct_canonical:
+                        target = result
+                    elif normalized.sequence == normalized_direct.sequence:
+                        raise RetentionSimulationError(
+                            "fetched retention target differs from direct response"
+                        )
+                previous = normalized.sequence
+            if target is None:
+                raise RetentionSimulationError(
+                    "direct retention response is absent from the fetched path"
+                )
+            if (
+                target.event_type != event_type
+                or target.evidence_priority != "protected"
+                or target._normalized_fields_canonical != request_canonical
+            ):
+                raise RetentionSimulationError(
+                    "retention target does not exactly bind the sent request"
+                )
+        except BaseException:
+            self._fsm = fsm_before
+            self._accepted = accepted_before
+            raise
+        return self._issue_proof(
+            proof_type=proof_type,
+            request_canonical=request_canonical,
+            target=target,
         )
 
     def verify_exact_authorization(
@@ -2340,4 +2636,40 @@ class EnvelopeSimulation:
             proof_type=SimulatedRepairCompletion,
         )
         assert isinstance(proof, SimulatedRepairCompletion)
+        return proof
+
+    def verify_exact_retention_tombstone(
+        self,
+        request: RetentionTombstoneV2,
+        direct: CoreEventV1,
+        fetched: Sequence[CoreEventV1],
+    ) -> SimulatedRetentionTombstone:
+        """Verify a bounded path through one exact retention tombstone."""
+        proof = self._verify_exact_retention_path(
+            request,
+            direct,
+            fetched,
+            request_type=RetentionTombstoneV2,
+            event_type="retention_tombstone",
+            proof_type=SimulatedRetentionTombstone,
+        )
+        assert isinstance(proof, SimulatedRetentionTombstone)
+        return proof
+
+    def verify_exact_retention_blocked(
+        self,
+        request: RetentionBlockedV1,
+        direct: CoreEventV1,
+        fetched: Sequence[CoreEventV1],
+    ) -> SimulatedRetentionBlocked:
+        """Verify a bounded path through one exact retention blocked event."""
+        proof = self._verify_exact_retention_path(
+            request,
+            direct,
+            fetched,
+            request_type=RetentionBlockedV1,
+            event_type="retention_blocked_priority_evidence",
+            proof_type=SimulatedRetentionBlocked,
+        )
+        assert isinstance(proof, SimulatedRetentionBlocked)
         return proof

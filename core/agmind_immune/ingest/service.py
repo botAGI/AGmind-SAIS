@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, final
+from typing import Literal, Protocol, cast, final
 
 import httpx
 
 from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.clock import CoreClockProvider
-from agmind_immune.contracts import MAX_UINT64
+from agmind_immune.contracts import (
+    MAX_UINT64,
+    RetentionBlockedV1,
+    RetentionTombstoneV2,
+)
 from agmind_immune.coverage import CoverageAckBarrier, CoverageState
 from agmind_immune.evidence.segments import (
     EvidencePriority,
@@ -34,7 +40,11 @@ from agmind_immune.ingest.envelope import (
     CoreEventV1,
     EnvelopeConflict,
     EnvelopeVerifier,
+    IngestVerificationError,
     PageDecodeError,
+    SimulatedRetentionBlocked,
+    SimulatedRetentionTombstone,
+    VerifierCommitError,
     decode_core_event,
     decode_events_page,
 )
@@ -43,11 +53,17 @@ _COORDINATOR_FACTORY = object()
 _REPAIR_ACCEPTANCE_FACTORY = object()
 _DELIVERY_FACTORY = object()
 _REPAIR_DELIVERY_FACTORY = object()
+_RETENTION_PREFLIGHT_FACTORY = object()
 _COVERAGE_ADAPTER_FACTORY = object()
 _MAX_ERROR_BODY_BYTES = 4_096
 _MAX_REPAIR_DRAIN_EVENTS = 4_096
 _MAX_REPAIR_DRAIN_PAGES = 64
 _MAX_REPAIR_DRAIN_RESPONSE_BYTES = 64 * 1024 * 1024
+_MAX_RETENTION_PREFLIGHT_EVENTS = 4_096
+_MAX_RETENTION_PREFLIGHT_PAGES = 64
+_MAX_RETENTION_PREFLIGHT_RESPONSE_BYTES = 64 * 1024 * 1024
+_MAX_RETENTION_TOMBSTONE_REQUEST_BYTES = 16 * 1024
+_MAX_RETENTION_BLOCKED_REQUEST_BYTES = 4 * 1024
 
 
 @final
@@ -235,6 +251,13 @@ class ObserverCoreTransport(Protocol):
 
     async def publish_repair_completion(self, canonical_body: bytes) -> bytes: ...
 
+    async def publish_retention_tombstone(
+        self,
+        canonical_body: bytes,
+    ) -> bytes: ...
+
+    async def publish_retention_blocked(self, canonical_body: bytes) -> bytes: ...
+
     async def close(self) -> None: ...
 
 
@@ -414,11 +437,29 @@ class HTTPXObserverCoreTransport:
         except (httpx.HTTPError, OSError, TimeoutError) as error:
             raise DeliveryAmbiguousAck("observer ACK transport failed") from error
 
-    async def _publish_repair(self, path: str, canonical_body: bytes) -> bytes:
+    async def _publish_control(
+        self,
+        path: str,
+        canonical_body: bytes,
+        *,
+        operation: str,
+        request_limit: int | None = None,
+        request_limit_label: str | None = None,
+    ) -> bytes:
         if self._closed:
             raise DeliveryFatalError("observer transport is closed")
         if type(canonical_body) is not bytes or not canonical_body:
-            raise DeliveryFatalError("repair request body must be exact nonempty bytes")
+            raise DeliveryFatalError(
+                f"{operation} request body must be exact nonempty bytes"
+            )
+        if request_limit is not None and len(canonical_body) > request_limit:
+            if request_limit_label is None:
+                raise DeliveryFatalError(
+                    f"{operation} request body exceeds its bound"
+                )
+            raise DeliveryFatalError(
+                f"{operation} request body exceeds {request_limit_label}"
+            )
         try:
             async with self._client.stream(
                 "POST",
@@ -429,13 +470,13 @@ class HTTPXObserverCoreTransport:
                 if "content-encoding" in response.headers:
                     await self._discard_error_body(response)
                     raise DeliveryFatalError(
-                        "observer repair response has Content-Encoding"
+                        f"observer {operation} response has Content-Encoding"
                     )
                 if response.status_code in (200, 201):
                     if response.headers.get("Content-Type") != "application/json":
                         await self._discard_error_body(response)
                         raise DeliveryFatalError(
-                            "observer repair Content-Type is not exact JSON"
+                            f"observer {operation} Content-Type is not exact JSON"
                         )
                     raw = await self._read_raw_bounded(
                         response,
@@ -443,27 +484,34 @@ class HTTPXObserverCoreTransport:
                     )
                     if len(raw) > MAX_CORE_EVENT_RESPONSE_BYTES:
                         raise DeliveryFatalError(
-                            "observer repair response exceeds bound"
+                            f"observer {operation} response exceeds bound"
                         )
                     return raw
                 await self._discard_error_body(response)
                 if response.status_code == 409:
                     raise DeliveryFatalError(
-                        "observer rejected exact repair authority"
+                        f"observer rejected exact {operation} authority"
                     )
                 if response.status_code == 408 or 500 <= response.status_code <= 599:
                     raise DeliveryRetryableError(
-                        f"observer repair POST returned {response.status_code}"
+                        f"observer {operation} POST returned {response.status_code}"
                     )
                 raise DeliveryFatalError(
-                    f"observer repair POST returned {response.status_code}"
+                    f"observer {operation} POST returned {response.status_code}"
                 )
         except DeliveryError:
             raise
         except (httpx.HTTPError, OSError, TimeoutError) as error:
             raise DeliveryRetryableError(
-                "observer repair POST transport failed"
+                f"observer {operation} POST transport failed"
             ) from error
+
+    async def _publish_repair(self, path: str, canonical_body: bytes) -> bytes:
+        return await self._publish_control(
+            path,
+            canonical_body,
+            operation="repair",
+        )
 
     async def publish_repair_authorization(self, canonical_body: bytes) -> bytes:
         return await self._publish_repair(
@@ -477,11 +525,91 @@ class HTTPXObserverCoreTransport:
             canonical_body,
         )
 
+    async def publish_retention_tombstone(
+        self,
+        canonical_body: bytes,
+    ) -> bytes:
+        return await self._publish_control(
+            "/v1/events/retention-tombstone",
+            canonical_body,
+            operation="retention tombstone",
+            request_limit=_MAX_RETENTION_TOMBSTONE_REQUEST_BYTES,
+            request_limit_label="16 KiB",
+        )
+
+    async def publish_retention_blocked(self, canonical_body: bytes) -> bytes:
+        return await self._publish_control(
+            "/v1/events/retention-blocked",
+            canonical_body,
+            operation="retention blocked",
+            request_limit=_MAX_RETENTION_BLOCKED_REQUEST_BYTES,
+            request_limit_label="4 KiB",
+        )
+
     async def close(self) -> None:
         if self._closed:
             return
         await self._client.aclose()
         self._closed = True
+
+
+@final
+class _DeliveryLock:
+    """Task-owned async lock with a monotonic transition epoch."""
+
+    __slots__ = ("_epoch", "_lock", "_owner")
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[object] | None = None
+        self._epoch = 0
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("_DeliveryLock is final")
+
+    async def acquire(self) -> bool:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("delivery lock requires an asyncio task")
+        if self._owner is task:
+            raise RuntimeError("delivery lock is not reentrant")
+        acquired = await self._lock.acquire()
+        if acquired is not True or self._owner is not None:
+            raise RuntimeError("delivery lock ownership is inconsistent")
+        self._owner = task
+        self._epoch += 1
+        return True
+
+    def release(self) -> None:
+        task = asyncio.current_task()
+        if (
+            task is None
+            or self._owner is not task
+            or self._lock.locked() is not True
+        ):
+            raise RuntimeError(
+                "delivery lock can only be released by its exact task owner"
+            )
+        self._lock.release()
+        self._owner = None
+        self._epoch += 1
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def __aenter__(self) -> _DeliveryLock:
+        await self.acquire()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.release()
 
 
 @dataclass(frozen=True)
@@ -493,6 +621,47 @@ class _DeliveryState:
     pending_ref: EvidenceRef | None
     pending_body: bytes | None
     delivery_ceiling: int
+
+
+@dataclass(frozen=True)
+class _RetentionPreflightInvariant:
+    state: _DeliveryState
+    status: EvidenceStatus
+    ack_snapshot: AckJournalSnapshot
+    pending_body: bytes | None
+    acceptance: object
+    store: object
+    store_lifecycle: object
+    store_bound_verifier: object
+    verifier: object
+    verifier_root: object
+    verifier_key_chain: object
+    verifier_authority: object
+    verifier_bound_lifecycle: object | None
+    verifier_repair_lifecycle: object | None
+    verifier_repair_owner: object
+    verifier_staged: object
+    verifier_authorizations: object
+    verifier_transient_generation: int
+    ack_journal: object
+    ack_store: object
+    ack_lifecycle: object
+    ack_delivery_lease: object
+    coverage_adapter: object
+    coverage_barrier: object
+    coverage_adapter_evidence: object
+    coverage: object
+    coverage_snapshot: object
+    coverage_evidence: object
+    coverage_lifecycle: object | None
+    coverage_capability: object | None
+    coverage_healthy: bool
+    coverage_closed: bool
+    lock: _DeliveryLock
+    lock_epoch: int
+    delivery_lock_owner: object
+    lock_owner: object
+    lock_authority: object
 
 
 @final
@@ -584,7 +753,9 @@ class DeliveryCoordinator:
         self._clock = clock
         self._ack_budget = ack_budget
         self._repair_mode = _repair_mode
-        self._lock = asyncio.Lock()
+        self._lock = _DeliveryLock()
+        self._retention_lock_owner: asyncio.Task[object] | None = None
+        self._retention_lock_authority: object | None = None
         self._fatal: DeliveryFatalError | None = None
         self._closed = False
         self._transport_closed = False
@@ -1070,6 +1241,588 @@ class DeliveryCoordinator:
             confirmed_through=confirmed_through,
         )
         return page
+
+    @asynccontextmanager
+    async def _retention_preflight_scope(
+        self,
+        *,
+        _factory: object,
+    ) -> AsyncIterator[object]:
+        if (
+            _factory is not _RETENTION_PREFLIGHT_FACTORY
+            or type(self) is not DeliveryCoordinator
+            or self._repair_mode
+        ):
+            raise TypeError(
+                "retention preflight requires the exact ordinary delivery factory"
+            )
+        if self._retention_lock_owner is not None:
+            raise TypeError(
+                "retention preflight already has an exact lock owner"
+            )
+        self._raise_if_unavailable()
+        task = asyncio.current_task()
+        if task is None:
+            raise TypeError("retention preflight requires an asyncio task owner")
+        lock = self._lock
+        await lock.acquire()
+        lock_epoch = lock._epoch
+        scope_entered = False
+        primary: BaseException | None = None
+        authority: object | None = None
+        try:
+            self._raise_if_unavailable()
+            if (
+                self._lock is not lock
+                or self._retention_lock_owner is not None
+                or self._retention_lock_authority is not None
+            ):
+                raise TypeError(
+                    "retention preflight already has an exact lock owner"
+                )
+            authority = object()
+            self._retention_lock_owner = task
+            self._retention_lock_authority = authority
+            scope_entered = True
+            yield authority
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            lock_unchanged = (
+                self._lock is lock
+                and lock.locked()
+                and lock._owner is task
+                and lock._epoch == lock_epoch
+            )
+            owner_unchanged = (
+                not scope_entered
+                or (
+                    asyncio.current_task() is task
+                    and self._retention_lock_owner is task
+                    and self._retention_lock_authority is authority
+                )
+            )
+            if scope_entered:
+                self._retention_lock_owner = None
+                self._retention_lock_authority = None
+            if lock.locked() and lock._owner is task:
+                lock.release()
+            if not lock_unchanged or not owner_unchanged:
+                raise self._latch(
+                    "retention preflight changed live authority",
+                    primary,
+                )
+
+    def _require_retention_preflight(
+        self,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> None:
+        if (
+            _factory is not _RETENTION_PREFLIGHT_FACTORY
+            or type(self) is not DeliveryCoordinator
+            or self._repair_mode
+        ):
+            raise TypeError(
+                "retention preflight requires the exact ordinary delivery factory"
+            )
+        task = asyncio.current_task()
+        if (
+            task is None
+            or self._lock.locked() is not True
+            or self._lock._owner is not task
+            or self._retention_lock_owner is not task
+            or self._retention_lock_authority is None
+            or _lock_authority is not self._retention_lock_authority
+        ):
+            raise TypeError(
+                "retention preflight requires its exact current-task lock owner"
+            )
+        self._raise_if_unavailable()
+
+    @staticmethod
+    def _exact_retention_body(
+        request: RetentionTombstoneV2 | RetentionBlockedV1,
+        canonical_body: bytes,
+    ) -> tuple[
+        RetentionTombstoneV2 | RetentionBlockedV1,
+        bytes,
+    ]:
+        if type(canonical_body) is not bytes or not canonical_body:
+            raise DeliveryFatalError(
+                "retention preflight body must be exact nonempty bytes"
+            )
+        request_type: type[
+            RetentionTombstoneV2 | RetentionBlockedV1
+        ]
+        if type(request) is RetentionTombstoneV2:
+            request_type = RetentionTombstoneV2
+        elif type(request) is RetentionBlockedV1:
+            request_type = RetentionBlockedV1
+        else:
+            raise TypeError(
+                "retention preflight requires an exact request type"
+            )
+        try:
+            encoded = canonical_json(request.model_dump(mode="python"))
+            decoded = request_type.model_validate_json(
+                canonical_body,
+                strict=True,
+            )
+            expected = canonical_json(decoded.model_dump(mode="python"))
+        except (
+            OverflowError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            raise DeliveryFatalError(
+                "retention preflight exact request is invalid"
+            ) from error
+        if (
+            type(decoded) is not request_type
+            or decoded != request
+            or expected != encoded
+            or canonical_body != expected
+        ):
+            raise DeliveryFatalError(
+                "retention preflight body differs from the exact request"
+            )
+        return decoded, expected
+
+    def _capture_retention_preflight_invariant(
+        self,
+        state: _DeliveryState,
+    ) -> _RetentionPreflightInvariant:
+        coverage = self._coverage_adapter._coverage
+        return _RetentionPreflightInvariant(
+            state=state,
+            status=self._store.status(),
+            ack_snapshot=self._ack_journal.snapshot(),
+            pending_body=self._ack_journal.pending_request_body(),
+            acceptance=self._acceptance,
+            store=self._store,
+            store_lifecycle=self._store._lifecycle_identity,
+            store_bound_verifier=self._store._bound_verifier,
+            verifier=self._verifier,
+            verifier_root=self._verifier.root,
+            verifier_key_chain=self._verifier.key_chain,
+            verifier_authority=self._verifier._authority,
+            verifier_bound_lifecycle=self._verifier._bound_lifecycle,
+            verifier_repair_lifecycle=(
+                self._verifier._repair_lifecycle_identity
+            ),
+            verifier_repair_owner=self._verifier._repair_owner_identity,
+            verifier_staged=dict(self._verifier._staged),
+            verifier_authorizations=dict(
+                self._verifier._authorizations
+            ),
+            verifier_transient_generation=(
+                self._verifier._repair_transient_generation
+            ),
+            ack_journal=self._ack_journal,
+            ack_store=self._ack_journal._store,
+            ack_lifecycle=self._ack_journal._lifecycle_identity,
+            ack_delivery_lease=self._ack_journal._delivery_lease,
+            coverage_adapter=self._coverage_adapter,
+            coverage_barrier=self._coverage_adapter._barrier,
+            coverage_adapter_evidence=self._coverage_adapter._evidence,
+            coverage=coverage,
+            coverage_snapshot=coverage._snapshot,
+            coverage_evidence=coverage._evidence,
+            coverage_lifecycle=coverage._lifecycle_identity,
+            coverage_capability=coverage._capability_token,
+            coverage_healthy=coverage._healthy,
+            coverage_closed=coverage._closed,
+            lock=self._lock,
+            lock_epoch=self._lock._epoch,
+            delivery_lock_owner=self._lock._owner,
+            lock_owner=self._retention_lock_owner,
+            lock_authority=self._retention_lock_authority,
+        )
+
+    def _retention_preflight_invariant_changed(
+        self,
+        before: _RetentionPreflightInvariant,
+    ) -> bool:
+        try:
+            coverage = self._coverage_adapter._coverage
+            return (
+                self._acceptance is not before.acceptance
+                or self._store is not before.store
+                or self._store._lifecycle_identity
+                is not before.store_lifecycle
+                or self._store._bound_verifier
+                is not before.store_bound_verifier
+                or self._acceptance.segment_store is not self._store
+                or self._acceptance.verifier is not self._verifier
+                or self._acceptance._repair_mode is not False
+                or self._verifier is not before.verifier
+                or self._verifier.root is not before.verifier_root
+                or self._verifier.key_chain is not before.verifier_key_chain
+                or self._verifier._authority
+                is not before.verifier_authority
+                or self._verifier._bound_lifecycle
+                is not before.verifier_bound_lifecycle
+                or self._verifier._repair_lifecycle_identity
+                is not before.verifier_repair_lifecycle
+                or self._verifier._repair_owner_identity
+                is not before.verifier_repair_owner
+                or self._verifier._staged != before.verifier_staged
+                or self._verifier._authorizations
+                != before.verifier_authorizations
+                or self._verifier._repair_transient_generation
+                != before.verifier_transient_generation
+                or self._ack_journal is not before.ack_journal
+                or self._ack_journal._store is not before.ack_store
+                or self._ack_journal._lifecycle_identity
+                is not before.ack_lifecycle
+                or self._ack_journal._delivery_lease
+                is not before.ack_delivery_lease
+                or self._coverage_adapter
+                is not before.coverage_adapter
+                or self._coverage_adapter._barrier
+                is not before.coverage_barrier
+                or self._coverage_adapter._evidence
+                is not before.coverage_adapter_evidence
+                or coverage is not before.coverage
+                or coverage._snapshot is not before.coverage_snapshot
+                or coverage._evidence is not before.coverage_evidence
+                or coverage._lifecycle_identity
+                is not before.coverage_lifecycle
+                or coverage._capability_token
+                is not before.coverage_capability
+                or coverage._healthy is not before.coverage_healthy
+                or coverage._closed is not before.coverage_closed
+                or self._lock is not before.lock
+                or before.lock.locked() is not True
+                or before.lock._epoch != before.lock_epoch
+                or before.lock._owner is not before.delivery_lock_owner
+                or before.delivery_lock_owner is not before.lock_owner
+                or self._retention_lock_owner is not before.lock_owner
+                or self._retention_lock_authority
+                is not before.lock_authority
+                or asyncio.current_task() is not before.lock_owner
+                or self._store.status() != before.status
+                or self._ack_journal.snapshot()
+                != before.ack_snapshot
+                or self._ack_journal.pending_request_body()
+                != before.pending_body
+            )
+        except BaseException:  # noqa: BLE001 - invariant loss fails closed
+            return True
+
+    async def _preflight_retention(
+        self,
+        request: RetentionTombstoneV2 | RetentionBlockedV1,
+        canonical_body: bytes,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> SimulatedRetentionTombstone | SimulatedRetentionBlocked:
+        self._require_retention_preflight(
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        frozen_request, frozen_body = self._exact_retention_body(
+            request,
+            canonical_body,
+        )
+        state = self._local_state(apply_coverage_barrier=False)
+        if state.pending is not None:
+            raise DeliveryRetryableError(
+                "retention preflight requires pending ACK recovery"
+            )
+        invariant = self._capture_retention_preflight_invariant(state)
+        try:
+            proof = await self._preflight_retention_inner(
+                frozen_request,
+                frozen_body,
+                _factory=_factory,
+                _lock_authority=_lock_authority,
+            )
+        except BaseException as primary:
+            if self._retention_preflight_invariant_changed(invariant):
+                raise self._latch(
+                    "retention preflight changed live authority",
+                    primary,
+                )
+            raise
+        if self._retention_preflight_invariant_changed(invariant):
+            raise self._latch(
+                "retention preflight changed live authority"
+            )
+        return proof
+
+    async def _preflight_retention_inner(
+        self,
+        request: RetentionTombstoneV2 | RetentionBlockedV1,
+        canonical_body: bytes,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> SimulatedRetentionTombstone | SimulatedRetentionBlocked:
+        self._require_retention_preflight(
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        request, body = self._exact_retention_body(
+            request,
+            canonical_body,
+        )
+        state_before = self._local_state(apply_coverage_barrier=False)
+        if state_before.pending is not None:
+            raise DeliveryRetryableError(
+                "retention preflight requires pending ACK recovery"
+            )
+        status_before = self._store.status()
+        ack_before = self._ack_journal.snapshot()
+        authority_before = self._verifier._authority
+        stages_before = dict(self._verifier._staged)
+        authorizations_before = dict(self._verifier._authorizations)
+        transient_before = self._verifier._repair_transient_generation
+        simulation = self._verifier._new_control_simulation()
+        try:
+            if type(request) is RetentionTombstoneV2:
+                direct_raw = (
+                    await self._transport.publish_retention_tombstone(body)
+                )
+            elif type(request) is RetentionBlockedV1:
+                direct_raw = await self._transport.publish_retention_blocked(
+                    body
+                )
+            else:
+                raise TypeError(
+                    "retention preflight requires an exact request type"
+                )
+        except asyncio.CancelledError:
+            raise
+        except DeliveryRetryableError:
+            raise
+        except DeliveryFatalError as error:
+            raise self._latch("retention POST failed fatally", error)
+        except (httpx.HTTPError, OSError, TimeoutError) as error:
+            raise DeliveryRetryableError(
+                "retention POST transport failed"
+            ) from error
+        except Exception as error:  # noqa: BLE001 - transport protocol boundary
+            raise self._latch(
+                "retention POST transport violated its contract",
+                error,
+            )
+        try:
+            if type(direct_raw) is not bytes:
+                raise DeliveryFatalError(
+                    "retention POST returned a non-exact byte response"
+                )
+            direct = decode_core_event(direct_raw)
+            direct_canonical = canonical_json(
+                direct.model_dump(mode="python")
+            )
+        except (
+            IngestVerificationError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            raise self._latch(
+                "retention direct response is invalid",
+                error,
+            )
+        if direct.sequence <= state_before.evidence_head:
+            raise self._latch(
+                "retention preflight target is not ahead of evidence"
+            )
+
+        after = state_before.evidence_head
+        total_events = 0
+        total_response_bytes = 0
+        fetched: list[CoreEventV1] = []
+        for _page_number in range(_MAX_RETENTION_PREFLIGHT_PAGES):
+            remaining_events = (
+                _MAX_RETENTION_PREFLIGHT_EVENTS - total_events
+            )
+            if remaining_events <= 0:
+                raise self._latch(
+                    "retention preflight event bound exhausted"
+                )
+            page, response_bytes = await self._fetch_page_with_size(
+                after=after,
+                limit=min(
+                    MAX_PAGE_EVENTS,
+                    remaining_events,
+                    direct.sequence - after,
+                ),
+                confirmed_through=state_before.confirmed_through,
+            )
+            total_response_bytes += response_bytes
+            total_events += len(page.events)
+            if (
+                total_response_bytes
+                > _MAX_RETENTION_PREFLIGHT_RESPONSE_BYTES
+            ):
+                raise self._latch(
+                    "retention preflight response-byte bound exhausted"
+                )
+            if total_events > _MAX_RETENTION_PREFLIGHT_EVENTS:
+                raise self._latch(
+                    "retention preflight event bound exhausted"
+                )
+            if page.reserved_through < direct.sequence:
+                raise self._latch(
+                    "observer reservation does not include retention target"
+                )
+            if not page.events:
+                raise self._latch(
+                    "observer returned no path to the retention target"
+                )
+
+            target_found = False
+            normalized_page: list[CoreEventV1] = []
+            for item in page.events:
+                try:
+                    normalized = decode_core_event(
+                        canonical_json(item.model_dump(mode="python"))
+                    )
+                except (
+                    IngestVerificationError,
+                    RecursionError,
+                    TypeError,
+                    UnicodeError,
+                    ValueError,
+                ) as error:
+                    raise self._latch(
+                        "retention page item outer binding is invalid",
+                        error,
+                    )
+                if normalized.sequence <= after:
+                    raise self._latch(
+                        "retention preflight local cursor did not advance"
+                    )
+                if not target_found:
+                    if normalized.sequence > direct.sequence:
+                        raise self._latch(
+                            "observer passed the exact retention target"
+                        )
+                    if normalized.sequence == direct.sequence:
+                        if (
+                            canonical_json(
+                                normalized.model_dump(mode="python")
+                            )
+                            != direct_canonical
+                        ):
+                            raise self._latch(
+                                "observer returned a different retention target"
+                            )
+                        target_found = True
+                normalized_page.append(normalized)
+            fetched.extend(normalized_page)
+            after = normalized_page[-1].sequence
+            if not target_found:
+                continue
+            try:
+                if type(request) is RetentionTombstoneV2:
+                    tombstone_proof = (
+                        simulation.verify_exact_retention_tombstone(
+                            request,
+                            direct,
+                            tuple(fetched),
+                        )
+                    )
+                    proof: (
+                        SimulatedRetentionTombstone
+                        | SimulatedRetentionBlocked
+                    ) = tombstone_proof
+                    self._verifier._validate_retention_tombstone_proof(
+                        tombstone_proof
+                    )
+                else:
+                    blocked_request = cast(RetentionBlockedV1, request)
+                    blocked_proof = simulation.verify_exact_retention_blocked(
+                        blocked_request,
+                        direct,
+                        tuple(fetched),
+                    )
+                    proof = blocked_proof
+                    self._verifier._validate_retention_blocked_proof(
+                        blocked_proof
+                    )
+            except (IngestVerificationError, VerifierCommitError) as error:
+                raise self._latch(
+                    "retention simulation proof is invalid",
+                    error,
+                )
+            state_after = self._local_state(
+                apply_coverage_barrier=False
+            )
+            if (
+                self._verifier._authority is not authority_before
+                or self._verifier._staged != stages_before
+                or self._verifier._authorizations
+                != authorizations_before
+                or self._verifier._repair_transient_generation
+                != transient_before
+                or self._store.status() != status_before
+                or self._ack_journal.snapshot() != ack_before
+                or state_after != state_before
+            ):
+                raise self._latch(
+                    "retention preflight changed live authority"
+                )
+            return proof
+        raise self._latch("retention preflight page bound exhausted")
+
+    async def _preflight_retention_tombstone(
+        self,
+        request: RetentionTombstoneV2,
+        canonical_body: bytes,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> SimulatedRetentionTombstone:
+        if type(request) is not RetentionTombstoneV2:
+            raise TypeError(
+                "retention tombstone preflight requires its exact request"
+            )
+        proof = await self._preflight_retention(
+            request,
+            canonical_body,
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        if type(proof) is not SimulatedRetentionTombstone:
+            raise DeliveryFatalError(
+                "retention tombstone preflight returned the wrong proof"
+            )
+        return proof
+
+    async def _preflight_retention_blocked(
+        self,
+        request: RetentionBlockedV1,
+        canonical_body: bytes,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> SimulatedRetentionBlocked:
+        if type(request) is not RetentionBlockedV1:
+            raise TypeError(
+                "retention blocked preflight requires its exact request"
+            )
+        proof = await self._preflight_retention(
+            request,
+            canonical_body,
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        if type(proof) is not SimulatedRetentionBlocked:
+            raise DeliveryFatalError(
+                "retention blocked preflight returned the wrong proof"
+            )
+        return proof
 
     @staticmethod
     def _repair_target_bytes(expected: CoreEventV1) -> bytes:
