@@ -1118,6 +1118,7 @@ class SegmentStore:
         self._lifecycle_identity = object()
         self._bound_verifier: EnvelopeVerifier | None = None
         self._authority_state: Literal["unbound", "recovering", "ready"] = "unbound"
+        self._coverage_state_owner: object | None = None
         self._ack_journal_owner: object | None = None
         self._ack_journal_state: Literal[
             "unknown",
@@ -1288,6 +1289,89 @@ class SegmentStore:
             if indexed is None:
                 raise EvidenceCorrupt("authenticated evidence sequence index changed")
             yield self.resolve_authenticated_ref(indexed[1])
+
+    def _acquire_coverage_state(self, owner: object) -> object:
+        self._require_authenticated_recovered()
+        if self._coverage_state_owner is not None:
+            raise EvidenceStoreBusy("evidence root already has one coverage-state owner")
+        self._coverage_state_owner = owner
+        return self._lifecycle_identity
+
+    def _resolve_next_coverage_record(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        record: StoredEvidenceRecord,
+        *,
+        after_ref: EvidenceRef | None,
+    ) -> StoredEvidenceRecord:
+        verifier = self._require_authenticated_recovered()
+        if (
+            owner is not self._coverage_state_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise EvidenceSealError("coverage state is outside this evidence lifecycle")
+        host_id = verifier.fsm.host_id
+        sequences = self._sequences_by_host.get(host_id, [])
+        if after_ref is None:
+            position = 0
+        else:
+            self.resolve_authenticated_ref(after_ref)
+            position = bisect_right(sequences, after_ref.source_sequence)
+        if position >= len(sequences):
+            raise EvidenceSealError(
+                "coverage apply has no next authenticated real evidence ref"
+            )
+        next_ref = self._index[(host_id, sequences[position])][1]
+        if record.ref != next_ref:
+            raise EvidenceSealError(
+                "coverage apply skipped the next authenticated real evidence ref"
+            )
+        resolved = self.resolve_authenticated_ref(next_ref)
+        if resolved != record:
+            raise EvidenceSealError(
+                "coverage apply record differs from authenticated evidence"
+            )
+        return resolved
+
+    def _validate_coverage_state_owner(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        *,
+        reducer_head: EvidenceRef | None,
+    ) -> EvidenceRef | None:
+        verifier = self._require_authenticated_recovered()
+        if (
+            owner is not self._coverage_state_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise EvidenceSealError("coverage state is outside this evidence lifecycle")
+        sequence = verifier.fsm.last_sequence
+        authenticated_head: EvidenceRef | None = None
+        if sequence != 0:
+            ref = verifier.accepted_ref(sequence)
+            if type(ref) is not EvidenceRef:
+                raise EvidenceCorrupt("authenticated evidence head has no exact ref")
+            self.resolve_authenticated_ref(ref)
+            authenticated_head = ref
+        if authenticated_head != reducer_head:
+            raise EvidenceSealError(
+                "coverage reducer head differs from authenticated evidence head"
+            )
+        return authenticated_head
+
+    def _release_coverage_state(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._coverage_state_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise EvidenceSealError("coverage state release has the wrong lifecycle")
+        self._coverage_state_owner = None
 
     def authenticated_refs(
         self,
@@ -3728,25 +3812,56 @@ class SegmentStore:
                 self._active.descriptor = -1
         finally:
             try:
-                owner = self._ack_journal_owner
-                if owner is not None:
-                    close_from_store = getattr(
-                        owner,
-                        "_close_from_segment_store",
-                        None,
-                    )
-                    if not callable(close_from_store):
-                        raise EvidenceStoreError(
-                            "ACK-journal owner cannot close before evidence unlock"
+                try:
+                    coverage_close_error: BaseException | None = None
+                    coverage_owner = self._coverage_state_owner
+                    if coverage_owner is not None:
+                        close_from_store = getattr(
+                            coverage_owner,
+                            "_close_from_segment_store",
+                            None,
                         )
-                    cast(Callable[[object], None], close_from_store)(
-                        self._lifecycle_identity
-                    )
-                if self._ack_journal_owner is not None:
-                    raise EvidenceStoreError(
-                        "ACK-journal owner survived evidence shutdown"
-                    )
-                self._fence_missing_expected_ack_journal()
+                        if not callable(close_from_store):
+                            coverage_close_error = EvidenceStoreError(
+                                "coverage-state owner cannot close before evidence unlock"
+                            )
+                        else:
+                            try:
+                                cast(Callable[[object], None], close_from_store)(
+                                    self._lifecycle_identity
+                                )
+                            except BaseException as error:  # noqa: BLE001
+                                coverage_close_error = error
+                    if self._coverage_state_owner is not None:
+                        self._coverage_state_owner = None
+                        survivor_error = EvidenceStoreError(
+                            "coverage-state owner survived evidence shutdown"
+                        )
+                        if coverage_close_error is not None:
+                            raise survivor_error from coverage_close_error
+                        raise survivor_error
+                    if coverage_close_error is not None:
+                        raise coverage_close_error
+                finally:
+                    owner = self._ack_journal_owner
+                    if owner is not None:
+                        close_from_store = getattr(
+                            owner,
+                            "_close_from_segment_store",
+                            None,
+                        )
+                        if not callable(close_from_store):
+                            raise EvidenceStoreError(
+                                "ACK-journal owner cannot close before evidence unlock"
+                            )
+                        cast(Callable[[object], None], close_from_store)(
+                            self._lifecycle_identity
+                        )
+                    if self._ack_journal_owner is not None:
+                        raise EvidenceStoreError(
+                            "ACK-journal owner survived evidence shutdown"
+                        )
+                    self._fence_missing_expected_ack_journal()
             finally:
                 for descriptor in self._date_descriptors.values():
                     os.close(descriptor)
