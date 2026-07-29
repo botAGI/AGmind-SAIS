@@ -71,6 +71,122 @@ def _fixture_refs(coordinator: AcceptanceCoordinator) -> list[EvidenceRef]:
     ]
 
 
+@pytest.mark.parametrize("recovery", ["apply", "rebuild"])
+def test_existing_legal_projection_lag_opens_and_catches_up(
+    tmp_path: Path,
+    recovery: str,
+) -> None:
+    projection = _projection()
+    coordinator, store, journal = _system(tmp_path / recovery / "evidence")
+    key = private_key(11)
+    refs = [
+        _accept(coordinator, boot_boundary(key)),
+        _accept(
+            coordinator,
+            envelope_value(
+                key,
+                sequence=2,
+                boot_id=BOOT_A,
+                normalized_fields={"kind": "confirmed_after_projection"},
+            ),
+        ),
+    ]
+    _confirm(journal, refs[0])
+    path = tmp_path / recovery / "projection.sqlite3"
+    cache = projection.ProjectionStore.open(
+        path,
+        evidence=store,
+        acknowledgements=journal,
+    )
+    cache.apply(refs[0])
+    cache.close()
+    _confirm(journal, refs[1])
+
+    reopened = projection.ProjectionStore.open(
+        path,
+        evidence=store,
+        acknowledgements=journal,
+    )
+    if recovery == "apply":
+        assert reopened.apply(refs[1]).cursor.source_sequence == 2
+    else:
+        report = reopened.rebuild()
+        assert report.cursor is not None
+        assert report.cursor.source_sequence == 2
+    reopened.close()
+    store.close()
+
+
+@pytest.mark.parametrize("substitution", ["main", "temp"])
+def test_persistent_pre_rename_substitution_never_crosses_replace(
+    tmp_path: Path,
+    substitution: str,
+) -> None:
+    projection = _projection()
+    coordinator, store, journal = _system(tmp_path / substitution / "evidence")
+    refs = _fixture_refs(coordinator)
+    _confirm(journal, *refs)
+    path = tmp_path / substitution / "projection.sqlite3"
+    baseline = projection.ProjectionStore.open(
+        path,
+        evidence=store,
+        acknowledgements=journal,
+    )
+    baseline.rebuild()
+    baseline.close()
+    original_main_inode = path.stat().st_ino
+    source_bytes = {
+        child.relative_to(store.root): child.read_bytes()
+        for child in store.root.rglob("*")
+        if child.is_file()
+    }
+    substituted_inode: int | None = None
+    fired = False
+
+    def substitute_at_last_pre_rename_seam(step: str) -> None:
+        nonlocal fired, substituted_inode
+        if step != "old_sidecar_cleanup" or fired:
+            return
+        fired = True
+        if substitution == "main":
+            authentic = path.with_name("authentic-main.saved")
+            path.rename(authentic)
+            shutil.copyfile(authentic, path)
+            path.chmod(0o600)
+            substituted_inode = path.stat().st_ino
+        else:
+            temp = next(path.parent.glob(f".{path.name}.projection.*.tmp"))
+            authentic = path.with_name("authentic-temp.saved")
+            temp.rename(authentic)
+            shutil.copyfile(authentic, temp)
+            temp.chmod(0o600)
+            substituted_inode = temp.stat().st_ino
+
+    cache = projection.ProjectionStore.open(
+        path,
+        evidence=store,
+        acknowledgements=journal,
+        step_hook=substitute_at_last_pre_rename_seam,
+    )
+    with pytest.raises(projection.ProjectionConflict):
+        cache.rebuild()
+    assert fired is True
+    assert substituted_inode is not None
+    if substitution == "main":
+        assert path.stat().st_ino == substituted_inode
+        assert cache._healthy is False
+    else:
+        assert path.stat().st_ino == original_main_inode
+        assert cache.snapshot_hash()
+    assert source_bytes == {
+        child.relative_to(store.root): child.read_bytes()
+        for child in store.root.rglob("*")
+        if child.is_file()
+    }
+    cache.close()
+    store.close()
+
+
 @pytest.mark.parametrize(
     "forgery",
     ["skipped_prefix", "cursor_ref", "duplicate_marker", "reducer_row"],

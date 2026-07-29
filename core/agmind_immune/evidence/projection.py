@@ -672,7 +672,10 @@ class ProjectionStore:
             store._validate_sidecars(permit_nonempty=True)
             store._verify_namespace_bindings()
             if not new:
-                records = store._records_for_snapshot(snapshot)
+                records = store._records_for_current_cursor(
+                    store._connection,
+                    snapshot,
+                )
                 store._validate_logical_prefix(store._connection, records)
         except BaseException:
             store.close()
@@ -1353,7 +1356,12 @@ class ProjectionStore:
                     dir_fd=self._parent_fd,
                 )
                 try:
-                    _validate_regular(os.fstat(descriptor), label="temporary projection")
+                    temp_fsync_info = os.fstat(descriptor)
+                    _validate_regular(temp_fsync_info, label="temporary projection")
+                    if _binding(temp_fsync_info) != temp_binding:
+                        raise ProjectionConflict(
+                            "temporary projection changed before fsync"
+                        )
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
@@ -1378,6 +1386,18 @@ class ProjectionStore:
                     os.unlink(sidecar, dir_fd=self._parent_fd)
                 os.fsync(self._parent_fd)
                 self._step_hook(_REBUILD_STEPS[5])
+                _require_entry_binding(
+                    self._parent_fd,
+                    self._path.name,
+                    self._main_binding,
+                    label="projection database before rename",
+                )
+                _require_entry_binding(
+                    self._parent_fd,
+                    temp_name,
+                    temp_binding,
+                    label="temporary projection before rename",
+                )
                 os.replace(
                     temp_name,
                     self._path.name,
