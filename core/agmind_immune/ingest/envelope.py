@@ -7,6 +7,7 @@ import re
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Never, SupportsIndex, final
@@ -1039,6 +1040,18 @@ def _simulated_event_binding(
     )
 
 
+def _control_path_sha256(path_canonical: tuple[bytes, ...]) -> str:
+    digest = hashlib.sha256(b"agmind.control-simulation-path.v1\0")
+    for raw in path_canonical:
+        if type(raw) is not bytes:
+            raise VerifierCommitError(
+                "control simulation path has a non-exact byte item"
+            )
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
 class _SimulatedControlProof:
     _base_authorization_ids: tuple[int, ...]
     _base_authority: _RepairAuthoritySnapshot
@@ -1049,6 +1062,7 @@ class _SimulatedControlProof:
     _lifecycle_identity: object
     _owner: object
     _owner_identity: object
+    _path_sha256: str | None
     _predicted_generation: int
     _request_canonical: bytes
     _target: SimulatedEvent
@@ -1065,6 +1079,7 @@ class _SimulatedControlProof:
         "_lifecycle_identity",
         "_owner",
         "_owner_identity",
+        "_path_sha256",
         "_predicted_generation",
         "_request_canonical",
         "_target",
@@ -1089,6 +1104,7 @@ class _SimulatedControlProof:
         lifecycle_identity: object,
         owner: object,
         owner_identity: object,
+        path_sha256: str | None,
         predicted_generation: int,
         request_canonical: bytes,
         target: SimulatedEvent,
@@ -1114,6 +1130,7 @@ class _SimulatedControlProof:
         object.__setattr__(self, "_lifecycle_identity", lifecycle_identity)
         object.__setattr__(self, "_owner", owner)
         object.__setattr__(self, "_owner_identity", owner_identity)
+        object.__setattr__(self, "_path_sha256", path_sha256)
         object.__setattr__(
             self,
             "_predicted_generation",
@@ -1233,6 +1250,8 @@ class SimulatedRetentionBlocked(_SimulatedControlProof):
 class _IssuedControlProofBinding:
     proof: _SimulatedControlProof
     target: SimulatedEvent
+    path_canonical: tuple[bytes, ...] | None
+    path_sha256: str | None
     factory_marker: object
     base_authority: _RepairAuthoritySnapshot
     base_authorization_ids: tuple[int, ...]
@@ -1910,6 +1929,11 @@ class EnvelopeVerifier:
                 "control simulation proof is stale, foreign, or inexact"
             )
         target_presentation = _simulated_event_binding(target)
+        issued_path_sha256 = (
+            None
+            if issued.path_canonical is None
+            else _control_path_sha256(issued.path_canonical)
+        )
         if (
             proof._factory_marker is not _CONTROL_SIMULATION_FACTORY
             or proof._factory_marker is not issued.factory_marker
@@ -1924,6 +1948,8 @@ class EnvelopeVerifier:
             is not issued.lifecycle_identity
             or proof._owner is not issued.owner
             or proof._owner_identity is not issued.owner_identity
+            or proof._path_sha256 != issued.path_sha256
+            or issued.path_sha256 != issued_path_sha256
             or proof._predicted_generation
             != issued.predicted_generation
             or proof._request_canonical != issued.request_canonical
@@ -2025,6 +2051,100 @@ class EnvelopeVerifier:
         )
         return proof
 
+    def _consume_retention_proof(
+        self,
+        proof: _SimulatedControlProof,
+        *,
+        proof_type: type[_SimulatedControlProof],
+        event_type: str,
+    ) -> tuple[CoreEventV1, ...]:
+        """Atomically consume one issued proof and return its exact prefix."""
+        self._validate_simulated_control_proof(
+            proof,
+            proof_type=proof_type,
+            event_type=event_type,
+        )
+        owner = proof._owner
+        if type(owner) is not EnvelopeSimulation:
+            raise VerifierCommitError(
+                "retention proof has no exact simulation owner"
+            )
+        issued = owner._issued_proofs.get(id(proof))
+        if (
+            issued is None
+            or issued.proof is not proof
+            or issued.path_canonical is None
+            or not issued.path_canonical
+        ):
+            raise VerifierCommitError(
+                "retention proof has no exact consumable path"
+            )
+        try:
+            path = tuple(
+                decode_core_event(bytes(raw))
+                for raw in issued.path_canonical
+            )
+            canonical = tuple(
+                canonical_json(item.model_dump(mode="python"))
+                for item in path
+            )
+        except (
+            IngestVerificationError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            ValidationError,
+        ) as error:
+            raise VerifierCommitError(
+                "retention proof path is no longer exact"
+            ) from error
+        target = path[-1]
+        target_binding = proof.target
+        if (
+            canonical != issued.path_canonical
+            or len(path)
+            != proof.predicted_generation - proof.base_generation
+            or any(
+                left.sequence >= right.sequence
+                for left, right in pairwise(path)
+            )
+            or target.sequence != target_binding.sequence
+            or target.event_id != target_binding.event_id
+            or target.content_sha256 != target_binding.content_sha256
+            or canonical_json(target.envelope)
+            != target_binding._canonical_envelope
+        ):
+            raise VerifierCommitError(
+                "retention proof path differs from its issued prefix"
+            )
+        consumed = owner._issued_proofs.pop(id(proof), None)
+        if consumed is not issued:
+            raise VerifierCommitError(
+                "retention proof consumption lost exact issuer authority"
+            )
+        return path
+
+    def _consume_retention_tombstone_proof(
+        self,
+        proof: SimulatedRetentionTombstone,
+    ) -> tuple[CoreEventV1, ...]:
+        return self._consume_retention_proof(
+            proof,
+            proof_type=SimulatedRetentionTombstone,
+            event_type="retention_tombstone",
+        )
+
+    def _consume_retention_blocked_proof(
+        self,
+        proof: SimulatedRetentionBlocked,
+    ) -> tuple[CoreEventV1, ...]:
+        return self._consume_retention_proof(
+            proof,
+            proof_type=SimulatedRetentionBlocked,
+            event_type="retention_blocked_priority_evidence",
+        )
+
     def _restricted_historical_replay(
         self,
         accepted_items: Sequence[tuple[CoreEventV1, object]],
@@ -2095,6 +2215,94 @@ class EnvelopeVerifier:
                 "live verifier changed during restricted historical replay"
             )
         return tuple(replayed)
+
+    def _restricted_historical_retention_replay(
+        self,
+        accepted_item: tuple[CoreEventV1, object],
+        request: RetentionTombstoneV2 | RetentionBlockedV1,
+    ) -> SimulatedEvent:
+        """Freshly reverify one exact accepted retention record."""
+        if (
+            not isinstance(accepted_item, tuple)
+            or len(accepted_item) != 2
+            or type(accepted_item[0]) is not CoreEventV1
+        ):
+            raise RetentionSimulationError(
+                "historical retention replay requires one exact item/ref pair"
+            )
+        if type(request) is RetentionTombstoneV2:
+            event_type = "retention_tombstone"
+            _normalized_tombstone, request_canonical = (
+                EnvelopeSimulation._normalize_retention_request(
+                    request,
+                    RetentionTombstoneV2,
+                )
+            )
+        elif type(request) is RetentionBlockedV1:
+            event_type = "retention_blocked_priority_evidence"
+            _normalized_blocked, request_canonical = (
+                EnvelopeSimulation._normalize_retention_request(
+                    request,
+                    RetentionBlockedV1,
+                )
+            )
+        else:
+            raise RetentionSimulationError(
+                "historical retention replay has the wrong request type"
+            )
+        item, evidence_ref = accepted_item
+        normalized, _outer_canonical = EnvelopeSimulation._normalize_item(
+            item
+        )
+        authority_object = self._authority
+        authority_before = self._repair_authority_snapshot()
+        stages_before = dict(self._staged)
+        authorizations_before = dict(self._authorizations)
+        transient_before = self._repair_transient_generation
+        bound_lifecycle_before = self._bound_lifecycle
+        lifecycle_before = self._repair_lifecycle_identity
+        owner_before = self._repair_owner_identity
+        accepted = authority_object.accepted.get(normalized.sequence)
+        canonical_envelope = canonical_json(normalized.envelope)
+        if (
+            accepted is None
+            or accepted.canonical != canonical_envelope
+            or accepted.evidence_ref != evidence_ref
+            or getattr(evidence_ref, "source_sequence", None)
+            != normalized.sequence
+            or getattr(evidence_ref, "event_id", None)
+            != normalized.event_id
+            or getattr(evidence_ref, "content_sha256", None)
+            != normalized.content_sha256
+        ):
+            raise RetentionSimulationError(
+                "historical retention record is outside exact accepted evidence"
+            )
+        simulation = self._new_control_simulation()
+        result = simulation.advance(normalized)
+        if (
+            result.is_retry is not True
+            or result.event_type != event_type
+            or result.evidence_priority != "protected"
+            or result._normalized_fields_canonical != request_canonical
+        ):
+            raise RetentionSimulationError(
+                "historical retention record differs from the exact request"
+            )
+        if (
+            self._authority is not authority_object
+            or self._repair_authority_snapshot() != authority_before
+            or self._staged != stages_before
+            or self._authorizations != authorizations_before
+            or self._repair_transient_generation != transient_before
+            or self._bound_lifecycle is not bound_lifecycle_before
+            or self._repair_lifecycle_identity is not lifecycle_before
+            or self._repair_owner_identity is not owner_before
+        ):
+            raise VerifierCommitError(
+                "live verifier changed during historical retention replay"
+            )
+        return result
 
     def accepted_ref(self, source_sequence: int) -> object | None:
         accepted = self._authority.accepted.get(source_sequence)
@@ -2385,6 +2593,7 @@ class EnvelopeSimulation:
         proof_type: type[_SimulatedControlProof],
         request_canonical: bytes,
         target: SimulatedEvent,
+        path_canonical: tuple[bytes, ...] | None = None,
     ) -> _SimulatedControlProof:
         added = len(self._accepted) - len(self._base_authority.accepted)
         predicted_generation = self._base_authority.generation + added
@@ -2396,6 +2605,11 @@ class EnvelopeSimulation:
             raise VerifierCommitError(
                 "control simulation generation arithmetic is invalid"
             )
+        path_sha256 = (
+            None
+            if path_canonical is None
+            else _control_path_sha256(path_canonical)
+        )
         proof = proof_type(
             base_authorization_ids=self._base_authorization_ids,
             base_authority=self._base_authority,
@@ -2404,6 +2618,7 @@ class EnvelopeSimulation:
             lifecycle_identity=self._lifecycle_identity,
             owner=self,
             owner_identity=self._identity,
+            path_sha256=path_sha256,
             predicted_generation=predicted_generation,
             request_canonical=request_canonical,
             target=target,
@@ -2413,6 +2628,8 @@ class EnvelopeSimulation:
         self._issued_proofs[id(proof)] = _IssuedControlProofBinding(
             proof=proof,
             target=target,
+            path_canonical=path_canonical,
+            path_sha256=path_sha256,
             factory_marker=proof._factory_marker,
             base_authority=proof._base_authority,
             base_authorization_ids=tuple(proof._base_authorization_ids),
@@ -2560,6 +2777,7 @@ class EnvelopeSimulation:
         accepted_before = dict(self._accepted)
         previous = self._fsm.last_sequence
         target: SimulatedEvent | None = None
+        prefix_canonical: list[bytes] = []
         try:
             for candidate in fetched:
                 normalized, candidate_canonical = self._normalize_item(candidate)
@@ -2573,6 +2791,7 @@ class EnvelopeSimulation:
                             "retention simulation path overshot its exact target"
                         )
                     result = self.advance(normalized)
+                    prefix_canonical.append(candidate_canonical)
                     if candidate_canonical == direct_canonical:
                         target = result
                     elif normalized.sequence == normalized_direct.sequence:
@@ -2600,6 +2819,7 @@ class EnvelopeSimulation:
             proof_type=proof_type,
             request_canonical=request_canonical,
             target=target,
+            path_canonical=tuple(prefix_canonical),
         )
 
     def verify_exact_authorization(

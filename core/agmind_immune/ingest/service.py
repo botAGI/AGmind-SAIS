@@ -20,11 +20,17 @@ from agmind_immune.contracts import (
     RetentionTombstoneV2,
 )
 from agmind_immune.coverage import CoverageAckBarrier, CoverageState
+from agmind_immune.evidence.retention import (
+    RetentionStateJournal,
+    RetentionStateV1,
+    RetentionTargetV1,
+)
 from agmind_immune.evidence.segments import (
     EvidencePriority,
     EvidenceRef,
     EvidenceStatus,
     SegmentStore,
+    _RetentionStateAuthority,
 )
 from agmind_immune.ingest.ack_journal import (
     AckDeliveryLease,
@@ -42,6 +48,7 @@ from agmind_immune.ingest.envelope import (
     EnvelopeVerifier,
     IngestVerificationError,
     PageDecodeError,
+    SimulatedEvent,
     SimulatedRetentionBlocked,
     SimulatedRetentionTombstone,
     VerifierCommitError,
@@ -54,6 +61,7 @@ _REPAIR_ACCEPTANCE_FACTORY = object()
 _DELIVERY_FACTORY = object()
 _REPAIR_DELIVERY_FACTORY = object()
 _RETENTION_PREFLIGHT_FACTORY = object()
+_RETENTION_DELIVERY_FACTORY = object()
 _COVERAGE_ADAPTER_FACTORY = object()
 _MAX_ERROR_BODY_BYTES = 4_096
 _MAX_REPAIR_DRAIN_EVENTS = 4_096
@@ -1249,7 +1257,10 @@ class DeliveryCoordinator:
         _factory: object,
     ) -> AsyncIterator[object]:
         if (
-            _factory is not _RETENTION_PREFLIGHT_FACTORY
+            (
+                _factory is not _RETENTION_PREFLIGHT_FACTORY
+                and _factory is not _RETENTION_DELIVERY_FACTORY
+            )
             or type(self) is not DeliveryCoordinator
             or self._repair_mode
         ):
@@ -1313,6 +1324,34 @@ class DeliveryCoordinator:
                     "retention preflight changed live authority",
                     primary,
                 )
+
+    def _require_retention_delivery(
+        self,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> None:
+        if (
+            _factory is not _RETENTION_DELIVERY_FACTORY
+            or type(self) is not DeliveryCoordinator
+            or self._repair_mode
+        ):
+            raise TypeError(
+                "retention target delivery requires its exact factory"
+            )
+        task = asyncio.current_task()
+        if (
+            task is None
+            or self._lock.locked() is not True
+            or self._lock._owner is not task
+            or self._retention_lock_owner is not task
+            or self._retention_lock_authority is None
+            or _lock_authority is not self._retention_lock_authority
+        ):
+            raise TypeError(
+                "retention target delivery requires its exact locked scope"
+            )
+        self._raise_if_unavailable()
 
     def _require_retention_preflight(
         self,
@@ -1823,6 +1862,644 @@ class DeliveryCoordinator:
                 "retention blocked preflight returned the wrong proof"
             )
         return proof
+
+    def _retention_journal_state(
+        self,
+        journal: RetentionStateJournal,
+    ) -> RetentionStateV1:
+        if type(journal) is not RetentionStateJournal:
+            raise TypeError(
+                "retention target delivery requires the exact journal type"
+            )
+        authority = journal._authority
+        if (
+            type(authority) is not _RetentionStateAuthority
+            or authority._store is not self._store
+            or authority._lifecycle_identity
+            is not self._store._lifecycle_identity
+            or self._store._retention_state_authority is not authority
+            or authority._retention_journal is not journal
+        ):
+            raise TypeError(
+                "retention target delivery requires the cached same-store journal"
+            )
+        try:
+            if authority._require() is not self._store:
+                raise DeliveryFatalError(
+                    "retention journal lost its exact store lifecycle"
+                )
+            journal._assert_consistent()
+            state = journal.state
+        except DeliveryFatalError as error:
+            raise self._latch(
+                "retention journal authority is unavailable",
+                error,
+            )
+        except Exception as error:  # noqa: BLE001 - journal authority boundary
+            raise self._latch(
+                "retention journal authority is unavailable",
+                error,
+            )
+        if type(state) is not RetentionStateV1:
+            raise self._latch(
+                "retention target delivery has no exact selected state"
+            )
+        if (
+            (
+                type(state.request) is RetentionTombstoneV2
+                and state.operation != "tombstone"
+            )
+            or (
+                type(state.request) is RetentionBlockedV1
+                and state.operation != "blocked"
+            )
+            or type(state.request)
+            not in {RetentionTombstoneV2, RetentionBlockedV1}
+        ):
+            raise self._latch(
+                "retention state request and operation differ"
+            )
+        return state
+
+    @staticmethod
+    def _retention_event_type(
+        request: RetentionTombstoneV2 | RetentionBlockedV1,
+    ) -> str:
+        if type(request) is RetentionTombstoneV2:
+            return "retention_tombstone"
+        if type(request) is RetentionBlockedV1:
+            return "retention_blocked_priority_evidence"
+        raise TypeError("retention target has the wrong exact request type")
+
+    def _exact_authenticated_retention_target(
+        self,
+        target: RetentionTargetV1,
+        request: RetentionTombstoneV2 | RetentionBlockedV1,
+    ) -> tuple[CoreEventV1, EvidenceRef]:
+        if type(target) is not RetentionTargetV1:
+            raise TypeError(
+                "retention evidence lookup requires the exact target type"
+            )
+        expected_event_type = self._retention_event_type(request)
+        expected_request = canonical_json(
+            request.model_dump(mode="python")
+        )
+        refs = self._authenticated_refs(
+            after=target.sequence - 1,
+            through=target.sequence,
+            limit=1,
+        )
+        if len(refs) != 1 or refs[0].source_sequence != target.sequence:
+            raise self._latch(
+                "exact retention target is absent from authenticated evidence"
+            )
+        ref = refs[0]
+        try:
+            record = self._store.resolve_authenticated_ref(ref)
+            item = decode_core_event(
+                canonical_json(
+                    {
+                        "sequence": target.sequence,
+                        "event_id": target.event_id,
+                        "content_sha256": target.content_sha256,
+                        "envelope": record.envelope,
+                    }
+                )
+            )
+            canonical_envelope = canonical_json(item.envelope)
+            normalized_fields = canonical_json(
+                item.envelope.get("normalized_fields")
+            )
+        except Exception as error:  # noqa: BLE001 - authenticated store boundary
+            raise self._latch(
+                "exact retention target evidence lookup failed",
+                error,
+            )
+        if (
+            ref.event_id != target.event_id
+            or ref.content_sha256 != target.content_sha256
+            or item.sequence != target.sequence
+            or item.event_id != target.event_id
+            or item.content_sha256 != target.content_sha256
+            or record.ref != ref
+            or record.canonical_envelope != canonical_envelope
+            or record.priority is not EvidencePriority.PROTECTED
+            or item.envelope.get("event_type") != expected_event_type
+            or normalized_fields != expected_request
+            or self._verifier.accepted_ref(target.sequence) != ref
+        ):
+            raise self._latch(
+                "authenticated evidence differs from the exact retention target"
+            )
+        return item, ref
+
+    def _accept_retention_item(
+        self,
+        item: CoreEventV1,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> EvidenceRef:
+        self._require_retention_delivery(
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        if type(item) is not CoreEventV1:
+            raise TypeError(
+                "retention target delivery accepts exact CoreEventV1 items only"
+            )
+        receipt = self._live_receipt()
+        try:
+            state_before = self._local_state(
+                apply_coverage_barrier=False
+            )
+            if state_before.pending is not None:
+                raise DeliveryRetryableError(
+                    "retention target delivery requires pending ACK recovery"
+                )
+            status_before = self._store.status()
+            authority_before = self._verifier._authority
+            generation_before = authority_before.generation
+            if (
+                type(status_before) is not EvidenceStatus
+                or not status_before.healthy
+                or status_before.evidence_head != state_before.evidence_head
+                or item.sequence <= status_before.evidence_head
+            ):
+                raise DeliveryFatalError(
+                    "retention item is outside the exact evidence head"
+                )
+            ref = self._acceptance.accept(item)
+            self._validate_acceptance_binding()
+            status_after = self._store.status()
+            authority_after = self._verifier._authority
+            accepted = authority_after.accepted.get(item.sequence)
+            record = self._store.resolve_authenticated_ref(ref)
+            item_envelope = canonical_json(item.envelope)
+            if (
+                type(ref) is not EvidenceRef
+                or type(status_after) is not EvidenceStatus
+                or not status_after.healthy
+                or status_after.evidence_head != item.sequence
+                or ref.source_sequence != item.sequence
+                or ref.event_id != item.event_id
+                or ref.content_sha256 != item.content_sha256
+                or authority_after is authority_before
+                or authority_after.generation != generation_before + 1
+                or accepted is None
+                or accepted.evidence_ref != ref
+                or accepted.canonical != item_envelope
+                or record.ref != ref
+                or record.canonical_envelope != item_envelope
+                or record.priority.value != accepted.evidence_priority
+            ):
+                raise DeliveryFatalError(
+                    "ordinary retention acceptance did not commit the exact item"
+                )
+            self._coverage_adapter.apply_live_accepted(ref, receipt)
+            coverage = self._coverage_adapter._coverage
+            coverage_snapshot = coverage._snapshot
+            state_after = self._local_state(
+                apply_coverage_barrier=False
+            )
+            if (
+                coverage._healthy is not True
+                or coverage._closed is not False
+                or coverage._evidence is not self._store
+                or coverage_snapshot.head_sequence != item.sequence
+                or coverage_snapshot.head_ref != ref
+                or state_after.pending is not None
+                or state_after.evidence_head != item.sequence
+            ):
+                raise DeliveryFatalError(
+                    "retention coverage did not commit the exact accepted item"
+                )
+            return ref
+        except DeliveryRetryableError:
+            raise
+        except DeliveryFatalError as error:
+            raise self._latch(
+                "retention evidence or coverage acceptance failed",
+                error,
+            )
+        except Exception as error:  # noqa: BLE001 - evidence boundary is fail-closed
+            raise self._latch(
+                "retention evidence or coverage acceptance failed",
+                error,
+            )
+
+    def _settle_retention_boundary(self) -> None:
+        try:
+            self._validate_acceptance_binding()
+            before = self._store.status()
+            if type(before) is not EvidenceStatus or not before.healthy:
+                raise DeliveryFatalError(
+                    "pre-settlement retention evidence status is unhealthy"
+                )
+            self._store.flush_security_boundary()
+            self._validate_acceptance_binding()
+            after = self._store.status()
+            if (
+                type(after) is not EvidenceStatus
+                or not after.healthy
+                or after.evidence_head != before.evidence_head
+                or after.acceptance_cursor != before.acceptance_cursor
+            ):
+                raise DeliveryFatalError(
+                    "retention settlement changed acceptance authority"
+                )
+        except Exception as error:  # noqa: BLE001 - evidence settlement boundary
+            raise self._latch(
+                "retention evidence settlement failed",
+                error,
+            )
+
+    def _require_retention_coverage(
+        self,
+        ref: EvidenceRef,
+        *,
+        allow_later: bool,
+    ) -> None:
+        coverage = self._coverage_adapter._coverage
+        snapshot = coverage._snapshot
+        status = self._store.status()
+        head_ref: EvidenceRef | None = None
+        if type(status) is EvidenceStatus and status.evidence_head > 0:
+            refs = self._authenticated_refs(
+                after=status.evidence_head - 1,
+                through=status.evidence_head,
+                limit=1,
+            )
+            if (
+                len(refs) == 1
+                and refs[0].source_sequence == status.evidence_head
+            ):
+                head_ref = refs[0]
+        if (
+            type(ref) is not EvidenceRef
+            or type(status) is not EvidenceStatus
+            or not status.healthy
+            or status.evidence_head < ref.source_sequence
+            or head_ref is None
+            or coverage._healthy is not True
+            or coverage._closed is not False
+            or coverage._evidence is not self._store
+            or coverage._lifecycle_identity
+            is not self._store._lifecycle_identity
+            or snapshot.head_sequence != status.evidence_head
+            or snapshot.head_ref != head_ref
+            or (
+                not allow_later
+                and (
+                    status.evidence_head != ref.source_sequence
+                    or head_ref != ref
+                )
+            )
+        ):
+            raise self._latch(
+                "retention target lacks exact same-store coverage"
+            )
+
+    def _advance_retention_evidence_appended(
+        self,
+        journal: RetentionStateJournal,
+        target: RetentionTargetV1,
+    ) -> None:
+        try:
+            journal.advance_evidence_appended(target)
+            advanced = self._retention_journal_state(journal)
+        except DeliveryFatalError:
+            raise
+        except Exception as error:  # noqa: BLE001 - journal CAS boundary
+            raise self._latch(
+                "retention evidence-appended publication is uncertain",
+                error,
+            )
+        if advanced.phase != "evidence_appended" or advanced.target != target:
+            raise self._latch(
+                "retention journal did not publish exact evidence authority"
+            )
+
+    @staticmethod
+    def _retention_ack_changed(
+        acknowledgements: AckJournal,
+        before: AckJournalSnapshot,
+        body_before: bytes | None,
+    ) -> bool:
+        try:
+            return (
+                acknowledgements.snapshot() != before
+                or acknowledgements.pending_request_body() != body_before
+            )
+        except BaseException:  # noqa: BLE001 - unreadable ACK authority changed
+            return True
+
+    async def _deliver_future_retention_target(
+        self,
+        journal: RetentionStateJournal,
+        state: RetentionStateV1,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> EvidenceRef:
+        self._require_retention_delivery(
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        request = state.request
+        body = canonical_json(request.model_dump(mode="python"))
+        if type(request) is RetentionTombstoneV2:
+            proof: SimulatedRetentionTombstone | SimulatedRetentionBlocked = (
+                await self._preflight_retention_tombstone(
+                    request,
+                    body,
+                    _factory=_RETENTION_PREFLIGHT_FACTORY,
+                    _lock_authority=_lock_authority,
+                )
+            )
+        elif type(request) is RetentionBlockedV1:
+            proof = await self._preflight_retention_blocked(
+                request,
+                body,
+                _factory=_RETENTION_PREFLIGHT_FACTORY,
+                _lock_authority=_lock_authority,
+            )
+        else:
+            raise TypeError(
+                "retention target delivery has the wrong request type"
+            )
+        simulated_target = proof.target
+        if type(simulated_target) is not SimulatedEvent:
+            raise self._latch(
+                "retention proof has no exact simulated target"
+            )
+        try:
+            target = RetentionTargetV1(
+                sequence=simulated_target.sequence,
+                event_id=simulated_target.event_id,
+                content_sha256=simulated_target.content_sha256,
+            )
+        except Exception as error:  # noqa: BLE001 - proof target boundary
+            raise self._latch(
+                "retention proof target identity is invalid",
+                error,
+            )
+        if state.target is not None and state.target != target:
+            raise self._latch(
+                "retention proof differs from the durable target"
+            )
+        try:
+            journal.bind_target(target)
+        except Exception as error:  # noqa: BLE001 - journal CAS boundary
+            raise self._latch(
+                "retention target publication is uncertain",
+                error,
+            )
+        rebound = self._retention_journal_state(journal)
+        if rebound.phase != "target_bound" or rebound.target != target:
+            raise self._latch(
+                "retention journal did not bind the exact proof target"
+            )
+        try:
+            if type(proof) is SimulatedRetentionTombstone:
+                path = self._verifier._consume_retention_tombstone_proof(
+                    proof
+                )
+            elif type(proof) is SimulatedRetentionBlocked:
+                path = self._verifier._consume_retention_blocked_proof(
+                    proof
+                )
+            else:
+                raise TypeError(
+                    "retention preflight returned the wrong proof type"
+                )
+        except (IngestVerificationError, VerifierCommitError) as error:
+            raise self._latch(
+                "retention proof consumption failed",
+                error,
+            )
+        if (
+            type(path) is not tuple
+            or not path
+            or any(type(item) is not CoreEventV1 for item in path)
+            or path[-1].sequence != target.sequence
+            or path[-1].event_id != target.event_id
+            or path[-1].content_sha256 != target.content_sha256
+            or canonical_json(path[-1].envelope)
+            != simulated_target._canonical_envelope
+        ):
+            raise self._latch(
+                "retention proof did not consume its exact prefix"
+            )
+        target_ref: EvidenceRef | None = None
+        for item in path:
+            target_ref = self._accept_retention_item(
+                item,
+                _factory=_RETENTION_DELIVERY_FACTORY,
+                _lock_authority=_lock_authority,
+            )
+        if target_ref is None or target_ref.source_sequence != target.sequence:
+            raise self._latch(
+                "retention prefix did not accept its exact target"
+            )
+        self._settle_retention_boundary()
+        stored_item, exact_ref = (
+            self._exact_authenticated_retention_target(
+                target,
+                request,
+            )
+        )
+        self._require_retention_coverage(exact_ref, allow_later=False)
+        status = self._store.status()
+        if (
+            exact_ref != target_ref
+            or canonical_json(stored_item.envelope)
+            != simulated_target._canonical_envelope
+            or type(status) is not EvidenceStatus
+            or status.evidence_head != target.sequence
+            or self._verifier._authority.generation
+            != proof.predicted_generation
+        ):
+            raise self._latch(
+                "retention target commit differs from its consumed proof"
+            )
+        self._advance_retention_evidence_appended(
+            journal,
+            target,
+        )
+        return exact_ref
+
+    def _deliver_historical_retention_target(
+        self,
+        journal: RetentionStateJournal,
+        state: RetentionStateV1,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> EvidenceRef:
+        self._require_retention_delivery(
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        target = state.target
+        if type(target) is not RetentionTargetV1:
+            raise self._latch(
+                "historical retention delivery lacks an exact target"
+            )
+        request = state.request
+        status_before = self._store.status()
+        authority_before = self._verifier._authority
+        coverage = self._coverage_adapter._coverage
+        coverage_before = coverage._snapshot
+        item, target_ref = self._exact_authenticated_retention_target(
+            target,
+            request,
+        )
+        self._require_retention_coverage(target_ref, allow_later=True)
+        try:
+            replayed = (
+                self._verifier._restricted_historical_retention_replay(
+                    (item, target_ref),
+                    request,
+                )
+            )
+        except (IngestVerificationError, VerifierCommitError) as error:
+            raise self._latch(
+                "historical retention replay failed",
+                error,
+            )
+        if (
+            type(replayed) is not SimulatedEvent
+            or replayed.sequence != target.sequence
+            or replayed.event_id != target.event_id
+            or replayed.content_sha256 != target.content_sha256
+            or replayed.event_type != self._retention_event_type(request)
+            or replayed.evidence_priority != "protected"
+            or replayed.is_retry is not True
+            or replayed._canonical_envelope
+            != canonical_json(item.envelope)
+            or replayed._normalized_fields_canonical
+            != canonical_json(request.model_dump(mode="python"))
+            or self._verifier._authority is not authority_before
+            or self._store.status() != status_before
+            or coverage._snapshot is not coverage_before
+        ):
+            raise self._latch(
+                "historical retention replay changed exact live authority"
+            )
+        self._settle_retention_boundary()
+        stored_item, settled_ref = (
+            self._exact_authenticated_retention_target(
+                target,
+                request,
+            )
+        )
+        self._require_retention_coverage(settled_ref, allow_later=True)
+        if (
+            settled_ref != target_ref
+            or canonical_json(stored_item.envelope)
+            != canonical_json(item.envelope)
+            or self._verifier._authority is not authority_before
+            or self._store.status() != status_before
+            or coverage._snapshot is not coverage_before
+        ):
+            raise self._latch(
+                "historical retention settlement changed live authority"
+            )
+        self._advance_retention_evidence_appended(
+            journal,
+            target,
+        )
+        return target_ref
+
+    async def _deliver_retention_target(
+        self,
+        journal: RetentionStateJournal,
+        *,
+        _factory: object,
+    ) -> EvidenceRef:
+        """Commit one selected retention target without touching ACK state."""
+        if (
+            _factory is not _RETENTION_DELIVERY_FACTORY
+            or type(self) is not DeliveryCoordinator
+            or self._repair_mode
+        ):
+            raise TypeError(
+                "retention target delivery requires its exact factory"
+            )
+        async with self._retention_preflight_scope(
+            _factory=_RETENTION_DELIVERY_FACTORY,
+        ) as lock_authority:
+            self._require_retention_delivery(
+                _factory=_factory,
+                _lock_authority=lock_authority,
+            )
+            state = self._retention_journal_state(journal)
+            ack_before = self._ack_journal.snapshot()
+            ack_body_before = self._ack_journal.pending_request_body()
+            local = self._local_state(apply_coverage_barrier=False)
+            if local.pending is not None:
+                raise DeliveryRetryableError(
+                    "retention target delivery requires pending ACK recovery"
+                )
+            try:
+                target = state.target
+                if (
+                    state.phase == "target_bound"
+                    and type(target) is RetentionTargetV1
+                    and target.sequence <= local.evidence_head
+                ):
+                    result = self._deliver_historical_retention_target(
+                        journal,
+                        state,
+                        _factory=_RETENTION_DELIVERY_FACTORY,
+                        _lock_authority=lock_authority,
+                    )
+                elif state.phase in {"selected", "target_bound"}:
+                    result = await self._deliver_future_retention_target(
+                        journal,
+                        state,
+                        _factory=_RETENTION_DELIVERY_FACTORY,
+                        _lock_authority=lock_authority,
+                    )
+                elif (
+                    state.phase == "evidence_appended"
+                    and type(target) is RetentionTargetV1
+                ):
+                    _item, result = (
+                        self._exact_authenticated_retention_target(
+                            target,
+                            state.request,
+                        )
+                    )
+                    self._require_retention_coverage(
+                        result,
+                        allow_later=True,
+                    )
+                else:
+                    raise self._latch(
+                        "retention state phase cannot deliver a target"
+                    )
+            except BaseException as primary:
+                if self._retention_ack_changed(
+                    self._ack_journal,
+                    ack_before,
+                    ack_body_before,
+                ):
+                    raise self._latch(
+                        "retention target delivery changed ACK authority",
+                        primary,
+                    )
+                raise
+            if self._retention_ack_changed(
+                self._ack_journal,
+                ack_before,
+                ack_body_before,
+            ):
+                raise self._latch(
+                    "retention target delivery changed ACK authority"
+                )
+            return result
 
     @staticmethod
     def _repair_target_bytes(expected: CoreEventV1) -> bytes:

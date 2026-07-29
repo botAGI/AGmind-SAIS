@@ -17,6 +17,8 @@ from agmind_immune.contracts import (
     RetentionTombstoneV2,
 )
 from agmind_immune.coverage import CoverageState
+from agmind_immune.evidence import retention as retention_module
+from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.segments import SegmentStore
 from agmind_immune.ingest import envelope as envelope_module
 from agmind_immune.ingest import service as service_module
@@ -84,6 +86,71 @@ def _blocked(
         blocked_bytes=2,
         reason="protected_evidence",
         current_chain_head_sha256="4" * 64,
+    )
+
+
+def _selected_retention_state(
+    request: RetentionTombstoneV2,
+) -> retention_module.RetentionStateV1:
+    first_segment_id = "00000001-0000-4000-8000-000000000001"
+    second_segment_id = "00000002-0000-4000-8000-000000000002"
+    return retention_module.RetentionStateV1.model_validate(
+        {
+            "schema_version": "agmind.retention-state.v1",
+            "operation": "tombstone",
+            "phase": "selected",
+            "request": request.model_dump(mode="python"),
+            "target": None,
+            "h0": request.current_chain_head_sha256,
+            "entries": [
+                {
+                    "manifest_sha256": "1" * 64,
+                    "segment_id": first_segment_id,
+                    "segment_relative_path": (
+                        "segments/2026-07-01/"
+                        f"00000000000000000001-{first_segment_id}.agseg"
+                    ),
+                    "segment_size_bytes": 8,
+                    "segment_sha256": "5" * 64,
+                    "original_device": 1,
+                    "original_inode": 11,
+                },
+                {
+                    "manifest_sha256": "2" * 64,
+                    "segment_id": second_segment_id,
+                    "segment_relative_path": (
+                        "segments/2026-07-01/"
+                        f"00000000000000000002-{second_segment_id}.agseg"
+                    ),
+                    "segment_size_bytes": 9,
+                    "segment_sha256": "6" * 64,
+                    "original_device": 1,
+                    "original_inode": 12,
+                },
+            ],
+            "selection_witness": {
+                "policy_version": "agmind-retention-v1",
+                "maximum_age_ns": 7 * 24 * 60 * 60 * 1_000_000_000,
+                "target_bytes": 5 * 1024**3,
+                "maximum_run_manifests": 128,
+                "removable_event_types": ["falco_connect"],
+                "decision_utc": "2026-07-29T12:00:00Z",
+                "clock_healthy": True,
+                "age_selection_enabled": True,
+                "uncertainty_ns": 0,
+                "routine_bytes": 17,
+                "protected_bytes": 0,
+                "total_bytes": 17,
+                "age_pressure": True,
+                "size_pressure": False,
+                "prior_index_count": 0,
+                "prior_index_through_sequence": 0,
+                "prior_index_sha256": hashlib.sha256(
+                    b"agmind.retention-prior-index.v1\0"
+                ).hexdigest(),
+            },
+        },
+        strict=True,
     )
 
 
@@ -259,6 +326,34 @@ def _bound_delivery(
     return delivery, store, acceptance.verifier, acknowledgements
 
 
+def _bound_retention_delivery(
+    path: Path,
+    transport: _RetentionTransport,
+    request: RetentionTombstoneV2,
+) -> tuple[
+    DeliveryCoordinator,
+    SegmentStore,
+    EnvelopeVerifier,
+    AckJournal,
+    retention_module.RetentionStateJournal,
+]:
+    delivery, store, verifier, acknowledgements = _bound_delivery(
+        path,
+        transport,
+    )
+    authority = store._open_retention_state_authority(
+        _factory=segments_module._RETENTION_STATE_AUTHORITY_FACTORY,
+    )
+    authority.publish_initial_retention_state(
+        retention_module.encode_retention_state(
+            _selected_retention_state(request)
+        )
+    )
+    journal = retention_module._open_retention_state_journal(store)
+    assert journal.state == _selected_retention_state(request)
+    return delivery, store, verifier, acknowledgements, journal
+
+
 class _OneChunk(httpx.AsyncByteStream):
     def __init__(self, body: bytes) -> None:
         self._body = body
@@ -420,6 +515,7 @@ def test_retention_simulation_excludes_valid_suffix_and_mints_exact_proof(
             (ordinary, direct, suffix),
         )
         validator = verifier._validate_retention_tombstone_proof
+        consumer = verifier._consume_retention_tombstone_proof
         proof_type = envelope_module.SimulatedRetentionTombstone
     else:
         proof = simulation.verify_exact_retention_blocked(
@@ -428,6 +524,7 @@ def test_retention_simulation_excludes_valid_suffix_and_mints_exact_proof(
             (ordinary, direct, suffix),
         )
         validator = verifier._validate_retention_blocked_proof
+        consumer = verifier._consume_retention_blocked_proof
         proof_type = envelope_module.SimulatedRetentionBlocked
 
     assert type(proof) is proof_type
@@ -509,6 +606,17 @@ def test_retention_simulation_excludes_valid_suffix_and_mints_exact_proof(
     )
     with pytest.raises(VerifierCommitError, match="foreign"):
         foreign_validator(proof)
+    issued = simulation._issued_proofs[id(proof)]
+    issued_path = issued.path_canonical
+    assert issued_path is not None
+    object.__setattr__(issued, "path_canonical", tuple(reversed(issued_path)))
+    with pytest.raises(VerifierCommitError, match="foreign"):
+        consumer(proof)
+    object.__setattr__(issued, "path_canonical", issued_path)
+    consumed = consumer(proof)
+    assert [item.sequence for item in consumed] == [2, 5]
+    with pytest.raises(VerifierCommitError, match="foreign"):
+        consumer(proof)
     assert verifier._authority is authority_before
     assert verifier._staged == stages_before
     assert verifier._authorizations == {}
@@ -1033,5 +1141,320 @@ async def test_retention_preflight_rejects_mutated_request_before_post(
             )
 
     assert transport.posts == []
+    await delivery.close()
+    store.close(flush=False)
+
+
+@pytest.mark.asyncio
+async def test_retention_target_delivery_uses_one_locked_ordinary_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = private_key(11)
+    request = _tombstone()
+    body = canonical_json(request.model_dump(mode="python"))
+    first = envelope_value(
+        key,
+        sequence=2,
+        normalized_fields={"kind": "first-intervening"},
+    )
+    second = envelope_value(
+        key,
+        sequence=3,
+        normalized_fields={"kind": "second-intervening"},
+    )
+    target = envelope_value(
+        key,
+        sequence=7,
+        event_type="retention_tombstone",
+        normalized_fields=request.model_dump(mode="python"),
+    )
+    suffix = envelope_value(
+        key,
+        sequence=8,
+        normalized_fields={"kind": "post-target-suffix"},
+    )
+    direct = _item(target)
+    transport = _RetentionTransport(
+        tombstone_direct=canonical_json(
+            direct.model_dump(mode="python")
+        ),
+        pages=[
+            _page(first, second, reserved_through=7),
+            _page(target, suffix),
+        ],
+    )
+    (
+        delivery,
+        store,
+        verifier,
+        acknowledgements,
+        journal,
+    ) = _bound_retention_delivery(tmp_path, transport, request)
+    acceptance_before = delivery.acceptance
+    lease_before = delivery._delivery_lease
+    ack_before = acknowledgements.snapshot()
+    ack_body_before = acknowledgements.pending_request_body()
+    epoch_before = delivery._lock._epoch
+    transaction_epoch: int | None = None
+    accepted: list[int] = []
+    covered: list[int] = []
+
+    def require_same_lock() -> None:
+        nonlocal transaction_epoch
+        task = asyncio.current_task()
+        assert task is not None
+        assert delivery._lock._owner is task
+        if transaction_epoch is None:
+            transaction_epoch = delivery._lock._epoch
+        assert delivery._lock._epoch == transaction_epoch
+
+    publish = transport.publish_retention_tombstone
+
+    async def publish_under_lock(canonical_body: bytes) -> bytes:
+        require_same_lock()
+        return await publish(canonical_body)
+
+    original_bind = retention_module.RetentionStateJournal.bind_target
+
+    def bind_target(
+        self: retention_module.RetentionStateJournal,
+        exact_target: retention_module.RetentionTargetV1,
+    ) -> None:
+        require_same_lock()
+        original_bind(self, exact_target)
+        assert self.state is not None
+        assert self.state.phase == "target_bound"
+
+    original_accept = AcceptanceCoordinator.accept
+
+    def accept_ordinary(
+        self: AcceptanceCoordinator,
+        item: CoreEventV1,
+    ) -> object:
+        assert self is acceptance_before
+        assert journal.state is not None
+        assert journal.state.phase == "target_bound"
+        require_same_lock()
+        accepted.append(item.sequence)
+        return original_accept(self, item)
+
+    original_coverage = (
+        service_module._CoverageDeliveryAdapter.apply_live_accepted
+    )
+
+    def apply_coverage(
+        self: object,
+        ref: object,
+        receipt_monotonic: float | None,
+    ) -> None:
+        original_coverage(self, ref, receipt_monotonic)
+        require_same_lock()
+        covered.append(ref.source_sequence)
+
+    original_advance = (
+        retention_module.RetentionStateJournal.advance_evidence_appended
+    )
+
+    def advance_evidence_appended(
+        self: retention_module.RetentionStateJournal,
+        exact_target: retention_module.RetentionTargetV1,
+    ) -> None:
+        assert store.status().evidence_head == 7
+        assert delivery._coverage_adapter._coverage._snapshot.head_sequence == 7
+        require_same_lock()
+        original_advance(self, exact_target)
+
+    monkeypatch.setattr(
+        transport,
+        "publish_retention_tombstone",
+        publish_under_lock,
+    )
+    monkeypatch.setattr(
+        retention_module.RetentionStateJournal,
+        "bind_target",
+        bind_target,
+    )
+    monkeypatch.setattr(
+        AcceptanceCoordinator,
+        "accept",
+        accept_ordinary,
+    )
+    monkeypatch.setattr(
+        service_module._CoverageDeliveryAdapter,
+        "apply_live_accepted",
+        apply_coverage,
+    )
+    monkeypatch.setattr(
+        retention_module.RetentionStateJournal,
+        "advance_evidence_appended",
+        advance_evidence_appended,
+    )
+
+    target_ref = await delivery._deliver_retention_target(
+        journal,
+        _factory=service_module._RETENTION_DELIVERY_FACTORY,
+    )
+
+    assert target_ref.source_sequence == 7
+    assert target_ref.event_id == direct.event_id
+    assert target_ref.content_sha256 == direct.content_sha256
+    assert store.resolve_authenticated_ref(target_ref).priority.value == "protected"
+    assert accepted == [2, 3, 7]
+    assert covered == accepted
+    assert transaction_epoch == epoch_before + 1
+    assert delivery._lock._epoch == epoch_before + 2
+    assert transport.posts == [("tombstone", body)]
+    assert transport.fetches == [(1, 6), (3, 4)]
+    assert delivery.acceptance is acceptance_before
+    assert delivery._delivery_lease is lease_before
+    assert acknowledgements._delivery_lease is lease_before
+    assert store.status().evidence_head == 7
+    assert verifier.accepted_ref(8) is None
+    assert delivery._coverage_adapter._coverage._snapshot.head_sequence == 7
+    assert journal.state is not None
+    assert journal.state.phase == "evidence_appended"
+    assert acknowledgements.snapshot() == ack_before
+    assert acknowledgements.pending_request_body() == ack_body_before
+    await delivery.close()
+    store.close(flush=False)
+
+
+@pytest.mark.asyncio
+async def test_retention_target_delivery_retries_pending_ack_before_post(
+    tmp_path: Path,
+) -> None:
+    key = private_key(11)
+    request = _tombstone()
+    transport = _RetentionTransport(tombstone_direct=b"must-not-post")
+    (
+        delivery,
+        store,
+        _verifier,
+        acknowledgements,
+        journal,
+    ) = _bound_retention_delivery(tmp_path, transport, request)
+    pending_item = _item(
+        envelope_value(
+            key,
+            sequence=2,
+            normalized_fields={"kind": "pending-before-retention"},
+        )
+    )
+    pending_ref = delivery.acceptance.accept(pending_item)
+    delivery._coverage_adapter.apply_live_accepted(pending_ref, None)
+    acknowledgements.record_pending(pending_ref)
+    ack_before = acknowledgements.snapshot()
+    ack_body_before = acknowledgements.pending_request_body()
+    durable_state_before = (tmp_path / "retention-state.json").read_bytes()
+
+    with pytest.raises(DeliveryRetryableError, match="pending ACK"):
+        await delivery._deliver_retention_target(
+            journal,
+            _factory=service_module._RETENTION_DELIVERY_FACTORY,
+        )
+
+    assert transport.posts == []
+    assert transport.fetches == []
+    assert acknowledgements.snapshot() == ack_before
+    assert acknowledgements.pending_request_body() == ack_body_before
+    assert (tmp_path / "retention-state.json").read_bytes() == (
+        durable_state_before
+    )
+    assert journal.state is not None
+    assert journal.state.phase == "selected"
+    await delivery.close()
+    store.close(flush=False)
+
+
+@pytest.mark.asyncio
+async def test_retention_target_delivery_advances_exact_historical_target_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = private_key(11)
+    request = _tombstone()
+    target_envelope = envelope_value(
+        key,
+        sequence=3,
+        event_type="retention_tombstone",
+        normalized_fields=request.model_dump(mode="python"),
+    )
+    target = _item(target_envelope)
+    transport = _RetentionTransport()
+    (
+        delivery,
+        store,
+        verifier,
+        acknowledgements,
+        journal,
+    ) = _bound_retention_delivery(tmp_path, transport, request)
+    for item in (
+        _item(
+            envelope_value(
+                key,
+                sequence=2,
+                normalized_fields={"kind": "historical-prefix"},
+            )
+        ),
+        target,
+        _item(
+            envelope_value(
+                key,
+                sequence=4,
+                normalized_fields={"kind": "historical-suffix"},
+            )
+        ),
+    ):
+        ref = delivery.acceptance.accept(item)
+        delivery._coverage_adapter.apply_live_accepted(ref, None)
+    store.flush_security_boundary()
+    exact_target = retention_module.RetentionTargetV1(
+        sequence=target.sequence,
+        event_id=target.event_id,
+        content_sha256=target.content_sha256,
+    )
+    journal.bind_target(exact_target)
+    status_before = store.status()
+    authority_before = verifier._authority
+    ack_before = acknowledgements.snapshot()
+
+    def reject_accept(_self: object, _item: object) -> object:
+        raise AssertionError("historical retention target was reaccepted")
+
+    def reject_coverage(
+        _self: object,
+        _ref: object,
+        _receipt_monotonic: float | None,
+    ) -> None:
+        raise AssertionError("historical retention coverage was reapplied")
+
+    monkeypatch.setattr(
+        AcceptanceCoordinator,
+        "accept",
+        reject_accept,
+    )
+    monkeypatch.setattr(
+        service_module._CoverageDeliveryAdapter,
+        "apply_live_accepted",
+        reject_coverage,
+    )
+
+    target_ref = await delivery._deliver_retention_target(
+        journal,
+        _factory=service_module._RETENTION_DELIVERY_FACTORY,
+    )
+
+    assert target_ref.source_sequence == 3
+    assert target_ref.event_id == target.event_id
+    assert target_ref.content_sha256 == target.content_sha256
+    assert transport.posts == []
+    assert transport.fetches == []
+    assert store.status() == status_before
+    assert verifier._authority is authority_before
+    assert delivery._coverage_adapter._coverage._snapshot.head_sequence == 4
+    assert acknowledgements.snapshot() == ack_before
+    assert journal.state is not None
+    assert journal.state.phase == "evidence_appended"
     await delivery.close()
     store.close(flush=False)
