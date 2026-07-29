@@ -207,6 +207,65 @@ def test_ack_journal_recovers_exact_idempotent_pending_and_confirmed_state(
     recovered_store.close()
 
 
+@pytest.mark.parametrize("failure_point", ["recovery", "close"])
+def test_ack_journal_wrapped_commitment_io_remains_restart_only(
+    tmp_path: Path,
+    failure_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / failure_point
+    _coordinator, store, first, second = _two_refs(path)
+    journal = AckJournal.create_new(store)
+    journal.record_pending(first)
+    journal.record_confirmed(first)
+    journal.record_pending(second)
+
+    if failure_point == "recovery":
+        journal.close()
+        store.close()
+        _recovered_coordinator, uncertain_store = _reopen_system(path)
+    else:
+        uncertain_store = store
+
+    read_regular = segments_module._read_regular_at
+
+    def fail_commitment_read(
+        parent_descriptor: int,
+        name: str,
+        display_path: Path,
+        maximum: int,
+    ) -> bytes:
+        if name == "ack-commitment.json":
+            raise OSError(f"injected wrapped commitment {failure_point} I/O")
+        return read_regular(parent_descriptor, name, display_path, maximum)
+
+    monkeypatch.setattr(
+        segments_module,
+        "_read_regular_at",
+        fail_commitment_read,
+    )
+    with pytest.raises(Exception) as raised:
+        if failure_point == "recovery":
+            AckJournal.open_and_recover(uncertain_store)
+        else:
+            journal.close()
+    uncertain_store.close(flush=False)
+
+    assert isinstance(raised.value, OSError)
+    assert f"wrapped commitment {failure_point}" in str(raised.value)
+    assert not (path / "health.json").exists()
+
+    monkeypatch.setattr(segments_module, "_read_regular_at", read_regular)
+    _clean_coordinator, clean_store = _reopen_system(path)
+    recovered = AckJournal.open_and_recover(clean_store)
+    snapshot = recovered.snapshot()
+    assert snapshot.healthy is True
+    assert snapshot.confirmed == ack_journal_module.AckIdentity.from_ref(first)
+    assert snapshot.pending == ack_journal_module.AckIdentity.from_ref(second)
+    assert not (path / "health.json").exists()
+    clean_store.close()
+
+
 @pytest.mark.parametrize(
     "case",
     [

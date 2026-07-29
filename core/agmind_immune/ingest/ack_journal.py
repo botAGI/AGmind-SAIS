@@ -347,6 +347,16 @@ class AckJournal:
         except _AckLifecycleIoUncertain as error:
             journal._healthy = False
             primary = _primary_io_error(error)
+            authenticated_digest = (
+                None
+                if journal._authenticated_hasher is None
+                else journal._authenticated_hasher.digest()
+            )
+            journal._attempt_io_uncertain(
+                primary,
+                journal._authenticated_stat,
+                authenticated_digest,
+            )
             journal._close_after_failed_open(primary)
             raise primary from error
         except _AckLifecycleCorrupt as error:
@@ -1127,6 +1137,25 @@ class AckJournal:
                 f"{type(error).__name__}: {error}"
             )
 
+    def _attempt_io_uncertain(
+        self,
+        primary: BaseException,
+        authenticated: os.stat_result | None,
+        authenticated_digest: bytes | None,
+    ) -> None:
+        try:
+            self._store._mark_ack_io_uncertain(
+                self,
+                self._lifecycle_identity,
+                authenticated,
+                authenticated_digest,
+            )
+        except Exception as error:  # noqa: BLE001
+            primary.add_note(
+                "secondary ACK I/O-uncertainty latch failure: "
+                f"{type(error).__name__}: {error}"
+            )
+
     def _close_resources(self) -> list[Exception]:
         cleanup_errors: list[Exception] = []
         if self._descriptor >= 0:
@@ -1184,6 +1213,16 @@ class AckJournal:
                     authenticated,
                     self._authenticated_digest(),
                 )
+            except _AckLifecycleIoUncertain as error:
+                self._healthy = False
+                primary = _primary_io_error(error)
+                self._attempt_io_uncertain(
+                    primary,
+                    authenticated,
+                    self._authenticated_digest(),
+                )
+                self._close_after_failed_open(primary)
+                raise primary from error
             except _AckLifecycleCorrupt as error:
                 corrupt_error = AckJournalCorrupt(str(error))
                 self._healthy = False

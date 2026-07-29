@@ -1130,6 +1130,7 @@ class SegmentStore:
             "initialized",
             "append_uncertain",
             "commitment_uncertain",
+            "io_uncertain",
         ] = "unknown"
         self._ack_journal_operation: Literal["create", "recover"] | None = None
         self._ack_journal_identity: _FileIdentity | None = None
@@ -1843,6 +1844,50 @@ class SegmentStore:
             )
         self._ack_journal_state = "commitment_uncertain"
 
+    def _mark_ack_io_uncertain(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result | None,
+        authenticated_digest: bytes | None,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_state
+            not in {
+                "recovering",
+                "initialization_uncertain",
+                "initialized",
+                "io_uncertain",
+            }
+        ):
+            raise _AckLifecycleStateError(
+                "ACK I/O uncertainty has the wrong lifecycle"
+            )
+        if (authenticated is None) != (authenticated_digest is None):
+            raise _AckLifecycleCorrupt(
+                "ACK I/O uncertainty has an incomplete content anchor"
+            )
+        if authenticated is not None and authenticated_digest is not None:
+            retained_identity = _file_identity(authenticated)
+            expected_identity = self._ack_journal_identity
+            if (
+                len(authenticated_digest) != hashlib.sha256().digest_size
+                or expected_identity is None
+                or not self._same_ack_journal_inode(
+                    retained_identity,
+                    expected_identity,
+                )
+            ):
+                raise _AckLifecycleCorrupt(
+                    "ACK I/O uncertainty has an invalid content anchor"
+                )
+            self._ack_journal_identity = retained_identity
+            self._ack_journal_digest = authenticated_digest
+        if self._ack_journal_state != "initialization_uncertain":
+            self._ack_journal_state = "io_uncertain"
+
     def _acquire_ack_journal(
         self,
         owner: object,
@@ -1861,7 +1906,11 @@ class SegmentStore:
             raise _AckLifecycleStateError(
                 "ACK-journal initialization is uncertain until store restart"
             )
-        if state in {"append_uncertain", "commitment_uncertain"}:
+        if state in {
+            "append_uncertain",
+            "commitment_uncertain",
+            "io_uncertain",
+        }:
             raise _AckLifecycleStateError(
                 "ACK authority publication is uncertain until store restart"
             )
@@ -2431,6 +2480,7 @@ class SegmentStore:
             "initialized",
             "append_uncertain",
             "commitment_uncertain",
+            "io_uncertain",
         }:
             return
         try:
@@ -2459,12 +2509,13 @@ class SegmentStore:
                 "initialized",
                 "append_uncertain",
                 "commitment_uncertain",
+                "io_uncertain",
             }
             and expected_identity is not None
         ):
             expected_digest = self._ack_journal_digest
             if expected_digest is None:
-                content_changed = True
+                content_changed = state != "io_uncertain"
             else:
                 try:
                     hashed_identity, actual_digest = (
@@ -2489,6 +2540,13 @@ class SegmentStore:
                 self._validate_ack_commitment_binding()
             except (_AckLifecycleCorrupt, _AckLifecycleIoUncertain):
                 commitment_changed = True
+        elif state == "io_uncertain":
+            try:
+                self._validate_ack_commitment_binding()
+            except _AckLifecycleCorrupt:
+                commitment_changed = True
+            except _AckLifecycleIoUncertain:
+                commitment_changed = False
         elif state == "commitment_uncertain":
             expected_commitment = self._ack_commitment
             try:
