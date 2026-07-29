@@ -7,12 +7,14 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import re
 import stat
 import sys
 import time
 import uuid
+from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -80,6 +82,12 @@ _ROOT_TEMP_NAME = re.compile(rf"^\.chain-head\.json\.{_UUID4_TEXT}\.tmp$")
 _HEALTH_FINAL_TEMP_NAME = re.compile(
     rf"^\.health\.json\.{_UUID4_TEXT}\.tmp$"
 )
+_ACK_COMMITMENT_NAME = "ack-commitment.json"
+_ACK_COMMITMENT_TEMP_NAME = re.compile(
+    rf"^\.ack-commitment\.json\.{_UUID4_TEXT}\.tmp$"
+)
+_MAX_ACK_COMMITMENT_BYTES = 4096
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _UTC_TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?Z$"
@@ -116,6 +124,18 @@ class EvidenceCorrupt(EvidenceStoreError):
 
 class EvidenceReadOnly(EvidenceStoreError):
     """A persistent health marker prevents evidence mutation."""
+
+
+class _AckAuthorityError(EvidenceStoreError):
+    """An ACK identity is not the next authenticated contiguous evidence ref."""
+
+
+class _AckLifecycleStateError(EvidenceStoreError):
+    """The requested ACK-journal operation is illegal in this store lifecycle."""
+
+
+class _AckLifecycleCorrupt(EvidenceStoreError):
+    """An expected ACK-journal artifact disappeared or was substituted."""
 
 
 class TornTailRepairRequired(EvidenceStoreError):
@@ -226,6 +246,98 @@ class _EvidenceHealthIntentV1(ContractModel):
     schema_version: Literal["agmind.evidence-health-intent.v1"]
     mode: Literal["read_only_pending"]
     reason: Literal["segment_corrupt", "evidence_conflict"]
+
+
+class _AckCommitmentIdentityV1(ContractModel):
+    sequence: int = Field(ge=1, le=MAX_UINT64)
+    event_id: str
+    content_sha256: str
+
+    @field_validator("event_id")
+    @classmethod
+    def event_id_is_exact(cls, value: str) -> str:
+        if not _EVENT.fullmatch(value):
+            raise ValueError("ACK commitment event_id is invalid")
+        return value
+
+    @field_validator("content_sha256")
+    @classmethod
+    def content_hash_is_exact(cls, value: str) -> str:
+        if not _HEX64.fullmatch(value):
+            raise ValueError("ACK commitment content hash is invalid")
+        return value
+
+
+class _AckCommitmentV1(ContractModel):
+    schema_version: Literal["agmind.core-ack-commitment.v1"]
+    phase: Literal["initializing", "ready"]
+    generation: int = Field(ge=0, le=MAX_UINT64)
+    confirmed: _AckCommitmentIdentityV1 | None
+    journal_prefix_size: int = Field(ge=0, le=MAX_UINT64)
+    journal_prefix_sha256: str
+
+    @field_validator("journal_prefix_sha256")
+    @classmethod
+    def prefix_hash_is_exact(cls, value: str) -> str:
+        if not _HEX64.fullmatch(value):
+            raise ValueError("ACK commitment prefix hash is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def state_is_coherent(self) -> _AckCommitmentV1:
+        genesis = (
+            self.generation == 0
+            and self.confirmed is None
+            and self.journal_prefix_size == 0
+            and self.journal_prefix_sha256 == _EMPTY_SHA256
+        )
+        if self.phase == "initializing":
+            if not genesis:
+                raise ValueError("initializing ACK commitment must be exact genesis")
+        elif not genesis and (
+            self.generation == 0
+            or self.confirmed is None
+            or self.journal_prefix_size == 0
+        ):
+            raise ValueError("ready ACK commitment state is incoherent")
+        return self
+
+
+@dataclass(frozen=True)
+class _AckCommitmentRecoveryView:
+    commitment: _AckCommitmentV1 | None
+    journal_present: bool
+    temporary_name: str | None
+
+
+def _canonical_ack_commitment(commitment: _AckCommitmentV1) -> bytes:
+    return canonical_json(commitment.model_dump(exclude_none=False))
+
+
+def _decode_ack_commitment(raw: bytes) -> _AckCommitmentV1:
+    if not raw or len(raw) > _MAX_ACK_COMMITMENT_BYTES:
+        raise ValueError("ACK commitment exceeds its explicit byte limit")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate ACK commitment property: {key}")
+            value[key] = item
+        return value
+
+    def reject_number(value: str) -> object:
+        raise ValueError(f"invalid ACK commitment number: {value}")
+
+    value = json.loads(
+        raw.decode("utf-8", "strict"),
+        object_pairs_hook=unique_object,
+        parse_float=reject_number,
+        parse_constant=reject_number,
+    )
+    if not isinstance(value, dict):
+        raise TypeError("ACK commitment must be one JSON object")
+    return _AckCommitmentV1.model_validate(value)
 
 
 @dataclass(frozen=True)
@@ -857,7 +969,10 @@ def _atomic_replace_at(
     name: str,
     display_path: Path,
     raw: bytes,
+    *,
+    step_hook: Callable[[str], None] | None = None,
 ) -> None:
+    hook = step_hook or (lambda _step: None)
     temporary_name = f".{name}.{uuid.uuid4()}.tmp"
     expected_sha256 = hashlib.sha256(raw).hexdigest()
     descriptor = -1
@@ -867,6 +982,7 @@ def _atomic_replace_at(
             temporary_name,
             raw,
         )
+        hook("commitment_temp_fsync")
         with _post_authentication_namespace(display_path):
             _bind_held_source(
                 parent_descriptor,
@@ -881,6 +997,7 @@ def _atomic_replace_at(
                 src_dir_fd=parent_descriptor,
                 dst_dir_fd=parent_descriptor,
             )
+            hook("commitment_atomic_replace")
             _validate_published_from_held(
                 parent_descriptor,
                 name,
@@ -890,6 +1007,7 @@ def _atomic_replace_at(
                 expected_sha256=expected_sha256,
             )
             os.fsync(parent_descriptor)
+            hook("commitment_directory_fsync")
     except BaseException:
         _cleanup_private_publication(
             parent_descriptor,
@@ -978,6 +1096,8 @@ class SegmentStore:
         self._chain_head: SegmentChainHeadV1 | None = None
         self._records: list[StoredEvidenceRecord] = []
         self._index: dict[tuple[str, int], tuple[bytes, EvidenceRef]] = {}
+        self._record_positions: dict[tuple[str, int], int] = {}
+        self._sequences_by_host: dict[str, list[int]] = {}
         self._last_sequence_by_host: dict[str, int] = {}
         self._read_only_reason: str | None = None
         self._append_uncertain = False
@@ -986,6 +1106,26 @@ class SegmentStore:
         self._lifecycle_identity = object()
         self._bound_verifier: EnvelopeVerifier | None = None
         self._authority_state: Literal["unbound", "recovering", "ready"] = "unbound"
+        self._ack_journal_owner: object | None = None
+        self._ack_journal_state: Literal[
+            "unknown",
+            "fresh",
+            "present",
+            "bootstrap",
+            "creating",
+            "recovering",
+            "initialization_uncertain",
+            "initialized",
+            "append_uncertain",
+            "commitment_uncertain",
+        ] = "unknown"
+        self._ack_journal_operation: Literal["create", "recover"] | None = None
+        self._ack_journal_identity: _FileIdentity | None = None
+        self._ack_journal_digest: bytes | None = None
+        self._ack_commitment: _AckCommitmentV1 | None = None
+        self._ack_commitment_raw: bytes | None = None
+        self._ack_commitment_identity: _FileIdentity | None = None
+        self._ack_commitment_temporary: str | None = None
         self.fail_next_append: BaseException | None = None
         self._segments_path = root / "segments"
         self._manifests_path = root / "manifests"
@@ -1058,6 +1198,915 @@ class SegmentStore:
     @property
     def read_only_reason(self) -> str | None:
         return self._read_only_reason
+
+    def _require_authenticated_recovered(self) -> EnvelopeVerifier:
+        if self._closed:
+            raise EvidenceStoreError("evidence store is closed")
+        verifier = self._bound_verifier
+        if verifier is None or self._authority_state != "ready":
+            raise EvidenceSealError(
+                "authenticated evidence is unavailable before verifier recovery"
+            )
+        return verifier
+
+    def _require_ack_mutation_ready(self) -> EnvelopeVerifier:
+        verifier = self._require_authenticated_recovered()
+        if self._read_only_reason is not None:
+            raise EvidenceReadOnly(
+                f"evidence root is read-only: {self._read_only_reason}"
+            )
+        if self._append_uncertain or self._pending_durable_commit is not None:
+            raise EvidenceReadOnly("evidence durability is not settled")
+        return verifier
+
+    @property
+    def acceptance_cursor(self) -> int:
+        """Highest source cursor made contiguous by signed-or-covered evidence."""
+        verifier = self._require_authenticated_recovered()
+        holes = verifier.fsm.unresolved_holes
+        return holes[0][0] - 1 if holes else verifier.fsm.last_sequence
+
+    def resolve_authenticated_ref(self, ref: EvidenceRef) -> StoredEvidenceRecord:
+        """Resolve one complete ref only after verifier-authenticated recovery."""
+        verifier = self._require_authenticated_recovered()
+        key = (verifier.fsm.host_id, ref.source_sequence)
+        indexed = self._index.get(key)
+        if (
+            indexed is None
+            or indexed[1] != ref
+            or verifier.accepted_ref(ref.source_sequence) != ref
+        ):
+            raise _AckAuthorityError(
+                "ACK ref does not match one complete authenticated evidence ref"
+            )
+        position = self._record_positions.get(key)
+        if position is None:
+            raise EvidenceCorrupt("authenticated evidence index has no record position")
+        record = self._records[position]
+        if record.ref != ref:
+            raise EvidenceCorrupt("authenticated evidence position changed")
+        return StoredEvidenceRecord(
+            envelope=copy.deepcopy(record.envelope),
+            canonical_envelope=record.canonical_envelope,
+            priority=record.priority,
+            accepted_at=record.accepted_at,
+            ref=record.ref,
+        )
+
+    def iter_authenticated_records(
+        self,
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> Iterator[StoredEvidenceRecord]:
+        """Iterate authenticated records in evidence order within explicit bounds."""
+        verifier = self._require_authenticated_recovered()
+        if not 0 <= after <= MAX_UINT64:
+            raise ValueError("authenticated evidence lower bound is invalid")
+        if through is not None and not 0 <= through <= MAX_UINT64:
+            raise ValueError("authenticated evidence upper bound is invalid")
+        host_id = verifier.fsm.host_id
+        sequences = self._sequences_by_host.get(host_id, [])
+        start = bisect_right(sequences, after)
+        stop = len(sequences) if through is None else bisect_right(sequences, through)
+        for position in range(start, stop):
+            sequence = sequences[position]
+            indexed = self._index.get((host_id, sequence))
+            if indexed is None:
+                raise EvidenceCorrupt("authenticated evidence sequence index changed")
+            yield self.resolve_authenticated_ref(indexed[1])
+
+    def authenticated_refs(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        limit: int,
+    ) -> tuple[EvidenceRef, ...]:
+        """Return one mutation-safe bounded batch of exact committed refs."""
+        verifier = self._require_ack_mutation_ready()
+        if (
+            isinstance(after_sequence, bool)
+            or not isinstance(after_sequence, int)
+            or not 0 <= after_sequence <= MAX_UINT64
+            or isinstance(through_sequence, bool)
+            or not isinstance(through_sequence, int)
+            or not 0 <= through_sequence <= MAX_UINT64
+            or through_sequence < after_sequence
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("authenticated ref bounds are invalid")
+
+        host_id = verifier.fsm.host_id
+        sequences = self._sequences_by_host.get(host_id, [])
+        start = bisect_right(sequences, after_sequence)
+        stop = bisect_right(sequences, through_sequence)
+        refs: list[EvidenceRef] = []
+        previous = after_sequence
+        for position in range(start, stop):
+            sequence = sequences[position]
+            if sequence <= previous:
+                raise EvidenceCorrupt(
+                    "authenticated evidence refs are not strictly ascending"
+                )
+            indexed = self._index.get((host_id, sequence))
+            if indexed is None:
+                raise EvidenceCorrupt(
+                    "authenticated evidence sequence index changed"
+                )
+            ref = indexed[1]
+            self.resolve_authenticated_ref(ref)
+            refs.append(ref)
+            previous = sequence
+            if len(refs) == limit:
+                break
+        return tuple(refs)
+
+    def _ack_journal_artifact_identity(self) -> _FileIdentity | None:
+        name = "ack-journal.agf"
+        try:
+            if _entry_stat_at(self._root_descriptor, name) is None:
+                return None
+            return _file_identity(
+                _regular_stat_at(
+                    self._root_descriptor,
+                    name,
+                    self.root / name,
+                )
+            )
+        except (EvidenceCorrupt, OSError) as error:
+            raise _AckLifecycleCorrupt(
+                "ACK-journal root artifact is unsafe or unstable"
+            ) from error
+
+    def _ack_journal_prefix_digest(
+        self,
+        prefix_size: int,
+    ) -> tuple[_FileIdentity, bytes]:
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                "ack-journal.agf",
+                flags,
+                dir_fd=self._root_descriptor,
+            )
+        except OSError as error:
+            raise _AckLifecycleCorrupt(
+                "ACK-journal authority disappeared during content binding"
+            ) from error
+        primary_error: BaseException | None = None
+        try:
+            try:
+                opened_identity = _file_identity(os.fstat(descriptor))
+                published_identity = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        "ack-journal.agf",
+                        self.root / "ack-journal.agf",
+                    )
+                )
+                if (
+                    opened_identity != published_identity
+                    or opened_identity.size < prefix_size
+                ):
+                    raise _AckLifecycleCorrupt(
+                        "ACK-journal prefix identity changed"
+                    )
+                digest = hashlib.sha256()
+                offset = 0
+                while offset < prefix_size:
+                    chunk = os.pread(
+                        descriptor,
+                        min(1024 * 1024, prefix_size - offset),
+                        offset,
+                    )
+                    if not chunk:
+                        raise _AckLifecycleCorrupt(
+                            "ACK-journal prefix shortened during hashing"
+                        )
+                    digest.update(chunk)
+                    offset += len(chunk)
+                after_identity = _file_identity(os.fstat(descriptor))
+                published_after = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        "ack-journal.agf",
+                        self.root / "ack-journal.agf",
+                    )
+                )
+                if (
+                    after_identity != opened_identity
+                    or published_after != opened_identity
+                ):
+                    raise _AckLifecycleCorrupt(
+                        "ACK-journal identity changed during prefix hashing"
+                    )
+                return opened_identity, digest.digest()
+            except (EvidenceCorrupt, OSError) as error:
+                raise _AckLifecycleCorrupt(
+                    "ACK-journal prefix is unsafe or unstable"
+                ) from error
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                if primary_error is None:
+                    raise _AckLifecycleCorrupt(
+                        "ACK-journal prefix descriptor close became uncertain"
+                    ) from close_error
+                primary_error.add_note(
+                    "secondary ACK-journal prefix descriptor close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+
+    @staticmethod
+    def _same_ack_journal_inode(
+        actual: _FileIdentity,
+        expected: _FileIdentity,
+    ) -> bool:
+        return (
+            actual.device == expected.device
+            and actual.inode == expected.inode
+        )
+
+    @staticmethod
+    def _ack_genesis_commitment(
+        phase: Literal["initializing", "ready"],
+    ) -> _AckCommitmentV1:
+        return _AckCommitmentV1(
+            schema_version="agmind.core-ack-commitment.v1",
+            phase=phase,
+            generation=0,
+            confirmed=None,
+            journal_prefix_size=0,
+            journal_prefix_sha256=_EMPTY_SHA256,
+        )
+
+    def _read_ack_commitment(
+        self,
+    ) -> tuple[_AckCommitmentV1, bytes, _FileIdentity]:
+        try:
+            raw = _read_regular_at(
+                self._root_descriptor,
+                _ACK_COMMITMENT_NAME,
+                self.root / _ACK_COMMITMENT_NAME,
+                _MAX_ACK_COMMITMENT_BYTES,
+            )
+            commitment = _decode_ack_commitment(raw)
+            if raw != _canonical_ack_commitment(commitment):
+                raise EvidenceCorrupt("ACK commitment is not canonical JSON")
+            identity = _file_identity(
+                _regular_stat_at(
+                    self._root_descriptor,
+                    _ACK_COMMITMENT_NAME,
+                    self.root / _ACK_COMMITMENT_NAME,
+                )
+            )
+            return commitment, raw, identity
+        except (
+            EvidenceCorrupt,
+            OSError,
+            RecursionError,
+            TypeError,
+            ValueError,
+            ValidationError,
+        ) as error:
+            raise _AckLifecycleCorrupt(
+                "ACK commitment artifact is invalid or unstable"
+            ) from error
+
+    def _rebind_ack_commitment(
+        self,
+        *,
+        expected: _AckCommitmentV1 | None = None,
+    ) -> _AckCommitmentV1:
+        commitment, raw, identity = self._read_ack_commitment()
+        if expected is not None and commitment != expected:
+            raise _AckLifecycleCorrupt(
+                "published ACK commitment differs from the requested state"
+            )
+        self._ack_commitment = commitment
+        self._ack_commitment_raw = raw
+        self._ack_commitment_identity = identity
+        return commitment
+
+    def _validate_ack_commitment_binding(self) -> _AckCommitmentV1:
+        expected = self._ack_commitment
+        expected_raw = self._ack_commitment_raw
+        expected_identity = self._ack_commitment_identity
+        if (
+            expected is None
+            or expected_raw is None
+            or expected_identity is None
+        ):
+            raise _AckLifecycleCorrupt("ACK commitment binding is absent")
+        actual, raw, identity = self._read_ack_commitment()
+        if (
+            actual != expected
+            or raw != expected_raw
+            or identity != expected_identity
+        ):
+            raise _AckLifecycleCorrupt(
+                "ACK commitment changed outside its durable publisher"
+            )
+        return actual
+
+    def _ack_commitment_recovery_view(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> _AckCommitmentRecoveryView:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_state
+            not in {
+                "creating",
+                "recovering",
+                "initialization_uncertain",
+                "initialized",
+            }
+        ):
+            raise _AckLifecycleStateError(
+                "ACK commitment recovery has the wrong lifecycle"
+            )
+        return _AckCommitmentRecoveryView(
+            commitment=(
+                None
+                if self._ack_commitment is None
+                else self._ack_commitment.model_copy(deep=True)
+            ),
+            journal_present=self._ack_journal_identity is not None,
+            temporary_name=self._ack_commitment_temporary,
+        )
+
+    def _remove_ack_commitment_temporary(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_state
+            not in {
+                "creating",
+                "recovering",
+                "initialization_uncertain",
+                "initialized",
+            }
+        ):
+            raise _AckLifecycleStateError(
+                "ACK commitment temporary cleanup has the wrong lifecycle"
+            )
+        temporary = self._ack_commitment_temporary
+        if temporary is None:
+            return
+        try:
+            os.unlink(temporary, dir_fd=self._root_descriptor)
+            os.fsync(self._root_descriptor)
+        except OSError as error:
+            raise _AckLifecycleCorrupt(
+                "ACK commitment temporary cleanup became uncertain"
+            ) from error
+        self._ack_commitment_temporary = None
+
+    def _publish_ack_initializing_genesis(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_operation != "create"
+            or self._ack_journal_state != "creating"
+            or self._ack_commitment is not None
+            or self._ack_journal_identity is not None
+        ):
+            raise _AckLifecycleStateError(
+                "ACK initializing commitment has the wrong lifecycle"
+            )
+        self._remove_ack_commitment_temporary(owner, lifecycle_identity)
+        commitment = self._ack_genesis_commitment("initializing")
+        try:
+            _publish_without_replacement_at(
+                self._root_descriptor,
+                _ACK_COMMITMENT_NAME,
+                self.root / _ACK_COMMITMENT_NAME,
+                _canonical_ack_commitment(commitment),
+            )
+        except (EvidenceCorrupt, OSError) as error:
+            raise _AckLifecycleCorrupt(
+                "ACK initializing commitment publication failed"
+            ) from error
+        self._rebind_ack_commitment(expected=commitment)
+        self._ack_journal_state = "initialization_uncertain"
+
+    def _publish_ack_ready_genesis(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        *,
+        step_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_state
+            not in {"initialization_uncertain", "recovering"}
+        ):
+            raise _AckLifecycleStateError(
+                "ACK ready-genesis publication has the wrong lifecycle"
+            )
+        current = self._validate_ack_commitment_binding()
+        if current != self._ack_genesis_commitment("initializing"):
+            raise _AckLifecycleCorrupt(
+                "ACK ready genesis does not follow initializing genesis"
+            )
+        journal_identity, digest = self._ack_journal_prefix_digest(0)
+        if journal_identity.size != 0 or digest.hex() != _EMPTY_SHA256:
+            raise _AckLifecycleCorrupt(
+                "ACK initializing commitment does not bind an empty journal"
+            )
+        commitment = self._ack_genesis_commitment("ready")
+        try:
+            _atomic_replace_at(
+                self._root_descriptor,
+                _ACK_COMMITMENT_NAME,
+                self.root / _ACK_COMMITMENT_NAME,
+                _canonical_ack_commitment(commitment),
+                step_hook=step_hook,
+            )
+        except EvidenceCorrupt as error:
+            if isinstance(error.__cause__, OSError):
+                raise error.__cause__
+            raise _AckLifecycleCorrupt(
+                "ACK ready-genesis publication failed"
+            ) from error
+        self._rebind_ack_commitment(expected=commitment)
+        self._remove_ack_commitment_temporary(owner, lifecycle_identity)
+
+    def _publish_ack_ready_generation(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        *,
+        generation: int,
+        sequence: int,
+        event_id: str,
+        content_sha256: str,
+        journal_prefix_size: int,
+        journal_prefix_sha256: str,
+        step_hook: Callable[[str], None] | None = None,
+    ) -> _AckCommitmentV1:
+        self._validate_ack_journal_owner(owner, lifecycle_identity)
+        current = self._validate_ack_commitment_binding()
+        if (
+            current.phase != "ready"
+            or generation != current.generation + 1
+        ):
+            raise _AckLifecycleCorrupt(
+                "ACK commitment generation is not one exact transition ahead"
+            )
+        try:
+            ref = self._validate_ack_identity(
+                owner,
+                lifecycle_identity,
+                sequence=sequence,
+                event_id=event_id,
+                content_sha256=content_sha256,
+            )
+        except _AckAuthorityError as error:
+            raise _AckLifecycleCorrupt(
+                "ACK commitment does not bind authenticated evidence"
+            ) from error
+        if (
+            ref.source_sequence != sequence
+            or ref.event_id != event_id
+            or ref.content_sha256 != content_sha256
+        ):
+            raise _AckLifecycleCorrupt(
+                "ACK commitment evidence identity changed"
+            )
+        journal_identity, digest = self._ack_journal_prefix_digest(
+            journal_prefix_size
+        )
+        if (
+            journal_identity.size < journal_prefix_size
+            or digest.hex() != journal_prefix_sha256
+        ):
+            raise _AckLifecycleCorrupt(
+                "ACK commitment prefix differs from the held journal"
+            )
+        commitment = _AckCommitmentV1(
+            schema_version="agmind.core-ack-commitment.v1",
+            phase="ready",
+            generation=generation,
+            confirmed=_AckCommitmentIdentityV1(
+                sequence=sequence,
+                event_id=event_id,
+                content_sha256=content_sha256,
+            ),
+            journal_prefix_size=journal_prefix_size,
+            journal_prefix_sha256=journal_prefix_sha256,
+        )
+        try:
+            _atomic_replace_at(
+                self._root_descriptor,
+                _ACK_COMMITMENT_NAME,
+                self.root / _ACK_COMMITMENT_NAME,
+                _canonical_ack_commitment(commitment),
+                step_hook=step_hook,
+            )
+        except EvidenceCorrupt as error:
+            if isinstance(error.__cause__, OSError):
+                raise error.__cause__
+            raise _AckLifecycleCorrupt(
+                "ACK commitment publication failed"
+            ) from error
+        self._rebind_ack_commitment(expected=commitment)
+        self._remove_ack_commitment_temporary(owner, lifecycle_identity)
+        rebound_identity, rebound_digest = self._ack_journal_prefix_digest(
+            journal_prefix_size
+        )
+        if (
+            rebound_identity != journal_identity
+            or rebound_digest.hex() != journal_prefix_sha256
+        ):
+            raise _AckLifecycleCorrupt(
+                "ACK journal changed after commitment publication"
+            )
+        return commitment.model_copy(deep=True)
+
+    def _mark_ack_commitment_uncertain(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_state
+            not in {"initialized", "append_uncertain", "commitment_uncertain"}
+        ):
+            raise _AckLifecycleStateError(
+                "ACK commitment uncertainty has the wrong lifecycle"
+            )
+        self._ack_journal_state = "commitment_uncertain"
+
+    def _acquire_ack_journal(
+        self,
+        owner: object,
+        *,
+        operation: Literal["create", "recover"],
+    ) -> tuple[int, object]:
+        self._require_ack_mutation_ready()
+        if self._ack_journal_owner is not None:
+            raise EvidenceStoreBusy("evidence root already has one ACK-journal owner")
+        state = self._ack_journal_state
+        if state == "unknown":
+            raise _AckLifecycleStateError(
+                "ACK-journal startup presence was not authenticated"
+            )
+        if state == "initialization_uncertain":
+            raise _AckLifecycleStateError(
+                "ACK-journal initialization is uncertain until store restart"
+            )
+        if state in {"append_uncertain", "commitment_uncertain"}:
+            raise _AckLifecycleStateError(
+                "ACK authority publication is uncertain until store restart"
+            )
+        if state in {"creating", "recovering"}:
+            raise _AckLifecycleStateError(
+                "ACK-journal initialization did not settle"
+            )
+
+        actual_identity = self._ack_journal_artifact_identity()
+        if state in {"present", "initialized"}:
+            expected_identity = self._ack_journal_identity
+            if actual_identity is None:
+                raise _AckLifecycleCorrupt(
+                    "expected ACK-journal authority disappeared"
+                )
+            if (
+                expected_identity is None
+                or actual_identity != expected_identity
+            ):
+                raise _AckLifecycleCorrupt(
+                    "expected ACK-journal authority changed identity"
+                )
+        if state == "bootstrap":
+            expected_identity = self._ack_journal_identity
+            if (
+                (expected_identity is None) != (actual_identity is None)
+                or (
+                    expected_identity is not None
+                    and actual_identity != expected_identity
+                )
+            ):
+                raise _AckLifecycleCorrupt(
+                    "bootstrap ACK journal changed after startup"
+                )
+        if state == "fresh" and actual_identity is not None:
+            raise _AckLifecycleCorrupt(
+                "unexpected ACK journal appeared in a fresh store lifecycle"
+            )
+        if operation == "create":
+            if state != "fresh":
+                raise _AckLifecycleStateError(
+                    "ACK journal may be created only in a fresh store lifecycle"
+                )
+            next_state: Literal["creating", "recovering"] = "creating"
+        else:
+            if state not in {"present", "bootstrap"}:
+                raise _AckLifecycleStateError(
+                    "ACK journal may be recovered only once from startup presence"
+                )
+            next_state = "recovering"
+
+        duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
+        if duplicate_command is None:
+            root_descriptor = os.dup(self._root_descriptor)
+            os.set_inheritable(root_descriptor, False)
+        else:
+            root_descriptor = fcntl.fcntl(
+                self._root_descriptor,
+                duplicate_command,
+                0,
+            )
+        self._ack_journal_owner = owner
+        self._ack_journal_operation = operation
+        self._ack_journal_state = next_state
+        return root_descriptor, self._lifecycle_identity
+
+    def _ack_journal_final_name_created(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or not (
+                (
+                    self._ack_journal_operation == "create"
+                    and self._ack_journal_state
+                    in {"creating", "initialization_uncertain"}
+                )
+                or (
+                    self._ack_journal_operation == "recover"
+                    and self._ack_journal_state == "recovering"
+                    and self._ack_journal_identity is None
+                )
+            )
+        ):
+            raise _AckLifecycleStateError(
+                "ACK-journal create publication has the wrong lifecycle"
+            )
+        self._ack_journal_state = "initialization_uncertain"
+
+    def _complete_ack_journal_initialization(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result,
+        authenticated_digest: bytes,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise _AckLifecycleStateError(
+                "ACK-journal completion has the wrong lifecycle"
+            )
+        operation = self._ack_journal_operation
+        state = self._ack_journal_state
+        if not (
+            (operation == "create" and state == "initialization_uncertain")
+            or (
+                operation == "recover"
+                and state in {"recovering", "initialization_uncertain"}
+            )
+        ):
+            raise _AckLifecycleStateError(
+                "ACK-journal completion did not follow create or recovery"
+            )
+        actual_identity = self._ack_journal_artifact_identity()
+        authenticated_identity = _file_identity(authenticated)
+        if actual_identity is None:
+            raise _AckLifecycleCorrupt(
+                "ACK-journal authority disappeared before initialization completed"
+            )
+        if actual_identity != authenticated_identity:
+            raise _AckLifecycleCorrupt(
+                "ACK-journal authority changed before initialization completed"
+            )
+        if len(authenticated_digest) != hashlib.sha256().digest_size:
+            raise _AckLifecycleCorrupt(
+                "ACK-journal authenticated digest is invalid"
+            )
+        commitment = self._validate_ack_commitment_binding()
+        if commitment.phase != "ready":
+            raise _AckLifecycleCorrupt(
+                "ACK journal cannot initialize under a non-ready commitment"
+            )
+        expected_identity = self._ack_journal_identity
+        if (
+            operation == "recover"
+            and (
+                (
+                    expected_identity is not None
+                    and not self._same_ack_journal_inode(
+                        authenticated_identity,
+                        expected_identity,
+                    )
+                )
+                or (
+                    expected_identity is None
+                    and self._ack_commitment is not None
+                    and self._ack_commitment.phase != "ready"
+                    and authenticated_identity.size != 0
+                )
+            )
+        ):
+            raise _AckLifecycleCorrupt(
+                "recovered ACK journal differs from startup identity"
+            )
+        self._ack_journal_identity = authenticated_identity
+        self._ack_journal_digest = authenticated_digest
+        self._ack_journal_state = "initialized"
+
+    def _seal_ack_journal_identity(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result,
+        authenticated_digest: bytes,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_state != "initialized"
+        ):
+            raise _AckLifecycleStateError(
+                "ACK-journal close has the wrong lifecycle"
+            )
+        authenticated_identity = _file_identity(authenticated)
+        if len(authenticated_digest) != hashlib.sha256().digest_size:
+            raise _AckLifecycleCorrupt(
+                "ACK-journal close digest is invalid"
+            )
+        commitment = self._validate_ack_commitment_binding()
+        if commitment.phase != "ready":
+            raise _AckLifecycleCorrupt(
+                "ACK journal cannot close under a non-ready commitment"
+            )
+        actual_identity = self._ack_journal_artifact_identity()
+        expected_identity = self._ack_journal_identity
+        if (
+            actual_identity is None
+            or actual_identity != authenticated_identity
+            or expected_identity is None
+            or not self._same_ack_journal_inode(
+                authenticated_identity,
+                expected_identity,
+            )
+        ):
+            raise _AckLifecycleCorrupt(
+                "ACK-journal authority changed before healthy close"
+            )
+        self._ack_journal_identity = authenticated_identity
+        self._ack_journal_digest = authenticated_digest
+
+    def _mark_ack_journal_append_uncertain(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated_before: os.stat_result,
+        authenticated_digest_before: bytes,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_state
+            not in {"initialized", "append_uncertain"}
+        ):
+            raise _AckLifecycleStateError(
+                "ACK-journal uncertainty has the wrong lifecycle"
+            )
+        retained_identity = _file_identity(authenticated_before)
+        if len(authenticated_digest_before) != hashlib.sha256().digest_size:
+            raise _AckLifecycleCorrupt(
+                "ACK-journal pre-append digest is invalid"
+            )
+        expected_identity = self._ack_journal_identity
+        if (
+            expected_identity is None
+            or not self._same_ack_journal_inode(
+                retained_identity,
+                expected_identity,
+            )
+        ):
+            raise _AckLifecycleCorrupt(
+                "ACK-journal pre-append identity changed"
+            )
+        self._ack_journal_identity = retained_identity
+        self._ack_journal_digest = authenticated_digest_before
+        self._ack_journal_state = "append_uncertain"
+
+    def _validate_ack_journal_owner(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        self._require_ack_mutation_ready()
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._ack_journal_state
+            not in {"recovering", "initialization_uncertain", "initialized"}
+        ):
+            raise EvidenceSealError("ACK journal is outside this evidence lifecycle")
+        if self._ack_journal_state == "initialized":
+            commitment = self._validate_ack_commitment_binding()
+            if commitment.phase != "ready":
+                raise _AckLifecycleCorrupt(
+                    "initialized ACK journal has no ready commitment"
+                )
+
+    def _release_ack_journal(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._ack_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise EvidenceSealError("ACK journal release has the wrong lifecycle")
+        state = self._ack_journal_state
+        if state == "creating":
+            self._ack_journal_state = "fresh"
+        elif state == "recovering":
+            self._ack_journal_state = "present"
+        self._ack_journal_owner = None
+        self._ack_journal_operation = None
+
+    def _validate_ack_identity(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        *,
+        sequence: int,
+        event_id: str,
+        content_sha256: str,
+    ) -> EvidenceRef:
+        self._validate_ack_journal_owner(owner, lifecycle_identity)
+        verifier = self._require_authenticated_recovered()
+        indexed = self._index.get((verifier.fsm.host_id, sequence))
+        if indexed is None:
+            raise _AckAuthorityError("ACK identity has no authenticated evidence")
+        ref = indexed[1]
+        if ref.event_id != event_id or ref.content_sha256 != content_sha256:
+            raise _AckAuthorityError("ACK identity differs from authenticated evidence")
+        self.resolve_authenticated_ref(ref)
+        return ref
+
+    def _validate_next_ack_ref(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        ref: EvidenceRef,
+        *,
+        confirmed_through: int,
+    ) -> None:
+        self._validate_ack_journal_owner(owner, lifecycle_identity)
+        self.resolve_authenticated_ref(ref)
+        verifier = self._require_authenticated_recovered()
+        host_id = verifier.fsm.host_id
+        sequences = self._sequences_by_host.get(host_id, [])
+        position = bisect_right(sequences, confirmed_through)
+        if position >= len(sequences):
+            raise _AckAuthorityError(
+                "pending ACK has no next authenticated evidence ref"
+            )
+        next_ref = self._index[(host_id, sequences[position])][1]
+        if next_ref != ref:
+            raise _AckAuthorityError(
+                "pending ACK is not the next authenticated evidence ref"
+            )
+        if ref.source_sequence > self.acceptance_cursor:
+            raise _AckAuthorityError(
+                "pending ACK exceeds the signed-or-covered acceptance cursor"
+            )
 
     def _date_descriptor(self, date_name: str, *, create: bool = False) -> int:
         if (
@@ -1290,6 +2339,94 @@ class SegmentStore:
         """Persist a verifier-detected critical conflict before returning it."""
         self._trip_read_only(reason)
 
+    def _trip_ack_journal_corrupt(self) -> None:
+        """Persist a root-wide fence without rewriting corrupt ACK bytes."""
+        self._trip_read_only("segment_corrupt")
+
+    def _fence_missing_expected_ack_journal(self) -> None:
+        state = self._ack_journal_state
+        if state not in {
+            "present",
+            "initialized",
+            "append_uncertain",
+            "commitment_uncertain",
+        }:
+            return
+        try:
+            actual_identity = self._ack_journal_artifact_identity()
+        except _AckLifecycleCorrupt:
+            actual_identity = None
+        expected_identity = self._ack_journal_identity
+        identity_changed = actual_identity is None or expected_identity is None
+        if not identity_changed and actual_identity is not None:
+            if state in {"append_uncertain", "commitment_uncertain"}:
+                identity_changed = (
+                    expected_identity is None
+                    or not self._same_ack_journal_inode(
+                        actual_identity,
+                        expected_identity,
+                    )
+                    or actual_identity.size < expected_identity.size
+                )
+            else:
+                identity_changed = actual_identity != expected_identity
+
+        content_changed = False
+        if (
+            not identity_changed
+            and state in {
+                "initialized",
+                "append_uncertain",
+                "commitment_uncertain",
+            }
+            and expected_identity is not None
+        ):
+            expected_digest = self._ack_journal_digest
+            if expected_digest is None:
+                content_changed = True
+            else:
+                try:
+                    hashed_identity, actual_digest = (
+                        self._ack_journal_prefix_digest(
+                            expected_identity.size
+                        )
+                    )
+                except _AckLifecycleCorrupt:
+                    content_changed = True
+                else:
+                    content_changed = (
+                        actual_identity is None
+                        or not self._same_ack_journal_inode(
+                            hashed_identity,
+                            actual_identity,
+                        )
+                        or actual_digest != expected_digest
+                    )
+        commitment_changed = False
+        if state in {"present", "initialized", "append_uncertain"}:
+            try:
+                self._validate_ack_commitment_binding()
+            except _AckLifecycleCorrupt:
+                commitment_changed = True
+        elif state == "commitment_uncertain":
+            expected_commitment = self._ack_commitment
+            try:
+                actual_commitment, _raw, _identity = self._read_ack_commitment()
+            except _AckLifecycleCorrupt:
+                commitment_changed = True
+            else:
+                commitment_changed = (
+                    expected_commitment is None
+                    or actual_commitment.phase != "ready"
+                    or actual_commitment.generation
+                    not in {
+                        expected_commitment.generation,
+                        expected_commitment.generation + 1,
+                    }
+                )
+        if identity_changed or content_changed or commitment_changed:
+            self._trip_read_only("segment_corrupt")
+
     def _scan_manifests_and_segments(
         self,
     ) -> tuple[_RecoveryPlan, set[tuple[str, str]]]:
@@ -1417,13 +2554,75 @@ class SegmentStore:
 
         root_temporaries: list[str] = []
         allowed_root = {
+            "ack-journal.agf",
+            _ACK_COMMITMENT_NAME,
             "chain-head.json",
             "health.intent.json",
             "health.json",
             "manifests",
             "segments",
         }
-        for name in os.listdir(self._root_descriptor):
+        root_entries = tuple(os.listdir(self._root_descriptor))
+        ack_journal_identity: _FileIdentity | None = None
+        ack_commitment: _AckCommitmentV1 | None = None
+        ack_commitment_raw: bytes | None = None
+        ack_commitment_identity: _FileIdentity | None = None
+        ack_commitment_temporaries: list[str] = []
+        for name in root_entries:
+            if name == "ack-journal.agf":
+                ack_journal_identity = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        name,
+                        self.root / name,
+                    )
+                )
+                continue
+            if name == _ACK_COMMITMENT_NAME:
+                try:
+                    (
+                        ack_commitment,
+                        ack_commitment_raw,
+                        ack_commitment_identity,
+                    ) = self._read_ack_commitment()
+                except _AckLifecycleCorrupt as error:
+                    raise EvidenceCorrupt(
+                        "ACK commitment is invalid at startup"
+                    ) from error
+                continue
+            if _ACK_COMMITMENT_TEMP_NAME.fullmatch(name):
+                info = _regular_stat_at(
+                    self._root_descriptor,
+                    name,
+                    self.root / name,
+                )
+                if info.st_size > _MAX_ACK_COMMITMENT_BYTES:
+                    raise EvidenceCorrupt(
+                        "ACK commitment temporary exceeds its bound"
+                    )
+                raw = _read_regular_at(
+                    self._root_descriptor,
+                    name,
+                    self.root / name,
+                    _MAX_ACK_COMMITMENT_BYTES,
+                )
+                try:
+                    temporary = _decode_ack_commitment(raw)
+                except (
+                    RecursionError,
+                    TypeError,
+                    ValueError,
+                    ValidationError,
+                ) as error:
+                    raise EvidenceCorrupt(
+                        "ACK commitment temporary schema is invalid"
+                    ) from error
+                if raw != _canonical_ack_commitment(temporary):
+                    raise EvidenceCorrupt(
+                        "ACK commitment temporary is not canonical JSON"
+                    )
+                ack_commitment_temporaries.append(name)
+                continue
             if name in allowed_root or (
                 name.startswith(".health-intent.") and name.endswith(".pending")
             ) or _HEALTH_FINAL_TEMP_NAME.fullmatch(name):
@@ -1437,6 +2636,23 @@ class SegmentStore:
                 root_temporaries.append(name)
                 continue
             raise EvidenceCorrupt(f"unexpected evidence-root artifact: {name}")
+        if len(ack_commitment_temporaries) > 1:
+            raise EvidenceCorrupt("multiple ACK commitment temporaries exist")
+        self._ack_journal_identity = ack_journal_identity
+        self._ack_commitment = ack_commitment
+        self._ack_commitment_raw = ack_commitment_raw
+        self._ack_commitment_identity = ack_commitment_identity
+        self._ack_commitment_temporary = (
+            ack_commitment_temporaries[0]
+            if ack_commitment_temporaries
+            else None
+        )
+        if ack_commitment is not None and ack_commitment.phase == "initializing":
+            self._ack_journal_state = "bootstrap"
+        elif ack_journal_identity is None and ack_commitment is None:
+            self._ack_journal_state = "fresh"
+        else:
+            self._ack_journal_state = "present"
         return (
             _RecoveryPlan(
                 promotions=tuple(promotions),
@@ -1823,6 +3039,10 @@ class SegmentStore:
             prior_sequence = self._last_sequence_by_host.get(host_id, 0)
             if record.ref.source_sequence <= prior_sequence:
                 raise EvidenceCorrupt("stored evidence is not in host-global sequence order")
+            self._record_positions[key] = len(self._records)
+            self._sequences_by_host.setdefault(host_id, []).append(
+                record.ref.source_sequence
+            )
             self._index[key] = (record.canonical_envelope, record.ref)
             self._last_sequence_by_host[host_id] = record.ref.source_sequence
             self._records.append(record)
@@ -2059,6 +3279,10 @@ class SegmentStore:
             priority=priority,
             accepted_at=accepted_at,
             ref=ref,
+        )
+        self._record_positions[key] = len(self._records)
+        self._sequences_by_host.setdefault(host_id, []).append(
+            authorization.source_sequence
         )
         self._index[key] = (authorization.canonical, ref)
         self._last_sequence_by_host[host_id] = authorization.source_sequence
@@ -2343,13 +3567,34 @@ class SegmentStore:
                 os.close(self._active.descriptor)
                 self._active.descriptor = -1
         finally:
-            for descriptor in self._date_descriptors.values():
-                os.close(descriptor)
-            os.close(self._manifests_descriptor)
-            os.close(self._segments_descriptor)
-            fcntl.flock(self._root_descriptor, fcntl.LOCK_UN)
-            os.close(self._root_descriptor)
-            self._closed = True
+            try:
+                owner = self._ack_journal_owner
+                if owner is not None:
+                    close_from_store = getattr(
+                        owner,
+                        "_close_from_segment_store",
+                        None,
+                    )
+                    if not callable(close_from_store):
+                        raise EvidenceStoreError(
+                            "ACK-journal owner cannot close before evidence unlock"
+                        )
+                    cast(Callable[[object], None], close_from_store)(
+                        self._lifecycle_identity
+                    )
+                if self._ack_journal_owner is not None:
+                    raise EvidenceStoreError(
+                        "ACK-journal owner survived evidence shutdown"
+                    )
+                self._fence_missing_expected_ack_journal()
+            finally:
+                for descriptor in self._date_descriptors.values():
+                    os.close(descriptor)
+                os.close(self._manifests_descriptor)
+                os.close(self._segments_descriptor)
+                fcntl.flock(self._root_descriptor, fcntl.LOCK_UN)
+                os.close(self._root_descriptor)
+                self._closed = True
 
 
 def replace_ref(
