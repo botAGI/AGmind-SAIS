@@ -21,7 +21,16 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    BinaryIO,
+    Literal,
+    Never,
+    SupportsIndex,
+    cast,
+    final,
+)
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
@@ -46,13 +55,26 @@ from agmind_immune.evidence.manifest import (
     chain_head_for,
     segment_manifest_hash,
 )
+from agmind_immune.evidence.repair import (
+    _FINAL_REPAIR_COMPLETION_FACTORY,
+    AuthenticatedRepairCompletion,
+    RepairStateConflict,
+    RepairStateCorrupt,
+    RepairStateJournal,
+    RepairStateV1,
+    decode_repair_state,
+)
 from agmind_immune.ingest.envelope import (
     EnvelopeVerifier,
     IngestVerificationError,
+    SimulatedRepairAuthorization,
     VerifiedEnvelope,
     VerifierCommitError,
     _AppendAuthorization,
 )
+
+if TYPE_CHECKING:
+    from agmind_immune.ingest.ack_journal import AckJournal
 
 MAX_EVIDENCE_RECORD_BYTES = 128 * 1024
 MAX_SEGMENT_BYTES = 64 * 1024 * 1024
@@ -92,7 +114,13 @@ _ACK_COMMITMENT_TEMP_NAME = re.compile(
     rf"^\.ack-commitment\.json\.{_UUID4_TEXT}\.tmp$"
 )
 _MAX_ACK_COMMITMENT_BYTES = 4096
+_REPAIR_STATE_NAME = "repair-state.json"
+_REPAIR_STATE_TEMP_NAME = re.compile(
+    rf"^\.repair-state\.json\.{_UUID4_TEXT}\.tmp$"
+)
+_MAX_REPAIR_STATE_BYTES = 4096
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+_ZERO_SHA256 = "0" * 64
 _UTC_TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?Z$"
@@ -157,6 +185,82 @@ class TornTailRepairRequired(EvidenceStoreError):
         self.actual_bytes = actual_bytes
 
 
+class TailRepairPending(EvidenceStoreError):
+    """A durable/in-flight repair gate requires the repair-aware factory."""
+
+
+class RepairPhysicalState(StrEnum):
+    """Exact held-namespace classification for one signed tail repair."""
+
+    ORIGINAL_TORN = "original_torn"
+    CLEAN_OPEN = "clean_open"
+    SETTLED_PREFIX = "settled_prefix"
+    ZERO_HELD = "zero_held"
+    ZERO_RETIRED = "zero_retired"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class TailRepairFacts:
+    """Immutable physical facts derived from one retained active-segment inode."""
+
+    segment_id: str
+    open_relative_path: str
+    original_device: int
+    original_inode: int
+    original_bytes: int
+    verified_bytes: int
+    discarded_bytes: int
+    discarded_sha256: str
+    post_repair_prefix_sha256: str
+    last_verified_frame_sha256: str
+    current_chain_head_sha256: str
+    manifest_predecessor_sha256: str
+
+
+_AUTHENTICATED_REPAIR_FACTORY = object()
+
+
+@final
+class AuthenticatedRepairAuthorization:
+    """Nonserializable, one-use destructive authority retained by one session."""
+
+    __slots__ = ("_factory_marker",)
+    _factory_marker: object
+
+    def __init__(self, *, _factory: object) -> None:
+        if _factory is not _AUTHENTICATED_REPAIR_FACTORY:
+            raise TypeError(
+                "AuthenticatedRepairAuthorization is issued only by a tail session"
+            )
+        object.__setattr__(self, "_factory_marker", _factory)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("repair authorization capabilities are immutable")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("AuthenticatedRepairAuthorization is final")
+
+    def __copy__(self) -> AuthenticatedRepairAuthorization:
+        raise TypeError("repair authorization capabilities cannot be copied")
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> AuthenticatedRepairAuthorization:
+        del memo
+        raise TypeError("repair authorization capabilities cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("repair authorization capabilities cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError("repair authorization capabilities cannot be serialized")
+
+
 @contextmanager
 def _post_authentication_namespace(display_path: Path) -> Iterator[None]:
     try:
@@ -195,6 +299,7 @@ class EvidenceStatus:
     evidence_head: int
     acceptance_cursor: int
     key_healthy: bool
+    repair_pending: bool = False
 
 
 def _exact_coverage_ref_key(
@@ -475,6 +580,13 @@ class _FileIdentity:
 
 
 @dataclass(frozen=True)
+class _RepairStateArtifactBinding:
+    name: str
+    raw: bytes
+    identity: _FileIdentity
+
+
+@dataclass(frozen=True)
 class _SegmentScan:
     records: tuple[StoredEvidenceRecord, ...]
     frames: tuple[FrameRecord, ...]
@@ -482,6 +594,54 @@ class _SegmentScan:
     size: int
     sha256: str
     identity: _FileIdentity
+
+
+@dataclass(frozen=True)
+class _ValidatedActiveScan:
+    records: tuple[StoredEvidenceRecord, ...]
+    frames: tuple[FrameRecord, ...]
+    segment_id: str
+    open_name: str
+    closed_name: str
+    closed_relative_path: str
+    date_name: str
+    priority: EvidencePriority
+    host_id: str
+    first_source_sequence: int
+    opened_at: str
+    verified_bytes: int
+
+
+@dataclass(frozen=True)
+class _RepairTarget:
+    date_name: str
+    open_name: str
+    path: Path
+    directory_descriptor: int
+    descriptor: int
+    original_identity: _FileIdentity
+    scan: _SegmentScan
+
+
+@dataclass(frozen=True)
+class _RepairAuthorizationBinding:
+    capability: AuthenticatedRepairAuthorization
+    simulated_proof: SimulatedRepairAuthorization
+    session_identity: object
+    descriptor_identity: _FileIdentity
+    facts: TailRepairFacts
+    request_canonical: bytes
+    target_identity: tuple[object, ...]
+    verifier_generation: int
+    repair_state_raw: bytes
+
+
+@dataclass(frozen=True)
+class _RepairCompletionAuthorizationBinding:
+    capability: AuthenticatedRepairCompletion
+    journal: RepairStateJournal
+    session_identity: object
+    repair_state_raw: bytes
 
 
 @dataclass(frozen=True)
@@ -782,6 +942,139 @@ def _hash_held_descriptor(
     return digest.hexdigest(), after
 
 
+def _held_range_bytes(
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    descriptor: int,
+    identity: _FileIdentity,
+    start: int,
+    end: int,
+) -> bytes:
+    if (
+        type(start) is not int
+        or type(end) is not int
+        or not 0 <= start <= end <= identity.size <= MAX_SEGMENT_BYTES
+    ):
+        raise EvidenceCorrupt(f"invalid held evidence byte range: {display_path}")
+    _bind_held_source(
+        parent_descriptor,
+        name,
+        display_path,
+        descriptor=descriptor,
+        identity=identity,
+    )
+    chunks: list[bytes] = []
+    offset = start
+    while offset < end:
+        chunk = os.pread(descriptor, min(1024 * 1024, end - offset), offset)
+        if not chunk:
+            raise EvidenceCorrupt(
+                f"held evidence shortened during range verification: {display_path}"
+            )
+        chunks.append(chunk)
+        offset += len(chunk)
+    _bind_held_source(
+        parent_descriptor,
+        name,
+        display_path,
+        descriptor=descriptor,
+        identity=identity,
+    )
+    return b"".join(chunks)
+
+
+def _hash_held_range(
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    descriptor: int,
+    identity: _FileIdentity,
+    start: int,
+    end: int,
+) -> str:
+    if (
+        type(start) is not int
+        or type(end) is not int
+        or not 0 <= start <= end <= identity.size <= MAX_SEGMENT_BYTES
+    ):
+        raise EvidenceCorrupt(f"invalid held evidence byte range: {display_path}")
+    _bind_held_source(
+        parent_descriptor,
+        name,
+        display_path,
+        descriptor=descriptor,
+        identity=identity,
+    )
+    digest = hashlib.sha256()
+    offset = start
+    while offset < end:
+        chunk = os.pread(descriptor, min(1024 * 1024, end - offset), offset)
+        if not chunk:
+            raise EvidenceCorrupt(
+                f"held evidence shortened during range verification: {display_path}"
+            )
+        digest.update(chunk)
+        offset += len(chunk)
+    _bind_held_source(
+        parent_descriptor,
+        name,
+        display_path,
+        descriptor=descriptor,
+        identity=identity,
+    )
+    return digest.hexdigest()
+
+
+def _validate_incomplete_frame_suffix(
+    raw: bytes,
+    *,
+    expected_previous: bytes,
+) -> None:
+    magic = b"AGF1"
+    if not raw or len(expected_previous) != 32:
+        raise EvidenceCorrupt("repair target has no exact incomplete final frame")
+    magic_prefix = raw[: min(len(raw), len(magic))]
+    if magic_prefix != magic[: len(magic_prefix)]:
+        raise EvidenceCorrupt("repair target suffix is not an incomplete AGF1 frame")
+    if len(raw) < 8:
+        return
+    payload_size = int.from_bytes(raw[4:8], "big")
+    if payload_size > MAX_EVIDENCE_RECORD_BYTES:
+        raise EvidenceCorrupt("repair target suffix declares an oversized AGF1 frame")
+    header_previous = raw[8 : min(len(raw), 40)]
+    if header_previous != expected_previous[: len(header_previous)]:
+        raise EvidenceCorrupt("repair target suffix has the wrong frame predecessor")
+    if len(raw) >= payload_size + 76:
+        raise EvidenceCorrupt("repair target suffix contains a complete AGF1 frame")
+
+
+def _read_stable_repair_artifact(
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+) -> _RepairStateArtifactBinding:
+    before = _file_identity(
+        _regular_stat_at(parent_descriptor, name, display_path)
+    )
+    if before.size > _MAX_REPAIR_STATE_BYTES:
+        raise EvidenceCorrupt(f"repair state exceeds 4096 bytes: {display_path}")
+    raw = _read_regular_at(
+        parent_descriptor,
+        name,
+        display_path,
+        _MAX_REPAIR_STATE_BYTES,
+    )
+    after = _file_identity(
+        _regular_stat_at(parent_descriptor, name, display_path)
+    )
+    if before != after:
+        raise EvidenceCorrupt(f"repair state changed during held scan: {display_path}")
+    return _RepairStateArtifactBinding(name=name, raw=raw, identity=after)
+
+
 def _open_regular_at(
     parent_descriptor: int,
     name: str,
@@ -809,6 +1102,35 @@ def _open_regular_at(
         ):
             raise EvidenceCorrupt(f"evidence file changed during open: {display_path}")
         return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_regular_read_write_at(
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    maximum: int,
+) -> tuple[int, _FileIdentity]:
+    expected = _regular_stat_at(parent_descriptor, name, display_path)
+    if expected.st_size > maximum:
+        raise EvidenceCorrupt(f"evidence file exceeds bound: {display_path}")
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    identity = _file_identity(expected)
+    try:
+        _bind_held_source(
+            parent_descriptor,
+            name,
+            display_path,
+            descriptor=descriptor,
+            identity=identity,
+        )
+        return descriptor, identity
     except BaseException:
         os.close(descriptor)
         raise
@@ -1205,6 +1527,29 @@ class SegmentStore:
         health_step_hook: Callable[[str], None] | None = None,
         segment_create_step_hook: Callable[[str], None] | None = None,
     ) -> None:
+        self._repair_mode = bool(getattr(self, "_repair_mode", False))
+        self._repair_pending = self._repair_mode
+        self._repair_pretruncate = self._repair_mode
+        self._repair_resumed = False
+        self._repair_prefix_needs_settlement = False
+        self._repair_session_identity: object | None = (
+            object() if self._repair_mode else None
+        )
+        self._repair_target: _RepairTarget | None = None
+        self._repair_post_h0_active: _RepairTarget | None = None
+        self._repair_facts: TailRepairFacts | None = None
+        self._repair_physical_state = RepairPhysicalState.INVALID
+        self._repair_namespace_uncertain = False
+        self._repair_recovery_plan: _RecoveryPlan | None = None
+        self._repair_state_binding: _RepairStateArtifactBinding | None = None
+        self._repair_state_temporary: _RepairStateArtifactBinding | None = None
+        self._repair_authorization: _RepairAuthorizationBinding | None = None
+        self._repair_completion_authorization: (
+            _RepairCompletionAuthorizationBinding | None
+        ) = None
+        self._repair_base_verifier_generation: int | None = None
+        self._repair_ack_journal: AckJournal | None = None
+        self._repair_ack_snapshot: object | None = None
         self.root = root
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self._monotonic = monotonic_clock or time.monotonic
@@ -1292,6 +1637,12 @@ class SegmentStore:
                 )
             self._startup()
         except BaseException:
+            for repair_target in (
+                self._repair_target,
+                self._repair_post_h0_active,
+            ):
+                if repair_target is not None and repair_target.descriptor >= 0:
+                    os.close(repair_target.descriptor)
             for descriptor in self._date_descriptors.values():
                 os.close(descriptor)
             if hasattr(self, "_manifests_descriptor"):
@@ -1302,6 +1653,31 @@ class SegmentStore:
             os.close(self._root_descriptor)
             self._closed = True
             raise
+
+    @classmethod
+    def open_tail_repair(
+        cls,
+        root: Path,
+        verifier: EnvelopeVerifier,
+        *,
+        wall_clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        health_step_hook: Callable[[str], None] | None = None,
+        segment_create_step_hook: Callable[[str], None] | None = None,
+    ) -> TailRepairSession:
+        """Open one torn-tail repair lifecycle without releasing the root lock."""
+        if cls is not SegmentStore or type(verifier) is not EnvelopeVerifier:
+            raise TypeError(
+                "tail repair requires the exact SegmentStore and EnvelopeVerifier"
+            )
+        return TailRepairSession(
+            root,
+            verifier,
+            wall_clock=wall_clock,
+            monotonic_clock=monotonic_clock,
+            health_step_hook=health_step_hook,
+            segment_create_step_hook=segment_create_step_hook,
+        )
 
     @property
     def manifests(self) -> tuple[SegmentManifestV1, ...]:
@@ -1322,6 +1698,27 @@ class SegmentStore:
     @property
     def read_only_reason(self) -> str | None:
         return self._read_only_reason
+
+    @property
+    def repair_facts(self) -> TailRepairFacts | None:
+        facts = self._repair_facts
+        return None if facts is None else copy.copy(facts)
+
+    @property
+    def verifier_generation(self) -> int:
+        verifier = self._require_authenticated_recovered()
+        generation = verifier._authority.generation
+        if type(generation) is not int or generation < 0:
+            raise EvidenceCorrupt("verifier generation is not an exact integer")
+        return generation
+
+    @property
+    def ack_journal(self) -> AckJournal:
+        self._require_repair_lifecycle()
+        journal = self._repair_ack_journal
+        if journal is None:
+            raise EvidenceSealError("repair ACK journal has not been recovered")
+        return journal
 
     def _is_bound_verifier(self, verifier: EnvelopeVerifier) -> bool:
         return (
@@ -1372,7 +1769,7 @@ class SegmentStore:
                 or active.descriptor == active_descriptor
             )
         )
-        healthy = base_healthy and stable
+        healthy = base_healthy and stable and not self._repair_pretruncate
         key_healthy = (
             type(fsm.mutation_read_only) is bool
             and not fsm.mutation_read_only
@@ -1384,7 +1781,25 @@ class SegmentStore:
             evidence_head,
             acceptance_cursor,
             key_healthy,
+            self._repair_pending,
         )
+
+    def _require_repair_lifecycle(self) -> None:
+        if (
+            self._closed
+            or self._repair_session_identity is None
+        ):
+            raise EvidenceSealError("no live signed tail-repair lifecycle exists")
+
+    def _require_repair_pending(self) -> None:
+        self._require_repair_lifecycle()
+        if not self._repair_pending:
+            raise EvidenceSealError("signed tail-repair lifecycle is already cleared")
+
+    def _latch_repair_namespace_uncertain(self) -> None:
+        self._repair_namespace_uncertain = True
+        self._repair_physical_state = RepairPhysicalState.INVALID
+        self._append_uncertain = True
 
     def _require_authenticated_recovered(self) -> EnvelopeVerifier:
         if self._closed:
@@ -1405,6 +1820,684 @@ class SegmentStore:
         if self._append_uncertain or self._pending_durable_commit is not None:
             raise EvidenceReadOnly("evidence durability is not settled")
         return verifier
+
+    @staticmethod
+    def _validate_repair_state_raw(raw: bytes) -> None:
+        if type(raw) is not bytes or not raw or len(raw) > _MAX_REPAIR_STATE_BYTES:
+            raise EvidenceStoreError("repair state must contain at most 4096 bytes")
+
+    def _read_bound_repair_artifact(
+        self,
+        binding: _RepairStateArtifactBinding | None,
+        *,
+        final: bool,
+    ) -> bytes | None:
+        self._require_repair_lifecycle()
+        if binding is None:
+            if final:
+                actual = _entry_stat_at(
+                    self._root_descriptor,
+                    _REPAIR_STATE_NAME,
+                )
+                if actual is not None:
+                    raise EvidenceCorrupt(
+                        "unbound repair-state final appeared after startup"
+                    )
+            return None
+        current = _read_stable_repair_artifact(
+            self._root_descriptor,
+            binding.name,
+            self.root / binding.name,
+        )
+        if current != binding:
+            raise EvidenceCorrupt("repair-state artifact changed after startup")
+        return current.raw
+
+    def read_repair_state_bytes(self) -> bytes | None:
+        return self._read_bound_repair_artifact(
+            self._repair_state_binding,
+            final=True,
+        )
+
+    def _decode_current_repair_state(self) -> tuple[RepairStateV1, bytes]:
+        raw = self.read_repair_state_bytes()
+        if raw is None:
+            raise EvidenceSealError("durable repair state is absent")
+        try:
+            return decode_repair_state(raw), raw
+        except RepairStateCorrupt as error:
+            raise EvidenceCorrupt("durable repair state is invalid") from error
+
+    def read_repair_state_temporary_bytes(self) -> bytes | None:
+        return self._read_bound_repair_artifact(
+            self._repair_state_temporary,
+            final=False,
+        )
+
+    def _require_clean_repair_state_publication_namespace(self) -> None:
+        if self._repair_state_temporary is not None:
+            raise EvidenceCorrupt(
+                "repair-state temporary must be classified before publication"
+            )
+
+    def publish_initial_repair_state(self, raw: bytes) -> None:
+        self._require_repair_pending()
+        self._validate_repair_state_raw(raw)
+        self._require_clean_repair_state_publication_namespace()
+        if self._repair_state_binding is not None:
+            raise FileExistsError(_REPAIR_STATE_NAME)
+        _publish_without_replacement_at(
+            self._root_descriptor,
+            _REPAIR_STATE_NAME,
+            self.root / _REPAIR_STATE_NAME,
+            raw,
+        )
+        self._repair_state_binding = _read_stable_repair_artifact(
+            self._root_descriptor,
+            _REPAIR_STATE_NAME,
+            self.root / _REPAIR_STATE_NAME,
+        )
+
+    def replace_repair_state(self, expected: bytes, raw: bytes) -> None:
+        self._require_repair_pending()
+        self._validate_repair_state_raw(expected)
+        self._validate_repair_state_raw(raw)
+        self._require_clean_repair_state_publication_namespace()
+        if self.read_repair_state_bytes() != expected:
+            raise RepairStateConflict("repair state compare-and-swap mismatch")
+        _atomic_replace_at(
+            self._root_descriptor,
+            _REPAIR_STATE_NAME,
+            self.root / _REPAIR_STATE_NAME,
+            raw,
+        )
+        replacement = _read_stable_repair_artifact(
+            self._root_descriptor,
+            _REPAIR_STATE_NAME,
+            self.root / _REPAIR_STATE_NAME,
+        )
+        if replacement.raw != raw:
+            raise EvidenceCorrupt("repair state replacement did not bind exact bytes")
+        self._repair_state_binding = replacement
+
+    def _remove_bound_repair_artifact(
+        self,
+        binding: _RepairStateArtifactBinding | None,
+        expected: bytes,
+    ) -> None:
+        if binding is None:
+            raise RepairStateConflict("repair state artifact is absent")
+        current = _read_stable_repair_artifact(
+            self._root_descriptor,
+            binding.name,
+            self.root / binding.name,
+        )
+        if current != binding or current.raw != expected:
+            raise RepairStateConflict("repair state compare-and-swap mismatch")
+        descriptor, opened = _open_regular_at(
+            self._root_descriptor,
+            binding.name,
+            self.root / binding.name,
+            maximum=_MAX_REPAIR_STATE_BYTES,
+        )
+        try:
+            _bind_held_source(
+                self._root_descriptor,
+                binding.name,
+                self.root / binding.name,
+                descriptor=descriptor,
+                identity=binding.identity,
+            )
+            os.unlink(binding.name, dir_fd=self._root_descriptor)
+            unlinked = os.fstat(descriptor)
+            if (
+                unlinked.st_dev != opened.st_dev
+                or unlinked.st_ino != opened.st_ino
+                or unlinked.st_size != opened.st_size
+                or unlinked.st_nlink != 0
+                or _entry_stat_at(self._root_descriptor, binding.name)
+                is not None
+            ):
+                self._latch_repair_namespace_uncertain()
+                raise EvidenceCorrupt(
+                    "repair-state conditional unlink became uncertain"
+                )
+            os.fsync(self._root_descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _validate_repair_completion_authority(
+        self,
+        expected: bytes,
+        proof: AuthenticatedRepairCompletion,
+        repair_journal: RepairStateJournal,
+        *,
+        used: bool,
+    ) -> None:
+        self._require_repair_pending()
+        self._validate_repair_state_raw(expected)
+        state, state_raw = self._decode_current_repair_state()
+        facts = self._repair_facts
+        ack_journal = self._repair_ack_journal
+        verifier = (
+            None
+            if type(proof) is not AuthenticatedRepairCompletion
+            else proof._verifier
+        )
+        if (
+            type(proof) is not AuthenticatedRepairCompletion
+            or type(repair_journal) is not RepairStateJournal
+            or proof._factory_marker is not _FINAL_REPAIR_COMPLETION_FACTORY
+            or proof._journal is not repair_journal
+            or proof._journal_identity is not repair_journal._identity
+            or repair_journal._authority is not self
+            or repair_journal._clear_authorization is not proof
+            or proof._used is not used
+            or state.phase != "completion_appended"
+            or state_raw != expected
+            or proof._expected_raw != expected
+            or proof._store is not self
+            or ack_journal is None
+            or ack_journal is not self._ack_journal_owner
+            or proof._acknowledgements is not ack_journal
+            or proof._ack_snapshot != ack_journal.snapshot()
+            or proof._status != self.status()
+            or verifier is not self._bound_verifier
+            or not self._is_bound_verifier(verifier)
+            or proof._verifier_generation != verifier._authority.generation
+            or proof._transient_generation
+            != verifier._repair_transient_generation
+            or verifier._staged
+            or verifier._authorizations
+            or facts is None
+            or self._active is not None
+            or self.classify_repair_physical(facts)
+            not in {
+                RepairPhysicalState.SETTLED_PREFIX,
+                RepairPhysicalState.ZERO_RETIRED,
+            }
+        ):
+            raise EvidenceSealError(
+                "repair state removal requires exact issued final completion authority"
+            )
+
+    def _register_repair_completion_authorization(
+        self,
+        proof: AuthenticatedRepairCompletion,
+        journal: RepairStateJournal,
+    ) -> None:
+        expected = proof._expected_raw
+        self._validate_repair_completion_authority(
+            expected,
+            proof,
+            journal,
+            used=False,
+        )
+        if self._repair_completion_authorization is not None:
+            raise EvidenceSealError(
+                "final repair completion authority is already registered"
+            )
+        self._repair_completion_authorization = (
+            _RepairCompletionAuthorizationBinding(
+                capability=proof,
+                journal=journal,
+                session_identity=self._repair_session_identity,
+                repair_state_raw=expected,
+            )
+        )
+
+    def remove_repair_state(
+        self,
+        expected: bytes,
+        proof: AuthenticatedRepairCompletion,
+    ) -> None:
+        completion_binding = self._repair_completion_authorization
+        if (
+            completion_binding is None
+            or completion_binding.capability is not proof
+            or completion_binding.session_identity
+            is not self._repair_session_identity
+            or completion_binding.repair_state_raw != expected
+        ):
+            raise EvidenceSealError(
+                "repair state removal requires exact issued final completion authority"
+            )
+        self._validate_repair_completion_authority(
+            expected,
+            proof,
+            completion_binding.journal,
+            used=True,
+        )
+        self._repair_completion_authorization = None
+        artifact_binding = self._repair_state_binding
+        self._remove_bound_repair_artifact(artifact_binding, expected)
+        self._repair_state_binding = None
+        self._repair_pending = False
+
+    def remove_repair_state_temporary(self, expected: bytes) -> None:
+        self._require_repair_pending()
+        if (
+            type(expected) is not bytes
+            or len(expected) > _MAX_REPAIR_STATE_BYTES
+        ):
+            raise EvidenceStoreError(
+                "repair-state temporary expectation exceeds 4096 bytes"
+            )
+        binding = self._repair_state_temporary
+        self._remove_bound_repair_artifact(binding, expected)
+        self._repair_state_temporary = None
+
+    def register_authorization(
+        self,
+        proof: SimulatedRepairAuthorization,
+    ) -> AuthenticatedRepairAuthorization:
+        self._require_repair_pending()
+        if not self._repair_pretruncate:
+            raise EvidenceSealError("repair truncate authority has ended")
+        verifier = self._require_authenticated_recovered()
+        validated = verifier._validate_repair_authorization_proof(proof)
+        facts = self._repair_facts
+        target = self._repair_target
+        if facts is None or target is None:
+            raise EvidenceCorrupt("repair target has no original torn facts")
+        request = validated.request
+        expected_request = (
+            request.segment_id == facts.segment_id
+            and request.verified_bytes == facts.verified_bytes
+            and request.discarded_bytes == facts.discarded_bytes
+            and request.discarded_sha256 == facts.discarded_sha256
+            and request.last_verified_frame_sha256
+            == facts.last_verified_frame_sha256
+            and request.current_chain_head_sha256
+            == facts.current_chain_head_sha256
+            and request.reason == "torn_open_tail"
+        )
+        if not expected_request:
+            raise EvidenceSealError(
+                "simulated authorization does not bind held repair facts"
+            )
+        if (
+            self.classify_repair_physical(facts)
+            is not RepairPhysicalState.ORIGINAL_TORN
+        ):
+            raise EvidenceCorrupt(
+                "repair target changed before authorization registration"
+            )
+        _bind_held_source(
+            target.directory_descriptor,
+            target.open_name,
+            target.path,
+            descriptor=target.descriptor,
+            identity=target.original_identity,
+        )
+        generation = verifier._authority.generation
+        if (
+            type(validated.base_generation) is not int
+            or validated.base_generation != generation
+            or generation != self._repair_base_verifier_generation
+        ):
+            raise EvidenceSealError(
+                "simulated authorization verifier generation is stale"
+            )
+        target_identity = (
+            validated.target.sequence,
+            validated.target.event_id,
+            validated.target.content_sha256,
+            validated.target.event_type,
+            validated.target.evidence_priority,
+            validated.target.key_epoch,
+            validated.target.key_id,
+            validated.target.is_retry,
+        )
+        state, state_raw = self._decode_current_repair_state()
+        authorization = state.authorization
+        if (
+            state.phase != "authorized"
+            or authorization is None
+            or self._repair_facts_from_state(state) != facts
+            or state.repair_id != request.repair_id
+            or authorization.sequence != validated.target.sequence
+            or authorization.event_id != validated.target.event_id
+            or authorization.content_sha256
+            != validated.target.content_sha256
+        ):
+            raise EvidenceSealError(
+                "durable authorized state does not bind the exact proof"
+            )
+        capability = AuthenticatedRepairAuthorization(
+            _factory=_AUTHENTICATED_REPAIR_FACTORY
+        )
+        self._repair_authorization = _RepairAuthorizationBinding(
+            capability=capability,
+            simulated_proof=validated,
+            session_identity=self._repair_session_identity,
+            descriptor_identity=target.original_identity,
+            facts=facts,
+            request_canonical=canonical_json(request),
+            target_identity=target_identity,
+            verifier_generation=generation,
+            repair_state_raw=state_raw,
+        )
+        return capability
+
+    def truncate(
+        self,
+        proof: AuthenticatedRepairAuthorization,
+    ) -> RepairPhysicalState:
+        self._require_repair_pending()
+        binding = self._repair_authorization
+        facts = self._repair_facts
+        target = self._repair_target
+        verifier = self._require_authenticated_recovered()
+        if (
+            type(proof) is not AuthenticatedRepairAuthorization
+            or binding is None
+            or binding.capability is not proof
+            or proof._factory_marker is not _AUTHENTICATED_REPAIR_FACTORY
+            or binding.session_identity is not self._repair_session_identity
+            or binding.facts is not facts
+            or target is None
+            or facts is None
+            or binding.descriptor_identity != target.original_identity
+            or binding.verifier_generation != verifier._authority.generation
+            or self.read_repair_state_bytes() != binding.repair_state_raw
+            or self.classify_repair_physical(facts)
+            is not RepairPhysicalState.ORIGINAL_TORN
+        ):
+            raise EvidenceSealError(
+                "truncate requires the exact live registered authorization"
+            )
+        _bind_held_source(
+            target.directory_descriptor,
+            target.open_name,
+            target.path,
+            descriptor=target.descriptor,
+            identity=target.original_identity,
+        )
+        try:
+            live_proof = verifier._validate_repair_authorization_proof(
+                binding.simulated_proof
+            )
+            live_target_identity = (
+                live_proof.target.sequence,
+                live_proof.target.event_id,
+                live_proof.target.content_sha256,
+                live_proof.target.event_type,
+                live_proof.target.evidence_priority,
+                live_proof.target.key_epoch,
+                live_proof.target.key_id,
+                live_proof.target.is_retry,
+            )
+            live_request_canonical = canonical_json(live_proof.request)
+        except (
+            AttributeError,
+            IngestVerificationError,
+            TypeError,
+            ValueError,
+            VerifierCommitError,
+        ) as error:
+            raise EvidenceSealError(
+                "registered repair authorization proof is stale"
+            ) from error
+        if (
+            live_proof is not binding.simulated_proof
+            or live_request_canonical != binding.request_canonical
+            or live_target_identity != binding.target_identity
+            or binding.verifier_generation != verifier._authority.generation
+        ):
+            raise EvidenceSealError(
+                "registered repair authorization proof is stale"
+            )
+        self._repair_authorization = None
+        os.ftruncate(target.descriptor, facts.verified_bytes)
+        os.fsync(target.descriptor)
+        current = _file_identity(os.fstat(target.descriptor))
+        current_path = _file_identity(
+            _regular_stat_at(
+                target.directory_descriptor,
+                target.open_name,
+                target.path,
+            )
+        )
+        if (
+            current != current_path
+            or current.device != facts.original_device
+            or current.inode != facts.original_inode
+            or current.size != facts.verified_bytes
+            or _hash_held_range(
+                target.directory_descriptor,
+                target.open_name,
+                target.path,
+                descriptor=target.descriptor,
+                identity=current,
+                start=0,
+                end=current.size,
+            )
+            != facts.post_repair_prefix_sha256
+        ):
+            self._repair_physical_state = RepairPhysicalState.INVALID
+            raise EvidenceCorrupt("authorized repair truncate has uncertain facts")
+        state = (
+            RepairPhysicalState.ZERO_HELD
+            if facts.verified_bytes == 0
+            else RepairPhysicalState.CLEAN_OPEN
+        )
+        self._repair_physical_state = state
+        return state
+
+    def retire_zero_prefix(self, expected_repair_state: bytes) -> None:
+        self._require_repair_pending()
+        if self.read_repair_state_bytes() != expected_repair_state:
+            raise RepairStateConflict("zero retirement state CAS mismatch")
+        facts = self._repair_facts
+        target = self._repair_target
+        state, state_raw = self._decode_current_repair_state()
+        if (
+            facts is None
+            or target is None
+            or facts.verified_bytes != 0
+            or state_raw != expected_repair_state
+            or state.phase
+            not in {
+                "truncated",
+                "authorization_appended",
+                "completion_appended",
+            }
+            or self._repair_facts_from_state(state) != facts
+            or self.classify_repair_physical(facts)
+            is not RepairPhysicalState.ZERO_HELD
+        ):
+            raise EvidenceCorrupt("repair target is not the exact held zero inode")
+        held = _file_identity(os.fstat(target.descriptor))
+        published = _file_identity(
+            _regular_stat_at(
+                target.directory_descriptor,
+                target.open_name,
+                target.path,
+            )
+        )
+        if (
+            held != published
+            or held.device != facts.original_device
+            or held.inode != facts.original_inode
+            or held.size != 0
+        ):
+            raise EvidenceCorrupt("zero repair inode changed before retirement")
+        os.unlink(target.open_name, dir_fd=target.directory_descriptor)
+        os.fsync(target.directory_descriptor)
+        retired = os.fstat(target.descriptor)
+        if (
+            retired.st_dev != facts.original_device
+            or retired.st_ino != facts.original_inode
+            or retired.st_size != 0
+            or retired.st_nlink != 0
+            or _entry_stat_at(target.directory_descriptor, target.open_name)
+            is not None
+        ):
+            self._latch_repair_namespace_uncertain()
+            raise EvidenceCorrupt("zero repair inode retirement is uncertain")
+        self._repair_physical_state = RepairPhysicalState.ZERO_RETIRED
+
+    def _activate_held_repair_open(
+        self,
+        target: _RepairTarget,
+        *,
+        original_facts: TailRepairFacts | None,
+    ) -> None:
+        scan = self._read_segment(
+            target.directory_descriptor,
+            target.open_name,
+            target.path,
+            allow_torn=False,
+        )
+        validated = self._validated_active_scan(
+            target.date_name,
+            target.open_name,
+            scan,
+        )
+        if original_facts is None:
+            state, _state_raw = self._decode_current_repair_state()
+            self._validate_post_h0_active_state(state, validated)
+            if (
+                scan.identity != target.original_identity
+                or scan.size != target.scan.size
+                or scan.sha256 != target.scan.sha256
+            ):
+                raise EvidenceCorrupt(
+                    "post-H0 active tail changed before handoff"
+                )
+        elif (
+            scan.size != original_facts.verified_bytes
+            or scan.sha256 != original_facts.post_repair_prefix_sha256
+            or scan.identity.device != original_facts.original_device
+            or scan.identity.inode != original_facts.original_inode
+            or validated.frames[-1].record_hash.hex()
+            != original_facts.last_verified_frame_sha256
+        ):
+            raise EvidenceCorrupt("repaired prefix changed before handoff")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(
+            target.open_name,
+            flags,
+            dir_fd=target.directory_descriptor,
+        )
+        try:
+            _bind_held_source(
+                target.directory_descriptor,
+                target.open_name,
+                target.path,
+                descriptor=descriptor,
+                identity=scan.identity,
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+        os.close(target.descriptor)
+        self._active = _ActiveSegment(
+            segment_id=validated.segment_id,
+            open_path=target.path,
+            open_name=target.open_name,
+            closed_name=validated.closed_name,
+            closed_relative_path=validated.closed_relative_path,
+            directory_descriptor=target.directory_descriptor,
+            priority=validated.priority,
+            host_id=validated.host_id,
+            first_source_sequence=validated.first_source_sequence,
+            opened_at=validated.opened_at,
+            opened_monotonic=self._monotonic() - MAX_SEGMENT_AGE_SECONDS,
+            descriptor=descriptor,
+            size=scan.size,
+            record_count=len(validated.records),
+            previous_frame_hash=validated.frames[-1].record_hash,
+        )
+        self._repair_prefix_needs_settlement = True
+
+    def resume_store(self) -> SegmentStore:
+        self._require_repair_pending()
+        facts = self._repair_facts
+        verifier = self._require_authenticated_recovered()
+        state, _state_raw = self._decode_current_repair_state()
+        if (
+            facts is None
+            or state.phase
+            not in {
+                "truncated",
+                "authorization_appended",
+                "completion_appended",
+            }
+            or self._repair_facts_from_state(state) != facts
+        ):
+            raise EvidenceSealError(
+                "repair resume requires exact durable state and physical facts"
+            )
+        if verifier._authority.generation != self._repair_base_verifier_generation:
+            raise EvidenceSealError("live verifier changed before repair resume")
+        journal = self._repair_ack_journal
+        if (
+            journal is None
+            or journal is not self._ack_journal_owner
+            or journal.snapshot() != self._repair_ack_snapshot
+        ):
+            raise EvidenceSealError("retained repair ACK authority changed")
+        startup_physical = self.classify_repair_physical(facts)
+        if startup_physical is RepairPhysicalState.ZERO_HELD:
+            raise EvidenceSealError(
+                "zero repair prefix must be retired before store resume"
+            )
+        if startup_physical not in {
+            RepairPhysicalState.CLEAN_OPEN,
+            RepairPhysicalState.SETTLED_PREFIX,
+            RepairPhysicalState.ZERO_RETIRED,
+        }:
+            raise EvidenceCorrupt("repair target is not durably resumable")
+        plan = self._repair_recovery_plan
+        if plan is None:
+            raise EvidenceSealError("repair startup recovery plan was already consumed")
+        self._apply_recovery_plan(plan)
+        self._repair_recovery_plan = None
+        physical = self.classify_repair_physical(facts)
+        if physical not in {
+            RepairPhysicalState.CLEAN_OPEN,
+            RepairPhysicalState.SETTLED_PREFIX,
+            RepairPhysicalState.ZERO_RETIRED,
+        }:
+            raise EvidenceCorrupt(
+                "repair target changed while startup recovery was applied"
+            )
+        self._repair_physical_state = physical
+
+        target = self._repair_target
+        if physical is RepairPhysicalState.CLEAN_OPEN:
+            if target is None:
+                raise EvidenceCorrupt("clean repaired prefix has no held target")
+            self._activate_held_repair_open(
+                target,
+                original_facts=facts,
+            )
+            self._repair_target = None
+        elif target is not None:
+            os.close(target.descriptor)
+            self._repair_target = None
+
+        post_h0_active = self._repair_post_h0_active
+        if post_h0_active is not None:
+            if self._active is not None:
+                raise EvidenceCorrupt(
+                    "repair resume found multiple active evidence tails"
+                )
+            self._activate_held_repair_open(
+                post_h0_active,
+                original_facts=None,
+            )
+            self._repair_post_h0_active = None
+
+        self._repair_mode = False
+        self._repair_pretruncate = False
+        self._repair_resumed = True
+        self.__class__ = SegmentStore
+        return self
 
     @property
     def acceptance_cursor(self) -> int:
@@ -2565,8 +3658,18 @@ class SegmentStore:
         return descriptor
 
     def _startup(self) -> None:
+        if self._repair_mode:
+            self._startup_tail_repair()
+            return
         try:
             plan, manifested_open = self._scan_manifests_and_segments()
+            if (
+                self._repair_state_binding is not None
+                or self._repair_state_temporary is not None
+            ):
+                raise TailRepairPending(
+                    "evidence root has a pending signed tail repair"
+                )
             active_cleanup = self._scan_unsettled_open(manifested_open)
             plan = _RecoveryPlan(
                 promotions=plan.promotions,
@@ -2589,6 +3692,27 @@ class SegmentStore:
             if self._read_only_reason is None:
                 self._trip_read_only("segment_corrupt")
             raise EvidenceCorrupt("evidence startup verification failed") from error
+
+    def _startup_tail_repair(self) -> None:
+        try:
+            plan, manifested_open = self._scan_manifests_and_segments()
+            self._repair_recovery_plan = plan
+            self._scan_tail_repair_target(manifested_open)
+            self._bind_durable_repair_facts()
+            if (
+                self._repair_target is None
+                and self._repair_state_binding is None
+                and self._repair_state_temporary is None
+            ):
+                raise EvidenceStoreError("evidence root has no tail-repair candidate")
+        except EvidenceCorrupt:
+            if self._read_only_reason is None:
+                self._trip_read_only("segment_corrupt")
+            raise
+        except (JournalCorrupt, OSError, ValidationError, ValueError) as error:
+            if self._read_only_reason is None:
+                self._trip_read_only("segment_corrupt")
+            raise EvidenceCorrupt("repair startup verification failed") from error
 
     def _load_health_state(self) -> None:
         names = set(os.listdir(self._root_descriptor))
@@ -3000,7 +4124,27 @@ class SegmentStore:
         ack_commitment_raw: bytes | None = None
         ack_commitment_identity: _FileIdentity | None = None
         ack_commitment_temporaries: list[_AckCommitmentTemporaryBinding] = []
+        repair_state_bindings: list[_RepairStateArtifactBinding] = []
+        repair_state_temporaries: list[_RepairStateArtifactBinding] = []
         for name in root_entries:
+            if name == _REPAIR_STATE_NAME:
+                repair_state_bindings.append(
+                    _read_stable_repair_artifact(
+                        self._root_descriptor,
+                        name,
+                        self.root / name,
+                    )
+                )
+                continue
+            if _REPAIR_STATE_TEMP_NAME.fullmatch(name):
+                repair_state_temporaries.append(
+                    _read_stable_repair_artifact(
+                        self._root_descriptor,
+                        name,
+                        self.root / name,
+                    )
+                )
+                continue
             if name == "ack-journal.agf":
                 ack_journal_identity = _file_identity(
                     _regular_stat_at(
@@ -3089,6 +4233,16 @@ class SegmentStore:
             raise EvidenceCorrupt(f"unexpected evidence-root artifact: {name}")
         if len(ack_commitment_temporaries) > 1:
             raise EvidenceCorrupt("multiple ACK commitment temporaries exist")
+        if len(repair_state_bindings) > 1:
+            raise EvidenceCorrupt("multiple final repair-state artifacts exist")
+        if len(repair_state_temporaries) > 1:
+            raise EvidenceCorrupt("multiple repair-state temporaries exist")
+        self._repair_state_binding = (
+            repair_state_bindings[0] if repair_state_bindings else None
+        )
+        self._repair_state_temporary = (
+            repair_state_temporaries[0] if repair_state_temporaries else None
+        )
         self._ack_journal_identity = ack_journal_identity
         self._ack_commitment = ack_commitment
         self._ack_commitment_raw = ack_commitment_raw
@@ -3177,6 +4331,593 @@ class SegmentStore:
         self._chain_head = expected
         return canonical_json(expected)
 
+    def _validated_active_scan(
+        self,
+        date_name: str,
+        open_name: str,
+        scan: _SegmentScan,
+    ) -> _ValidatedActiveScan:
+        match = _OPEN_NAME.fullmatch(open_name)
+        if match is None:
+            raise EvidenceCorrupt("active segment filename is not canonical")
+        filename_sequence = int(match.group("sequence"))
+        if not 1 <= filename_sequence <= MAX_UINT64:
+            raise EvidenceCorrupt("active filename first sequence is out of range")
+        verified_bytes = (
+            scan.size if scan.torn_verified is None else scan.torn_verified
+        )
+        records = list(scan.records)
+        frames = list(scan.frames)
+        if (
+            verified_bytes <= 0
+            or not records
+            or not frames
+            or len(records) != len(frames)
+            or frames[-1].offset + frames[-1].size != verified_bytes
+        ):
+            raise EvidenceCorrupt("active complete prefix cannot establish exact facts")
+        priorities = {record.priority for record in records}
+        hosts = {str(record.envelope["host_id"]) for record in records}
+        if len(priorities) != 1 or len(hosts) != 1:
+            raise EvidenceCorrupt("active segment mixes host or priority")
+        if filename_sequence != records[0].ref.source_sequence:
+            raise EvidenceCorrupt("active filename first sequence mismatch")
+        if records[0].accepted_at[:10] != date_name:
+            raise EvidenceCorrupt(
+                "active segment date differs from opened_at UTC date"
+            )
+        segment_id = match.group("segment")
+        closed_name = open_name.removesuffix(".open") + ".agseg"
+        closed_relative = f"segments/{date_name}/{closed_name}"
+        rebuilt: list[StoredEvidenceRecord] = []
+        for record, frame in zip(records, frames, strict=True):
+            ref = replace_ref(
+                record.ref,
+                segment_id=segment_id,
+                segment_relative_path=closed_relative,
+                frame=frame,
+            )
+            rebuilt.append(
+                StoredEvidenceRecord(
+                    envelope=record.envelope,
+                    canonical_envelope=record.canonical_envelope,
+                    priority=record.priority,
+                    accepted_at=record.accepted_at,
+                    ref=ref,
+                )
+            )
+        return _ValidatedActiveScan(
+            records=tuple(rebuilt),
+            frames=tuple(frames),
+            segment_id=segment_id,
+            open_name=open_name,
+            closed_name=closed_name,
+            closed_relative_path=closed_relative,
+            date_name=date_name,
+            priority=records[0].priority,
+            host_id=str(records[0].envelope["host_id"]),
+            first_source_sequence=records[0].ref.source_sequence,
+            opened_at=records[0].accepted_at,
+            verified_bytes=verified_bytes,
+        )
+
+    @staticmethod
+    def _validate_post_h0_active_state(
+        state: RepairStateV1,
+        active: _ValidatedActiveScan,
+    ) -> None:
+        if len(active.records) != 1:
+            raise EvidenceCorrupt(
+                "post-repair active tail must contain exactly one unsettled record"
+            )
+        record = active.records[0]
+        ref = record.ref
+        authorization = state.authorization
+        if state.phase == "truncated":
+            if authorization is None or ref.source_sequence > authorization.sequence:
+                raise EvidenceCorrupt(
+                    "post-repair active tail passed the authorization target"
+                )
+            expected = authorization
+            expected_type = "evidence_repair_authorized"
+        elif state.phase == "authorization_appended":
+            completion = state.completion
+            if (
+                authorization is None
+                or completion is None
+                or not authorization.sequence
+                < ref.source_sequence
+                <= completion.sequence
+            ):
+                raise EvidenceCorrupt(
+                    "post-repair active tail is outside the completion drain"
+                )
+            expected = completion
+            expected_type = "evidence_repair_completed"
+        else:
+            raise EvidenceCorrupt(
+                "durable repair phase cannot retain a post-H0 active tail"
+            )
+        if ref.source_sequence == expected.sequence and (
+            ref.event_id != expected.event_id
+            or ref.content_sha256 != expected.content_sha256
+            or record.envelope.get("event_type") != expected_type
+        ):
+            raise EvidenceCorrupt(
+                "post-repair active tail differs from the exact repair target"
+            )
+
+    def _scan_tail_repair_target(
+        self,
+        manifested_open: set[tuple[str, str]],
+    ) -> None:
+        open_entries: list[tuple[str, str]] = []
+        for date_name in sorted(os.listdir(self._segments_descriptor)):
+            date_descriptor = self._date_descriptor(date_name)
+            for name in sorted(os.listdir(date_descriptor)):
+                if name.endswith(".open") and (date_name, name) not in manifested_open:
+                    open_entries.append((date_name, name))
+        if len(open_entries) > 1:
+            raise EvidenceCorrupt("multiple active evidence segments exist")
+        if not open_entries:
+            if (
+                self._repair_state_binding is None
+                and self._repair_state_temporary is not None
+            ):
+                raise EvidenceCorrupt(
+                    "repair-state temporary has no original torn target"
+                )
+            if self._repair_state_binding is not None:
+                self._repair_physical_state = RepairPhysicalState.ZERO_RETIRED
+            return
+
+        date_name, open_name = open_entries[0]
+        match = _OPEN_NAME.fullmatch(open_name)
+        if (
+            match is None
+            or not 1 <= int(match.group("sequence")) <= MAX_UINT64
+        ):
+            raise EvidenceCorrupt("active segment filename is not canonical")
+        path = self._segments_path / date_name / open_name
+        date_descriptor = self._date_descriptor(date_name)
+        scan = self._read_segment(
+            date_descriptor,
+            open_name,
+            path,
+            allow_torn=True,
+        )
+        descriptor, identity = _open_regular_read_write_at(
+            date_descriptor,
+            open_name,
+            path,
+            maximum=MAX_SEGMENT_BYTES,
+        )
+        if identity != scan.identity:
+            os.close(descriptor)
+            raise EvidenceCorrupt(
+                "repair target changed between scan and retained open"
+            )
+        target = _RepairTarget(
+            date_name=date_name,
+            open_name=open_name,
+            path=path,
+            directory_descriptor=date_descriptor,
+            descriptor=descriptor,
+            original_identity=identity,
+            scan=scan,
+        )
+        self._repair_target = target
+        binding = self._repair_state_binding
+        if binding is not None:
+            try:
+                durable_state = decode_repair_state(binding.raw)
+            except RepairStateCorrupt as error:
+                raise EvidenceCorrupt("durable repair state is invalid") from error
+            relative_path = path.relative_to(self.root).as_posix()
+            if relative_path != durable_state.open_relative_path:
+                if scan.size == 0 or scan.torn_verified is not None:
+                    raise EvidenceCorrupt(
+                        "post-repair active tail is empty or torn"
+                    )
+                validated = self._validated_active_scan(
+                    date_name,
+                    open_name,
+                    scan,
+                )
+                self._validate_post_h0_active_state(
+                    durable_state,
+                    validated,
+                )
+                self._add_records(list(validated.records))
+                self._repair_post_h0_active = target
+                self._repair_target = None
+                return
+
+        if scan.size == 0:
+            if self._repair_state_binding is None:
+                raise EvidenceCorrupt(
+                    "zero-byte active segment lacks durable repair state"
+                )
+            self._repair_physical_state = RepairPhysicalState.ZERO_HELD
+            return
+
+        if scan.torn_verified is None:
+            if self._repair_state_binding is None:
+                if self._repair_state_temporary is not None:
+                    raise EvidenceCorrupt(
+                        "post-truncate prefix has no final repair state"
+                    )
+                raise EvidenceStoreError(
+                    "active segment is complete and needs no tail repair"
+                )
+            validated = self._validated_active_scan(date_name, open_name, scan)
+            self._add_records(list(validated.records))
+            self._repair_physical_state = RepairPhysicalState.CLEAN_OPEN
+            return
+
+        verified_bytes = scan.torn_verified
+        if not 0 <= verified_bytes < scan.size:
+            raise EvidenceCorrupt("torn repair byte range is invalid")
+        discarded_bytes = scan.size - verified_bytes
+        if discarded_bytes > MAX_EVIDENCE_RECORD_BYTES + 75:
+            raise EvidenceCorrupt("incomplete AGF1 suffix exceeds one frame")
+        suffix = _held_range_bytes(
+            date_descriptor,
+            open_name,
+            path,
+            descriptor=descriptor,
+            identity=identity,
+            start=verified_bytes,
+            end=scan.size,
+        )
+        previous_hash = (
+            scan.frames[-1].record_hash if scan.frames else bytes(32)
+        )
+        _validate_incomplete_frame_suffix(
+            suffix,
+            expected_previous=previous_hash,
+        )
+
+        if verified_bytes == 0:
+            if scan.frames or scan.records:
+                raise EvidenceCorrupt(
+                    "zero-prefix repair target contains a complete frame"
+                )
+            segment_id = match.group("segment")
+        else:
+            validated = self._validated_active_scan(date_name, open_name, scan)
+            self._add_records(list(validated.records))
+            segment_id = validated.segment_id
+
+        prefix_sha256 = _hash_held_range(
+            date_descriptor,
+            open_name,
+            path,
+            descriptor=descriptor,
+            identity=identity,
+            start=0,
+            end=verified_bytes,
+        )
+        discarded_sha256 = hashlib.sha256(suffix).hexdigest()
+        expected_head = (
+            chain_head_for(self._manifests[-1]) if self._manifests else None
+        )
+        current_chain_head_sha256 = (
+            _ZERO_SHA256
+            if expected_head is None
+            else hashlib.sha256(canonical_json(expected_head)).hexdigest()
+        )
+        manifest_predecessor_sha256 = (
+            self._manifests[-1].manifest_sha256
+            if self._manifests
+            else GENESIS_MANIFEST_SHA256
+        )
+        self._repair_facts = TailRepairFacts(
+            segment_id=segment_id,
+            open_relative_path=path.relative_to(self.root).as_posix(),
+            original_device=identity.device,
+            original_inode=identity.inode,
+            original_bytes=identity.size,
+            verified_bytes=verified_bytes,
+            discarded_bytes=discarded_bytes,
+            discarded_sha256=discarded_sha256,
+            post_repair_prefix_sha256=prefix_sha256,
+            last_verified_frame_sha256=(
+                scan.frames[-1].record_hash.hex()
+                if scan.frames
+                else _ZERO_SHA256
+            ),
+            current_chain_head_sha256=current_chain_head_sha256,
+            manifest_predecessor_sha256=manifest_predecessor_sha256,
+        )
+        self._repair_physical_state = RepairPhysicalState.ORIGINAL_TORN
+
+    def _manifest_predecessor_for_h0(self, h0: str) -> str:
+        matches: list[str] = []
+        if h0 == _ZERO_SHA256:
+            matches.append(GENESIS_MANIFEST_SHA256)
+        for manifest in self._manifests:
+            digest = hashlib.sha256(
+                canonical_json(chain_head_for(manifest))
+            ).hexdigest()
+            if digest == h0:
+                matches.append(manifest.manifest_sha256)
+        if len(matches) != 1:
+            raise EvidenceCorrupt(
+                "repair H0 does not select one historical manifest prefix"
+            )
+        return matches[0]
+
+    def _repair_facts_from_state(
+        self,
+        state: RepairStateV1,
+    ) -> TailRepairFacts:
+        return TailRepairFacts(
+            segment_id=state.segment_id,
+            open_relative_path=state.open_relative_path,
+            original_device=state.original_device,
+            original_inode=state.original_inode,
+            original_bytes=state.original_bytes,
+            verified_bytes=state.verified_bytes,
+            discarded_bytes=state.discarded_bytes,
+            discarded_sha256=state.discarded_sha256,
+            post_repair_prefix_sha256=state.post_repair_prefix_sha256,
+            last_verified_frame_sha256=state.last_verified_frame_sha256,
+            current_chain_head_sha256=state.current_chain_head_sha256,
+            manifest_predecessor_sha256=self._manifest_predecessor_for_h0(
+                state.current_chain_head_sha256
+            ),
+        )
+
+    def _bind_durable_repair_facts(self) -> None:
+        binding = self._repair_state_binding
+        if binding is None:
+            if (
+                self._repair_physical_state
+                is not RepairPhysicalState.ORIGINAL_TORN
+                and self._repair_state_temporary is not None
+            ):
+                raise EvidenceCorrupt(
+                    "repair temporary cannot authorize post-truncate bytes"
+                )
+            return
+        try:
+            state = decode_repair_state(binding.raw)
+        except RepairStateCorrupt as error:
+            raise EvidenceCorrupt("durable repair state is invalid") from error
+        durable_facts = self._repair_facts_from_state(state)
+        detected_facts = self._repair_facts
+        if (
+            self._repair_physical_state is RepairPhysicalState.ORIGINAL_TORN
+            and detected_facts != durable_facts
+        ):
+            raise EvidenceCorrupt(
+                "durable repair state differs from the original torn bytes"
+            )
+        self._repair_facts = durable_facts
+        physical = self.classify_repair_physical(durable_facts)
+        if physical is RepairPhysicalState.INVALID:
+            raise EvidenceCorrupt(
+                "durable repair state does not match the held physical namespace"
+            )
+        if not self._repair_phase_matches_physical(state, physical):
+            raise EvidenceCorrupt(
+                "durable repair phase contradicts the held physical namespace"
+            )
+        if (
+            self._repair_post_h0_active is not None
+            and physical
+            not in {
+                RepairPhysicalState.SETTLED_PREFIX,
+                RepairPhysicalState.ZERO_RETIRED,
+            }
+        ):
+            raise EvidenceCorrupt(
+                "post-H0 active tail precedes original repair settlement"
+            )
+        self._repair_physical_state = physical
+
+    @staticmethod
+    def _repair_phase_matches_physical(
+        state: RepairStateV1,
+        physical: RepairPhysicalState,
+    ) -> bool:
+        if state.phase == "detected":
+            return physical is RepairPhysicalState.ORIGINAL_TORN
+        if state.phase == "authorized":
+            return physical in {
+                RepairPhysicalState.ORIGINAL_TORN,
+                RepairPhysicalState.CLEAN_OPEN,
+                RepairPhysicalState.ZERO_HELD,
+            }
+        return physical in {
+            RepairPhysicalState.CLEAN_OPEN,
+            RepairPhysicalState.SETTLED_PREFIX,
+            RepairPhysicalState.ZERO_HELD,
+            RepairPhysicalState.ZERO_RETIRED,
+        }
+
+    def _historical_h0_matches(self, facts: TailRepairFacts) -> bool:
+        try:
+            return (
+                self._manifest_predecessor_for_h0(
+                    facts.current_chain_head_sha256
+                )
+                == facts.manifest_predecessor_sha256
+            )
+        except EvidenceCorrupt:
+            return False
+
+    def classify_repair_physical(
+        self,
+        facts: TailRepairFacts,
+    ) -> RepairPhysicalState:
+        self._require_repair_lifecycle()
+        if self._repair_namespace_uncertain:
+            return RepairPhysicalState.INVALID
+        if type(facts) is not TailRepairFacts or not self._historical_h0_matches(facts):
+            return RepairPhysicalState.INVALID
+        path_match = _OPEN_NAME.fullmatch(
+            facts.open_relative_path.rsplit("/", 1)[-1]
+        )
+        path_parts = facts.open_relative_path.split("/")
+        if (
+            path_match is None
+            or len(path_parts) != 3
+            or path_parts[0] != "segments"
+            or path_match.group("segment") != facts.segment_id
+            or not 1 <= int(path_match.group("sequence")) <= MAX_UINT64
+        ):
+            return RepairPhysicalState.INVALID
+        date_name = path_parts[1]
+        open_name = path_parts[2]
+        try:
+            date_descriptor = self._date_descriptor(date_name)
+            open_info = _entry_stat_at(date_descriptor, open_name)
+            if open_info is not None:
+                descriptor, identity = _open_regular_read_write_at(
+                    date_descriptor,
+                    open_name,
+                    self.root / facts.open_relative_path,
+                    maximum=MAX_SEGMENT_BYTES,
+                )
+                try:
+                    if (
+                        identity.device != facts.original_device
+                        or identity.inode != facts.original_inode
+                    ):
+                        return RepairPhysicalState.INVALID
+                    scan = self._read_segment(
+                        date_descriptor,
+                        open_name,
+                        self.root / facts.open_relative_path,
+                        allow_torn=True,
+                    )
+                    if scan.identity != identity:
+                        return RepairPhysicalState.INVALID
+                    if (
+                        identity.size == facts.original_bytes
+                        and scan.torn_verified == facts.verified_bytes
+                        and facts.discarded_bytes
+                        == facts.original_bytes - facts.verified_bytes
+                    ):
+                        suffix = _held_range_bytes(
+                            date_descriptor,
+                            open_name,
+                            self.root / facts.open_relative_path,
+                            descriptor=descriptor,
+                            identity=identity,
+                            start=facts.verified_bytes,
+                            end=facts.original_bytes,
+                        )
+                        prefix_sha256 = _hash_held_range(
+                            date_descriptor,
+                            open_name,
+                            self.root / facts.open_relative_path,
+                            descriptor=descriptor,
+                            identity=identity,
+                            start=0,
+                            end=facts.verified_bytes,
+                        )
+                        last_frame_sha256 = (
+                            scan.frames[-1].record_hash.hex()
+                            if scan.frames
+                            else _ZERO_SHA256
+                        )
+                        if (
+                            hashlib.sha256(suffix).hexdigest()
+                            == facts.discarded_sha256
+                            and prefix_sha256
+                            == facts.post_repair_prefix_sha256
+                            and last_frame_sha256
+                            == facts.last_verified_frame_sha256
+                        ):
+                            _validate_incomplete_frame_suffix(
+                                suffix,
+                                expected_previous=(
+                                    scan.frames[-1].record_hash
+                                    if scan.frames
+                                    else bytes(32)
+                                ),
+                            )
+                            return RepairPhysicalState.ORIGINAL_TORN
+                    if (
+                        facts.verified_bytes == 0
+                        and identity.size == 0
+                        and not scan.frames
+                        and not scan.records
+                        and scan.torn_verified is None
+                    ):
+                        return RepairPhysicalState.ZERO_HELD
+                    if (
+                        facts.verified_bytes > 0
+                        and identity.size == facts.verified_bytes
+                        and scan.torn_verified is None
+                        and scan.frames
+                        and scan.frames[-1].record_hash.hex()
+                        == facts.last_verified_frame_sha256
+                        and _hash_held_range(
+                            date_descriptor,
+                            open_name,
+                            self.root / facts.open_relative_path,
+                            descriptor=descriptor,
+                            identity=identity,
+                            start=0,
+                            end=identity.size,
+                        )
+                        == facts.post_repair_prefix_sha256
+                    ):
+                        self._validated_active_scan(date_name, open_name, scan)
+                        return RepairPhysicalState.CLEAN_OPEN
+                    return RepairPhysicalState.INVALID
+                finally:
+                    os.close(descriptor)
+
+            matching = [
+                manifest
+                for manifest in self._manifests
+                if manifest.segment_id == facts.segment_id
+            ]
+            if facts.verified_bytes == 0:
+                return (
+                    RepairPhysicalState.ZERO_RETIRED
+                    if not matching
+                    else RepairPhysicalState.INVALID
+                )
+            if len(matching) != 1:
+                return RepairPhysicalState.INVALID
+            manifest = matching[0]
+            expected_relative = facts.open_relative_path.removesuffix(
+                ".open"
+            ) + ".agseg"
+            if (
+                manifest.segment_relative_path != expected_relative
+                or manifest.previous_manifest_sha256
+                != facts.manifest_predecessor_sha256
+                or manifest.segment_size_bytes != facts.verified_bytes
+                or manifest.segment_sha256
+                != facts.post_repair_prefix_sha256
+                or manifest.last_frame_sha256
+                != facts.last_verified_frame_sha256
+            ):
+                return RepairPhysicalState.INVALID
+            _, manifest_date, closed_name = expected_relative.split("/")
+            closed_descriptor = self._date_descriptor(manifest_date)
+            closed_scan = self._verify_segment_against_manifest(
+                closed_descriptor,
+                closed_name,
+                self.root / expected_relative,
+                manifest,
+            )
+            if (
+                closed_scan.identity.device == facts.original_device
+                and closed_scan.identity.inode == facts.original_inode
+            ):
+                return RepairPhysicalState.SETTLED_PREFIX
+            return RepairPhysicalState.INVALID
+        except (EvidenceCorrupt, OSError, ValueError):
+            return RepairPhysicalState.INVALID
+
     def _scan_unsettled_open(
         self,
         manifested_open: set[tuple[str, str]],
@@ -3207,39 +4948,8 @@ class SegmentStore:
             raise EvidenceCorrupt("zero-byte active segment is impossible")
         if scan.torn_verified is not None:
             raise TornTailRepairRequired(path, scan.torn_verified, scan.size)
-        records = list(scan.records)
-        frames = list(scan.frames)
-        if not records or not frames:
-            raise EvidenceCorrupt("empty active segment cannot establish facts")
-        priorities = {record.priority for record in records}
-        hosts = {str(record.envelope["host_id"]) for record in records}
-        if len(priorities) != 1 or len(hosts) != 1:
-            raise EvidenceCorrupt("active segment mixes host or priority")
-        if int(match.group("sequence")) != records[0].ref.source_sequence:
-            raise EvidenceCorrupt("active filename first sequence mismatch")
-        if records[0].accepted_at[:10] != date_name:
-            raise EvidenceCorrupt("active segment date differs from opened_at UTC date")
-        segment_id = match.group("segment")
-        closed_name = open_name.removesuffix(".open") + ".agseg"
-        closed_relative = f"segments/{date_name}/{closed_name}"
-        rebuilt: list[StoredEvidenceRecord] = []
-        for record, frame in zip(records, frames, strict=True):
-            ref = replace_ref(
-                record.ref,
-                segment_id=segment_id,
-                segment_relative_path=closed_relative,
-                frame=frame,
-            )
-            rebuilt.append(
-                StoredEvidenceRecord(
-                    envelope=record.envelope,
-                    canonical_envelope=record.canonical_envelope,
-                    priority=record.priority,
-                    accepted_at=record.accepted_at,
-                    ref=ref,
-                )
-            )
-        self._add_records(rebuilt)
+        validated = self._validated_active_scan(date_name, open_name, scan)
+        self._add_records(list(validated.records))
         descriptor = -1
         if self._read_only_reason is None:
             flags = os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC
@@ -3258,21 +4968,21 @@ class SegmentStore:
                 os.close(descriptor)
                 raise
         self._active = _ActiveSegment(
-            segment_id=segment_id,
+            segment_id=validated.segment_id,
             open_path=path,
             open_name=open_name,
-            closed_name=closed_name,
-            closed_relative_path=closed_relative,
+            closed_name=validated.closed_name,
+            closed_relative_path=validated.closed_relative_path,
             directory_descriptor=date_descriptor,
-            priority=records[0].priority,
-            host_id=str(records[0].envelope["host_id"]),
-            first_source_sequence=records[0].ref.source_sequence,
-            opened_at=records[0].accepted_at,
+            priority=validated.priority,
+            host_id=validated.host_id,
+            first_source_sequence=validated.first_source_sequence,
+            opened_at=validated.opened_at,
             opened_monotonic=self._monotonic() - MAX_SEGMENT_AGE_SECONDS,
             descriptor=descriptor,
             size=scan.size,
-            record_count=len(records),
-            previous_frame_hash=frames[-1].record_hash,
+            record_count=len(validated.records),
+            previous_frame_hash=validated.frames[-1].record_hash,
         )
         return ()
 
@@ -3567,6 +5277,14 @@ class SegmentStore:
         if verifier is None or self._authority_state != "ready":
             raise EvidenceSealError(
                 "append requires one factory-bound recovered verifier lifecycle"
+            )
+        if self._repair_pretruncate:
+            raise EvidenceReadOnly(
+                "evidence append is disabled before authorized tail truncation"
+            )
+        if self._repair_prefix_needs_settlement:
+            raise EvidenceReadOnly(
+                "repaired prefix must be explicitly settled before evidence append"
             )
         if self._read_only_reason is not None:
             raise EvidenceReadOnly(
@@ -3991,6 +5709,7 @@ class SegmentStore:
         self._manifests.append(manifest)
         self._chain_head = head
         self._active = None
+        self._repair_prefix_needs_settlement = False
 
     def iter_records(self) -> Iterator[StoredEvidenceRecord]:
         for record in tuple(self._records):
@@ -4012,6 +5731,7 @@ class SegmentStore:
                 and self._read_only_reason is None
                 and not self._append_uncertain
                 and self._pending_durable_commit is None
+                and not self._repair_pending
             ):
                 self.flush_security_boundary()
             elif self._active is not None and self._active.descriptor >= 0:
@@ -4070,6 +5790,14 @@ class SegmentStore:
                         )
                     self._fence_missing_expected_ack_journal()
             finally:
+                for repair_target in (
+                    self._repair_target,
+                    self._repair_post_h0_active,
+                ):
+                    if repair_target is not None and repair_target.descriptor >= 0:
+                        os.close(repair_target.descriptor)
+                self._repair_target = None
+                self._repair_post_h0_active = None
                 for descriptor in self._date_descriptors.values():
                     os.close(descriptor)
                 os.close(self._manifests_descriptor)
@@ -4077,6 +5805,48 @@ class SegmentStore:
                 fcntl.flock(self._root_descriptor, fcntl.LOCK_UN)
                 os.close(self._root_descriptor)
                 self._closed = True
+
+
+@final
+class TailRepairSession(SegmentStore):
+    """Pre-truncate, same-lock evidence store with one retained ACK authority."""
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("TailRepairSession is final")
+
+    def __init__(
+        self,
+        root: Path,
+        verifier: EnvelopeVerifier,
+        *,
+        wall_clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        health_step_hook: Callable[[str], None] | None = None,
+        segment_create_step_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        if type(verifier) is not EnvelopeVerifier:
+            raise TypeError("tail repair requires the exact EnvelopeVerifier")
+        self._repair_mode = True
+        try:
+            super().__init__(
+                root,
+                wall_clock=wall_clock,
+                monotonic_clock=monotonic_clock,
+                health_step_hook=health_step_hook,
+                segment_create_step_hook=segment_create_step_hook,
+            )
+            self._bind_and_recover(verifier)
+            self._repair_base_verifier_generation = verifier._authority.generation
+            from agmind_immune.ingest.ack_journal import AckJournal
+
+            journal = AckJournal.open_and_recover(self)
+            self._repair_ack_journal = journal
+            self._repair_ack_snapshot = journal.snapshot()
+        except BaseException:
+            if hasattr(self, "_closed") and not self._closed:
+                self.close(flush=False)
+            raise
 
 
 def replace_ref(

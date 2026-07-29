@@ -6,10 +6,11 @@ import asyncio
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, final
+from typing import Literal, Protocol, final
 
 import httpx
 
+from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.clock import CoreClockProvider
 from agmind_immune.contracts import MAX_UINT64
 from agmind_immune.coverage import CoverageAckBarrier, CoverageState
@@ -26,6 +27,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournalSnapshot,
 )
 from agmind_immune.ingest.envelope import (
+    MAX_CORE_EVENT_RESPONSE_BYTES,
     MAX_EVENTS_PAGE_BYTES,
     MAX_PAGE_EVENTS,
     CoreEventsPageV1,
@@ -33,20 +35,26 @@ from agmind_immune.ingest.envelope import (
     EnvelopeConflict,
     EnvelopeVerifier,
     PageDecodeError,
+    decode_core_event,
     decode_events_page,
 )
 
 _COORDINATOR_FACTORY = object()
+_REPAIR_ACCEPTANCE_FACTORY = object()
 _DELIVERY_FACTORY = object()
+_REPAIR_DELIVERY_FACTORY = object()
 _COVERAGE_ADAPTER_FACTORY = object()
 _MAX_ERROR_BODY_BYTES = 4_096
+_MAX_REPAIR_DRAIN_EVENTS = 4_096
+_MAX_REPAIR_DRAIN_PAGES = 64
+_MAX_REPAIR_DRAIN_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 @final
 class AcceptanceCoordinator:
     """Durably append a staged envelope before committing verifier/FSM state."""
 
-    __slots__ = ("_segment_store", "_verifier")
+    __slots__ = ("_repair_mode", "_segment_store", "_verifier")
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("AcceptanceCoordinator is final")
@@ -56,14 +64,26 @@ class AcceptanceCoordinator:
         verifier: EnvelopeVerifier,
         segment_store: SegmentStore,
         *,
+        _repair_mode: bool = False,
         _factory: object,
     ) -> None:
-        if _factory is not _COORDINATOR_FACTORY:
+        if (
+            (_factory is _COORDINATOR_FACTORY and _repair_mode is not False)
+            or (
+                _factory is _REPAIR_ACCEPTANCE_FACTORY
+                and _repair_mode is not True
+            )
+            or (
+                _factory is not _COORDINATOR_FACTORY
+                and _factory is not _REPAIR_ACCEPTANCE_FACTORY
+            )
+        ):
             raise TypeError(
                 "use AcceptanceCoordinator.create_empty() or open_and_recover()"
             )
         self._verifier = verifier
         self._segment_store = segment_store
+        self._repair_mode = _repair_mode
 
     @property
     def verifier(self) -> EnvelopeVerifier:
@@ -73,7 +93,7 @@ class AcceptanceCoordinator:
     def segment_store(self) -> SegmentStore:
         return self._segment_store
 
-    def accept(self, item: CoreEventV1) -> EvidenceRef:
+    def _accept_bound(self, item: CoreEventV1) -> EvidenceRef:
         verifier = self._verifier
         segment_store = self._segment_store
         try:
@@ -91,6 +111,53 @@ class AcceptanceCoordinator:
             verified,
             EvidencePriority(verified.evidence_priority),
         )
+
+    def accept(self, item: CoreEventV1) -> EvidenceRef:
+        status = self._segment_store.status()
+        if self._repair_mode or (
+            type(status) is EvidenceStatus
+            and status.repair_pending is True
+        ):
+            raise DeliveryFatalError(
+                "repair-resumed acceptance requires repair delivery authority"
+            )
+        return self._accept_bound(item)
+
+    def _accept_for_repair(
+        self,
+        item: CoreEventV1,
+        *,
+        _factory: object,
+    ) -> EvidenceRef:
+        if _factory is not _REPAIR_DELIVERY_FACTORY:
+            raise TypeError("repair acceptance requires the delivery factory")
+        status = self._segment_store.status()
+        if (
+            self._repair_mode is not True
+            or type(status) is not EvidenceStatus
+            or status.repair_pending is not True
+            or not self._segment_store._is_bound_verifier(self._verifier)
+        ):
+            raise DeliveryFatalError(
+                "repair acceptance is outside its resumed delivery lifecycle"
+            )
+        return self._accept_bound(item)
+
+    def _finish_repair_resume(self, *, _factory: object) -> None:
+        if _factory is not _REPAIR_DELIVERY_FACTORY:
+            raise TypeError("repair acceptance finalization requires the delivery factory")
+        status = self._segment_store.status()
+        if (
+            self._repair_mode is not True
+            or type(status) is not EvidenceStatus
+            or not status.healthy
+            or status.repair_pending is not False
+            or not self._segment_store._is_bound_verifier(self._verifier)
+        ):
+            raise DeliveryFatalError(
+                "repair acceptance cannot become ordinary before gate clear"
+            )
+        self._repair_mode = False
 
     @classmethod
     def create_empty(
@@ -111,6 +178,34 @@ class AcceptanceCoordinator:
         """Rebuild verifier authority from every reverified AGF1 record."""
         segment_store._bind_and_recover(verifier)
         return cls(verifier, segment_store, _factory=_COORDINATOR_FACTORY)
+
+    @classmethod
+    def _from_repair_resume(
+        cls,
+        verifier: EnvelopeVerifier,
+        segment_store: SegmentStore,
+        *,
+        _factory: object,
+    ) -> AcceptanceCoordinator:
+        """Wrap the already-recovered same-lock store without verifier replay."""
+        if _factory is not _REPAIR_ACCEPTANCE_FACTORY:
+            raise TypeError("repair acceptance requires the exact repair factory")
+        if (
+            type(verifier) is not EnvelopeVerifier
+            or type(segment_store) is not SegmentStore
+            or segment_store._repair_resumed is not True
+            or segment_store.status().repair_pending is not True
+            or not segment_store._is_bound_verifier(verifier)
+        ):
+            raise DeliveryFatalError(
+                "repair acceptance requires one resumed bound store"
+            )
+        return cls(
+            verifier,
+            segment_store,
+            _repair_mode=True,
+            _factory=_REPAIR_ACCEPTANCE_FACTORY,
+        )
 
     recover = open_and_recover
 
@@ -135,6 +230,10 @@ class ObserverCoreTransport(Protocol):
     async def fetch_events(self, *, after: int, limit: int) -> bytes: ...
 
     async def ack_event(self, body: bytes) -> None: ...
+
+    async def publish_repair_authorization(self, canonical_body: bytes) -> bytes: ...
+
+    async def publish_repair_completion(self, canonical_body: bytes) -> bytes: ...
 
     async def close(self) -> None: ...
 
@@ -315,6 +414,69 @@ class HTTPXObserverCoreTransport:
         except (httpx.HTTPError, OSError, TimeoutError) as error:
             raise DeliveryAmbiguousAck("observer ACK transport failed") from error
 
+    async def _publish_repair(self, path: str, canonical_body: bytes) -> bytes:
+        if self._closed:
+            raise DeliveryFatalError("observer transport is closed")
+        if type(canonical_body) is not bytes or not canonical_body:
+            raise DeliveryFatalError("repair request body must be exact nonempty bytes")
+        try:
+            async with self._client.stream(
+                "POST",
+                path,
+                content=canonical_body,
+                headers={"Content-Type": "application/json"},
+            ) as response:
+                if "content-encoding" in response.headers:
+                    await self._discard_error_body(response)
+                    raise DeliveryFatalError(
+                        "observer repair response has Content-Encoding"
+                    )
+                if response.status_code in (200, 201):
+                    if response.headers.get("Content-Type") != "application/json":
+                        await self._discard_error_body(response)
+                        raise DeliveryFatalError(
+                            "observer repair Content-Type is not exact JSON"
+                        )
+                    raw = await self._read_raw_bounded(
+                        response,
+                        MAX_CORE_EVENT_RESPONSE_BYTES + 1,
+                    )
+                    if len(raw) > MAX_CORE_EVENT_RESPONSE_BYTES:
+                        raise DeliveryFatalError(
+                            "observer repair response exceeds bound"
+                        )
+                    return raw
+                await self._discard_error_body(response)
+                if response.status_code == 409:
+                    raise DeliveryFatalError(
+                        "observer rejected exact repair authority"
+                    )
+                if response.status_code == 408 or 500 <= response.status_code <= 599:
+                    raise DeliveryRetryableError(
+                        f"observer repair POST returned {response.status_code}"
+                    )
+                raise DeliveryFatalError(
+                    f"observer repair POST returned {response.status_code}"
+                )
+        except DeliveryError:
+            raise
+        except (httpx.HTTPError, OSError, TimeoutError) as error:
+            raise DeliveryRetryableError(
+                "observer repair POST transport failed"
+            ) from error
+
+    async def publish_repair_authorization(self, canonical_body: bytes) -> bytes:
+        return await self._publish_repair(
+            "/v1/events/evidence-repair-authorize",
+            canonical_body,
+        )
+
+    async def publish_repair_completion(self, canonical_body: bytes) -> bytes:
+        return await self._publish_repair(
+            "/v1/events/evidence-repair-complete",
+            canonical_body,
+        )
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -387,9 +549,20 @@ class DeliveryCoordinator:
         coverage_adapter: _CoverageDeliveryAdapter,
         clock: CoreClockProvider,
         ack_budget: int = MAX_PAGE_EVENTS,
+        _repair_mode: bool = False,
         _factory: object,
     ) -> None:
-        if _factory is not _DELIVERY_FACTORY:
+        if (
+            (_factory is _DELIVERY_FACTORY and _repair_mode is not False)
+            or (
+                _factory is _REPAIR_DELIVERY_FACTORY
+                and _repair_mode is not True
+            )
+            or (
+                _factory is not _DELIVERY_FACTORY
+                and _factory is not _REPAIR_DELIVERY_FACTORY
+            )
+        ):
             raise TypeError("use DeliveryCoordinator.create()")
         if type(delivery_lease) is not AckDeliveryLease:
             raise TypeError("delivery requires an exact ACK-journal lease")
@@ -410,6 +583,7 @@ class DeliveryCoordinator:
         self._coverage_adapter = coverage_adapter
         self._clock = clock
         self._ack_budget = ack_budget
+        self._repair_mode = _repair_mode
         self._lock = asyncio.Lock()
         self._fatal: DeliveryFatalError | None = None
         self._closed = False
@@ -427,6 +601,55 @@ class DeliveryCoordinator:
         clock: CoreClockProvider,
         ack_budget: int = MAX_PAGE_EVENTS,
     ) -> DeliveryCoordinator:
+        return cls._compose(
+            acceptance,
+            acknowledgements,
+            transport,
+            coverage=coverage,
+            clock=clock,
+            ack_budget=ack_budget,
+            repair_mode=False,
+            factory=_DELIVERY_FACTORY,
+        )
+
+    @classmethod
+    def _create_for_repair(
+        cls,
+        acceptance: AcceptanceCoordinator,
+        acknowledgements: AckJournal,
+        transport: ObserverCoreTransport,
+        *,
+        coverage: CoverageState,
+        clock: CoreClockProvider,
+        ack_budget: int = MAX_PAGE_EVENTS,
+        _factory: object,
+    ) -> DeliveryCoordinator:
+        if _factory is not _REPAIR_DELIVERY_FACTORY:
+            raise TypeError("repair delivery requires the exact repair factory")
+        return cls._compose(
+            acceptance,
+            acknowledgements,
+            transport,
+            coverage=coverage,
+            clock=clock,
+            ack_budget=ack_budget,
+            repair_mode=True,
+            factory=_REPAIR_DELIVERY_FACTORY,
+        )
+
+    @classmethod
+    def _compose(
+        cls,
+        acceptance: AcceptanceCoordinator,
+        acknowledgements: AckJournal,
+        transport: ObserverCoreTransport,
+        *,
+        coverage: CoverageState,
+        clock: CoreClockProvider,
+        ack_budget: int,
+        repair_mode: bool,
+        factory: object,
+    ) -> DeliveryCoordinator:
         if type(acceptance) is not AcceptanceCoordinator:
             raise TypeError("delivery requires exact acceptance authority")
         store = acceptance.segment_store
@@ -437,9 +660,19 @@ class DeliveryCoordinator:
             raise TypeError("delivery requires exact ACK authority")
         if type(coverage) is not CoverageState:
             raise TypeError("delivery requires exact coverage authority")
+        mode_status = store.status()
+        if (
+            type(mode_status) is not EvidenceStatus
+            or type(mode_status.repair_pending) is not bool
+            or mode_status.repair_pending is not repair_mode
+        ):
+            raise DeliveryFatalError(
+                "delivery mode does not match the evidence repair gate"
+            )
         if (
             acceptance.segment_store is not store
             or acceptance.verifier is not verifier
+            or acceptance._repair_mode is not repair_mode
             or not store._is_bound_verifier(verifier)
         ):
             raise DeliveryFatalError("acceptance authority binding is invalid")
@@ -470,7 +703,8 @@ class DeliveryCoordinator:
                 coverage_adapter=adapter,
                 clock=clock,
                 ack_budget=ack_budget,
-                _factory=_DELIVERY_FACTORY,
+                _repair_mode=repair_mode,
+                _factory=factory,
             )
             if (
                 acceptance.segment_store is not store
@@ -478,6 +712,9 @@ class DeliveryCoordinator:
                 or not store._is_bound_verifier(verifier)
                 or delivery._store is not store
                 or delivery._verifier is not verifier
+                or not delivery._status_matches_repair_mode(
+                    store.status(),
+                )
             ):
                 raise DeliveryFatalError(
                     "acceptance authority changed during delivery composition"
@@ -527,9 +764,17 @@ class DeliveryCoordinator:
         if (
             self._acceptance.segment_store is not self._store
             or self._acceptance.verifier is not self._verifier
+            or self._acceptance._repair_mode is not self._repair_mode
             or not self._store._is_bound_verifier(self._verifier)
         ):
             raise self._latch("retained acceptance authority changed")
+
+    def _status_matches_repair_mode(self, status: object) -> bool:
+        return (
+            type(status) is EvidenceStatus
+            and type(status.repair_pending) is bool
+            and status.repair_pending is self._repair_mode
+        )
 
     def _live_receipt(self) -> float | None:
         try:
@@ -633,6 +878,10 @@ class DeliveryCoordinator:
                 raise self._latch("ACK journal is unhealthy")
             if type(status) is not EvidenceStatus or not status.healthy:
                 raise self._latch("evidence status is unhealthy")
+            if not self._status_matches_repair_mode(status):
+                raise self._latch(
+                    "delivery mode does not match the evidence repair gate"
+                )
             pending_body = self._ack_journal.pending_request_body()
             evidence_head = status.evidence_head
             acceptance_cursor = status.acceptance_cursor
@@ -738,6 +987,10 @@ class DeliveryCoordinator:
             )
 
     async def recover_pending_ack(self) -> bool:
+        if self._repair_mode:
+            raise DeliveryFatalError(
+                "repair delivery must recover pending ACKs through exact drain"
+            )
         async with self._lock:
             state = self._local_state(apply_coverage_barrier=True)
             if state.pending is None:
@@ -767,13 +1020,13 @@ class DeliveryCoordinator:
         if any(gap.start <= after for gap in page.uncovered_gaps):
             raise DeliveryFatalError("observer gap is outside the fetch request")
 
-    async def _fetch_page(
+    async def _fetch_page_with_size(
         self,
         *,
         after: int,
         limit: int,
         confirmed_through: int,
-    ) -> CoreEventsPageV1:
+    ) -> tuple[CoreEventsPageV1, int]:
         try:
             raw = await self._transport.fetch_events(after=after, limit=limit)
         except asyncio.CancelledError:
@@ -787,6 +1040,10 @@ class DeliveryCoordinator:
         except Exception as error:  # noqa: BLE001 - transport protocol boundary
             raise self._latch("observer fetch transport violated its contract", error)
         try:
+            if type(raw) is not bytes:
+                raise DeliveryFatalError(
+                    "observer fetch returned a non-exact byte response"
+                )
             page = decode_events_page(raw)
             self._validate_page_binding(
                 page,
@@ -794,11 +1051,349 @@ class DeliveryCoordinator:
                 limit=limit,
                 confirmed_through=confirmed_through,
             )
-            return page
+            return page, len(raw)
         except DeliveryFatalError as error:
             raise self._latch("observer page binding is invalid", error)
         except PageDecodeError as error:
             raise self._latch("observer page is invalid", error)
+
+    async def _fetch_page(
+        self,
+        *,
+        after: int,
+        limit: int,
+        confirmed_through: int,
+    ) -> CoreEventsPageV1:
+        page, _size = await self._fetch_page_with_size(
+            after=after,
+            limit=limit,
+            confirmed_through=confirmed_through,
+        )
+        return page
+
+    @staticmethod
+    def _repair_target_bytes(expected: CoreEventV1) -> bytes:
+        if type(expected) is not CoreEventV1:
+            raise TypeError("repair target must use the exact CoreEventV1 type")
+        try:
+            raw = canonical_json(expected.model_dump(mode="python"))
+            decoded = decode_core_event(raw)
+        except (TypeError, ValueError) as error:
+            raise DeliveryFatalError(
+                "repair target does not have an exact outer identity"
+            ) from error
+        if (
+            canonical_json(decoded.model_dump(mode="python")) != raw
+            or expected.envelope.get("event_type")
+            not in {
+                "evidence_repair_authorized",
+                "evidence_repair_completed",
+            }
+        ):
+            raise DeliveryFatalError("repair target is not an exact repair event")
+        return raw
+
+    def _exact_authenticated_target(
+        self,
+        expected: CoreEventV1,
+    ) -> EvidenceRef:
+        refs = self._authenticated_refs(
+            after=expected.sequence - 1,
+            through=expected.sequence,
+            limit=1,
+        )
+        if len(refs) != 1 or refs[0].source_sequence != expected.sequence:
+            raise self._latch(
+                "exact repair target is absent from authenticated evidence"
+            )
+        ref = refs[0]
+        try:
+            record = self._store.resolve_authenticated_ref(ref)
+            expected_envelope = canonical_json(expected.envelope)
+        except Exception as error:  # noqa: BLE001 - authenticated store boundary
+            raise self._latch(
+                "exact repair target evidence lookup failed",
+                error,
+            )
+        if (
+            ref.event_id != expected.event_id
+            or ref.content_sha256 != expected.content_sha256
+            or record.canonical_envelope != expected_envelope
+        ):
+            raise self._latch(
+                "authenticated evidence differs from the exact repair target"
+            )
+        return ref
+
+    def _settle_repair_boundary(self) -> None:
+        try:
+            self._validate_acceptance_binding()
+            before = self._store.status()
+            if type(before) is not EvidenceStatus or not before.healthy:
+                raise DeliveryFatalError(
+                    "pre-settlement evidence status is unhealthy"
+                )
+            self._store.flush_security_boundary()
+            self._validate_acceptance_binding()
+            after = self._store.status()
+            if (
+                type(after) is not EvidenceStatus
+                or not after.healthy
+                or after.evidence_head != before.evidence_head
+                or after.acceptance_cursor != before.acceptance_cursor
+            ):
+                raise DeliveryFatalError(
+                    "repair settlement changed acceptance authority"
+                )
+        except Exception as error:  # noqa: BLE001 - evidence settlement boundary
+            raise self._latch(
+                "repair evidence settlement failed",
+                error,
+            )
+
+    async def _confirm_authenticated_through(self, through: int) -> None:
+        while True:
+            state = self._local_state(apply_coverage_barrier=True)
+            if state.pending is not None:
+                await self._post_pending(state)
+                continue
+            if state.confirmed_through >= through:
+                return
+            ceiling = min(through, state.delivery_ceiling)
+            refs = self._authenticated_refs(
+                after=state.confirmed_through,
+                through=ceiling,
+                limit=1,
+            )
+            if len(refs) != 1:
+                raise self._latch(
+                    "repair ACK cannot advance through authenticated evidence"
+                )
+            try:
+                self._ack_journal.record_pending(refs[0])
+                pending_state = self._local_state(
+                    apply_coverage_barrier=True,
+                )
+            except DeliveryFatalError:
+                raise
+            except Exception as error:  # noqa: BLE001 - ACK journal boundary
+                raise self._latch(
+                    "repair pending ACK durability is uncertain",
+                    error,
+                )
+            await self._post_pending(pending_state)
+
+    async def _accept_settle_and_confirm(
+        self,
+        item: CoreEventV1,
+    ) -> EvidenceRef:
+        receipt = self._live_receipt()
+        try:
+            self._validate_acceptance_binding()
+            before = self._store.status()
+            if type(before) is not EvidenceStatus or not before.healthy:
+                raise DeliveryFatalError(
+                    "pre-accept repair evidence status is unhealthy"
+                )
+            ref = self._acceptance._accept_for_repair(
+                item,
+                _factory=_REPAIR_DELIVERY_FACTORY,
+            )
+            self._validate_acceptance_binding()
+            accepted = self._store.status()
+            if (
+                type(accepted) is not EvidenceStatus
+                or not accepted.healthy
+                or type(ref) is not EvidenceRef
+                or ref.source_sequence != item.sequence
+                or ref.event_id != item.event_id
+                or ref.content_sha256 != item.content_sha256
+                or ref.source_sequence != accepted.evidence_head
+                or ref.source_sequence <= before.evidence_head
+            ):
+                raise DeliveryFatalError(
+                    "repair acceptance did not advance the exact evidence head"
+                )
+            self._settle_repair_boundary()
+            self._coverage_adapter.apply_live_accepted(ref, receipt)
+        except DeliveryFatalError:
+            raise
+        except Exception as error:  # noqa: BLE001 - repair evidence boundary
+            raise self._latch(
+                "repair evidence, settlement, or coverage failed",
+                error,
+            )
+        try:
+            self._ack_journal.record_pending(ref)
+            pending_state = self._local_state(
+                apply_coverage_barrier=True,
+            )
+        except DeliveryFatalError:
+            raise
+        except Exception as error:  # noqa: BLE001 - ACK journal boundary
+            raise self._latch(
+                "repair pending ACK durability is uncertain",
+                error,
+            )
+        await self._post_pending(pending_state)
+        confirmed = self._local_state(apply_coverage_barrier=False)
+        if (
+            confirmed.pending is not None
+            or confirmed.confirmed_through != ref.source_sequence
+        ):
+            raise self._latch(
+                "repair ACK did not durably confirm the accepted item"
+            )
+        return ref
+
+    async def drain_until_exact(
+        self,
+        expected: CoreEventV1,
+        *,
+        settle_each: Literal[True] = True,
+    ) -> EvidenceRef:
+        """Deliver through one exact repair event with a boundary per accepted item."""
+        if not self._repair_mode:
+            raise DeliveryFatalError(
+                "exact repair drain requires the repair factory"
+            )
+        if settle_each is not True:
+            raise ValueError("exact repair drain requires settle_each=True")
+        expected_bytes = self._repair_target_bytes(expected)
+        async with self._lock:
+            state = self._local_state(apply_coverage_barrier=False)
+            if state.pending is not None:
+                pending_state = self._local_state(
+                    apply_coverage_barrier=True,
+                )
+                await self._post_pending(pending_state)
+                state = self._local_state(apply_coverage_barrier=False)
+
+            target_ref: EvidenceRef | None = None
+            if state.evidence_head > expected.sequence:
+                raise self._latch(
+                    "authenticated evidence advanced beyond the exact repair target"
+                )
+            if state.evidence_head == expected.sequence:
+                target_ref = self._exact_authenticated_target(expected)
+
+            existing_through = min(state.evidence_head, expected.sequence)
+            if state.confirmed_through < existing_through:
+                self._settle_repair_boundary()
+                await self._confirm_authenticated_through(existing_through)
+                state = self._local_state(apply_coverage_barrier=False)
+
+            if target_ref is not None:
+                if state.confirmed_through < expected.sequence:
+                    raise self._latch(
+                        "exact repair target lacks durable ACK confirmation"
+                    )
+                return target_ref
+
+            total_events = 0
+            total_response_bytes = 0
+            for _page_number in range(_MAX_REPAIR_DRAIN_PAGES):
+                state = self._local_state(apply_coverage_barrier=False)
+                remaining_events = _MAX_REPAIR_DRAIN_EVENTS - total_events
+                if remaining_events <= 0:
+                    raise self._latch("repair drain event bound exhausted")
+                page, response_bytes = await self._fetch_page_with_size(
+                    after=state.evidence_head,
+                    limit=min(
+                        MAX_PAGE_EVENTS,
+                        remaining_events,
+                        expected.sequence - state.evidence_head,
+                    ),
+                    confirmed_through=state.confirmed_through,
+                )
+                total_response_bytes += response_bytes
+                if total_response_bytes > _MAX_REPAIR_DRAIN_RESPONSE_BYTES:
+                    raise self._latch(
+                        "repair drain response-byte bound exhausted"
+                    )
+                if page.reserved_through < expected.sequence:
+                    raise self._latch(
+                        "observer reservation does not include exact repair target"
+                    )
+                if not page.events:
+                    raise self._latch(
+                        "observer returned no path to the exact repair target"
+                    )
+                total_events += len(page.events)
+                if total_events > _MAX_REPAIR_DRAIN_EVENTS:
+                    raise self._latch("repair drain event bound exhausted")
+
+                for item in page.events:
+                    if item.sequence > expected.sequence:
+                        raise self._latch(
+                            "observer passed the exact repair target"
+                        )
+                    if (
+                        item.sequence == expected.sequence
+                        and canonical_json(item.model_dump(mode="python"))
+                        != expected_bytes
+                    ):
+                        raise self._latch(
+                            "observer returned a different exact repair target"
+                        )
+                for item in page.events:
+                    ref = await self._accept_settle_and_confirm(item)
+                    if item.sequence == expected.sequence:
+                        return ref
+            raise self._latch("repair drain page bound exhausted")
+
+    async def finalize_repair(
+        self,
+        proof: object,
+        *,
+        _factory: object,
+    ) -> None:
+        """Close delivery, then consume the exact gate-clear proof last."""
+        from agmind_immune.evidence.repair import (
+            _FINAL_REPAIR_COMPLETION_FACTORY,
+            AuthenticatedRepairCompletion,
+        )
+
+        if _factory is not _REPAIR_DELIVERY_FACTORY:
+            raise TypeError(
+                "repair finalization requires the exact finalization factory"
+            )
+        if (
+            type(proof) is not AuthenticatedRepairCompletion
+            or getattr(proof, "_factory_marker", None)
+            is not _FINAL_REPAIR_COMPLETION_FACTORY
+            or getattr(proof, "_store", None) is not self._store
+            or getattr(proof, "_verifier", None) is not self._verifier
+            or getattr(proof, "_acknowledgements", None)
+            is not self._ack_journal
+        ):
+            raise TypeError(
+                "repair finalization requires exact completion authority"
+            )
+        if not self._repair_mode:
+            raise DeliveryFatalError(
+                "repair finalization requires the repair delivery factory"
+            )
+        async with self._lock:
+            self._local_state(apply_coverage_barrier=False)
+            status = self._store.status()
+            if (
+                type(status) is not EvidenceStatus
+                or not status.healthy
+                or status.repair_pending is not True
+                or not self._store._is_bound_verifier(self._verifier)
+                or self._acceptance._repair_mode is not True
+            ):
+                raise DeliveryFatalError(
+                    "repair finalization precondition is not exact"
+                )
+            self._closed = True
+            await self._close_resources_under_lock()
+            proof._clear_under_delivery_fence(
+                _factory=_REPAIR_DELIVERY_FACTORY,
+            )
+            self._acceptance._repair_mode = False
+            self._repair_mode = False
 
     def _result(
         self,
@@ -819,6 +1414,10 @@ class DeliveryCoordinator:
         )
 
     async def poll_once(self, *, limit: int = MAX_PAGE_EVENTS) -> PollResult:
+        if self._repair_mode:
+            raise DeliveryFatalError(
+                "repair delivery must use drain_until_exact"
+            )
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
@@ -913,31 +1512,34 @@ class DeliveryCoordinator:
                 retry_required=False,
             )
 
+    async def _close_resources_under_lock(self) -> None:
+        primary: BaseException | None = None
+        if not self._transport_closed:
+            try:
+                await self._transport.close()
+            except BaseException as error:  # noqa: BLE001 - cleanup boundary
+                primary = error
+            else:
+                self._transport_closed = True
+        if not self._lease_released:
+            try:
+                self._delivery_lease.release()
+            except BaseException as error:  # noqa: BLE001 - preserve close primary
+                if primary is None:
+                    primary = error
+                else:
+                    primary.add_note(
+                        "secondary ACK delivery-lease release failure "
+                        f"({type(error).__name__})"
+                    )
+            else:
+                self._lease_released = True
+        if primary is not None:
+            raise primary
+
     async def close(self) -> None:
         async with self._lock:
             if self._transport_closed and self._lease_released:
                 return
             self._closed = True
-            primary: BaseException | None = None
-            if not self._transport_closed:
-                try:
-                    await self._transport.close()
-                except BaseException as error:  # noqa: BLE001 - cleanup boundary
-                    primary = error
-                else:
-                    self._transport_closed = True
-            if not self._lease_released:
-                try:
-                    self._delivery_lease.release()
-                except BaseException as error:  # noqa: BLE001 - preserve close primary
-                    if primary is None:
-                        primary = error
-                    else:
-                        primary.add_note(
-                            "secondary ACK delivery-lease release failure "
-                            f"({type(error).__name__})"
-                        )
-                else:
-                    self._lease_released = True
-            if primary is not None:
-                raise primary
+            await self._close_resources_under_lock()

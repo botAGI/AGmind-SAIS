@@ -282,6 +282,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
     baseline_evidence = original_evidence_status()
     for changes, reason in (
         ({"healthy": False}, "evidence_unhealthy"),
+        ({"repair_pending": True}, "evidence_unhealthy"),
         ({"key_healthy": False}, "key_unhealthy"),
         ({"acceptance_cursor": 4}, "cursor_evidence_acceptance_mismatch"),
     ):
