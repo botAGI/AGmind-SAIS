@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from pathlib import Path
+from threading import Lock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -612,6 +613,24 @@ class _RetentionStateArtifactBinding:
 
 
 @dataclass(frozen=True)
+class _RetentionAcceptedEnvelopeBinding:
+    sequence: int
+    accepted: object
+    canonical: bytes
+    evidence_ref: EvidenceRef
+    evidence_ref_key: tuple[str, str, int, int, str, str, int, str]
+    evidence_priority: Literal["routine", "protected"]
+    key_epoch: int
+    key_id: str
+
+
+@dataclass(frozen=True)
+class _RetentionAcceptedAuthorityBinding:
+    accepted: object
+    entries: tuple[_RetentionAcceptedEnvelopeBinding, ...]
+
+
+@dataclass(frozen=True)
 class _RetentionSnapshotBinding:
     snapshot: object
     snapshot_binding: bytes
@@ -620,6 +639,7 @@ class _RetentionSnapshotBinding:
     verifier_authority: object
     verifier_generation: int
     transient_generation: int
+    accepted_authority: _RetentionAcceptedAuthorityBinding
     status: EvidenceStatus
     manifest_canonical: tuple[bytes, ...]
     payload_identities: tuple[_FileIdentity, ...]
@@ -629,6 +649,7 @@ class _RetentionSnapshotBinding:
 class _AuthenticatedRetentionTombstoneBinding:
     capability: object
     journal: object
+    journal_identity: object
     snapshot: object
     lifecycle_identity: object
     state_raw: bytes
@@ -640,7 +661,96 @@ class _AuthenticatedRetentionTombstoneBinding:
     verifier_authority: object
     verifier_generation: int
     transient_generation: int
+    accepted_authority: _RetentionAcceptedAuthorityBinding
     status: EvidenceStatus
+
+
+def _retention_accepted_authority_binding(
+    verifier: EnvelopeVerifier,
+) -> _RetentionAcceptedAuthorityBinding:
+    accepted_authority = verifier._authority.accepted
+    entries: list[_RetentionAcceptedEnvelopeBinding] = []
+    try:
+        for sequence, accepted in sorted(accepted_authority.items()):
+            evidence_ref = accepted.evidence_ref
+            if type(evidence_ref) is not EvidenceRef:
+                raise ValueError(
+                    "accepted verifier evidence ref is not exact"
+                )
+            exact_ref = evidence_ref
+            evidence_ref_key = _exact_coverage_ref_key(evidence_ref)
+            if (
+                type(sequence) is not int
+                or exact_ref.source_sequence != sequence
+                or type(accepted.canonical) is not bytes
+                or type(accepted.evidence_priority) is not str
+                or accepted.evidence_priority not in {"routine", "protected"}
+                or type(accepted.key_epoch) is not int
+                or type(accepted.key_id) is not str
+            ):
+                raise ValueError(
+                    "accepted verifier authority is not exact"
+                )
+            entries.append(
+                _RetentionAcceptedEnvelopeBinding(
+                    sequence=sequence,
+                    accepted=accepted,
+                    canonical=accepted.canonical,
+                    evidence_ref=exact_ref,
+                    evidence_ref_key=evidence_ref_key,
+                    evidence_priority=accepted.evidence_priority,
+                    key_epoch=accepted.key_epoch,
+                    key_id=accepted.key_id,
+                )
+            )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise EvidenceSealError(
+            "retention verifier accepted authority is malformed"
+        ) from error
+    return _RetentionAcceptedAuthorityBinding(
+        accepted=accepted_authority,
+        entries=tuple(entries),
+    )
+
+
+def _same_retention_accepted_authority(
+    verifier: EnvelopeVerifier,
+    binding: _RetentionAcceptedAuthorityBinding,
+) -> bool:
+    accepted_authority = verifier._authority.accepted
+    if (
+        accepted_authority is not binding.accepted
+        or len(accepted_authority) != len(binding.entries)
+    ):
+        return False
+    for (sequence, accepted), expected in zip(
+        sorted(accepted_authority.items()),
+        binding.entries,
+        strict=True,
+    ):
+        try:
+            evidence_ref_key = _exact_coverage_ref_key(
+                accepted.evidence_ref
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if (
+            type(sequence) is not int
+            or sequence != expected.sequence
+            or accepted is not expected.accepted
+            or type(accepted.canonical) is not bytes
+            or accepted.canonical != expected.canonical
+            or accepted.evidence_ref is not expected.evidence_ref
+            or evidence_ref_key != expected.evidence_ref_key
+            or type(accepted.evidence_priority) is not str
+            or accepted.evidence_priority != expected.evidence_priority
+            or type(accepted.key_epoch) is not int
+            or accepted.key_epoch != expected.key_epoch
+            or type(accepted.key_id) is not str
+            or accepted.key_id != expected.key_id
+        ):
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -1882,6 +1992,7 @@ class SegmentStore:
         self._authenticated_retention_tombstone: (
             _AuthenticatedRetentionTombstoneBinding | None
         ) = None
+        self._retention_tombstone_lock = Lock()
         self._retention_state_namespace_uncertain = False
         self._repair_authorization: _RepairAuthorizationBinding | None = None
         self._repair_completion_authorization: (
@@ -2131,11 +2242,12 @@ class SegmentStore:
             self.root,
             exact_mode=True,
         )
-        reopened_root = _reopen_root_directory(self.root)
+        canonical_root = _reopen_root_directory(self.root)
+        canonical_segments = -1
         try:
             if (
                 _directory_authority_identity(
-                    reopened_root,
+                    canonical_root,
                     self.root,
                     exact_mode=True,
                 )
@@ -2144,67 +2256,101 @@ class SegmentStore:
                 raise EvidenceCorrupt(
                     "retention evidence root changed after startup"
                 )
+            for name, retained, display_path in (
+                (
+                    "manifests",
+                    self._manifests_descriptor,
+                    self._manifests_path,
+                ),
+                (
+                    "segments",
+                    self._segments_descriptor,
+                    self._segments_path,
+                ),
+            ):
+                expected = _directory_authority_identity(
+                    retained,
+                    display_path,
+                    exact_mode=True,
+                )
+                reopened = _open_directory_at(
+                    canonical_root,
+                    name,
+                    display_path,
+                )
+                try:
+                    if (
+                        _directory_authority_identity(
+                            reopened,
+                            display_path,
+                            exact_mode=True,
+                        )
+                        != expected
+                    ):
+                        raise EvidenceCorrupt(
+                            "retention evidence directory changed: "
+                            f"{display_path}"
+                        )
+                    if name == "segments":
+                        canonical_segments = reopened
+                        reopened = -1
+                finally:
+                    if reopened >= 0:
+                        os.close(reopened)
+
+            if canonical_segments < 0:
+                raise EvidenceCorrupt(
+                    "retention segments directory is unavailable"
+                )
+            for date_name, retained in tuple(
+                sorted(self._date_descriptors.items())
+            ):
+                display_path = self._segments_path / date_name
+                expected = _directory_authority_identity(
+                    retained,
+                    display_path,
+                    exact_mode=True,
+                )
+                reopened = _open_directory_at(
+                    canonical_segments,
+                    date_name,
+                    display_path,
+                )
+                try:
+                    if (
+                        _directory_authority_identity(
+                            reopened,
+                            display_path,
+                            exact_mode=True,
+                        )
+                        != expected
+                    ):
+                        raise EvidenceCorrupt(
+                            "retention date directory changed: "
+                            f"{display_path}"
+                        )
+                finally:
+                    os.close(reopened)
+
+            final_root = _reopen_root_directory(self.root)
+            try:
+                if (
+                    _directory_authority_identity(
+                        final_root,
+                        self.root,
+                        exact_mode=True,
+                    )
+                    != retained_root
+                ):
+                    raise EvidenceCorrupt(
+                        "retention evidence root changed during rebinding"
+                    )
+            finally:
+                os.close(final_root)
         finally:
-            os.close(reopened_root)
-
-        for name, retained, display_path in (
-            ("manifests", self._manifests_descriptor, self._manifests_path),
-            ("segments", self._segments_descriptor, self._segments_path),
-        ):
-            expected = _directory_authority_identity(
-                retained,
-                display_path,
-                exact_mode=True,
-            )
-            reopened = _open_directory_at(
-                self._root_descriptor,
-                name,
-                display_path,
-            )
-            try:
-                if (
-                    _directory_authority_identity(
-                        reopened,
-                        display_path,
-                        exact_mode=True,
-                    )
-                    != expected
-                ):
-                    raise EvidenceCorrupt(
-                        f"retention evidence directory changed: {display_path}"
-                    )
-            finally:
-                os.close(reopened)
-
-        for date_name, retained in tuple(
-            sorted(self._date_descriptors.items())
-        ):
-            display_path = self._segments_path / date_name
-            expected = _directory_authority_identity(
-                retained,
-                display_path,
-                exact_mode=True,
-            )
-            reopened = _open_directory_at(
-                self._segments_descriptor,
-                date_name,
-                display_path,
-            )
-            try:
-                if (
-                    _directory_authority_identity(
-                        reopened,
-                        display_path,
-                        exact_mode=True,
-                    )
-                    != expected
-                ):
-                    raise EvidenceCorrupt(
-                        "retention date directory changed: "
-                        f"{display_path}"
-                    )
-            finally:
-                os.close(reopened)
+            if canonical_segments >= 0:
+                os.close(canonical_segments)
+            os.close(canonical_root)
 
     def _read_retention_manifest_chain(
         self,
@@ -2467,6 +2613,7 @@ class SegmentStore:
         authority_before = verifier._authority
         generation_before = authority_before.generation
         transient_before = verifier._repair_transient_generation
+        accepted_before = _retention_accepted_authority_binding(verifier)
         if (
             type(status_before) is not EvidenceStatus
             or not status_before.healthy
@@ -2537,6 +2684,10 @@ class SegmentStore:
             self._read_retention_manifest_chain()
         )
         self._require_retention_payload_namespace(chain_after)
+        if len(chain_after) != len(payload_identities):
+            raise EvidenceSealError(
+                "retention snapshot authority changed during JIT verification"
+            )
         for manifest, identity in zip(
             chain_after,
             payload_identities,
@@ -2566,6 +2717,10 @@ class SegmentStore:
             or verifier._authority.generation != generation_before
             or verifier._repair_transient_generation
             != transient_before
+            or not _same_retention_accepted_authority(
+                verifier,
+                accepted_before,
+            )
             or verifier._staged
             or verifier._authorizations
         ):
@@ -2580,6 +2735,7 @@ class SegmentStore:
             verifier_authority=authority_before,
             verifier_generation=generation_before,
             transient_generation=transient_before,
+            accepted_authority=accepted_before,
             status=status_after,
             manifest_canonical=canonical_after,
             payload_identities=tuple(payload_identities),
@@ -2620,6 +2776,10 @@ class SegmentStore:
             != binding.verifier_generation
             or verifier._repair_transient_generation
             != binding.transient_generation
+            or not _same_retention_accepted_authority(
+                verifier,
+                binding.accepted_authority,
+            )
             or verifier._staged
             or verifier._authorizations
             or self.status() != binding.status
@@ -2658,6 +2818,10 @@ class SegmentStore:
             or verifier._authority is not binding.verifier_authority
             or verifier._repair_transient_generation
             != binding.transient_generation
+            or not _same_retention_accepted_authority(
+                verifier,
+                binding.accepted_authority,
+            )
             or verifier._staged
             or verifier._authorizations
         ):
@@ -2697,43 +2861,29 @@ class SegmentStore:
         self,
         capability: object,
         binding: _AuthenticatedRetentionTombstoneBinding,
-        *,
-        used: bool,
     ) -> None:
         from agmind_immune.coverage.state import CoverageState
         from agmind_immune.evidence.retention import (
             _AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY,
-            AuthenticatedRetentionTombstone,
             RetentionStateJournal,
         )
 
         if (
-            type(capability) is not AuthenticatedRetentionTombstone
-            or binding.capability is not capability
-            or type(binding.journal) is not RetentionStateJournal
-            or capability._factory_marker
+            binding.capability is not capability
+            or getattr(capability, "_factory_marker", None)
             is not _AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY
-            or capability._store is not self
-            or capability._journal is not binding.journal
-            or capability._journal_identity
-            is not binding.journal._identity
-            or capability._state_raw != binding.state_raw
-            or capability._snapshot is not binding.snapshot
-            or capability._target_ref != binding.target_ref
-            or capability._coverage is not binding.coverage
-            or capability._coverage_snapshot
-            is not binding.coverage_snapshot
-            or capability._coverage_token is not binding.coverage_token
-            or capability._verifier is not binding.verifier
-            or capability._verifier_authority
-            is not binding.verifier_authority
-            or capability._verifier_generation
-            != binding.verifier_generation
-            or capability._transient_generation
-            != binding.transient_generation
-            or capability._status != binding.status
-            or capability._used is not used
+            or type(binding.journal) is not RetentionStateJournal
+            or binding.journal_identity is not binding.journal._identity
+            or type(binding.state_raw) is not bytes
+            or type(binding.target_ref) is not EvidenceRef
+            or type(binding.coverage) is not CoverageState
+            or type(binding.verifier) is not EnvelopeVerifier
+            or type(binding.status) is not EvidenceStatus
             or binding.lifecycle_identity is not self._lifecycle_identity
+            or not _same_retention_accepted_authority(
+                binding.verifier,
+                binding.accepted_authority,
+            )
         ):
             raise EvidenceSealError(
                 "retention proof is not the exact issued store authority"
@@ -2768,6 +2918,10 @@ class SegmentStore:
             != binding.verifier_generation
             or verifier._repair_transient_generation
             != binding.transient_generation
+            or not _same_retention_accepted_authority(
+                verifier,
+                binding.accepted_authority,
+            )
             or verifier._staged
             or verifier._authorizations
             or self.status() != binding.status
@@ -2790,7 +2944,7 @@ class SegmentStore:
                 "retention proof target or coverage is no longer authenticated"
             ) from error
         if (
-            resolved.ref != binding.target_ref
+            resolved.ref is not binding.target_ref
             or coverage._snapshot.head_sequence
             != binding.status.evidence_head
             or coverage._snapshot.head_ref is None
@@ -2800,11 +2954,25 @@ class SegmentStore:
             raise EvidenceSealError(
                 "retention proof target or coverage authority changed"
             )
+        self._require_retention_snapshot(binding.snapshot)
 
     def _register_authenticated_retention_tombstone(
         self,
         capability: object,
         *,
+        journal: object,
+        journal_identity: object,
+        state_raw: bytes,
+        snapshot: object,
+        target_ref: object,
+        coverage: object,
+        coverage_snapshot: object,
+        coverage_token: object,
+        verifier: object,
+        verifier_authority: object,
+        verifier_generation: int,
+        transient_generation: int,
+        status: object,
         _factory: object,
     ) -> None:
         from agmind_immune.coverage.state import CoverageState
@@ -2825,53 +2993,51 @@ class SegmentStore:
             raise EvidenceSealError(
                 "retention proof registration requires exact issued authority"
             )
-        journal = capability._journal
-        snapshot = capability._snapshot
-        target_ref = capability._target_ref
-        coverage = capability._coverage
-        verifier = capability._verifier
         if (
-            capability._factory_marker
+            getattr(capability, "_factory_marker", None)
             is not _AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY
-            or capability._store is not self
             or type(journal) is not RetentionStateJournal
-            or capability._journal_identity is not journal._identity
+            or journal_identity is not journal._identity
+            or type(state_raw) is not bytes
             or type(target_ref) is not EvidenceRef
             or type(coverage) is not CoverageState
             or type(verifier) is not EnvelopeVerifier
-            or type(capability._status) is not EvidenceStatus
-            or capability._used is not False
+            or type(verifier_generation) is not int
+            or type(transient_generation) is not int
+            or type(status) is not EvidenceStatus
         ):
             raise EvidenceSealError(
                 "retention proof registration requires exact issued authority"
             )
-        self._require_retention_snapshot(snapshot)
-        if self._authenticated_retention_tombstone is not None:
-            raise EvidenceSealError(
-                "an authenticated retention tombstone is already registered"
-            )
+        snapshot_binding = self._require_retention_snapshot(snapshot)
         binding = _AuthenticatedRetentionTombstoneBinding(
             capability=capability,
             journal=journal,
+            journal_identity=journal_identity,
             snapshot=snapshot,
             lifecycle_identity=self._lifecycle_identity,
-            state_raw=capability._state_raw,
+            state_raw=state_raw,
             target_ref=target_ref,
             coverage=coverage,
-            coverage_snapshot=capability._coverage_snapshot,
-            coverage_token=capability._coverage_token,
+            coverage_snapshot=coverage_snapshot,
+            coverage_token=coverage_token,
             verifier=verifier,
-            verifier_authority=capability._verifier_authority,
-            verifier_generation=capability._verifier_generation,
-            transient_generation=capability._transient_generation,
-            status=capability._status,
+            verifier_authority=verifier_authority,
+            verifier_generation=verifier_generation,
+            transient_generation=transient_generation,
+            accepted_authority=snapshot_binding.accepted_authority,
+            status=status,
         )
-        self._validate_authenticated_retention_tombstone(
-            capability,
-            binding,
-            used=False,
-        )
-        self._authenticated_retention_tombstone = binding
+        with self._retention_tombstone_lock:
+            if self._authenticated_retention_tombstone is not None:
+                raise EvidenceSealError(
+                    "an authenticated retention tombstone is already registered"
+                )
+            self._validate_authenticated_retention_tombstone(
+                capability,
+                binding,
+            )
+            self._authenticated_retention_tombstone = binding
 
     def _consume_authenticated_retention_tombstone(
         self,
@@ -2880,6 +3046,7 @@ class SegmentStore:
         _factory: object,
     ) -> None:
         from agmind_immune.evidence.retention import (
+            _AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY,
             AuthenticatedRetentionTombstone,
         )
 
@@ -2890,24 +3057,26 @@ class SegmentStore:
             raise TypeError(
                 "retention proof consumption requires the exact factory"
             )
-        binding = self._authenticated_retention_tombstone
         if (
             type(capability) is not AuthenticatedRetentionTombstone
-            or binding is None
-            or binding.capability is not capability
+            or getattr(capability, "_factory_marker", None)
+            is not _AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY
         ):
             raise EvidenceSealError(
                 "retention proof is not the exact registered store authority"
             )
-        self._authenticated_retention_tombstone = None
-        try:
-            self._validate_authenticated_retention_tombstone(
-                capability,
-                binding,
-                used=False,
-            )
-        finally:
-            object.__setattr__(capability, "_used", True)
+        with self._retention_tombstone_lock:
+            binding = self._authenticated_retention_tombstone
+            if binding is None or binding.capability is not capability:
+                raise EvidenceSealError(
+                    "retention proof is not the exact registered "
+                    "store authority"
+                )
+            self._authenticated_retention_tombstone = None
+        self._validate_authenticated_retention_tombstone(
+            capability,
+            binding,
+        )
 
     def _require_repair_lifecycle(self) -> None:
         if (

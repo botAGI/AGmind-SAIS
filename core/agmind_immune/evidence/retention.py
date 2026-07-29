@@ -104,87 +104,22 @@ class RetentionProtocolError(RetentionError):
 
 @final
 class AuthenticatedRetentionTombstone:
-    """One-use store-registered final proof; never path or unlink authority."""
+    """Opaque one-use proof identity; all authority remains store-side."""
 
-    _coverage: object
-    _coverage_snapshot: object
-    _coverage_token: object
     _factory_marker: object
-    _journal: object
-    _journal_identity: object
-    _snapshot: RetentionSnapshot
-    _state_raw: bytes
-    _status: object
-    _store: object
-    _target_ref: object
-    _transient_generation: int
-    _used: bool
-    _verifier: object
-    _verifier_authority: object
-    _verifier_generation: int
 
-    __slots__ = (
-        "_coverage",
-        "_coverage_snapshot",
-        "_coverage_token",
-        "_factory_marker",
-        "_journal",
-        "_journal_identity",
-        "_snapshot",
-        "_state_raw",
-        "_status",
-        "_store",
-        "_target_ref",
-        "_transient_generation",
-        "_used",
-        "_verifier",
-        "_verifier_authority",
-        "_verifier_generation",
-    )
+    __slots__ = ("_factory_marker",)
 
     def __init__(
         self,
         *,
-        store: object,
-        journal: object,
-        journal_identity: object,
-        state_raw: bytes,
-        snapshot: RetentionSnapshot,
-        target_ref: object,
-        coverage: object,
-        coverage_snapshot: object,
-        coverage_token: object,
-        verifier: object,
-        verifier_authority: object,
-        verifier_generation: int,
-        transient_generation: int,
-        status: object,
         _factory: object,
     ) -> None:
         if _factory is not _AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY:
             raise TypeError(
                 "AuthenticatedRetentionTombstone is factory-only"
             )
-        values = {
-            "_factory_marker": _factory,
-            "_store": store,
-            "_journal": journal,
-            "_journal_identity": journal_identity,
-            "_state_raw": state_raw,
-            "_snapshot": snapshot,
-            "_target_ref": target_ref,
-            "_coverage": coverage,
-            "_coverage_snapshot": coverage_snapshot,
-            "_coverage_token": coverage_token,
-            "_verifier": verifier,
-            "_verifier_authority": verifier_authority,
-            "_verifier_generation": verifier_generation,
-            "_transient_generation": transient_generation,
-            "_status": status,
-            "_used": False,
-        }
-        for name, value in values.items():
-            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_factory_marker", _factory)
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         del kwargs
@@ -3298,7 +3233,7 @@ def _authenticate_store_retention_tombstone(
     from agmind_immune.ingest.envelope import (
         CoreEventV1,
         EnvelopeVerifier,
-        RetentionSimulationError,
+        IngestVerificationError,
         VerifierCommitError,
     )
 
@@ -3606,7 +3541,12 @@ def _authenticate_store_retention_tombstone(
             (item, target_ref),
             request,
         )
-    except (RetentionSimulationError, VerifierCommitError) as error:
+    except (
+        IngestVerificationError,
+        VerifierCommitError,
+        TypeError,
+        ValueError,
+    ) as error:
         raise EvidenceSealError(
             "final retention target historical replay failed"
         ) from error
@@ -3631,7 +3571,10 @@ def _authenticate_store_retention_tombstone(
     exact_store._require_retention_snapshot(snapshot)
     journal._prove_publication(state_raw)
     capability = AuthenticatedRetentionTombstone(
-        store=exact_store,
+        _factory=_AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY,
+    )
+    exact_store._register_authenticated_retention_tombstone(
+        capability,
         journal=journal,
         journal_identity=journal._identity,
         state_raw=state_raw,
@@ -3645,10 +3588,6 @@ def _authenticate_store_retention_tombstone(
         verifier_generation=verifier._authority.generation,
         transient_generation=verifier._repair_transient_generation,
         status=status,
-        _factory=_AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY,
-    )
-    exact_store._register_authenticated_retention_tombstone(
-        capability,
         _factory=_factory,
     )
     return capability

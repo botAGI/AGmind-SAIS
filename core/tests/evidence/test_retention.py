@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier, Thread
 from typing import Literal
 
 import pytest
@@ -45,6 +46,7 @@ from agmind_immune.evidence.segments import (
     EvidenceSealError,
     SegmentStore,
 )
+from agmind_immune.ingest.envelope import OuterBindingError
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from tests.evidence.test_projection import _falco_fields
@@ -1422,6 +1424,25 @@ def test_authenticated_retention_tombstone_is_registered_and_one_use(
             case.target_ref,
             _factory=segments_module._RETENTION_PROOF_FACTORY,
         )
+        assert not hasattr(capability, "__dict__")
+        for authority_name in (
+            "_coverage",
+            "_coverage_snapshot",
+            "_coverage_token",
+            "_journal",
+            "_journal_identity",
+            "_snapshot",
+            "_state_raw",
+            "_status",
+            "_store",
+            "_target_ref",
+            "_transient_generation",
+            "_used",
+            "_verifier",
+            "_verifier_authority",
+            "_verifier_generation",
+        ):
+            assert not hasattr(capability, authority_name)
         with pytest.raises(TypeError, match="cop"):
             copy.copy(capability)
         with pytest.raises(TypeError, match="cop"):
@@ -1461,3 +1482,301 @@ def test_authenticated_retention_tombstone_is_registered_and_one_use(
         foreign.close(flush=False)
         case.coverage.close()
         case.store.close(flush=False)
+
+
+def test_authenticated_retention_tombstone_concurrent_consumers_claim_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _retention_proof_case(tmp_path)
+    capability = case.store._authenticate_retention_tombstone(
+        case.journal,
+        case.final_snapshot,
+        case.target_ref,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    loaded_binding = Barrier(2)
+    original_type = type
+
+    def synchronized_type(value: object) -> type[object]:
+        if value is capability:
+            loaded_binding.wait(timeout=5)
+        return original_type(value)
+
+    monkeypatch.setattr(
+        segments_module,
+        "type",
+        synchronized_type,
+        raising=False,
+    )
+    results: list[BaseException | None] = []
+
+    def consume() -> None:
+        try:
+            case.store._consume_authenticated_retention_tombstone(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+        except EvidenceSealError as error:
+            results.append(error)
+        else:
+            results.append(None)
+
+    consumers = (Thread(target=consume), Thread(target=consume))
+    try:
+        for consumer in consumers:
+            consumer.start()
+        for consumer in consumers:
+            consumer.join(timeout=10)
+
+        assert all(not consumer.is_alive() for consumer in consumers)
+        assert sum(result is None for result in results) == 1
+        failures = [result for result in results if result is not None]
+        assert len(failures) == 1
+        assert isinstance(failures[0], EvidenceSealError)
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_authenticated_retention_tombstone_stale_owner_failure_burns_claim(
+    tmp_path: Path,
+) -> None:
+    case = _retention_proof_case(tmp_path)
+    capability = case.store._authenticate_retention_tombstone(
+        case.journal,
+        case.final_snapshot,
+        case.target_ref,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    verifier = case.store._bound_verifier
+    assert verifier is not None
+    original_transient = verifier._repair_transient_generation
+    verifier._repair_transient_generation += 1
+    try:
+        with pytest.raises(EvidenceSealError, match="authority"):
+            case.store._consume_authenticated_retention_tombstone(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+        verifier._repair_transient_generation = original_transient
+        with pytest.raises(EvidenceSealError, match="registered"):
+            case.store._consume_authenticated_retention_tombstone(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        verifier._repair_transient_generation = original_transient
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_retention_proof_directory_rebind_rejects_root_rename_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(root)
+    parked = tmp_path / "parked"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir(mode=0o700)
+    (replacement / "manifests").mkdir(mode=0o700)
+    (replacement / "segments").mkdir(mode=0o700)
+    original_reopen = segments_module._reopen_root_directory
+    swapped = False
+
+    def reopen_then_swap(path: Path) -> int:
+        nonlocal swapped
+        descriptor = original_reopen(path)
+        if not swapped:
+            root.rename(parked)
+            replacement.rename(root)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(
+        segments_module,
+        "_reopen_root_directory",
+        reopen_then_swap,
+    )
+    try:
+        with pytest.raises(EvidenceCorrupt, match="root changed"):
+            store._require_retention_directory_bindings()
+    finally:
+        coverage.close()
+        store.close(flush=False)
+        if swapped:
+            (root / "manifests").rmdir()
+            (root / "segments").rmdir()
+            root.rmdir()
+            parked.rename(root)
+
+
+def test_retention_proof_rejects_equal_distinct_accepted_ref_substitution(
+    tmp_path: Path,
+) -> None:
+    case = _retention_proof_case(tmp_path)
+    verifier = case.store._bound_verifier
+    assert verifier is not None
+    accepted = verifier._authority.accepted[
+        case.target_ref.source_sequence
+    ]
+    original_ref = accepted.evidence_ref
+    substitute = replace(case.target_ref)
+    assert substitute == original_ref
+    assert substitute is not original_ref
+    object.__setattr__(accepted, "evidence_ref", substitute)
+    try:
+        with pytest.raises(EvidenceSealError, match="authority"):
+            case.store._require_retention_snapshot(case.final_snapshot)
+    finally:
+        object.__setattr__(accepted, "evidence_ref", original_ref)
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_retention_proof_chain_length_race_is_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(
+        tmp_path
+    )
+    original_read = store._read_retention_manifest_chain
+    reads = 0
+
+    def lengthened_chain() -> tuple[
+        tuple[SegmentManifestV1, ...],
+        tuple[bytes, ...],
+    ]:
+        nonlocal reads
+        chain, canonical = original_read()
+        reads += 1
+        if reads == 2:
+            return chain + (chain[-1],), canonical + (canonical[-1],)
+        return chain, canonical
+
+    monkeypatch.setattr(
+        store,
+        "_read_retention_manifest_chain",
+        lengthened_chain,
+    )
+    try:
+        with pytest.raises(EvidenceSealError, match="authority changed"):
+            store._freeze_retention_snapshot(
+                _proof_clock(),
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        coverage.close()
+        store.close(flush=False)
+
+
+def test_retention_proof_replay_validation_failure_is_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _retention_proof_case(tmp_path)
+    verifier = case.store._bound_verifier
+    assert verifier is not None
+
+    def invalid_replay(*_args: object, **_kwargs: object) -> None:
+        raise OuterBindingError("injected replay validation failure")
+
+    monkeypatch.setattr(
+        type(verifier),
+        "_restricted_historical_retention_replay",
+        invalid_replay,
+    )
+    try:
+        with pytest.raises(EvidenceSealError, match="historical replay"):
+            case.store._authenticate_retention_tombstone(
+                case.journal,
+                case.final_snapshot,
+                case.target_ref,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_retention_proof_rejects_malformed_protected_blocked_prior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _retention_proof_case(tmp_path)
+    verifier = case.store._bound_verifier
+    assert verifier is not None
+    original_scan = case.store._retention_scanned_record
+
+    def malformed_blocked(
+        record: object,
+        exact_verifier: object,
+    ) -> object:
+        envelope = original_scan(record, exact_verifier)
+        if record.ref == case.target_ref:
+            return envelope.model_copy(
+                update={
+                    "event_type": "retention_blocked_priority_evidence",
+                    "normalized_fields": {
+                        "schema_version": "agmind.retention-blocked.v1",
+                        "blocked_id": "not-a-uuid",
+                    },
+                }
+            )
+        return envelope
+
+    monkeypatch.setattr(
+        case.store,
+        "_retention_scanned_record",
+        malformed_blocked,
+    )
+    try:
+        with pytest.raises(EvidenceCorrupt, match="blocked record is invalid"):
+            case.store._retention_prior_tombstones(
+                verifier,
+                through_sequence=case.target_ref.source_sequence,
+            )
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_retention_proof_rejects_transient_verifier_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(
+        tmp_path
+    )
+    verifier = store._bound_verifier
+    assert verifier is not None
+    original_verify = store._verify_retention_payload
+    raced = False
+
+    def race_transient(manifest: SegmentManifestV1) -> object:
+        nonlocal raced
+        scan = original_verify(manifest)
+        if not raced:
+            verifier._repair_transient_generation += 1
+            raced = True
+        return scan
+
+    monkeypatch.setattr(
+        store,
+        "_verify_retention_payload",
+        race_transient,
+    )
+    try:
+        with pytest.raises(
+            EvidenceSealError,
+            match="authority changed during JIT",
+        ):
+            store._freeze_retention_snapshot(
+                _proof_clock(),
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        coverage.close()
+        store.close(flush=False)
