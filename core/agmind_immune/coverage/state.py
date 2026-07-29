@@ -6,13 +6,15 @@ import hashlib
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import final
 
 from pydantic import ValidationError
 
 from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.contracts import (
+    MAX_UINT64,
     CoverageEventV1,
     EventEnvelopeV1,
     KeyTransitionV1,
@@ -31,6 +33,8 @@ from agmind_immune.evidence.segments import (
 
 _MAX_CANONICAL_ENVELOPE_BYTES = 64 * 1024
 _LEASE_WINDOW = timedelta(seconds=15)
+_COVERAGE_SNAPSHOT_DOMAIN = b"AGMIND_COVERAGE_SNAPSHOT_V1\0"
+_COVERAGE_SNAPSHOT_SCHEMA = "agmind.coverage-snapshot.v1"
 _STATE_FACTORY = object()
 _BARRIER_FACTORY = object()
 
@@ -53,6 +57,81 @@ class CoverageAuthorityError(CoverageError):
 
 class CoverageUnhealthy(CoverageError):
     """A prior failed apply permanently fenced this reducer instance."""
+
+
+@dataclass(frozen=True)
+class MutationReadinessContext:
+    decision_utc: datetime
+    decision_monotonic: float
+    clock_healthy: bool
+    clock_uncertainty_seconds: Decimal | None
+    max_clock_uncertainty_seconds: Decimal
+    evidence_head: int
+    acceptance_cursor: int
+    confirmed_through: int
+    projection_cursor: int
+    evidence_healthy: bool
+    key_healthy: bool
+    ack_journal_healthy: bool
+    projection_healthy: bool
+
+    def __post_init__(self) -> None:
+        _validate_mutation_readiness_context(self)
+
+
+def _validate_mutation_readiness_context(
+    context: MutationReadinessContext,
+) -> None:
+    if (
+        type(context.decision_utc) is not datetime
+        or context.decision_utc.tzinfo != UTC
+        or context.decision_utc.utcoffset() != timedelta(0)
+        or context.decision_utc.fold != 0
+    ):
+        raise CoverageValidationError("decision UTC is not exact canonical UTC")
+    if (
+        type(context.decision_monotonic) is not float
+        or not math.isfinite(context.decision_monotonic)
+        or context.decision_monotonic < 0
+    ):
+        raise CoverageValidationError("decision monotonic is invalid")
+    for value in (
+        context.clock_healthy,
+        context.evidence_healthy,
+        context.key_healthy,
+        context.ack_journal_healthy,
+        context.projection_healthy,
+    ):
+        if type(value) is not bool:
+            raise CoverageValidationError("readiness health bit is not exact bool")
+    uncertainty = context.clock_uncertainty_seconds
+    if uncertainty is not None and (
+        type(uncertainty) is not Decimal or not uncertainty.is_finite() or uncertainty < 0
+    ):
+        raise CoverageValidationError("clock uncertainty is invalid")
+    maximum = context.max_clock_uncertainty_seconds
+    if type(maximum) is not Decimal or not maximum.is_finite() or maximum < 0:
+        raise CoverageValidationError("maximum clock uncertainty is invalid")
+    for cursor in (
+        context.evidence_head,
+        context.acceptance_cursor,
+        context.confirmed_through,
+        context.projection_cursor,
+    ):
+        if type(cursor) is not int or not 0 <= cursor <= MAX_UINT64:
+            raise CoverageValidationError("readiness cursor is not exact uint64")
+
+
+@dataclass(frozen=True)
+class MutationReadiness:
+    ready: bool
+    reason_codes: tuple[str, ...]
+    evidence_head: int
+    acceptance_cursor: int
+    confirmed_through: int
+    projection_cursor: int
+    observer_reconcile_generation: int | None
+    coverage_snapshot_sha256: str
 
 
 @dataclass(frozen=True)
@@ -126,6 +205,11 @@ class _PreparedRecord:
 
 def _timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _canonical_decision_utc(value: datetime) -> str:
+    rendered = value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return rendered.replace(".000000Z", "Z")
 
 
 def _prepare(record: StoredEvidenceRecord) -> _PreparedRecord:
@@ -836,6 +920,214 @@ class CoverageState:
             raise CoverageUnhealthy("coverage reducer is unhealthy")
         if self._closed:
             raise CoverageAuthorityError("coverage reducer is closed")
+
+    def mutation_readiness(
+        self,
+        context: MutationReadinessContext,
+    ) -> MutationReadiness:
+        if type(context) is not MutationReadinessContext:
+            raise CoverageValidationError("readiness requires exact MutationReadinessContext")
+        _validate_mutation_readiness_context(context)
+        snapshot = self._snapshot
+        coverage_reducer_healthy = (
+            self._healthy and not self._closed and snapshot.head_sequence == context.evidence_head
+        )
+        reasons: set[str] = set()
+        if not context.ack_journal_healthy:
+            reasons.add("ack_journal_unhealthy")
+        uncertainty = context.clock_uncertainty_seconds
+        if uncertainty is not None and uncertainty > context.max_clock_uncertainty_seconds:
+            reasons.add("clock_uncertainty_exceeded")
+        if not context.clock_healthy or uncertainty is None:
+            reasons.add("clock_unhealthy")
+        if not coverage_reducer_healthy:
+            reasons.add("coverage_reducer_unhealthy")
+        if snapshot.open_critical_intervals:
+            reasons.add("critical_coverage_open")
+        if context.acceptance_cursor != context.confirmed_through:
+            reasons.add("cursor_acceptance_confirmed_mismatch")
+        if context.confirmed_through != context.projection_cursor:
+            reasons.add("cursor_confirmed_projection_mismatch")
+        if context.evidence_head != context.acceptance_cursor:
+            reasons.add("cursor_evidence_acceptance_mismatch")
+        if (
+            snapshot.boot_transition_sequence is None
+            or snapshot.docker_generation is None
+            or bool(snapshot.docker_opens)
+        ):
+            reasons.add("docker_reconcile_missing")
+        if not context.evidence_healthy:
+            reasons.add("evidence_unhealthy")
+        if not context.key_healthy:
+            reasons.add("key_unhealthy")
+        if snapshot.boot_transition_sequence is None or not snapshot.observer_started:
+            reasons.add("observer_start_missing")
+        if not context.projection_healthy:
+            reasons.add("projection_unhealthy")
+        if any(gap.close_source_sequence is None for gap in snapshot.sequence_gaps):
+            reasons.add("structural_gap_open")
+
+        lease = snapshot.falco_lease
+        deadline = snapshot.live_lease_deadline
+        lease_after_stop = lease is not None and (
+            snapshot.latest_falco_stop_sequence is None
+            or lease.source_sequence > snapshot.latest_falco_stop_sequence
+        )
+        lease_ingest_valid = False
+        lease_wall_valid = False
+        lease_monotonic_valid = False
+        if lease is not None:
+            opened_at = _timestamp(lease.opened_at)
+            ingest_time = _timestamp(lease.ingest_time)
+            ingest_age = ingest_time - opened_at
+            decision_age = context.decision_utc - opened_at
+            lease_ingest_valid = (
+                opened_at <= ingest_time <= context.decision_utc
+                and timedelta(0) <= ingest_age <= _LEASE_WINDOW
+            )
+            lease_wall_valid = timedelta(0) <= decision_age <= _LEASE_WINDOW
+            lease_monotonic_valid = deadline is not None and context.decision_monotonic <= deadline
+            if not lease_ingest_valid:
+                reasons.add("falco_lease_ingest_invalid")
+            if decision_age > _LEASE_WINDOW or (
+                deadline is not None and context.decision_monotonic > deadline
+            ):
+                reasons.add("falco_lease_stale")
+        if lease is None or deadline is None or not lease_after_stop:
+            reasons.add("falco_lease_missing")
+        live_lease_usable = (
+            lease is not None
+            and deadline is not None
+            and lease_after_stop
+            and lease_ingest_valid
+            and lease_wall_valid
+            and lease_monotonic_valid
+        )
+
+        reason_codes = tuple(sorted(reasons))
+        ready = not reason_codes
+        interval_rows: list[
+            tuple[
+                tuple[str, str, str, str, int, int],
+                dict[str, object],
+            ]
+        ] = []
+        for item in snapshot.docker_opens:
+            interval_rows.append(
+                (
+                    (
+                        "docker",
+                        "observer",
+                        "docker_reconcile_gap",
+                        item.opened_at,
+                        item.source_sequence,
+                        item.generation,
+                    ),
+                    {
+                        "interval_class": "docker",
+                        "component": "observer",
+                        "kind": "docker_reconcile_gap",
+                        "opened_at": item.opened_at,
+                        "source_sequence": item.source_sequence,
+                        "reconcile_generation": item.generation,
+                    },
+                )
+            )
+        for critical in snapshot.open_critical_intervals:
+            interval_rows.append(
+                (
+                    (
+                        "generic",
+                        critical.component,
+                        critical.kind,
+                        critical.opened_at,
+                        critical.source_sequence,
+                        0,
+                    ),
+                    {
+                        "interval_class": "generic",
+                        "component": critical.component,
+                        "kind": critical.kind,
+                        "opened_at": critical.opened_at,
+                        "source_sequence": critical.source_sequence,
+                        "reconcile_generation": None,
+                    },
+                )
+            )
+        open_critical_intervals = tuple(payload for _sort_key, payload in sorted(interval_rows))
+        open_sequence_gaps = tuple(
+            {
+                "affected_source_sequence_start": item.affected_start,
+                "affected_source_sequence_end": item.affected_end,
+                "opened_at": item.opened_at,
+                "open_source_sequence": item.open_source_sequence,
+                "baseline_recovery_generation": (item.baseline_recovery_generation),
+            }
+            for item in sorted(
+                (gap for gap in snapshot.sequence_gaps if gap.close_source_sequence is None),
+                key=lambda gap: (
+                    gap.affected_start,
+                    gap.affected_end,
+                    gap.opened_at,
+                    gap.open_source_sequence,
+                ),
+            )
+        )
+        lease_logical_identity: dict[str, object] | None = None
+        if lease is not None:
+            lease_logical_identity = {
+                "source_sequence": lease.source_sequence,
+                "event_id": lease.event_id,
+                "opened_at": lease.opened_at,
+                "ingest_time": lease.ingest_time,
+                "live_usable": live_lease_usable,
+            }
+        payload = {
+            "schema_version": _COVERAGE_SNAPSHOT_SCHEMA,
+            "decision_utc": _canonical_decision_utc(context.decision_utc),
+            "ready": ready,
+            "reason_codes": reason_codes,
+            "cursors": {
+                "evidence_head": context.evidence_head,
+                "acceptance_cursor": context.acceptance_cursor,
+                "confirmed_through": context.confirmed_through,
+                "projection_cursor": context.projection_cursor,
+            },
+            "health_bits": {
+                "ack_journal_healthy": context.ack_journal_healthy,
+                "clock_healthy": context.clock_healthy,
+                "clock_uncertainty_present": uncertainty is not None,
+                "clock_uncertainty_within_limit": (
+                    uncertainty is not None and uncertainty <= context.max_clock_uncertainty_seconds
+                ),
+                "coverage_reducer_healthy": coverage_reducer_healthy,
+                "evidence_healthy": context.evidence_healthy,
+                "key_healthy": context.key_healthy,
+                "projection_healthy": context.projection_healthy,
+            },
+            "boot_epoch": {
+                "host_id": snapshot.host_id,
+                "transition_source_sequence": (snapshot.boot_transition_sequence),
+            },
+            "observer_started": snapshot.observer_started,
+            "docker_generation": snapshot.docker_generation,
+            "open_critical_intervals": open_critical_intervals,
+            "open_sequence_gaps": open_sequence_gaps,
+            "lease_logical_identity": lease_logical_identity,
+        }
+        snapshot_hash = hashlib.sha256(
+            _COVERAGE_SNAPSHOT_DOMAIN + canonical_json(payload)
+        ).hexdigest()
+        return MutationReadiness(
+            ready=ready,
+            reason_codes=reason_codes,
+            evidence_head=context.evidence_head,
+            acceptance_cursor=context.acceptance_cursor,
+            confirmed_through=context.confirmed_through,
+            projection_cursor=context.projection_cursor,
+            observer_reconcile_generation=snapshot.docker_generation,
+            coverage_snapshot_sha256=snapshot_hash,
+        )
 
     def apply(
         self,

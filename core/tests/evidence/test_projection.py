@@ -26,6 +26,7 @@ from agmind_immune.ingest.envelope import (
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from tests.phase5b_helpers import (
     BOOT_A,
+    HOST_ID,
     NOW,
     boot_boundary,
     envelope_value,
@@ -419,3 +420,155 @@ def test_projection_dedup_is_logical_and_provenanced(tmp_path: Path, case: str) 
         assert connection.execute("SELECT count(*) FROM events").fetchone() == (3,)
     cache.close()
     store.close()
+
+
+def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
+    projection = _projection()
+    coordinator, store, journal = _system(tmp_path / "healthy" / "evidence")
+    path = tmp_path / "healthy" / "projection.sqlite3"
+    cache = projection.ProjectionStore.open(
+        path,
+        evidence=store,
+        acknowledgements=journal,
+    )
+    empty_ack = journal.snapshot()
+    empty_counts = _counts(path)
+    assert cache.status() == projection.ProjectionStatus(True, None)
+    assert journal.snapshot() == empty_ack
+    assert _counts(path) == empty_counts
+
+    key = private_key(11)
+    first = _accept(coordinator, boot_boundary(key))
+    _confirm(journal, first)
+    applied = cache.apply(first)
+    before_ack = journal.snapshot()
+    before_counts = _counts(path)
+    status = cache.status()
+    assert type(status) is projection.ProjectionStatus
+    assert status == projection.ProjectionStatus(
+        True,
+        projection.ProjectionCursor(
+            host_id=HOST_ID,
+            source_sequence=first.source_sequence,
+            event_id=first.event_id,
+            content_sha256=first.content_sha256,
+            frame_sha256=first.frame_sha256,
+        ),
+    )
+    assert status.cursor == applied.cursor
+    assert type(status.cursor) is projection.ProjectionCursor
+    assert journal.snapshot() == before_ack
+    assert _counts(path) == before_counts
+
+    retained_connection = cache._connection
+    assert retained_connection is not None
+    cache._connection = None
+    assert cache.status() == projection.ProjectionStatus(False, None)
+    cache._connection = retained_connection
+    cache.close()
+    assert cache.status() == projection.ProjectionStatus(False, None)
+    store.close()
+
+    _latched_coordinator, latched_store, latched_journal = _system(
+        tmp_path / "latched" / "evidence"
+    )
+    latched_path = tmp_path / "latched" / "projection.sqlite3"
+    latched = projection.ProjectionStore.open(
+        latched_path,
+        evidence=latched_store,
+        acknowledgements=latched_journal,
+    )
+    latched._healthy = False
+    latched_ack = latched_journal.snapshot()
+    latched_counts = _counts(latched_path)
+    assert latched.status() == projection.ProjectionStatus(False, None)
+    assert latched_journal.snapshot() == latched_ack
+    assert _counts(latched_path) == latched_counts
+    latched.close()
+    latched_store.close()
+
+    for case in (
+        "malformed_uint64",
+        "malformed_host",
+        "malformed_event",
+        "malformed_content_hash",
+        "malformed_frame_hash",
+        "multiple",
+    ):
+        coordinator, candidate_store, candidate_journal = _system(
+            tmp_path / case / "evidence"
+        )
+        candidate_path = tmp_path / case / "projection.sqlite3"
+        candidate = projection.ProjectionStore.open(
+            candidate_path,
+            evidence=candidate_store,
+            acknowledgements=candidate_journal,
+        )
+        candidate_ref = _accept(coordinator, boot_boundary(key))
+        _confirm(candidate_journal, candidate_ref)
+        candidate.apply(candidate_ref)
+        assert candidate._connection is not None
+        if case == "malformed_uint64":
+            candidate._connection.execute(
+                "UPDATE ingest_cursors SET source_sequence=?",
+                ("18446744073709551616",),
+            )
+        elif case == "malformed_host":
+            candidate._connection.execute(
+                "UPDATE ingest_cursors SET host_id=?",
+                ("not-a-host-id",),
+            )
+        elif case == "malformed_event":
+            candidate._connection.execute("PRAGMA foreign_keys=OFF")
+            candidate._connection.execute(
+                "UPDATE ingest_cursors SET event_id=?",
+                ("evt_" + "z" * 64,),
+            )
+        elif case == "malformed_content_hash":
+            candidate._connection.execute(
+                "UPDATE ingest_cursors SET content_sha256=?",
+                ("g" * 64,),
+            )
+        elif case == "malformed_frame_hash":
+            candidate._connection.execute(
+                "UPDATE ingest_cursors SET frame_sha256=?",
+                ("g" * 64,),
+            )
+        else:
+            candidate._connection.execute(
+                "INSERT INTO ingest_cursors("
+                "host_id,source_sequence,event_id,content_sha256,segment_id,"
+                "segment_relative_path,frame_offset,frame_size,frame_sha256"
+                ") SELECT ?,source_sequence,event_id,content_sha256,segment_id,"
+                "segment_relative_path,frame_offset,frame_size,frame_sha256 "
+                "FROM ingest_cursors",
+                ("423e4567-e89b-42d3-a456-426614174000",),
+            )
+        candidate_ack = candidate_journal.snapshot()
+        candidate_counts = _counts(candidate_path)
+        assert candidate.status() == projection.ProjectionStatus(False, None)
+        assert not candidate._healthy
+        assert candidate_journal.snapshot() == candidate_ack
+        assert _counts(candidate_path) == candidate_counts
+        candidate.close()
+        candidate_store.close()
+
+    _interrupt_coordinator, interrupt_store, interrupt_journal = _system(
+        tmp_path / "interrupt" / "evidence"
+    )
+    interrupt = projection.ProjectionStore.open(
+        tmp_path / "interrupt" / "projection.sqlite3",
+        evidence=interrupt_store,
+        acknowledgements=interrupt_journal,
+    )
+
+    def interrupt_cursor(_connection: sqlite3.Connection) -> object:
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(projection, "_current_cursor", interrupt_cursor)
+        with pytest.raises(KeyboardInterrupt):
+            interrupt.status()
+    assert interrupt._healthy
+    interrupt.close()
+    interrupt_store.close()

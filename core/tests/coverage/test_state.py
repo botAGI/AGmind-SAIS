@@ -4,6 +4,8 @@ import hashlib
 import importlib
 import math
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -332,6 +334,673 @@ def _falco_point(
             source_payload_hash="a" * 64,
         )
     )
+
+
+def _readiness_context(
+    coverage: Any,
+    head: int,
+    **overrides: object,
+) -> Any:
+    values: dict[str, object] = {
+        "decision_utc": datetime.fromisoformat(T3),
+        "decision_monotonic": 101.0,
+        "clock_healthy": True,
+        "clock_uncertainty_seconds": Decimal("0.5"),
+        "max_clock_uncertainty_seconds": Decimal(1),
+        "evidence_head": head,
+        "acceptance_cursor": head,
+        "confirmed_through": head,
+        "projection_cursor": head,
+        "evidence_healthy": True,
+        "key_healthy": True,
+        "ack_journal_healthy": True,
+        "projection_healthy": True,
+    }
+    values.update(overrides)
+    return coverage.MutationReadinessContext(**values)
+
+
+def _live_ready_state(
+    coverage: Any,
+    path: Path,
+    *,
+    receipt_monotonic: float = 100.0,
+    lease_opened_at: str = T2,
+    lease_ingest_time: str = T3,
+) -> tuple[Any, SegmentStore]:
+    key = private_key(11)
+    coordinator, store = _system(path)
+    _accept(coordinator, store, boot_boundary(key))
+    state = coverage.CoverageState.open_and_recover(store)
+    for value in (
+        _observer_start(key, 2),
+        _docker_open(key, 3, opened_at=T0, generation=1).envelope,
+        _docker_recovery(
+            key,
+            4,
+            opened_at=T0,
+            closed_at=T1,
+            generation=1,
+        ).envelope,
+    ):
+        state.apply(_accept(coordinator, store, value))
+    lease = _accept(
+        coordinator,
+        store,
+        _falco_point(
+            key,
+            5,
+            kind="falco_heartbeat_lease",
+            severity="INFO",
+            at=lease_opened_at,
+            reason="valid_heartbeat",
+            ingest_time=lease_ingest_time,
+        ).envelope,
+    )
+    state.apply(lease, live_receipt_monotonic=receipt_monotonic)
+    return state, store
+
+
+def _generic_critical(
+    key: Ed25519PrivateKey,
+    sequence: int,
+    *,
+    component: str,
+    kind: str,
+    opened_at: str,
+    closed_at: str | None = None,
+) -> StoredEvidenceRecord:
+    fields: dict[str, object] = {
+        "component": component,
+        "kind": kind,
+        "severity": "CRITICAL",
+        "opened_at": opened_at,
+        "reason_code": "test_critical",
+    }
+    if closed_at is not None:
+        fields["closed_at"] = closed_at
+    return _stored(
+        _coverage(
+            key,
+            sequence,
+            fields,
+            source_payload_hash=hashlib.sha256(
+                f"{component}\0{kind}\0{opened_at}\0{closed_at}".encode()
+            ).hexdigest(),
+        )
+    )
+
+
+def test_readiness_context_health_and_cursor_matrix(tmp_path: Path) -> None:
+    coverage = _coverage_module()
+    state, store = _live_ready_state(coverage, tmp_path / "context")
+    valid = _readiness_context(coverage, 5)
+    assert state.mutation_readiness(valid).ready
+
+    class DatetimeSubclass(datetime):
+        pass
+
+    invalid_fields = (
+        (
+            "decision_utc",
+            datetime(2026, 7, 28, 10, 0, 3, tzinfo=UTC).replace(tzinfo=None),
+        ),
+        (
+            "decision_utc",
+            datetime(2026, 7, 28, 10, 0, 3, tzinfo=timezone(timedelta(hours=1))),
+        ),
+        ("decision_utc", datetime(2026, 7, 28, 10, 0, 3, tzinfo=UTC, fold=1)),
+        ("decision_utc", DatetimeSubclass(2026, 7, 28, 10, 0, 3, tzinfo=UTC)),
+        ("decision_monotonic", True),
+        ("decision_monotonic", 1),
+        ("decision_monotonic", -1.0),
+        ("decision_monotonic", math.inf),
+        ("decision_monotonic", math.nan),
+        ("clock_uncertainty_seconds", 0),
+        ("clock_uncertainty_seconds", Decimal("-0.1")),
+        ("clock_uncertainty_seconds", Decimal("NaN")),
+        ("clock_uncertainty_seconds", Decimal("Infinity")),
+        ("max_clock_uncertainty_seconds", 1),
+        ("max_clock_uncertainty_seconds", Decimal("-0.1")),
+        ("max_clock_uncertainty_seconds", Decimal("NaN")),
+        ("max_clock_uncertainty_seconds", Decimal("Infinity")),
+    )
+    for field, value in invalid_fields:
+        with pytest.raises(coverage.CoverageValidationError):
+            _readiness_context(coverage, 5, **{field: value})
+    for field in (
+        "clock_healthy",
+        "evidence_healthy",
+        "key_healthy",
+        "ack_journal_healthy",
+        "projection_healthy",
+    ):
+        with pytest.raises(coverage.CoverageValidationError):
+            _readiness_context(coverage, 5, **{field: 1})
+    for field in (
+        "evidence_head",
+        "acceptance_cursor",
+        "confirmed_through",
+        "projection_cursor",
+    ):
+        for value in (True, 1.0, -1, 2**64):
+            with pytest.raises(coverage.CoverageValidationError):
+                _readiness_context(coverage, 5, **{field: value})
+
+    health_reasons = {
+        "clock_healthy": "clock_unhealthy",
+        "evidence_healthy": "evidence_unhealthy",
+        "key_healthy": "key_unhealthy",
+        "ack_journal_healthy": "ack_journal_unhealthy",
+        "projection_healthy": "projection_unhealthy",
+    }
+    for field, reason in health_reasons.items():
+        result = state.mutation_readiness(replace(valid, **{field: False}))
+        assert not result.ready
+        assert result.reason_codes == (reason,)
+    assert state.mutation_readiness(
+        replace(valid, clock_uncertainty_seconds=None)
+    ).reason_codes == ("clock_unhealthy",)
+    assert state.mutation_readiness(
+        replace(
+            valid,
+            clock_uncertainty_seconds=Decimal(1),
+            max_clock_uncertainty_seconds=Decimal(1),
+        )
+    ).ready
+    assert state.mutation_readiness(
+        replace(valid, clock_uncertainty_seconds=Decimal("1.000000001"))
+    ).reason_codes == ("clock_uncertainty_exceeded",)
+
+    cursor_cases = (
+        (
+            {"acceptance_cursor": 4, "confirmed_through": 4, "projection_cursor": 4},
+            "cursor_evidence_acceptance_mismatch",
+        ),
+        (
+            {"confirmed_through": 4, "projection_cursor": 4},
+            "cursor_acceptance_confirmed_mismatch",
+        ),
+        ({"projection_cursor": 4}, "cursor_confirmed_projection_mismatch"),
+        (
+            {
+                "evidence_head": 4,
+                "acceptance_cursor": 4,
+                "confirmed_through": 4,
+                "projection_cursor": 4,
+            },
+            "coverage_reducer_unhealthy",
+        ),
+    )
+    for changes, reason in cursor_cases:
+        result = state.mutation_readiness(replace(valid, **changes))
+        assert result.reason_codes == (reason,)
+
+    combined = state.mutation_readiness(
+        replace(
+            valid,
+            clock_healthy=False,
+            clock_uncertainty_seconds=Decimal(2),
+            evidence_head=4,
+            acceptance_cursor=3,
+            confirmed_through=2,
+            projection_cursor=1,
+            evidence_healthy=False,
+            key_healthy=False,
+            ack_journal_healthy=False,
+            projection_healthy=False,
+        )
+    )
+    expected = (
+        "ack_journal_unhealthy",
+        "clock_uncertainty_exceeded",
+        "clock_unhealthy",
+        "coverage_reducer_unhealthy",
+        "cursor_acceptance_confirmed_mismatch",
+        "cursor_confirmed_projection_mismatch",
+        "cursor_evidence_acceptance_mismatch",
+        "evidence_unhealthy",
+        "key_unhealthy",
+        "projection_unhealthy",
+    )
+    assert combined.reason_codes == expected == tuple(sorted(set(expected)))
+
+    class ContextSubclass(coverage.MutationReadinessContext):
+        pass
+
+    before = state._snapshot
+    before_owner = store._coverage_state_owner
+    barrier = state.ack_barrier_capability()
+    for invalid in (valid.__dict__, object(), ContextSubclass(**valid.__dict__)):
+        with pytest.raises(coverage.CoverageValidationError):
+            state.mutation_readiness(invalid)
+    tampered_fields = (
+        (
+            "decision_utc",
+            datetime(2026, 7, 28, 10, 0, 3, tzinfo=UTC).replace(tzinfo=None),
+        ),
+        ("decision_monotonic", True),
+        ("clock_healthy", 1),
+        ("clock_uncertainty_seconds", 0),
+        ("max_clock_uncertainty_seconds", 1),
+        ("evidence_head", True),
+        ("acceptance_cursor", True),
+        ("confirmed_through", True),
+        ("projection_cursor", True),
+        ("evidence_healthy", 1),
+        ("key_healthy", 1),
+        ("ack_journal_healthy", 1),
+        ("projection_healthy", 1),
+    )
+    for field, value in tampered_fields:
+        tampered = replace(valid)
+        object.__setattr__(tampered, field, value)
+        with pytest.raises(coverage.CoverageValidationError):
+            state.mutation_readiness(tampered)
+    assert state._snapshot is before
+    assert state._healthy
+    assert store._coverage_state_owner is before_owner
+    assert barrier._first_unclosed_sequence_gap(store) is None
+
+    state.close()
+    closed = state.mutation_readiness(valid)
+    assert not closed.ready
+    assert closed.reason_codes == ("coverage_reducer_unhealthy",)
+    store.close()
+
+
+def test_readiness_boot_docker_and_open_gap_matrix() -> None:
+    coverage = _coverage_module()
+    key = private_key(11)
+    boot = _stored(boot_boundary(key))
+    start = _stored(_observer_start(key, 2))
+    docker_open = _docker_open(key, 3, opened_at=T0, generation=1)
+    recovery = _docker_recovery(
+        key,
+        4,
+        opened_at=T0,
+        closed_at=T1,
+        generation=1,
+    )
+
+    def decide(records: list[StoredEvidenceRecord]) -> Any:
+        state = coverage.CoverageState.rebuild(records)
+        return state.mutation_readiness(_readiness_context(coverage, state._snapshot.head_sequence))
+
+    empty = decide([])
+    assert empty.reason_codes == (
+        "docker_reconcile_missing",
+        "falco_lease_missing",
+        "observer_start_missing",
+    )
+    assert empty.observer_reconcile_generation is None
+
+    isolated_start = decide([_stored(_observer_start(key, 1))])
+    assert isolated_start.reason_codes == (
+        "docker_reconcile_missing",
+        "falco_lease_missing",
+        "observer_start_missing",
+    )
+    assert decide([boot]).reason_codes == isolated_start.reason_codes
+
+    started = decide([boot, start])
+    assert started.reason_codes == (
+        "docker_reconcile_missing",
+        "falco_lease_missing",
+    )
+    opened = decide([boot, start, docker_open])
+    assert opened.reason_codes == (
+        "docker_reconcile_missing",
+        "falco_lease_missing",
+    )
+    assert "critical_coverage_open" not in opened.reason_codes
+    assert opened.observer_reconcile_generation is None
+
+    recovered = decide([boot, start, docker_open, recovery])
+    assert recovered.reason_codes == ("falco_lease_missing",)
+    assert recovered.observer_reconcile_generation == 1
+
+    reset = decide(
+        [
+            boot,
+            start,
+            docker_open,
+            recovery,
+            _stored(
+                boot_boundary(
+                    key,
+                    sequence=5,
+                    boot_id=BOOT_B,
+                    previous_boot_id=BOOT_A,
+                    previous_source_sequence=4,
+                )
+            ),
+        ]
+    )
+    assert reset.reason_codes == (
+        "docker_reconcile_missing",
+        "falco_lease_missing",
+        "observer_start_missing",
+    )
+    assert reset.observer_reconcile_generation is None
+
+    generic_open = _generic_critical(
+        key,
+        5,
+        component="falco-adapter",
+        kind="falco_heartbeat_gap",
+        opened_at=T1,
+    )
+    generic_close = _generic_critical(
+        key,
+        6,
+        component="falco-adapter",
+        kind="falco_heartbeat_gap",
+        opened_at=T1,
+        closed_at=T2,
+    )
+    assert decide([boot, start, docker_open, recovery, generic_open]).reason_codes == (
+        "critical_coverage_open",
+        "falco_lease_missing",
+    )
+    assert decide(
+        [boot, start, docker_open, recovery, generic_open, generic_close]
+    ).reason_codes == ("falco_lease_missing",)
+
+    gap_open = _gap_open(key, 5, start=20, end=21, opened_at=T1)
+    next_docker_open = _docker_open(key, 6, opened_at=T2, generation=2)
+    next_recovery = _docker_recovery(
+        key,
+        7,
+        opened_at=T2,
+        closed_at=T3,
+        generation=2,
+    )
+    gap_close = _gap_close(
+        key,
+        8,
+        start=20,
+        end=21,
+        opened_at=T1,
+        closed_at=T3,
+        generation=2,
+    )
+    structural = decide([boot, start, docker_open, recovery, gap_open])
+    assert structural.reason_codes == ("falco_lease_missing", "structural_gap_open")
+    assert "critical_coverage_open" not in structural.reason_codes
+    assert structural.observer_reconcile_generation == 1
+
+    docker_and_structural = decide([boot, start, docker_open, recovery, gap_open, next_docker_open])
+    assert docker_and_structural.reason_codes == (
+        "docker_reconcile_missing",
+        "falco_lease_missing",
+        "structural_gap_open",
+    )
+    assert "critical_coverage_open" not in docker_and_structural.reason_codes
+
+    structurally_recovered = decide(
+        [
+            boot,
+            start,
+            docker_open,
+            recovery,
+            gap_open,
+            next_docker_open,
+            next_recovery,
+            gap_close,
+        ]
+    )
+    assert structurally_recovered.reason_codes == ("falco_lease_missing",)
+    assert structurally_recovered.observer_reconcile_generation == 2
+
+
+def test_readiness_lease_clock_edges_and_logical_hash(tmp_path: Path) -> None:
+    coverage = _coverage_module()
+    edge_state, edge_store = _live_ready_state(coverage, tmp_path / "edge")
+    edge_context = _readiness_context(
+        coverage,
+        5,
+        decision_utc=datetime(2026, 7, 28, 10, 0, 17, tzinfo=UTC),
+        decision_monotonic=114.0,
+        clock_uncertainty_seconds=Decimal(1),
+        max_clock_uncertainty_seconds=Decimal(1),
+    )
+    edge = edge_state.mutation_readiness(edge_context)
+    assert edge.ready
+    assert edge.reason_codes == ()
+
+    wall_beyond = edge_state.mutation_readiness(
+        replace(
+            edge_context,
+            decision_utc=datetime(2026, 7, 28, 10, 0, 17, 1, tzinfo=UTC),
+        )
+    )
+    assert wall_beyond.reason_codes == ("falco_lease_stale",)
+    monotonic_beyond = edge_state.mutation_readiness(
+        replace(
+            edge_context,
+            decision_monotonic=math.nextafter(114.0, math.inf),
+        )
+    )
+    assert monotonic_beyond.reason_codes == ("falco_lease_stale",)
+    decision_before_ingest = edge_state.mutation_readiness(
+        replace(
+            edge_context,
+            decision_utc=datetime(2026, 7, 28, 10, 0, 2, 999999, tzinfo=UTC),
+            decision_monotonic=100.0,
+        )
+    )
+    assert decision_before_ingest.reason_codes == ("falco_lease_ingest_invalid",)
+    uncertainty_beyond = edge_state.mutation_readiness(
+        replace(edge_context, clock_uncertainty_seconds=Decimal("1.000000001"))
+    )
+    assert uncertainty_beyond.reason_codes == ("clock_uncertainty_exceeded",)
+
+    maximum_state, maximum_store = _live_ready_state(
+        coverage,
+        tmp_path / "maximum-year",
+        receipt_monotonic=7.0,
+        lease_opened_at="9999-12-31T23:59:44Z",
+        lease_ingest_time="9999-12-31T23:59:44Z",
+    )
+    assert maximum_state.mutation_readiness(
+        _readiness_context(
+            coverage,
+            5,
+            decision_utc=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+            decision_monotonic=22.0,
+        )
+    ).ready
+
+    key = private_key(11)
+    replay_records = [
+        _stored(boot_boundary(key)),
+        _stored(_observer_start(key, 2)),
+        _docker_open(key, 3, opened_at=T0, generation=1),
+        _docker_recovery(
+            key,
+            4,
+            opened_at=T0,
+            closed_at=T1,
+            generation=1,
+        ),
+        _falco_point(
+            key,
+            5,
+            kind="falco_heartbeat_lease",
+            severity="INFO",
+            at=T2,
+            reason="valid_heartbeat",
+            ingest_time=T3,
+        ),
+    ]
+    replay = coverage.CoverageState.rebuild(replay_records)
+    assert replay.mutation_readiness(edge_context).reason_codes == ("falco_lease_missing",)
+    assert replay.mutation_readiness(
+        replace(
+            edge_context,
+            decision_utc=datetime(2026, 7, 28, 10, 0, 17, 1, tzinfo=UTC),
+        )
+    ).reason_codes == ("falco_lease_missing", "falco_lease_stale")
+    stopped = coverage.CoverageState.rebuild(
+        [
+            *replay_records,
+            _falco_point(
+                key,
+                6,
+                kind="falco_adapter_stop",
+                severity="CRITICAL",
+                at=T4,
+                reason="adapter_stopping",
+            ),
+        ]
+    )
+    assert stopped.mutation_readiness(
+        _readiness_context(coverage, 6, decision_utc=datetime.fromisoformat(T4))
+    ).reason_codes == ("falco_lease_missing",)
+
+    origin_state, origin_store = _live_ready_state(
+        coverage,
+        tmp_path / "origin",
+        receipt_monotonic=1000.0,
+    )
+    origin_context = replace(edge_context, decision_monotonic=1014.0)
+    origin = origin_state.mutation_readiness(origin_context)
+    assert origin.ready
+    assert origin.coverage_snapshot_sha256 == edge.coverage_snapshot_sha256
+    assert (
+        edge_state.mutation_readiness(
+            replace(edge_context, decision_monotonic=113.0)
+        ).coverage_snapshot_sha256
+        == edge.coverage_snapshot_sha256
+    )
+    assert (
+        edge_state.mutation_readiness(
+            replace(
+                edge_context,
+                decision_utc=datetime(2026, 7, 28, 10, 0, 16, 999999, tzinfo=UTC),
+            )
+        ).coverage_snapshot_sha256
+        != edge.coverage_snapshot_sha256
+    )
+
+    retained = origin_state._snapshot.falco_lease
+    assert retained is not None
+    origin_state._snapshot = replace(
+        origin_state._snapshot,
+        falco_lease=replace(retained, event_id="evt_" + "f" * 64),
+    )
+    assert (
+        origin_state.mutation_readiness(origin_context).coverage_snapshot_sha256
+        != edge.coverage_snapshot_sha256
+    )
+
+    ordering_records = [
+        _stored(boot_boundary(key)),
+        _stored(_observer_start(key, 2)),
+        _docker_open(key, 3, opened_at=T1, generation=2),
+        _docker_open(key, 4, opened_at=T0, generation=1),
+        _generic_critical(
+            key,
+            5,
+            component="z-component",
+            kind="z-kind",
+            opened_at=T2,
+        ),
+        _generic_critical(
+            key,
+            6,
+            component="a-component",
+            kind="a-kind",
+            opened_at=T1,
+        ),
+        _gap_open(key, 7, start=30, end=31, opened_at=T2),
+        _gap_open(key, 8, start=10, end=11, opened_at=T1),
+        _falco_point(
+            key,
+            9,
+            kind="falco_heartbeat_lease",
+            severity="INFO",
+            at=T2,
+            reason="valid_heartbeat",
+            ingest_time=T3,
+        ),
+    ]
+    ordered = coverage.CoverageState.rebuild(ordering_records)
+    reordered = coverage.CoverageState.rebuild(ordering_records)
+    reordered._snapshot = replace(
+        reordered._snapshot,
+        docker_opens=tuple(reversed(reordered._snapshot.docker_opens)),
+        open_critical_intervals=tuple(reversed(reordered._snapshot.open_critical_intervals)),
+        sequence_gaps=tuple(reversed(reordered._snapshot.sequence_gaps)),
+    )
+    ordering_context = _readiness_context(coverage, 9)
+    assert (
+        ordered.mutation_readiness(ordering_context).coverage_snapshot_sha256
+        == reordered.mutation_readiness(ordering_context).coverage_snapshot_sha256
+    )
+
+    empty_context = _readiness_context(
+        coverage,
+        0,
+        decision_utc=datetime.fromisoformat(T0),
+        decision_monotonic=0.0,
+    )
+    empty_hash = (
+        coverage.CoverageState.rebuild([])
+        .mutation_readiness(empty_context)
+        .coverage_snapshot_sha256
+    )
+    independent_payload = {
+        "schema_version": "agmind.coverage-snapshot.v1",
+        "decision_utc": T0,
+        "ready": False,
+        "reason_codes": (
+            "docker_reconcile_missing",
+            "falco_lease_missing",
+            "observer_start_missing",
+        ),
+        "cursors": {
+            "evidence_head": 0,
+            "acceptance_cursor": 0,
+            "confirmed_through": 0,
+            "projection_cursor": 0,
+        },
+        "health_bits": {
+            "ack_journal_healthy": True,
+            "clock_healthy": True,
+            "clock_uncertainty_present": True,
+            "clock_uncertainty_within_limit": True,
+            "coverage_reducer_healthy": True,
+            "evidence_healthy": True,
+            "key_healthy": True,
+            "projection_healthy": True,
+        },
+        "boot_epoch": {
+            "host_id": None,
+            "transition_source_sequence": None,
+        },
+        "observer_started": False,
+        "docker_generation": None,
+        "open_critical_intervals": (),
+        "open_sequence_gaps": (),
+        "lease_logical_identity": None,
+    }
+    fixed_digest = "069743223f798123b9f632be2a68babdc649d5ec350430a0d2aa5115bc30acab"
+    assert (
+        hashlib.sha256(
+            b"AGMIND_COVERAGE_SNAPSHOT_V1\0" + canonical_json(independent_payload)
+        ).hexdigest()
+        == fixed_digest
+    )
+    assert empty_hash == fixed_digest
+
+    edge_state.close()
+    maximum_state.close()
+    origin_state.close()
+    edge_store.close()
+    maximum_store.close()
+    origin_store.close()
 
 
 def test_input_order_atomicity_and_unhealthy_latch(tmp_path: Path) -> None:

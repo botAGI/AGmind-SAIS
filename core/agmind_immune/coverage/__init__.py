@@ -8,6 +8,8 @@ from agmind_immune.coverage.state import (
     CoverageState,
     CoverageUnhealthy,
     CoverageValidationError,
+    MutationReadiness,
+    MutationReadinessContext,
 )
 
 __all__ = [
@@ -18,4 +20,6 @@ __all__ = [
     "CoverageState",
     "CoverageUnhealthy",
     "CoverageValidationError",
+    "MutationReadiness",
+    "MutationReadinessContext",
 ]

@@ -26,7 +26,13 @@ from threading import RLock
 from pydantic import ValidationError
 
 from agmind_immune.canonicaljson import canonical_json
-from agmind_immune.contracts import CoverageEventV1, EventEnvelopeV1, FalcoConnectV1
+from agmind_immune.contracts import (
+    HEX64,
+    UUID4,
+    CoverageEventV1,
+    EventEnvelopeV1,
+    FalcoConnectV1,
+)
 from agmind_immune.evidence.segments import (
     EvidenceRef,
     SegmentStore,
@@ -35,6 +41,7 @@ from agmind_immune.evidence.segments import (
 from agmind_immune.ingest.ack_journal import AckJournal, AckJournalSnapshot
 
 _UINT64 = re.compile(r"^[0-9]{20}$")
+_EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 _SNAPSHOT_DOMAIN = b"AGMIND_PROJECTION_SNAPSHOT_V1\0"
 _SCHEMA_META = {
@@ -219,6 +226,12 @@ class ProjectionCursor:
     event_id: str
     content_sha256: str
     frame_sha256: str
+
+
+@dataclass(frozen=True)
+class ProjectionStatus:
+    healthy: bool
+    cursor: ProjectionCursor | None
 
 
 @dataclass(frozen=True)
@@ -454,12 +467,27 @@ def _verify_schema(connection: sqlite3.Connection) -> None:
 def _cursor_from_row(row: sqlite3.Row | None) -> ProjectionCursor | None:
     if row is None:
         return None
+    host_id = row["host_id"]
+    event_id = row["event_id"]
+    content_sha256 = row["content_sha256"]
+    frame_sha256 = row["frame_sha256"]
+    if (
+        type(host_id) is not str
+        or UUID4.fullmatch(host_id) is None
+        or type(event_id) is not str
+        or _EVENT_ID.fullmatch(event_id) is None
+        or type(content_sha256) is not str
+        or HEX64.fullmatch(content_sha256) is None
+        or type(frame_sha256) is not str
+        or HEX64.fullmatch(frame_sha256) is None
+    ):
+        raise ProjectionConflict("projection cursor identity is invalid")
     return ProjectionCursor(
-        host_id=str(row["host_id"]),
+        host_id=host_id,
         source_sequence=_decode_uint64(row["source_sequence"]),
-        event_id=str(row["event_id"]),
-        content_sha256=str(row["content_sha256"]),
-        frame_sha256=str(row["frame_sha256"]),
+        event_id=event_id,
+        content_sha256=content_sha256,
+        frame_sha256=frame_sha256,
     )
 
 
@@ -685,6 +713,20 @@ class ProjectionStore:
     @property
     def path(self) -> Path:
         return self._path
+
+    def status(self) -> ProjectionStatus:
+        with self._mutex:
+            if self._closed or not self._healthy or self._connection is None:
+                return ProjectionStatus(False, None)
+            connection = self._connection
+            try:
+                self._verify_live_connection(connection)
+                cursor = _current_cursor(connection)
+                self._verify_live_connection(connection)
+            except (ProjectionError, sqlite3.Error, OSError):
+                self._healthy = False
+                return ProjectionStatus(False, None)
+            return ProjectionStatus(True, cursor)
 
     def _require_usable(self) -> sqlite3.Connection:
         if self._closed:
