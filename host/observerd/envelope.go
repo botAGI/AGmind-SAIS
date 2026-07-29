@@ -229,7 +229,9 @@ func (legacy observerStateV1) Validate() error {
 	}
 	state := observerStateFromV1(legacy)
 	state.MutationReadOnly = true
-	state.ReadOnlyReason = "observer_legacy_boot_boundary_unproven"
+	if state.ReadOnlyReason == "" {
+		state.ReadOnlyReason = "observer_legacy_boot_boundary_unproven"
+	}
 	state.ReconcileRequired = true
 	state.BootBoundaryState = bootBoundaryLegacyUnproven
 	return state.Validate()
@@ -270,7 +272,9 @@ func migrateObserverStateV1(legacy observerStateV1) ObserverState {
 		return state
 	}
 	state.MutationReadOnly = true
-	state.ReadOnlyReason = "observer_legacy_boot_boundary_unproven"
+	if state.ReadOnlyReason == "" {
+		state.ReadOnlyReason = "observer_legacy_boot_boundary_unproven"
+	}
 	state.ReconcileRequired = true
 	state.BootBoundaryState = bootBoundaryLegacyUnproven
 	state.PendingBootBoundary = nil
@@ -485,9 +489,7 @@ func (state ObserverState) Validate() error {
 		}
 	case bootBoundaryLegacyUnproven:
 		if state.PendingBootBoundary != nil ||
-			!state.MutationReadOnly ||
-			state.ReadOnlyReason !=
-				"observer_legacy_boot_boundary_unproven" {
+			!state.MutationReadOnly {
 			return fmt.Errorf("unproven legacy state must remain fenced")
 		}
 	default:

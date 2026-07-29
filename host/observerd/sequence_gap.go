@@ -584,6 +584,21 @@ func (service *Service) closeOutstandingSequenceGaps(
 	if err != nil {
 		return service.daemon.spool.failSequenceGapProofs(err)
 	}
+	openTimes := make([]time.Time, len(scan.Unpaired))
+	for index, open := range scan.Unpaired {
+		openTimes[index], err = time.Parse(time.RFC3339Nano, open.OpenedAt)
+		if err != nil {
+			return service.daemon.spool.failSequenceGapProofs(err)
+		}
+	}
+	for _, openedAt := range openTimes {
+		if closedTime.Before(openedAt) {
+			return errors.Join(
+				fmt.Errorf("Docker recovery predates sequence-gap open"),
+				service.openDockerReconcileFences(),
+			)
+		}
+	}
 	for _, open := range scan.Unpaired {
 		fields := map[string]any{
 			"component":                      "observer",

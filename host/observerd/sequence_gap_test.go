@@ -125,6 +125,14 @@ func rewriteObserverStateAsLegacyForTest(
 	if schema == observerStateSchemaV1 {
 		delete(value, "boot_boundary_state")
 		delete(value, "pending_boot_boundary")
+		if history, ok := value["boot_history"].([]any); ok {
+			for _, entry := range history {
+				if boundary, ok := entry.(map[string]any); ok {
+					delete(boundary, "boundary_event_id")
+					delete(boundary, "boundary_event_type")
+				}
+			}
+		}
 	}
 	if mutate != nil {
 		mutate(value)
@@ -252,6 +260,16 @@ func (fixture *c8BootstrapFixture) closeGapsAndAck(t *testing.T) {
 func dockerGapFixture(
 	t *testing.T,
 ) (*Service, *StateStore, *Spool, *Inventory, *fakeDockerReader) {
+	return dockerGapFixtureAt(
+		t,
+		time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+	)
+}
+
+func dockerGapFixtureAt(
+	t *testing.T,
+	openedAt time.Time,
+) (*Service, *StateStore, *Spool, *Inventory, *fakeDockerReader) {
 	t.Helper()
 	service, state, spool, inventory, docker := observerServiceFixture(t)
 	reserveUnpublishedSequenceForTest(t, service.daemon.signer)
@@ -259,7 +277,7 @@ func dockerGapFixture(
 		t,
 		service.daemon.signer,
 		"CRITICAL",
-		time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+		openedAt,
 		nil,
 		1,
 		1,
@@ -270,6 +288,39 @@ func dockerGapFixture(
 		t.Fatal(err)
 	}
 	return service, state, spool, inventory, docker
+}
+
+func gapRuntimeOptions(
+	docker DockerReader,
+	now func() time.Time,
+	listenCalled *bool,
+) observerRuntimeOptions {
+	return observerRuntimeOptions{
+		openDocker: func() (DockerReader, io.Closer, error) {
+			return docker, io.NopCloser(bytes.NewReader(nil)), nil
+		},
+		processes: fakeProcessIdentityReader{
+			byPID: map[int]processIdentity{4242: validProcessIdentity()},
+		},
+		groupID: func(name string) (uint32, error) {
+			if name == "agmind-sensor" {
+				return 2001, nil
+			}
+			return 2002, nil
+		},
+		userID: func(string) (uint32, error) { return 1002, nil },
+		listen: func(
+			string,
+			os.FileMode,
+			int,
+			int64,
+			http.Handler,
+		) (observerRuntimeServer, error) {
+			*listenCalled = true
+			return nil, errors.New("listener must not be reached")
+		},
+		now: now,
+	}
 }
 
 func requireNoCoverageKind(t *testing.T, spool *Spool, kinds ...string) {
@@ -498,6 +549,8 @@ func TestC8MigrationRejectsInvalidAndPreservesExistingFence(
 		name            string
 		schema          string
 		existingFence   string
+		wantFence       string
+		clearFence      bool
 		invalidMutation func(map[string]any)
 	}{
 		{
@@ -520,6 +573,19 @@ func TestC8MigrationRejectsInvalidAndPreservesExistingFence(
 			name:          "existing fence is preserved",
 			schema:        observerStateSchemaV2,
 			existingFence: "observer_existing_fence",
+			wantFence:     "observer_existing_fence",
+		},
+		{
+			name:      "V1 marker creates boot fence",
+			schema:    observerStateSchemaV1,
+			wantFence: "observer_legacy_boot_boundary_unproven",
+		},
+		{
+			name:          "V1 marker preserves rotation fence",
+			schema:        observerStateSchemaV1,
+			existingFence: "observer_rotation_incomplete",
+			wantFence:     "observer_rotation_incomplete",
+			clearFence:    true,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -579,8 +645,19 @@ func TestC8MigrationRejectsInvalidAndPreservesExistingFence(
 			if persisted.SequenceGapProtocol !=
 				sequenceGapProtocolLegacyUnproven ||
 				!persisted.MutationReadOnly ||
-				persisted.ReadOnlyReason != testCase.existingFence {
+				persisted.ReadOnlyReason != testCase.wantFence {
 				t.Fatalf("existing fence was not preserved: %+v", persisted)
+			}
+			if testCase.clearFence {
+				if err := restarted.state.clearRotationFence(); err == nil {
+					t.Fatal("legacy sequence-gap protocol cleared rotation fence")
+				}
+				after := restarted.state.Snapshot()
+				if !after.MutationReadOnly ||
+					after.ReadOnlyReason != testCase.wantFence ||
+					after.SequenceGapProtocol != sequenceGapProtocolLegacyUnproven {
+					t.Fatalf("failed clear mutated legacy fence: %+v", after)
+				}
 			}
 		})
 	}
@@ -1123,36 +1200,7 @@ func TestReverseDockerRecoveryTimePublishesNoRecoveryCloseOrListener(
 	listenCalled := false
 	err := service.daemon.runWithOptions(
 		context.Background(),
-		observerRuntimeOptions{
-			openDocker: func() (DockerReader, io.Closer, error) {
-				return docker, io.NopCloser(bytes.NewReader(nil)), nil
-			},
-			processes: fakeProcessIdentityReader{
-				byPID: map[int]processIdentity{
-					4242: validProcessIdentity(),
-				},
-			},
-			groupID: func(name string) (uint32, error) {
-				if name == "agmind-sensor" {
-					return 2001, nil
-				}
-				return 2002, nil
-			},
-			userID: func(string) (uint32, error) {
-				return 1002, nil
-			},
-			listen: func(
-				string,
-				os.FileMode,
-				int,
-				int64,
-				http.Handler,
-			) (observerRuntimeServer, error) {
-				listenCalled = true
-				return nil, errors.New("listener must not be reached")
-			},
-			now: reverseNow,
-		},
+		gapRuntimeOptions(docker, reverseNow, &listenCalled),
 	)
 	if err == nil || listenCalled {
 		t.Fatalf("reverse recovery err=%v listen_called=%v", err, listenCalled)
@@ -1163,6 +1211,120 @@ func TestReverseDockerRecoveryTimePublishesNoRecoveryCloseOrListener(
 		"docker_reconcile_recovered",
 		"observer_sequence_gap",
 	)
+}
+
+func TestRecoveryBeforeSequenceGapReopensFenceWithoutPoisoningRetry(
+	t *testing.T,
+) {
+	gapOpenedAt := time.Date(2026, 7, 27, 12, 2, 0, 0, time.UTC)
+	service, state, spool, inventory, docker := dockerGapFixtureAt(
+		t,
+		time.Date(2026, 7, 27, 11, 59, 0, 0, time.UTC),
+	)
+	secondGap := state.Snapshot().LastSequence + 1
+	reserveUnpublishedSequenceForTest(t, service.daemon.signer)
+	signSequenceGapProofForTest(
+		t,
+		service.daemon.signer,
+		"CRITICAL",
+		gapOpenedAt,
+		nil,
+		secondGap,
+		secondGap,
+		"reserved_sequence_not_published",
+		0,
+	)
+	if err := state.markGapCovered(secondGap); err != nil {
+		t.Fatal(err)
+	}
+	service.daemon.config = Config{
+		SchemaVersion:             "agmind.observer-config.v1",
+		HostIDFile:                "/var/lib/agmind-sais/identity/host-id",
+		PrivateKeyFile:            "/etc/agmind-sais/secrets/observer.key",
+		StateDir:                  filepath.Dir(inventory.path),
+		RunDir:                    t.TempDir(),
+		SpoolMaxBytes:             4 * 1024 * 1024,
+		SpoolPriorityReserveBytes: 1024 * 1024,
+	}
+	docker.eventsResult = &DockerEventStream{
+		Messages: make(chan events.Message),
+		Err:      make(chan error),
+	}
+	var nowCalls int
+	recoveryBeforeGap := func() time.Time {
+		nowCalls++
+		if nowCalls == 1 {
+			return time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+		}
+		return time.Date(2026, 7, 27, 12, 1, 0, 0, time.UTC)
+	}
+	listenCalled := false
+	err := service.daemon.runWithOptions(
+		context.Background(),
+		gapRuntimeOptions(docker, recoveryBeforeGap, &listenCalled),
+	)
+	if err == nil || errors.Is(err, ErrSpoolCorrupt) || listenCalled {
+		t.Fatalf("preflight err=%v listen_called=%v", err, listenCalled)
+	}
+	scan, scanErr := spool.scanSequenceGapProofs()
+	if scanErr != nil || len(scan.Unpaired) != 2 || len(scan.Closes) != 0 {
+		t.Fatalf("preflight poisoned retained proofs: scan=%+v err=%v", scan, scanErr)
+	}
+	snapshot := state.Snapshot()
+	if snapshot.MutationReadOnly ||
+		snapshot.ReadOnlyReason != "" ||
+		!snapshot.ReconcileRequired {
+		t.Fatalf("preflight observer fence=%+v", snapshot)
+	}
+	persistedInventory, err := loadInventoryState(inventory.path)
+	if err != nil || !persistedInventory.DockerReconcileGap {
+		t.Fatalf("preflight inventory fence=%+v err=%v", persistedInventory, err)
+	}
+	requireNoCoverageKind(t, spool, "observer_sequence_gap")
+
+	retryNow := func() time.Time {
+		return time.Date(2026, 7, 27, 12, 4, 0, 0, time.UTC)
+	}
+	retryInventory, err := openInventory(
+		service.daemon.config.StateDir,
+		docker,
+		fakeProcessIdentityReader{
+			byPID: map[int]processIdentity{4242: validProcessIdentity()},
+		},
+		retryNow,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry := newObserverService(service.daemon, retryInventory, docker, retryNow)
+	docker.eventsResult = &DockerEventStream{
+		Messages: make(chan events.Message),
+		Err:      make(chan error),
+	}
+	baseline := retryInventory.Generation()
+	receipt, err := retry.recoverDockerWithSubscribedSessionReceipt(
+		context.Background(),
+		"observer_startup",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retry.closeOutstandingSequenceGaps(
+		context.Background(),
+		baseline,
+		receipt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	retry.closeDockerEventSession()
+	finalScan, err := spool.scanSequenceGapProofs()
+	if err != nil ||
+		len(finalScan.Unpaired) != 0 ||
+		len(finalScan.Closes) != 2 ||
+		state.Snapshot().ReconcileRequired ||
+		retryInventory.ReconcileGapOpen() {
+		t.Fatalf("valid retry scan=%+v state=%+v err=%v", finalScan, state.Snapshot(), err)
+	}
 }
 
 func TestRetainedReverseDockerRecoveryFencesAuthenticatedProofScan(
