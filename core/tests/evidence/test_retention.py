@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import copy
 import hashlib
+import os
+import pickle
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -16,6 +20,7 @@ from agmind_immune.contracts import (
     RetentionTombstoneV2,
 )
 from agmind_immune.evidence import retention as retention_module
+from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.manifest import (
     SegmentManifestV1,
     chain_head_for,
@@ -32,6 +37,11 @@ from agmind_immune.evidence.retention import (
     _freeze_retention_record,
     _freeze_retention_snapshot,
     select_retention,
+)
+from agmind_immune.evidence.segments import (
+    EvidenceCorrupt,
+    EvidenceSealError,
+    SegmentStore,
 )
 
 REQUEST_ID = "11111111-1111-4111-8111-111111111111"
@@ -106,6 +116,7 @@ def _snapshot(
     *specs: _FactSpec,
     clock: CoreClockSample | None = None,
     prior: tuple[AcceptedRetentionTombstone, ...] = (),
+    prior_index_through_sequence: int | None = None,
 ) -> RetentionSnapshot:
     facts: list[FrozenRetentionFact] = []
     previous = ZERO_SHA256
@@ -125,6 +136,8 @@ def _snapshot(
                     )
                     for position, event_type in enumerate(spec.event_types)
                 ),
+                original_device=100 + index,
+                original_inode=1_000 + index,
             )
         )
         previous = manifest.manifest_sha256
@@ -132,6 +145,11 @@ def _snapshot(
         facts=tuple(facts),
         clock=_clock() if clock is None else clock,
         prior_tombstones=prior,
+        prior_index_through_sequence=(
+            max((item.sequence for item in prior), default=0)
+            if prior_index_through_sequence is None
+            else prior_index_through_sequence
+        ),
     )
 
 
@@ -183,6 +201,19 @@ def _accepted(
         content_sha256=hashlib.sha256(f"content-{sequence}".encode()).hexdigest(),
         request=request,
     )
+
+
+def _selected_state(
+    snapshot: RetentionSnapshot,
+    *,
+    request_id: str = REQUEST_ID,
+) -> object:
+    decision = select_retention(
+        snapshot,
+        request_id=request_id,
+    )
+    assert decision.request is not None
+    return retention_module.selected_retention_state(decision)
 
 
 def test_selection_seven_day_nanosecond_boundary_is_strict() -> None:
@@ -696,3 +727,403 @@ def test_selection_age_only_protected_pressure_does_not_fabricate_blocked() -> N
     )
 
     assert decision.request is None
+
+
+def test_state_selection_witness_is_canonical_bounded_and_complete() -> None:
+    base = _snapshot(
+        _FactSpec(EXPIRED, 3),
+        _FactSpec(EXPIRED, 5),
+    )
+    prior = _accepted(_tombstone(base, (0,)))
+    snapshot = _snapshot(
+        _FactSpec(EXPIRED, 3),
+        _FactSpec(EXPIRED, 5),
+        prior=(prior,),
+        prior_index_through_sequence=90,
+    )
+    decision = select_retention(
+        snapshot,
+        request_id=OTHER_REQUEST_ID,
+    )
+    state = retention_module.selected_retention_state(decision)
+
+    request = prior.request
+    index_record = canonical_json(
+        {
+            "sequence": prior.sequence,
+            "event_id": prior.event_id,
+            "content_sha256": prior.content_sha256,
+            "tombstone_id": request.tombstone_id,
+            "h0": request.current_chain_head_sha256,
+            "first_removed_manifest_sha256": (
+                request.first_removed_manifest_sha256
+            ),
+            "last_removed_manifest_sha256": (
+                request.last_removed_manifest_sha256
+            ),
+            "first_retained_manifest_sha256": (
+                request.first_retained_manifest_sha256
+            ),
+            "removed_manifest_count": len(request.removed_manifest_hashes),
+            "removed_bytes": request.removed_bytes,
+            "manifest_run_sha256": request.manifest_run_sha256,
+        }
+    )
+    expected_index = hashlib.sha256(
+        b"agmind.retention-prior-index.v1\0"
+        + len(index_record).to_bytes(8, "big")
+        + index_record
+    ).hexdigest()
+    raw = retention_module.encode_retention_state(state)
+
+    assert len(raw) <= 128 * 1024
+    assert retention_module.decode_retention_state(raw) == state
+    assert state.phase == "selected"
+    assert state.target is None
+    assert state.selection_witness.policy_version == "agmind-retention-v1"
+    assert state.selection_witness.maximum_age_ns == 7 * 24 * 60 * 60 * 10**9
+    assert state.selection_witness.target_bytes == 5 * 1024**3
+    assert state.selection_witness.maximum_run_manifests == 128
+    assert state.selection_witness.removable_event_types == ["falco_connect"]
+    assert state.selection_witness.prior_index_count == 1
+    assert state.selection_witness.prior_index_through_sequence == 90
+    assert state.selection_witness.prior_index_sha256 == expected_index
+    assert decision.prior_index_sha256 == expected_index
+    assert state.entries[0].original_device == snapshot.facts[1].original_device
+    assert state.entries[0].original_inode == snapshot.facts[1].original_inode
+
+    with pytest.raises(retention_module.RetentionStateCorrupt, match="canonical"):
+        retention_module.decode_retention_state(raw + b"\n")
+    with pytest.raises(retention_module.RetentionStateCorrupt, match="128 KiB"):
+        retention_module.decode_retention_state(b"x" * (128 * 1024 + 1))
+
+
+def test_state_target_binding_historical_advance_and_exact_cas(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(_FactSpec(EXPIRED, 5))
+    decision = select_retention(snapshot, request_id=REQUEST_ID)
+    selected = retention_module.selected_retention_state(decision)
+    target = retention_module.RetentionTargetV1(
+        sequence=81,
+        event_id="evt_" + "a" * 64,
+        content_sha256="b" * 64,
+    )
+    other_target = retention_module.RetentionTargetV1(
+        sequence=81,
+        event_id="evt_" + "c" * 64,
+        content_sha256="d" * 64,
+    )
+    bound = retention_module.bind_retention_target(selected, target)
+    appended = retention_module.advance_retention_evidence_appended(
+        bound,
+        target,
+    )
+    historical = retention_module.advance_retention_evidence_appended(
+        selected,
+        target,
+    )
+
+    assert bound.phase == "target_bound"
+    assert appended.phase == "evidence_appended"
+    assert historical == appended
+    with pytest.raises(retention_module.RetentionProtocolError, match="target"):
+        retention_module.advance_retention_evidence_appended(
+            bound,
+            other_target,
+        )
+
+    store = SegmentStore(tmp_path)
+    journal = retention_module._open_retention_state_journal(store)
+    reopened = retention_module._open_retention_state_journal(store)
+    body = journal.prepare_publication(decision)
+    durable = (tmp_path / "retention-state.json").read_bytes()
+
+    assert retention_module.decode_retention_state(durable) == selected
+    assert reopened is journal
+    assert body == canonical_json(selected.request.model_dump(mode="python"))
+    assert journal.prepare_publication(decision) == body
+    journal.bind_target(target)
+    journal.bind_target(target)
+    mutated_document = bound.model_dump(exclude_none=False)
+    mutated_document["entries"][0]["original_inode"] += 1
+    mutated = retention_module.RetentionStateV1.model_validate(
+        mutated_document,
+        strict=True,
+    )
+    with pytest.raises(
+        retention_module.RetentionProtocolError,
+        match="immutable",
+    ):
+        journal._transition(mutated)
+    skipped_document = bound.model_dump(exclude_none=False)
+    skipped_document["phase"] = "completed"
+    skipped = retention_module.RetentionStateV1.model_validate(
+        skipped_document,
+        strict=True,
+    )
+    with pytest.raises(
+        retention_module.RetentionProtocolError,
+        match="transition",
+    ):
+        journal._transition(skipped)
+    with pytest.raises(retention_module.RetentionStateConflict, match="CAS"):
+        journal._authority.replace_retention_state_bytes(
+            retention_module.encode_retention_state(selected),
+            retention_module.encode_retention_state(appended),
+        )
+    with pytest.raises(retention_module.RetentionProtocolError, match="transition"):
+        journal.prepare_publication(decision)
+    with pytest.raises(TypeError, match="copied"):
+        copy.copy(journal)
+    with pytest.raises(TypeError, match="serialized"):
+        pickle.dumps(journal)
+    assert not hasattr(journal, "clear")
+    assert not hasattr(journal, "path")
+    store.close(flush=False)
+
+
+def test_state_publication_retries_only_exact_durable_body(tmp_path: Path) -> None:
+    snapshot = _snapshot(_FactSpec(EXPIRED, 5))
+    decision = select_retention(snapshot, request_id=REQUEST_ID)
+    conflicting = select_retention(snapshot, request_id=OTHER_REQUEST_ID)
+    selected = retention_module.selected_retention_state(decision)
+    store = SegmentStore(tmp_path)
+    journal = retention_module._open_retention_state_journal(store)
+
+    first = journal.prepare_publication(decision)
+    second = journal.prepare_publication(decision)
+
+    assert first == second
+    with pytest.raises(retention_module.RetentionStateConflict, match="request"):
+        journal.prepare_publication(conflicting)
+    with pytest.raises(TypeError, match="decision"):
+        journal.prepare_publication(
+            retention_module.decode_retention_state(
+                retention_module.encode_retention_state(selected)
+            )
+        )
+    assert (tmp_path / "retention-state.json").read_bytes() == (
+        retention_module.encode_retention_state(selected)
+    )
+    store.close(flush=False)
+
+
+def test_state_temp_namespace_is_discarded_without_promotion(
+    tmp_path: Path,
+) -> None:
+    selected = _selected_state(_snapshot(_FactSpec(EXPIRED, 5)))
+    selected_raw = retention_module.encode_retention_state(selected)
+    temporary_name = (
+        ".retention-state.json."
+        "33333333-3333-4333-8333-333333333333.tmp"
+    )
+
+    temp_only = tmp_path / "temp-only"
+    temp_only.mkdir(mode=0o700)
+    store = SegmentStore(temp_only)
+    store.close(flush=False)
+    temporary = temp_only / temporary_name
+    temporary.write_bytes(b'{"partial":')
+    temporary.chmod(0o600)
+
+    recovered = SegmentStore(temp_only)
+    assert not temporary.exists()
+    assert retention_module._open_retention_state_journal(recovered).state is None
+    recovered.close(flush=False)
+
+    final_and_temp = tmp_path / "final-and-temp"
+    final_and_temp.mkdir(mode=0o700)
+    store = SegmentStore(final_and_temp)
+    store.close(flush=False)
+    final = final_and_temp / "retention-state.json"
+    final.write_bytes(selected_raw)
+    final.chmod(0o600)
+    temporary = final_and_temp / temporary_name
+    temporary.write_bytes(b'{"partial":')
+    temporary.chmod(0o600)
+
+    recovered = SegmentStore(final_and_temp)
+    assert not temporary.exists()
+    assert final.read_bytes() == selected_raw
+    assert retention_module._open_retention_state_journal(recovered).state == selected
+    recovered.close(flush=False)
+
+    multiple = tmp_path / "multiple"
+    multiple.mkdir(mode=0o700)
+    store = SegmentStore(multiple)
+    store.close(flush=False)
+    for request_id in (REQUEST_ID, OTHER_REQUEST_ID):
+        path = multiple / f".retention-state.json.{request_id}.tmp"
+        path.write_bytes(b"")
+        path.chmod(0o600)
+    with pytest.raises(EvidenceCorrupt, match="multiple retention-state"):
+        SegmentStore(multiple)
+
+
+def test_state_unbound_temporary_appearing_after_open_is_rejected(
+    tmp_path: Path,
+) -> None:
+    decision = select_retention(
+        _snapshot(_FactSpec(EXPIRED, 5)),
+        request_id=REQUEST_ID,
+    )
+    store = SegmentStore(tmp_path)
+    journal = retention_module._open_retention_state_journal(store)
+    temporary = (
+        tmp_path
+        / ".retention-state.json."
+        "33333333-3333-4333-8333-333333333333.tmp"
+    )
+    temporary.write_bytes(b'{"foreign":true}')
+    temporary.chmod(0o600)
+
+    with pytest.raises(EvidenceCorrupt, match="unbound retention-state temporary"):
+        journal.prepare_publication(decision)
+
+    store.close(flush=False)
+
+
+@pytest.mark.parametrize("artifact_kind", ["final", "temporary"])
+@pytest.mark.parametrize("attack", ["mode", "type", "link", "oversize"])
+def test_state_startup_rejects_unsafe_final_and_temporary_artifacts(
+    tmp_path: Path,
+    artifact_kind: str,
+    attack: str,
+) -> None:
+    root = tmp_path / f"{artifact_kind}-{attack}"
+    store = SegmentStore(root)
+    store.close(flush=False)
+    name = (
+        "retention-state.json"
+        if artifact_kind == "final"
+        else (
+            ".retention-state.json."
+            "33333333-3333-4333-8333-333333333333.tmp"
+        )
+    )
+    artifact = root / name
+    if attack == "type":
+        artifact.mkdir(mode=0o700)
+    elif attack == "link":
+        source = tmp_path / f"{artifact_kind}-{attack}-source"
+        source.write_bytes(b"{}")
+        source.chmod(0o600)
+        os.link(source, artifact)
+    else:
+        artifact.write_bytes(
+            b"x" * (128 * 1024 + 1)
+            if attack == "oversize"
+            else b"{}"
+        )
+        artifact.chmod(0o644 if attack == "mode" else 0o600)
+
+    with pytest.raises(
+        EvidenceCorrupt,
+        match="unsafe evidence file|exceeds 128 KiB",
+    ):
+        SegmentStore(root)
+
+
+def test_state_cas_destination_swap_keeps_valid_new_final_and_fences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _snapshot(_FactSpec(EXPIRED, 5))
+    decision = select_retention(snapshot, request_id=REQUEST_ID)
+    selected = retention_module.selected_retention_state(decision)
+    target = retention_module.RetentionTargetV1(
+        sequence=81,
+        event_id="evt_" + "a" * 64,
+        content_sha256="b" * 64,
+    )
+    expected_new = retention_module.encode_retention_state(
+        retention_module.bind_retention_target(selected, target)
+    )
+    store = SegmentStore(tmp_path)
+    journal = retention_module._open_retention_state_journal(store)
+    journal.prepare_publication(decision)
+    foreign_name = ".adversarial-retention-state"
+    hidden_old_name = ".adversarial-held-old-retention-state"
+    foreign = tmp_path / foreign_name
+    foreign_raw = b'{"foreign":true}'
+    foreign.write_bytes(foreign_raw)
+    foreign.chmod(0o600)
+    original_exchange = segments_module._rename_exchange
+
+    def exchange_after_destination_swap(
+        left_name: str,
+        right_name: str,
+        *,
+        parent_descriptor: int,
+    ) -> None:
+        os.rename(
+            right_name,
+            hidden_old_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        os.rename(
+            foreign_name,
+            right_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        original_exchange(
+            left_name,
+            right_name,
+            parent_descriptor=parent_descriptor,
+        )
+
+    monkeypatch.setattr(
+        segments_module,
+        "_rename_exchange",
+        exchange_after_destination_swap,
+    )
+
+    with pytest.raises(EvidenceCorrupt, match="namespace is uncertain"):
+        journal.bind_target(target)
+
+    assert (tmp_path / "retention-state.json").read_bytes() == expected_new
+    assert (tmp_path / "retention-state.json").read_bytes() != foreign_raw
+    with pytest.raises(EvidenceSealError, match="exact store lifecycle"):
+        journal.bind_target(target)
+
+    store.close(flush=False)
+
+
+def test_state_root_fsync_ambiguity_fences_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _snapshot(_FactSpec(EXPIRED, 5))
+    decision = select_retention(snapshot, request_id=REQUEST_ID)
+    target = retention_module.RetentionTargetV1(
+        sequence=81,
+        event_id="evt_" + "a" * 64,
+        content_sha256="b" * 64,
+    )
+    store = SegmentStore(tmp_path)
+    journal = retention_module._open_retention_state_journal(store)
+    journal.prepare_publication(decision)
+    original_fsync = segments_module.os.fsync
+    failed = False
+
+    def fail_first_root_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if descriptor == store._root_descriptor and not failed:
+            failed = True
+            raise OSError("injected root fsync ambiguity")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(segments_module.os, "fsync", fail_first_root_fsync)
+
+    with pytest.raises(EvidenceCorrupt, match="namespace became uncertain"):
+        journal.bind_target(target)
+
+    assert failed
+    with pytest.raises(EvidenceSealError, match="exact store lifecycle"):
+        journal.bind_target(target)
+
+    monkeypatch.setattr(segments_module.os, "fsync", original_fsync)
+    store.close(flush=False)

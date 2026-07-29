@@ -119,6 +119,12 @@ _REPAIR_STATE_TEMP_NAME = re.compile(
     rf"^\.repair-state\.json\.{_UUID4_TEXT}\.tmp$"
 )
 _MAX_REPAIR_STATE_BYTES = 4096
+_RETENTION_STATE_NAME = "retention-state.json"
+_RETENTION_STATE_TEMP_NAME = re.compile(
+    rf"^\.retention-state\.json\.{_UUID4_TEXT}\.tmp$"
+)
+_MAX_RETENTION_STATE_BYTES = 128 * 1024
+_RETENTION_STATE_AUTHORITY_FACTORY = object()
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _ZERO_SHA256 = "0" * 64
 _UTC_TIMESTAMP = re.compile(
@@ -587,6 +593,13 @@ class _RepairStateArtifactBinding:
 
 
 @dataclass(frozen=True)
+class _RetentionStateArtifactBinding:
+    name: str
+    raw: bytes
+    identity: _FileIdentity
+
+
+@dataclass(frozen=True)
 class _SegmentScan:
     records: tuple[StoredEvidenceRecord, ...]
     frames: tuple[FrameRecord, ...]
@@ -670,6 +683,10 @@ class _RecoveryPlan:
     delete_private_temporaries: tuple[tuple[str, str], ...] = ()
     delete_manifest_temporaries: tuple[str, ...] = ()
     delete_root_temporaries: tuple[str, ...] = ()
+    delete_retention_state_temporaries: tuple[
+        _RetentionStateArtifactBinding,
+        ...,
+    ] = ()
     head_raw: bytes | None = None
 
 
@@ -1075,6 +1092,38 @@ def _read_stable_repair_artifact(
     return _RepairStateArtifactBinding(name=name, raw=raw, identity=after)
 
 
+def _read_stable_retention_artifact(
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+) -> _RetentionStateArtifactBinding:
+    before = _file_identity(
+        _regular_stat_at(parent_descriptor, name, display_path)
+    )
+    if before.size > _MAX_RETENTION_STATE_BYTES:
+        raise EvidenceCorrupt(
+            f"retention state exceeds 128 KiB: {display_path}"
+        )
+    raw = _read_regular_at(
+        parent_descriptor,
+        name,
+        display_path,
+        _MAX_RETENTION_STATE_BYTES,
+    )
+    after = _file_identity(
+        _regular_stat_at(parent_descriptor, name, display_path)
+    )
+    if before != after:
+        raise EvidenceCorrupt(
+            f"retention state changed during held scan: {display_path}"
+        )
+    return _RetentionStateArtifactBinding(
+        name=name,
+        raw=raw,
+        identity=after,
+    )
+
+
 def _open_regular_at(
     parent_descriptor: int,
     name: str,
@@ -1237,6 +1286,85 @@ def _rename_noreplace(
         raise EvidenceStoreError("atomic no-replace rename is unavailable on Darwin")
     raise EvidenceStoreError(
         f"atomic no-replace rename is unavailable on {sys.platform}"
+    )
+
+
+def _rename_exchange(
+    left_name: str,
+    right_name: str,
+    *,
+    parent_descriptor: int,
+) -> None:
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameat2.restype = ctypes.c_int
+            result = renameat2(
+                parent_descriptor,
+                os.fsencode(left_name),
+                parent_descriptor,
+                os.fsencode(right_name),
+                2,
+            )
+            if result == 0:
+                return
+            error_number = ctypes.get_errno()
+            if error_number in _ATOMIC_RENAME_UNAVAILABLE:
+                raise EvidenceStoreError(
+                    "atomic exchange rename is unavailable on Linux"
+                )
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                right_name,
+            )
+        raise EvidenceStoreError(
+            "atomic exchange rename is unavailable on Linux"
+        )
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is not None:
+            renameatx_np.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameatx_np.restype = ctypes.c_int
+            result = renameatx_np(
+                parent_descriptor,
+                os.fsencode(left_name),
+                parent_descriptor,
+                os.fsencode(right_name),
+                2,
+            )
+            if result == 0:
+                return
+            error_number = ctypes.get_errno()
+            if error_number in _ATOMIC_RENAME_UNAVAILABLE:
+                raise EvidenceStoreError(
+                    "atomic exchange rename is unavailable on Darwin"
+                )
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                right_name,
+            )
+        raise EvidenceStoreError(
+            "atomic exchange rename is unavailable on Darwin"
+        )
+    raise EvidenceStoreError(
+        f"atomic exchange rename is unavailable on {sys.platform}"
     )
 
 
@@ -1515,6 +1643,108 @@ def _publish_without_replacement_at(
         )
 
 
+@final
+class _RetentionStateAuthority:
+    """Factory-only held-root retention-state I/O capability."""
+
+    __slots__ = (
+        "_lifecycle_identity",
+        "_retention_journal",
+        "_store",
+    )
+
+    def __init__(
+        self,
+        store: SegmentStore,
+        *,
+        _factory: object,
+    ) -> None:
+        if _factory is not _RETENTION_STATE_AUTHORITY_FACTORY:
+            raise TypeError(
+                "retention-state authority is issued only by SegmentStore"
+            )
+        self._store = store
+        self._lifecycle_identity = store._lifecycle_identity
+        self._retention_journal: object | None = None
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("_RetentionStateAuthority is final")
+
+    def __copy__(self) -> _RetentionStateAuthority:
+        raise TypeError("retention-state capabilities cannot be copied")
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> _RetentionStateAuthority:
+        del memo
+        raise TypeError("retention-state capabilities cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("retention-state capabilities cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError("retention-state capabilities cannot be serialized")
+
+    def _require(self) -> SegmentStore:
+        store = self._store
+        if (
+            store._closed
+            or store._lifecycle_identity is not self._lifecycle_identity
+            or store._retention_state_authority is not self
+            or store._retention_state_namespace_uncertain
+        ):
+            raise EvidenceSealError(
+                "retention-state authority lost its exact store lifecycle"
+            )
+        return store
+
+    def read_retention_state_bytes(self) -> bytes | None:
+        return self._require()._read_retention_state_bytes(self)
+
+    def read_retention_state_temporary_bytes(self) -> bytes | None:
+        return self._require()._read_retention_state_temporary_bytes(self)
+
+    def publish_initial_retention_state(self, raw: bytes) -> None:
+        self._require()._publish_initial_retention_state(self, raw)
+
+    def replace_retention_state_bytes(
+        self,
+        expected: bytes,
+        raw: bytes,
+    ) -> None:
+        self._require()._replace_retention_state_bytes(
+            self,
+            expected,
+            raw,
+        )
+
+    def _bind_retention_journal(
+        self,
+        journal: object,
+        *,
+        _factory: object,
+    ) -> None:
+        from agmind_immune.evidence.retention import RetentionStateJournal
+
+        self._require()
+        if (
+            _factory is not _RETENTION_STATE_AUTHORITY_FACTORY
+            or type(journal) is not RetentionStateJournal
+            or journal._authority is not self
+        ):
+            raise EvidenceSealError(
+                "retention journal is not bound to exact store authority"
+            )
+        if self._retention_journal is not None:
+            raise EvidenceSealError(
+                "retention journal is already bound in this lifecycle"
+            )
+        self._retention_journal = journal
+
+
 class SegmentStore:
     """One lifetime-locked authoritative AGF1 evidence root."""
 
@@ -1543,6 +1773,16 @@ class SegmentStore:
         self._repair_recovery_plan: _RecoveryPlan | None = None
         self._repair_state_binding: _RepairStateArtifactBinding | None = None
         self._repair_state_temporary: _RepairStateArtifactBinding | None = None
+        self._retention_state_binding: (
+            _RetentionStateArtifactBinding | None
+        ) = None
+        self._retention_state_temporary: (
+            _RetentionStateArtifactBinding | None
+        ) = None
+        self._retention_state_authority: (
+            _RetentionStateAuthority | None
+        ) = None
+        self._retention_state_namespace_uncertain = False
         self._repair_authorization: _RepairAuthorizationBinding | None = None
         self._repair_completion_authorization: (
             _RepairCompletionAuthorizationBinding | None
@@ -1820,6 +2060,490 @@ class SegmentStore:
         if self._append_uncertain or self._pending_durable_commit is not None:
             raise EvidenceReadOnly("evidence durability is not settled")
         return verifier
+
+    def _open_retention_state_authority(
+        self,
+        *,
+        _factory: object,
+    ) -> _RetentionStateAuthority:
+        if (
+            _factory is not _RETENTION_STATE_AUTHORITY_FACTORY
+            or type(self) is not SegmentStore
+        ):
+            raise TypeError(
+                "retention state requires the exact SegmentStore factory"
+            )
+        if self._closed:
+            raise EvidenceStoreError("evidence store is closed")
+        authority = self._retention_state_authority
+        if authority is None:
+            authority = _RetentionStateAuthority(
+                self,
+                _factory=_RETENTION_STATE_AUTHORITY_FACTORY,
+            )
+            self._retention_state_authority = authority
+        else:
+            authority._require()
+        return authority
+
+    def _require_retention_state_authority(
+        self,
+        authority: _RetentionStateAuthority,
+    ) -> None:
+        if (
+            type(authority) is not _RetentionStateAuthority
+            or self._retention_state_authority is not authority
+            or authority._store is not self
+            or authority._lifecycle_identity is not self._lifecycle_identity
+            or self._closed
+        ):
+            raise EvidenceSealError(
+                "retention state requires exact held-root authority"
+            )
+        if self._retention_state_namespace_uncertain:
+            raise EvidenceSealError(
+                "retention-state namespace is uncertain"
+            )
+
+    def _require_retention_state_mutation(
+        self,
+        authority: _RetentionStateAuthority,
+    ) -> None:
+        self._require_retention_state_authority(authority)
+        if self._repair_mode or self._repair_pending:
+            raise EvidenceSealError(
+                "retention state is unavailable during signed tail repair"
+            )
+        if self._read_only_reason is not None:
+            raise EvidenceReadOnly(
+                f"evidence root is read-only: {self._read_only_reason}"
+            )
+        if self._append_uncertain or self._pending_durable_commit is not None:
+            raise EvidenceReadOnly("evidence durability is not settled")
+
+    @staticmethod
+    def _validate_retention_state_raw(raw: bytes) -> None:
+        if (
+            type(raw) is not bytes
+            or not raw
+            or len(raw) > _MAX_RETENTION_STATE_BYTES
+        ):
+            raise EvidenceStoreError(
+                "retention state must contain at most 128 KiB"
+            )
+
+    def _read_bound_retention_artifact(
+        self,
+        binding: _RetentionStateArtifactBinding | None,
+        *,
+        final: bool,
+    ) -> bytes | None:
+        if final:
+            name = _RETENTION_STATE_NAME
+            if binding is None:
+                if _entry_stat_at(self._root_descriptor, name) is not None:
+                    raise EvidenceCorrupt(
+                        "unbound retention-state final appeared"
+                    )
+                return None
+        else:
+            names = tuple(
+                entry
+                for entry in os.listdir(self._root_descriptor)
+                if _RETENTION_STATE_TEMP_NAME.fullmatch(entry)
+            )
+            if binding is None:
+                if names:
+                    raise EvidenceCorrupt(
+                        "unbound retention-state temporary appeared"
+                    )
+                return None
+            if names != (binding.name,):
+                raise EvidenceCorrupt(
+                    "retention-state temporary namespace changed"
+                )
+            name = binding.name
+        if binding is None:
+            raise EvidenceCorrupt("retention-state binding is invalid")
+        current = _read_stable_retention_artifact(
+            self._root_descriptor,
+            name,
+            self.root / name,
+        )
+        if current != binding:
+            raise EvidenceCorrupt(
+                "retention-state artifact changed after startup"
+            )
+        return current.raw
+
+    def _read_retention_state_bytes(
+        self,
+        authority: _RetentionStateAuthority,
+    ) -> bytes | None:
+        self._require_retention_state_authority(authority)
+        return self._read_bound_retention_artifact(
+            self._retention_state_binding,
+            final=True,
+        )
+
+    def _read_retention_state_temporary_bytes(
+        self,
+        authority: _RetentionStateAuthority,
+    ) -> bytes | None:
+        self._require_retention_state_authority(authority)
+        return self._read_bound_retention_artifact(
+            self._retention_state_temporary,
+            final=False,
+        )
+
+    def _require_clean_retention_state_temporary_namespace(
+        self,
+        authority: _RetentionStateAuthority,
+    ) -> None:
+        if self._read_retention_state_temporary_bytes(authority) is not None:
+            raise EvidenceCorrupt(
+                "retention-state temporary requires startup recovery"
+            )
+
+    def _commit_retention_state_bytes(
+        self,
+        raw: bytes,
+        *,
+        replace: bool,
+        expected_binding: _RetentionStateArtifactBinding | None = None,
+    ) -> _RetentionStateArtifactBinding:
+        if replace != (expected_binding is not None):
+            raise EvidenceSealError(
+                "retention-state commit lost its CAS binding"
+            )
+        temporary_name = f".{_RETENTION_STATE_NAME}.{uuid.uuid4()}.tmp"
+        display_path = self.root / _RETENTION_STATE_NAME
+        expected_sha256 = hashlib.sha256(raw).hexdigest()
+        descriptor = -1
+        identity: _FileIdentity | None = None
+        old_descriptor = -1
+        old_exchange_identity: _FileIdentity | None = None
+        if expected_binding is not None:
+            old_descriptor, opened = _open_regular_at(
+                self._root_descriptor,
+                _RETENTION_STATE_NAME,
+                display_path,
+                maximum=_MAX_RETENTION_STATE_BYTES,
+            )
+            try:
+                _validate_identity(
+                    opened,
+                    expected_binding.identity,
+                    display_path,
+                )
+                _validate_published_from_held(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    display_path,
+                    descriptor=old_descriptor,
+                    identity=expected_binding.identity,
+                    expected_sha256=hashlib.sha256(
+                        expected_binding.raw
+                    ).hexdigest(),
+                )
+            except BaseException:
+                os.close(old_descriptor)
+                raise
+        self._retention_state_namespace_uncertain = True
+        try:
+            descriptor, identity = _write_temporary_at(
+                self._root_descriptor,
+                temporary_name,
+                raw,
+            )
+            with _post_authentication_namespace(display_path):
+                _bind_held_source(
+                    self._root_descriptor,
+                    temporary_name,
+                    display_path,
+                    descriptor=descriptor,
+                    identity=identity,
+                )
+                if replace:
+                    if expected_binding is None or old_descriptor < 0:
+                        raise EvidenceSealError(
+                            "retention-state CAS source is absent"
+                        )
+                    _bind_held_source(
+                        self._root_descriptor,
+                        _RETENTION_STATE_NAME,
+                        display_path,
+                        descriptor=old_descriptor,
+                        identity=expected_binding.identity,
+                    )
+                    _rename_exchange(
+                        temporary_name,
+                        _RETENTION_STATE_NAME,
+                        parent_descriptor=self._root_descriptor,
+                    )
+                    try:
+                        _validate_published_from_held(
+                            self._root_descriptor,
+                            temporary_name,
+                            self.root / temporary_name,
+                            descriptor=old_descriptor,
+                            identity=expected_binding.identity,
+                            expected_sha256=hashlib.sha256(
+                                expected_binding.raw
+                            ).hexdigest(),
+                        )
+                    except BaseException as error:
+                        try:
+                            _validate_published_from_held(
+                                self._root_descriptor,
+                                _RETENTION_STATE_NAME,
+                                display_path,
+                                descriptor=descriptor,
+                                identity=identity,
+                                expected_sha256=expected_sha256,
+                            )
+                            os.fsync(self._root_descriptor)
+                        except BaseException as final_error:
+                            raise EvidenceCorrupt(
+                                "retention-state CAS final is uncertain"
+                            ) from final_error
+                        raise EvidenceCorrupt(
+                            "retention-state CAS source changed at exchange"
+                        ) from error
+                    old_exchange_identity = _file_identity(
+                        os.fstat(old_descriptor)
+                    )
+                else:
+                    _rename_noreplace(
+                        temporary_name,
+                        _RETENTION_STATE_NAME,
+                        source_dir_fd=self._root_descriptor,
+                        destination_dir_fd=self._root_descriptor,
+                    )
+                _validate_published_from_held(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    display_path,
+                    descriptor=descriptor,
+                    identity=identity,
+                    expected_sha256=expected_sha256,
+                )
+                os.fsync(self._root_descriptor)
+                if replace:
+                    if expected_binding is None or old_descriptor < 0:
+                        raise EvidenceSealError(
+                            "retention-state CAS cleanup source is absent"
+                        )
+                    if old_exchange_identity is None:
+                        raise EvidenceSealError(
+                            "retention-state CAS old inode is unbound"
+                        )
+                    _bind_held_source(
+                        self._root_descriptor,
+                        temporary_name,
+                        self.root / temporary_name,
+                        descriptor=old_descriptor,
+                        identity=old_exchange_identity,
+                    )
+                    os.unlink(
+                        temporary_name,
+                        dir_fd=self._root_descriptor,
+                    )
+                    unlinked = os.fstat(old_descriptor)
+                    if (
+                        unlinked.st_dev
+                        != expected_binding.identity.device
+                        or unlinked.st_ino
+                        != expected_binding.identity.inode
+                        or unlinked.st_size
+                        != expected_binding.identity.size
+                        or unlinked.st_nlink != 0
+                        or _entry_stat_at(
+                            self._root_descriptor,
+                            temporary_name,
+                        )
+                        is not None
+                    ):
+                        raise EvidenceCorrupt(
+                            "retention-state old CAS inode was not unlinked"
+                        )
+                    os.fsync(self._root_descriptor)
+                elif (
+                    _entry_stat_at(
+                        self._root_descriptor,
+                        temporary_name,
+                    )
+                    is not None
+                ):
+                    raise EvidenceCorrupt(
+                        "retention-state temporary survived atomic rename"
+                    )
+            binding = _read_stable_retention_artifact(
+                self._root_descriptor,
+                _RETENTION_STATE_NAME,
+                display_path,
+            )
+            if binding.raw != raw:
+                raise EvidenceCorrupt(
+                    "retention-state commit did not bind exact bytes"
+                )
+        except BaseException:
+            capture_error: BaseException | None = None
+            try:
+                if (
+                    _entry_stat_at(
+                        self._root_descriptor,
+                        temporary_name,
+                    )
+                    is not None
+                ):
+                    retained_identity = _file_identity(
+                        _regular_stat_at(
+                            self._root_descriptor,
+                            temporary_name,
+                            self.root / temporary_name,
+                        )
+                    )
+                    current_new_identity = (
+                        _file_identity(os.fstat(descriptor))
+                        if descriptor >= 0
+                        else None
+                    )
+                    current_old_identity = (
+                        _file_identity(os.fstat(old_descriptor))
+                        if old_descriptor >= 0
+                        else None
+                    )
+                    if (
+                        descriptor >= 0
+                        and current_new_identity is not None
+                        and retained_identity == current_new_identity
+                    ):
+                        _bind_held_source(
+                            self._root_descriptor,
+                            temporary_name,
+                            self.root / temporary_name,
+                            descriptor=descriptor,
+                            identity=current_new_identity,
+                        )
+                    elif (
+                        old_descriptor >= 0
+                        and expected_binding is not None
+                        and retained_identity
+                        == current_old_identity
+                    ):
+                        _bind_held_source(
+                            self._root_descriptor,
+                            temporary_name,
+                            self.root / temporary_name,
+                            descriptor=old_descriptor,
+                            identity=retained_identity,
+                        )
+                    else:
+                        raise EvidenceCorrupt(
+                            "retention-state temporary has foreign identity"
+                        )
+                    retained = _read_stable_retention_artifact(
+                        self._root_descriptor,
+                        temporary_name,
+                        self.root / temporary_name,
+                    )
+                    if retained.identity != retained_identity:
+                        raise EvidenceCorrupt(
+                            "retention-state temporary lost held identity"
+                        )
+                    self._retention_state_temporary = retained
+            except (OSError, EvidenceStoreError) as error:
+                capture_error = error
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    if capture_error is None:
+                        capture_error = error
+            if old_descriptor >= 0:
+                try:
+                    os.close(old_descriptor)
+                except OSError as error:
+                    if capture_error is None:
+                        capture_error = error
+            if capture_error is not None:
+                raise EvidenceCorrupt(
+                    "retention-state commit namespace is uncertain"
+                ) from capture_error
+            raise
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise EvidenceCorrupt(
+                "retention-state held descriptor close is uncertain"
+            ) from error
+        if old_descriptor >= 0:
+            try:
+                os.close(old_descriptor)
+            except OSError as error:
+                raise EvidenceCorrupt(
+                    "retention-state old CAS descriptor close is uncertain"
+                ) from error
+        self._retention_state_binding = binding
+        self._retention_state_temporary = None
+        self._retention_state_namespace_uncertain = False
+        return binding
+
+    def _publish_initial_retention_state(
+        self,
+        authority: _RetentionStateAuthority,
+        raw: bytes,
+    ) -> None:
+        self._require_retention_state_mutation(authority)
+        self._validate_retention_state_raw(raw)
+        self._require_clean_retention_state_temporary_namespace(authority)
+        if self._retention_state_binding is not None:
+            raise FileExistsError(_RETENTION_STATE_NAME)
+        binding = self._commit_retention_state_bytes(
+            raw,
+            replace=False,
+        )
+        if binding.raw != raw:
+            raise EvidenceCorrupt("retention state publication is uncertain")
+
+    def _replace_retention_state_bytes(
+        self,
+        authority: _RetentionStateAuthority,
+        expected: bytes,
+        raw: bytes,
+    ) -> None:
+        from agmind_immune.evidence.retention import RetentionStateConflict
+
+        self._require_retention_state_mutation(authority)
+        self._validate_retention_state_raw(expected)
+        self._validate_retention_state_raw(raw)
+        self._require_clean_retention_state_temporary_namespace(authority)
+        expected_binding = self._retention_state_binding
+        if expected_binding is None:
+            raise RetentionStateConflict(
+                "retention state CAS source is absent"
+            )
+        if (
+            expected_binding.raw != expected
+            or self._read_bound_retention_artifact(
+                expected_binding,
+                final=True,
+            )
+            != expected
+        ):
+            raise RetentionStateConflict(
+                "retention state CAS mismatch"
+            )
+        replacement = self._commit_retention_state_bytes(
+            raw,
+            replace=True,
+            expected_binding=expected_binding,
+        )
+        if replacement.raw != raw:
+            raise EvidenceCorrupt(
+                "retention state replacement did not bind exact bytes"
+            )
 
     @staticmethod
     def _validate_repair_state_raw(raw: bytes) -> None:
@@ -3678,6 +4402,9 @@ class SegmentStore:
                 ),
                 delete_manifest_temporaries=plan.delete_manifest_temporaries,
                 delete_root_temporaries=plan.delete_root_temporaries,
+                delete_retention_state_temporaries=(
+                    plan.delete_retention_state_temporaries
+                ),
                 head_raw=plan.head_raw,
             )
             if self._read_only_reason is None:
@@ -4126,7 +4853,31 @@ class SegmentStore:
         ack_commitment_temporaries: list[_AckCommitmentTemporaryBinding] = []
         repair_state_bindings: list[_RepairStateArtifactBinding] = []
         repair_state_temporaries: list[_RepairStateArtifactBinding] = []
+        retention_state_bindings: list[
+            _RetentionStateArtifactBinding
+        ] = []
+        retention_state_temporaries: list[
+            _RetentionStateArtifactBinding
+        ] = []
         for name in root_entries:
+            if name == _RETENTION_STATE_NAME:
+                retention_state_bindings.append(
+                    _read_stable_retention_artifact(
+                        self._root_descriptor,
+                        name,
+                        self.root / name,
+                    )
+                )
+                continue
+            if _RETENTION_STATE_TEMP_NAME.fullmatch(name):
+                retention_state_temporaries.append(
+                    _read_stable_retention_artifact(
+                        self._root_descriptor,
+                        name,
+                        self.root / name,
+                    )
+                )
+                continue
             if name == _REPAIR_STATE_NAME:
                 repair_state_bindings.append(
                     _read_stable_repair_artifact(
@@ -4237,11 +4988,29 @@ class SegmentStore:
             raise EvidenceCorrupt("multiple final repair-state artifacts exist")
         if len(repair_state_temporaries) > 1:
             raise EvidenceCorrupt("multiple repair-state temporaries exist")
+        if len(retention_state_bindings) > 1:
+            raise EvidenceCorrupt(
+                "multiple final retention-state artifacts exist"
+            )
+        if len(retention_state_temporaries) > 1:
+            raise EvidenceCorrupt(
+                "multiple retention-state temporaries exist"
+            )
         self._repair_state_binding = (
             repair_state_bindings[0] if repair_state_bindings else None
         )
         self._repair_state_temporary = (
             repair_state_temporaries[0] if repair_state_temporaries else None
+        )
+        self._retention_state_binding = (
+            retention_state_bindings[0]
+            if retention_state_bindings
+            else None
+        )
+        self._retention_state_temporary = (
+            retention_state_temporaries[0]
+            if retention_state_temporaries
+            else None
         )
         self._ack_journal_identity = ack_journal_identity
         self._ack_commitment = ack_commitment
@@ -4264,6 +5033,9 @@ class SegmentStore:
                 delete_private_temporaries=tuple(private_temporaries),
                 delete_manifest_temporaries=tuple(manifest_temporaries),
                 delete_root_temporaries=tuple(root_temporaries),
+                delete_retention_state_temporaries=tuple(
+                    retention_state_temporaries
+                ),
                 head_raw=head_raw,
             ),
             manifested_open,
@@ -4986,6 +5758,61 @@ class SegmentStore:
         )
         return ()
 
+    def _discard_retention_state_temporary(
+        self,
+        binding: _RetentionStateArtifactBinding,
+    ) -> None:
+        current = _read_stable_retention_artifact(
+            self._root_descriptor,
+            binding.name,
+            self.root / binding.name,
+        )
+        if current != binding:
+            raise EvidenceCorrupt(
+                "retention-state temporary changed before discard"
+            )
+        descriptor, opened = _open_regular_at(
+            self._root_descriptor,
+            binding.name,
+            self.root / binding.name,
+            maximum=_MAX_RETENTION_STATE_BYTES,
+        )
+        try:
+            with _post_authentication_namespace(self.root / binding.name):
+                _bind_held_source(
+                    self._root_descriptor,
+                    binding.name,
+                    self.root / binding.name,
+                    descriptor=descriptor,
+                    identity=binding.identity,
+                )
+                self._retention_state_namespace_uncertain = True
+                os.unlink(binding.name, dir_fd=self._root_descriptor)
+                unlinked = os.fstat(descriptor)
+                if (
+                    unlinked.st_dev != opened.st_dev
+                    or unlinked.st_ino != opened.st_ino
+                    or unlinked.st_size != opened.st_size
+                    or unlinked.st_nlink != 0
+                    or _entry_stat_at(
+                        self._root_descriptor,
+                        binding.name,
+                    )
+                    is not None
+                ):
+                    raise EvidenceCorrupt(
+                        "retention-state temporary discard became uncertain"
+                    )
+                os.fsync(self._root_descriptor)
+        finally:
+            os.close(descriptor)
+        if self._retention_state_temporary != binding:
+            raise EvidenceCorrupt(
+                "retention-state temporary binding changed after discard"
+            )
+        self._retention_state_temporary = None
+        self._retention_state_namespace_uncertain = False
+
     def _apply_recovery_plan(self, plan: _RecoveryPlan) -> None:
         for promotion in plan.promotions:
             date_descriptor = self._date_descriptor(promotion.date_name)
@@ -5022,6 +5849,8 @@ class SegmentStore:
             os.unlink(name, dir_fd=self._root_descriptor)
         if plan.delete_root_temporaries:
             os.fsync(self._root_descriptor)
+        for binding in plan.delete_retention_state_temporaries:
+            self._discard_retention_state_temporary(binding)
 
     def _read_segment(
         self,
