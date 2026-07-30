@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Never
 
 from agmind_immune.clock import (
     CoreClockProvider,
@@ -12,7 +12,9 @@ from agmind_immune.clock import (
     _validate_core_clock_sample,
 )
 from agmind_immune.contracts import (
+    HEX64,
     MAX_UINT64,
+    UUID4,
     RetentionBlockedV1,
     RetentionTombstoneV2,
 )
@@ -65,19 +67,36 @@ from agmind_immune.ingest.service import (
 _CONTROLLER_FACTORY = object()
 _PROJECTION_BATCH = 100
 
-_RetentionOutcome = Literal[
+RetentionOutcome = Literal[
     "not_due",
     "blocked_unchanged",
     "retry_required",
     "blocked_reported",
     "tombstone_completed",
 ]
-_RetentionRetryReason = Literal[
+RetentionRetryReason = Literal[
     "pending_ack",
     "ack_prefix_lag",
     "observer_retryable",
 ]
 _RetentionRequestKind = Literal["tombstone", "blocked"]
+_RETENTION_OUTCOMES = frozenset(
+    {
+        "not_due",
+        "blocked_unchanged",
+        "retry_required",
+        "blocked_reported",
+        "tombstone_completed",
+    }
+)
+_RETENTION_RETRY_REASONS = frozenset(
+    {
+        "pending_ack",
+        "ack_prefix_lag",
+        "observer_retryable",
+    }
+)
+_RETENTION_REQUEST_KINDS = frozenset({"tombstone", "blocked"})
 
 
 class CoreControllerError(RuntimeError):
@@ -104,9 +123,25 @@ class CorePollResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CoreRetentionResult:
+    outcome: RetentionOutcome
+    retry_reason: RetentionRetryReason | None
+    request_kind: Literal["tombstone", "blocked"] | None
+    request_id: str | None
+    target_sequence: int | None
+    target_event_id: str | None
+    target_content_sha256: str | None
+    unlinked_manifest_count: int
+    unlinked_bytes: int
+    projected: int
+    projection_rebuilt: bool
+    readiness: MutationReadiness
+
+
+@dataclass(frozen=True, slots=True)
 class _RetentionObservation:
-    outcome: _RetentionOutcome
-    retry_reason: _RetentionRetryReason | None
+    outcome: RetentionOutcome
+    retry_reason: RetentionRetryReason | None
     request_kind: _RetentionRequestKind | None
     request_id: str | None
     target_sequence: int | None
@@ -122,6 +157,149 @@ class _RetentionExecution:
     observation: _RetentionObservation
     projected: int
     readiness: MutationReadiness
+
+
+def _invalid_retention_result(message: str) -> Never:
+    raise CoreControllerAuthorityError(
+        f"Core retention result {message}"
+    )
+
+
+def _validate_core_retention_result(result: CoreRetentionResult) -> None:
+    if type(result) is not CoreRetentionResult:
+        _invalid_retention_result("has an inexact runtime type")
+    if (
+        type(result.outcome) is not str
+        or result.outcome not in _RETENTION_OUTCOMES
+    ):
+        _invalid_retention_result("has an invalid outcome")
+    if (
+        result.retry_reason is not None
+        and (
+            type(result.retry_reason) is not str
+            or result.retry_reason not in _RETENTION_RETRY_REASONS
+        )
+    ):
+        _invalid_retention_result("has an invalid retry reason")
+    if (result.outcome == "retry_required") != (
+        result.retry_reason is not None
+    ):
+        _invalid_retention_result("has an inconsistent retry reason")
+
+    request_present = result.request_kind is not None
+    if request_present != (result.request_id is not None):
+        _invalid_retention_result("has a partial request identity")
+    if request_present and (
+        type(result.request_kind) is not str
+        or result.request_kind not in _RETENTION_REQUEST_KINDS
+        or type(result.request_id) is not str
+        or UUID4.fullmatch(result.request_id) is None
+    ):
+        _invalid_retention_result("has an invalid request identity")
+
+    target_fields = (
+        result.target_sequence,
+        result.target_event_id,
+        result.target_content_sha256,
+    )
+    target_present = all(value is not None for value in target_fields)
+    if target_present != any(value is not None for value in target_fields):
+        _invalid_retention_result("has a partial target identity")
+    if target_present and (
+        not request_present
+        or type(result.target_sequence) is not int
+        or not 1 <= result.target_sequence <= MAX_UINT64
+        or type(result.target_event_id) is not str
+        or not result.target_event_id.startswith("evt_")
+        or HEX64.fullmatch(result.target_event_id[4:]) is None
+        or type(result.target_content_sha256) is not str
+        or HEX64.fullmatch(result.target_content_sha256) is None
+    ):
+        _invalid_retention_result("has an invalid target identity")
+
+    if (
+        type(result.unlinked_manifest_count) is not int
+        or not 0 <= result.unlinked_manifest_count <= 128
+        or type(result.unlinked_bytes) is not int
+        or not 0 <= result.unlinked_bytes <= MAX_UINT64
+        or type(result.projected) is not int
+        or not 0 <= result.projected <= MAX_UINT64
+        or type(result.projection_rebuilt) is not bool
+        or type(result.readiness) is not MutationReadiness
+    ):
+        _invalid_retention_result("has invalid exact values")
+
+    if result.outcome == "not_due":
+        if request_present or target_present:
+            _invalid_retention_result("exposes identity for a no-op")
+    elif result.outcome in {"blocked_unchanged", "blocked_reported"}:
+        if result.request_kind != "blocked" or not target_present:
+            _invalid_retention_result(
+                "does not bind an exact blocked observation"
+            )
+    elif result.outcome == "tombstone_completed":
+        if (
+            result.request_kind != "tombstone"
+            or not target_present
+            or not 1 <= result.unlinked_manifest_count <= 128
+            or not 1 <= result.unlinked_bytes <= MAX_UINT64
+            or result.projection_rebuilt is not True
+        ):
+            _invalid_retention_result(
+                "does not bind an exact tombstone completion"
+            )
+    else:
+        reason = result.retry_reason
+        if reason == "pending_ack":
+            if not request_present and target_present:
+                _invalid_retention_result(
+                    "has a target without durable pending identity"
+                )
+        elif reason == "ack_prefix_lag":
+            if result.request_kind != "tombstone":
+                _invalid_retention_result(
+                    "has a non-tombstone ACK prefix retry"
+                )
+        elif reason == "observer_retryable":
+            if not request_present:
+                _invalid_retention_result(
+                    "has no durable observer retry identity"
+                )
+        else:
+            _invalid_retention_result("has no exact retry branch")
+
+    if result.outcome != "tombstone_completed" and (
+        result.unlinked_manifest_count != 0
+        or result.unlinked_bytes != 0
+        or result.projection_rebuilt is not False
+    ):
+        _invalid_retention_result(
+            "reports mutation outside tombstone completion"
+        )
+
+
+def _public_retention_result(execution: object) -> CoreRetentionResult:
+    if type(execution) is not _RetentionExecution:
+        _invalid_retention_result("has an inexact execution envelope")
+    observation = execution.observation
+    if type(observation) is not _RetentionObservation:
+        _invalid_retention_result("has an inexact observation envelope")
+    result = CoreRetentionResult(
+        outcome=observation.outcome,
+        retry_reason=observation.retry_reason,
+        request_kind=observation.request_kind,
+        request_id=observation.request_id,
+        target_sequence=observation.target_sequence,
+        target_event_id=observation.target_event_id,
+        target_content_sha256=observation.target_content_sha256,
+        unlinked_manifest_count=observation.unlinked_manifest_count,
+        unlinked_bytes=observation.unlinked_bytes,
+        projected=execution.projected,
+        projection_rebuilt=observation.projection_rebuilt,
+        readiness=execution.readiness,
+    )
+    _validate_core_retention_result(result)
+    return result
 
 
 class CoreController:
@@ -727,8 +905,8 @@ class CoreController:
         def state_observation(
             state: RetentionStateV1,
             *,
-            outcome: _RetentionOutcome,
-            retry_reason: _RetentionRetryReason | None = None,
+            outcome: RetentionOutcome,
+            retry_reason: RetentionRetryReason | None = None,
             target_ref: EvidenceRef | None = None,
             unlinked_manifest_count: int = 0,
             unlinked_bytes: int = 0,
@@ -1040,6 +1218,11 @@ class CoreController:
                 projected=projected,
                 readiness=readiness,
             )
+
+    async def run_retention_once(self) -> CoreRetentionResult:
+        """Execute at most one retention transaction and return observation only."""
+        execution = await self._run_retention_once()
+        return _public_retention_result(execution)
 
     async def poll_once(self, *, limit: int = MAX_PAGE_EVENTS) -> CorePollResult:
         if (
