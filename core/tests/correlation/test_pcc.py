@@ -29,6 +29,7 @@ from agmind_immune.correlation.pcc import (
     HistoricalCoverageAssessment,
     Rejected,
     TerminalCandidateObservation,
+    _correlate_pcc_facts,
     correlate_pcc,
     correlate_pcc_facts,
 )
@@ -256,7 +257,7 @@ def _correlate_facts(
     authenticated: AuthenticatedPCCInput,
     context: CorrelationContext,
 ) -> object:
-    return correlate_pcc_facts(
+    return _correlate_pcc_facts(
         authenticated.snapshot.trigger,
         authenticated,
         context,
@@ -322,6 +323,22 @@ def test_raw_context_cannot_mint_a_public_candidate(
     coordinator, authenticated = _accepted_complete(tmp_path)
     try:
         result = correlate_pcc(authenticated, _context(authenticated))
+
+        assert _reason(result) == ("correlation_proof_mismatch",)
+    finally:
+        coordinator.segment_store.close()
+
+
+def test_raw_context_cannot_mint_a_candidate_through_named_facts_api(
+    tmp_path: Path,
+) -> None:
+    coordinator, authenticated = _accepted_complete(tmp_path)
+    try:
+        result = correlate_pcc_facts(
+            authenticated.snapshot.trigger,
+            authenticated,
+            _context(authenticated),
+        )
 
         assert _reason(result) == ("correlation_proof_mismatch",)
     finally:

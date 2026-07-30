@@ -491,7 +491,7 @@ def incident_from_retained_trigger(
         or not authenticated_pcc_input_is_issued(proof)
     ):
         raise TypeError(
-            "retained incident requires exact issued PCC authority"
+            "retained incident requires an exact issued PCC authority binding"
         )
     return _incident(proof, ())
 
@@ -946,12 +946,11 @@ def _correlate_pcc_kernel(
     )
 
 
-def correlate_pcc_facts(
+def _validate_pcc_facts_binding(
     trigger: PCCFalcoTriggerProjectionV1,
     proof: AuthenticatedPCCInput,
     context: CorrelationContext,
-) -> CorrelationResult:
-    """Evaluate exact proof-bound facts without promoting public authority."""
+) -> None:
     if (
         type(trigger) is not PCCFalcoTriggerProjectionV1
         or type(proof) is not AuthenticatedPCCInput
@@ -964,6 +963,33 @@ def correlate_pcc_facts(
     if canonical_json(trigger) != canonical_json(proof.snapshot.trigger):
         raise ValueError(
             "trigger facts do not bind the authenticated PCC snapshot"
+        )
+
+
+def _correlate_pcc_facts(
+    trigger: PCCFalcoTriggerProjectionV1,
+    proof: AuthenticatedPCCInput,
+    context: CorrelationContext,
+) -> CorrelationResult:
+    """Internal deterministic kernel for exact proof-bound fact rebuilds."""
+    _validate_pcc_facts_binding(trigger, proof, context)
+    return _correlate_pcc_kernel(proof, context)
+
+
+def correlate_pcc_facts(
+    trigger: PCCFalcoTriggerProjectionV1,
+    proof: AuthenticatedPCCInput,
+    context: CorrelationContext,
+) -> CorrelationResult:
+    """Evaluate proof-bound facts only under issued local context authority."""
+    _validate_pcc_facts_binding(trigger, proof, context)
+    if (
+        proof.snapshot.outcome == "complete"
+        and not correlation_context_is_issued(context)
+    ):
+        return _one_rejection(
+            proof,
+            "correlation_proof_mismatch",
         )
     return _correlate_pcc_kernel(proof, context)
 

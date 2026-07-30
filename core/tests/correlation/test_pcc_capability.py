@@ -11,6 +11,7 @@ from agmind_immune.contracts import EventEnvelopeV1
 from agmind_immune.correlation.pcc import (
     CorrelationContext,
     correlate_pcc,
+    incident_from_retained_trigger,
     incident_from_verified_falco,
 )
 from agmind_immune.evidence.segments import EvidenceRef
@@ -159,6 +160,74 @@ def test_issued_capability_binds_strict_canonical_envelope(
         coordinator.segment_store.close()
 
 
+def test_mutating_an_issued_pcc_capability_invalidates_its_authority(
+    tmp_path: Path,
+) -> None:
+    coordinator, item, request = _accepted_pcc(tmp_path)
+    try:
+        issued = coordinator.accept_pcc_for_correlation(item, request)
+        object.__setattr__(issued, "_event_id", "evt_" + "0" * 64)
+
+        with pytest.raises(TypeError, match="binding"):
+            incident_from_retained_trigger(issued)
+    finally:
+        coordinator.segment_store.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "boot_id",
+        "canonical",
+        "content_sha256",
+        "event_type",
+        "evidence_ref",
+        "host_id",
+        "request",
+        "snapshot_trigger",
+        "source_sequence",
+    ],
+)
+def test_every_pcc_authority_binding_is_rechecked_at_use(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    coordinator, item, request = _accepted_pcc(tmp_path / mutation)
+    try:
+        issued = coordinator.accept_pcc_for_correlation(item, request)
+        if mutation == "boot_id":
+            object.__setattr__(issued, "_boot_id", "0" * 36)
+        elif mutation == "canonical":
+            object.__setattr__(issued, "_canonical", b"{}")
+        elif mutation == "content_sha256":
+            object.__setattr__(issued, "_content_sha256", "0" * 64)
+        elif mutation == "event_type":
+            object.__setattr__(issued, "_event_type", "falco_connect")
+        elif mutation == "evidence_ref":
+            object.__setattr__(issued, "_evidence_ref", object())
+        elif mutation == "host_id":
+            object.__setattr__(issued, "_host_id", "0" * 36)
+        elif mutation == "request":
+            object.__setattr__(
+                issued.request,
+                "requested_ttl_seconds",
+                30,
+            )
+        elif mutation == "snapshot_trigger":
+            object.__setattr__(
+                issued.snapshot.trigger,
+                "destination_port",
+                8443,
+            )
+        else:
+            object.__setattr__(issued, "_source_sequence", 1)
+
+        with pytest.raises(TypeError, match="binding"):
+            incident_from_retained_trigger(issued)
+    finally:
+        coordinator.segment_store.close()
+
+
 def test_exact_retry_and_recovery_export_the_same_committed_pcc(
     tmp_path: Path,
 ) -> None:
@@ -222,6 +291,38 @@ def test_unissued_or_copied_falco_capability_has_no_incident_authority(
         with pytest.raises(TypeError):
             restored = pickle.loads(pickle.dumps(issued))
             incident_from_verified_falco(restored)
+    finally:
+        coordinator.segment_store.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("_boot_id", "0" * 36),
+        ("_canonical", b"{}"),
+        ("_content_sha256", "0" * 64),
+        ("_coverage_flags", ("forged",)),
+        ("_event_id", "evt_" + "0" * 64),
+        ("_event_time", "2026-07-28T10:00:01Z"),
+        ("_evidence_ref", object()),
+        ("_falco_canonical", b"{}"),
+        ("_host_id", "0" * 36),
+        ("_ingest_time", "2026-07-28T10:00:01Z"),
+        ("_source_sequence", 1),
+    ],
+)
+def test_every_falco_authority_binding_is_rechecked_at_use(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    coordinator, ref = _accepted_falco(tmp_path / field)
+    try:
+        issued = coordinator.authenticated_falco_input(ref)
+        object.__setattr__(issued, field, value)
+
+        with pytest.raises(TypeError, match="issued"):
+            incident_from_verified_falco(issued)
     finally:
         coordinator.segment_store.close()
 

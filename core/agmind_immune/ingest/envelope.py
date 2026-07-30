@@ -10,7 +10,16 @@ from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, Never, Self, SupportsIndex, final
+from typing import (
+    Any,
+    Literal,
+    Never,
+    Protocol,
+    Self,
+    SupportsIndex,
+    cast,
+    final,
+)
 
 from cryptography.exceptions import InvalidSignature
 from pydantic import Field, ValidationError, field_validator, model_validator
@@ -1193,6 +1202,68 @@ class _AuthenticatedPCCFacts:
     snapshot: PCCCorrelationSnapshotV1
 
 
+type _EvidenceRefFingerprint = tuple[type[object], tuple[object, ...]]
+
+
+class _EvidenceRefShape(Protocol):
+    segment_id: object
+    segment_relative_path: object
+    frame_offset: object
+    frame_size: object
+    frame_sha256: object
+    event_id: object
+    source_sequence: object
+    content_sha256: object
+
+
+def _evidence_ref_fingerprint(value: object) -> _EvidenceRefFingerprint:
+    ref = cast(_EvidenceRefShape, value)
+    return (
+        type(value),
+        (
+            ref.segment_id,
+            ref.segment_relative_path,
+            ref.frame_offset,
+            ref.frame_size,
+            ref.frame_sha256,
+            ref.event_id,
+            ref.source_sequence,
+            ref.content_sha256,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _IssuedFalcoBinding:
+    boot_id: str
+    canonical: bytes
+    content_sha256: str
+    coverage_flags: tuple[str, ...]
+    event_id: str
+    event_time: str
+    evidence_ref: _EvidenceRefFingerprint
+    falco_canonical: bytes
+    host_id: str
+    ingest_time: str
+    source_sequence: int
+
+
+@dataclass(frozen=True)
+class _IssuedPCCBinding:
+    boot_id: str
+    canonical: bytes
+    content_sha256: str
+    event_id: str
+    event_type: str
+    evidence_ref: _EvidenceRefFingerprint
+    host_id: str
+    request_canonical: bytes
+    request_fields_set: frozenset[str]
+    snapshot_canonical: bytes
+    snapshot_fields_set: frozenset[str]
+    source_sequence: int
+
+
 def _authenticated_input_issuers() -> tuple[
     Callable[[object, object, object], AuthenticatedFalcoInput],
     Callable[
@@ -1202,8 +1273,14 @@ def _authenticated_input_issuers() -> tuple[
     Callable[[object], bool],
     Callable[[object], bool],
 ]:
-    issued_falco: weakref.WeakSet[AuthenticatedFalcoInput] = weakref.WeakSet()
-    issued_pcc: weakref.WeakSet[AuthenticatedPCCInput] = weakref.WeakSet()
+    issued_falco: weakref.WeakKeyDictionary[
+        AuthenticatedFalcoInput,
+        _IssuedFalcoBinding,
+    ] = weakref.WeakKeyDictionary()
+    issued_pcc: weakref.WeakKeyDictionary[
+        AuthenticatedPCCInput,
+        _IssuedPCCBinding,
+    ] = weakref.WeakKeyDictionary()
 
     def issue_falco(
         verifier: object,
@@ -1257,7 +1334,19 @@ def _authenticated_input_issuers() -> tuple[
             "_source_sequence",
             facts.envelope.source_sequence,
         )
-        issued_falco.add(capability)
+        issued_falco[capability] = _IssuedFalcoBinding(
+            boot_id=facts.envelope.boot_id,
+            canonical=facts.canonical,
+            content_sha256=facts.content_sha256,
+            coverage_flags=tuple(facts.envelope.coverage_flags),
+            event_id=facts.envelope.event_id,
+            event_time=facts.envelope.event_time,
+            evidence_ref=_evidence_ref_fingerprint(facts.evidence_ref),
+            falco_canonical=canonical_json(facts.falco),
+            host_id=facts.envelope.host_id,
+            ingest_time=facts.envelope.ingest_time,
+            source_sequence=facts.envelope.source_sequence,
+        )
         return capability
 
     def issue_pcc(
@@ -1309,20 +1398,83 @@ def _authenticated_input_issuers() -> tuple[
             "_source_sequence",
             facts.envelope.source_sequence,
         )
-        issued_pcc.add(capability)
+        issued_pcc[capability] = _IssuedPCCBinding(
+            boot_id=facts.envelope.boot_id,
+            canonical=facts.canonical,
+            content_sha256=facts.content_sha256,
+            event_id=facts.envelope.event_id,
+            event_type=facts.envelope.event_type,
+            evidence_ref=_evidence_ref_fingerprint(facts.evidence_ref),
+            host_id=facts.envelope.host_id,
+            request_canonical=canonical_json(facts.request),
+            request_fields_set=frozenset(facts.request.model_fields_set),
+            snapshot_canonical=canonical_json(facts.snapshot),
+            snapshot_fields_set=frozenset(facts.snapshot.model_fields_set),
+            source_sequence=facts.envelope.source_sequence,
+        )
         return capability
 
     def falco_is_issued(value: object) -> bool:
-        return (
-            type(value) is AuthenticatedFalcoInput
-            and value in issued_falco
-        )
+        if type(value) is not AuthenticatedFalcoInput:
+            return False
+        binding = issued_falco.get(value)
+        if binding is None:
+            return False
+        try:
+            return (
+                value._boot_id == binding.boot_id
+                and value._canonical == binding.canonical
+                and value._content_sha256 == binding.content_sha256
+                and value._coverage_flags == binding.coverage_flags
+                and value._event_id == binding.event_id
+                and value._event_time == binding.event_time
+                and _evidence_ref_fingerprint(value._evidence_ref)
+                == binding.evidence_ref
+                and value._falco_canonical == binding.falco_canonical
+                and value._host_id == binding.host_id
+                and value._ingest_time == binding.ingest_time
+                and value._source_sequence == binding.source_sequence
+            )
+        except (AttributeError, RecursionError, TypeError, ValueError):
+            return False
 
     def pcc_is_issued(value: object) -> bool:
-        return (
-            type(value) is AuthenticatedPCCInput
-            and value in issued_pcc
-        )
+        if type(value) is not AuthenticatedPCCInput:
+            return False
+        binding = issued_pcc.get(value)
+        if binding is None:
+            return False
+        try:
+            return (
+                value._boot_id == binding.boot_id
+                and value._canonical == binding.canonical
+                and value._content_sha256 == binding.content_sha256
+                and value._event_id == binding.event_id
+                and value._event_type == binding.event_type
+                and _evidence_ref_fingerprint(value._evidence_ref)
+                == binding.evidence_ref
+                and value._host_id == binding.host_id
+                and type(value._request)
+                is PCCCorrelationSnapshotRequestV1
+                and canonical_json(value._request)
+                == binding.request_canonical
+                and frozenset(value._request.model_fields_set)
+                == binding.request_fields_set
+                and type(value._snapshot) is PCCCorrelationSnapshotV1
+                and canonical_json(value._snapshot)
+                == binding.snapshot_canonical
+                and frozenset(value._snapshot.model_fields_set)
+                == binding.snapshot_fields_set
+                and value._source_sequence == binding.source_sequence
+            )
+        except (
+            AttributeError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ):
+            return False
 
     return issue_falco, issue_pcc, falco_is_issued, pcc_is_issued
 
