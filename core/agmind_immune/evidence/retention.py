@@ -80,6 +80,7 @@ _SNAPSHOT_FACTORY = object()
 _RUN_FACTORY = object()
 _DECISION_FACTORY = object()
 _AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY = object()
+_AUTHENTICATED_RETENTION_UNLINK_COMPLETION_FACTORY = object()
 
 
 class RetentionError(RuntimeError):
@@ -154,6 +155,64 @@ class AuthenticatedRetentionTombstone:
         del protocol
         raise TypeError(
             "authenticated retention tombstones cannot be serialized"
+        )
+
+
+@final
+class AuthenticatedRetentionUnlinkCompletion:
+    """Opaque same-lifecycle proof that every selected payload was synced."""
+
+    _factory_marker: object
+
+    __slots__ = ("_factory_marker",)
+
+    def __init__(
+        self,
+        *,
+        _factory: object,
+    ) -> None:
+        if (
+            _factory
+            is not _AUTHENTICATED_RETENTION_UNLINK_COMPLETION_FACTORY
+        ):
+            raise TypeError(
+                "AuthenticatedRetentionUnlinkCompletion is factory-only"
+            )
+        object.__setattr__(self, "_factory_marker", _factory)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("AuthenticatedRetentionUnlinkCompletion is final")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError(
+            "authenticated retention unlink completions are immutable"
+        )
+
+    def __copy__(self) -> AuthenticatedRetentionUnlinkCompletion:
+        raise TypeError(
+            "authenticated retention unlink completions cannot be copied"
+        )
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> AuthenticatedRetentionUnlinkCompletion:
+        del memo
+        raise TypeError(
+            "authenticated retention unlink completions cannot be copied"
+        )
+
+    def __reduce__(self) -> Never:
+        raise TypeError(
+            "authenticated retention unlink completions cannot be serialized"
+        )
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError(
+            "authenticated retention unlink completions cannot be serialized"
         )
 
 
@@ -2809,6 +2868,40 @@ def advance_retention_evidence_appended(
     )
 
 
+def _retention_execution_states(
+    state: RetentionStateV1,
+) -> tuple[RetentionStateV1, RetentionStateV1, RetentionStateV1]:
+    """Derive the only exact destructive states from accepted evidence."""
+    exact = _validated_retention_state(state)
+    if (
+        exact.operation != "tombstone"
+        or exact.phase != "evidence_appended"
+        or type(exact.request) is not RetentionTombstoneV2
+        or type(exact.target) is not RetentionTargetV1
+        or not exact.entries
+    ):
+        raise RetentionProtocolError(
+            "retention execution requires exact evidence-appended authority"
+        )
+    target = exact.target
+    in_progress = _derived_retention_state(
+        exact,
+        phase="retention_unlink_in_progress",
+        target=target,
+    )
+    uncertain = _derived_retention_state(
+        in_progress,
+        phase="retention_commit_uncertain",
+        target=target,
+    )
+    completed = _derived_retention_state(
+        in_progress,
+        phase="completed",
+        target=target,
+    )
+    return in_progress, uncertain, completed
+
+
 def _validate_retention_transition(
     current: RetentionStateV1,
     next_state: RetentionStateV1,
@@ -3570,14 +3663,25 @@ def _authenticate_store_retention_tombstone(
         )
     exact_store._require_retention_snapshot(snapshot)
     journal._prove_publication(state_raw)
+    in_progress, uncertain, completed = _retention_execution_states(state)
+    in_progress_raw = encode_retention_state(in_progress)
+    uncertain_raw = encode_retention_state(uncertain)
+    completed_raw = encode_retention_state(completed)
     capability = AuthenticatedRetentionTombstone(
         _factory=_AUTHENTICATED_RETENTION_TOMBSTONE_FACTORY,
+    )
+    completion = AuthenticatedRetentionUnlinkCompletion(
+        _factory=_AUTHENTICATED_RETENTION_UNLINK_COMPLETION_FACTORY,
     )
     exact_store._register_authenticated_retention_tombstone(
         capability,
         journal=journal,
         journal_identity=journal._identity,
         state_raw=state_raw,
+        unlink_in_progress_state_raw=in_progress_raw,
+        commit_uncertain_state_raw=uncertain_raw,
+        completed_state_raw=completed_raw,
+        completion_capability=completion,
         snapshot=snapshot,
         target_ref=target_ref,
         coverage=exact_coverage,
