@@ -3,15 +3,36 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
-from typing import Any
+import ipaddress
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel
 
+if TYPE_CHECKING:
+    from .contracts import (
+        PCCBootTransitionHopV1,
+        PCCCorrelationSnapshotRequestV1,
+        PCCDockerNetworkV1,
+    )
+
 MIN_CANONICAL_INTEGER = -(2**63)
 MAX_CANONICAL_INTEGER = 2**64 - 1
 MAX_JSON_NESTING_DEPTH = 64
+_PCC_ADAPTER_SCHEMA_VERSION = b"agmind.falco-connect.v1"
+_PCC_FALCO_VERSION = b"0.44.1"
+_PCC_DETECTOR_BUNDLE_DOMAIN = b"AGMIND_DETECTOR_BUNDLE_V1\0"
+_PCC_DOCKER_NETWORK_DOMAIN = b"AGMIND_DOCKER_NETWORK_SNAPSHOT_V1\0"
+_PCC_OPERATOR_DENYLIST_DOMAIN = b"AGMIND_OPERATOR_DENYLIST_V1\0"
+_PCC_MANAGEMENT_DENYLIST_DOMAIN = b"AGMIND_MANAGEMENT_DENYLIST_V1\0"
+_PCC_BOOT_TRANSITION_CHAIN_DOMAIN = b"AGMIND_BOOT_TRANSITION_CHAIN_V1\0"
+_PCC_MAX_DENYLIST_ITEMS = 128
+_PCC_MAX_DOCKER_NETWORKS = 64
+_PCC_MAX_DOCKER_SUBNETS = 128
+_PCC_MAX_DOCKER_GATEWAYS = 128
+_PCC_MAX_DOCKER_NETWORK_BYTES = 16 * 1024
+_PCC_MAX_BOOT_TRANSITION_HOPS = 1_024
 
 
 def _quote(value: str) -> str:
@@ -84,6 +105,208 @@ def _encode(value: object, container_depth: int = 0) -> str:
 
 def canonical_json(value: object) -> bytes:
     return _encode(value).encode("utf-8")
+
+
+def pcc_correlation_request_sha256(
+    request: PCCCorrelationSnapshotRequestV1,
+) -> str:
+    """Hash the exact canonical narrow correlation request."""
+    from .contracts import PCCCorrelationSnapshotRequestV1
+
+    if type(request) is not PCCCorrelationSnapshotRequestV1:
+        raise TypeError("request must be an exact PCCCorrelationSnapshotRequestV1")
+    normalized = PCCCorrelationSnapshotRequestV1.model_validate(
+        request.model_dump(mode="python"),
+        strict=True,
+    )
+    return hashlib.sha256(canonical_json(normalized)).hexdigest()
+
+
+def pcc_detector_bundle_sha256(rule_file_bytes: bytes) -> str:
+    """Hash the exact rule bytes with fixed, length-prefixed deployment pins."""
+    if type(rule_file_bytes) is not bytes:
+        raise TypeError("PCC rule bundle must be exact bytes")
+
+    preimage = bytearray(_PCC_DETECTOR_BUNDLE_DOMAIN)
+    for value in (
+        rule_file_bytes,
+        _PCC_ADAPTER_SCHEMA_VERSION,
+        _PCC_FALCO_VERSION,
+    ):
+        preimage.extend(len(value).to_bytes(8, "big", signed=False))
+        preimage.extend(value)
+    return hashlib.sha256(preimage).hexdigest()
+
+
+def _pcc_exact_sequence[T](values: Sequence[T], field: str) -> tuple[T, ...]:
+    if type(values) not in (list, tuple):
+        raise TypeError(f"{field} must be an exact list or tuple")
+    result = tuple(values)
+    return result
+
+
+def _pcc_ipv4_tuple(
+    values: Sequence[str],
+    field: str,
+    *,
+    network: bool,
+) -> tuple[str, ...]:
+    result = _pcc_exact_sequence(values, field)
+    if any(type(value) is not str for value in result):
+        raise TypeError(f"{field} must contain exact strings")
+    if len(result) > _PCC_MAX_DENYLIST_ITEMS:
+        raise ValueError(f"{field} exceeds {_PCC_MAX_DENYLIST_ITEMS} entries")
+    if result != tuple(sorted(set(result))):
+        raise ValueError(f"{field} must be unique and sorted")
+    for value in result:
+        try:
+            parsed = (
+                ipaddress.ip_network(value, strict=True)
+                if network
+                else ipaddress.ip_address(value)
+            )
+        except ValueError as error:
+            raise ValueError(f"{field} contains an invalid IPv4 value") from error
+        expected_type = ipaddress.IPv4Network if network else ipaddress.IPv4Address
+        if type(parsed) is not expected_type or str(parsed) != value:
+            raise ValueError(f"{field} must contain canonical IPv4 values")
+    return result
+
+
+def _pcc_denylist_sha256(
+    domain: bytes,
+    denied_networks: Sequence[str],
+    denied_addresses: Sequence[str],
+) -> str:
+    payload = {
+        "denied_addresses": _pcc_ipv4_tuple(
+            denied_addresses,
+            "denied_addresses",
+            network=False,
+        ),
+        "denied_networks": _pcc_ipv4_tuple(
+            denied_networks,
+            "denied_networks",
+            network=True,
+        ),
+    }
+    return hashlib.sha256(domain + canonical_json(payload)).hexdigest()
+
+
+def pcc_operator_denylist_sha256(
+    denied_networks: Sequence[str],
+    denied_addresses: Sequence[str],
+) -> str:
+    """Hash the canonical operator denylist under its dedicated domain."""
+    return _pcc_denylist_sha256(
+        _PCC_OPERATOR_DENYLIST_DOMAIN,
+        denied_networks,
+        denied_addresses,
+    )
+
+
+def pcc_management_denylist_sha256(
+    denied_networks: Sequence[str],
+    denied_addresses: Sequence[str],
+) -> str:
+    """Hash the canonical management denylist under its dedicated domain."""
+    return _pcc_denylist_sha256(
+        _PCC_MANAGEMENT_DENYLIST_DOMAIN,
+        denied_networks,
+        denied_addresses,
+    )
+
+
+def pcc_docker_network_snapshot_sha256(
+    docker_networks: Sequence[PCCDockerNetworkV1],
+) -> str:
+    """Hash the complete canonical Docker-network snapshot."""
+    from .contracts import PCCDockerNetworkV1
+
+    raw_networks = _pcc_exact_sequence(docker_networks, "docker_networks")
+    if len(raw_networks) > _PCC_MAX_DOCKER_NETWORKS:
+        raise ValueError(
+            f"docker_networks exceeds {_PCC_MAX_DOCKER_NETWORKS} networks"
+        )
+    normalized: list[PCCDockerNetworkV1] = []
+    for network in raw_networks:
+        if type(network) is not PCCDockerNetworkV1:
+            raise TypeError("docker_networks must contain exact PCCDockerNetworkV1 models")
+        normalized.append(
+            PCCDockerNetworkV1.model_validate(
+                network.model_dump(mode="python"),
+                strict=True,
+            )
+        )
+    payload = tuple(normalized)
+    network_ids = tuple(network.network_id for network in payload)
+    if network_ids != tuple(sorted(set(network_ids))):
+        raise ValueError("docker_networks must have unique sorted network IDs")
+    if sum(len(network.subnet_cidrs) for network in payload) > _PCC_MAX_DOCKER_SUBNETS:
+        raise ValueError("docker_networks exceeds the global subnet limit")
+    if (
+        sum(len(network.gateway_addresses) for network in payload)
+        > _PCC_MAX_DOCKER_GATEWAYS
+    ):
+        raise ValueError("docker_networks exceeds the global gateway limit")
+    canonical = canonical_json(payload)
+    if len(canonical) > _PCC_MAX_DOCKER_NETWORK_BYTES:
+        raise ValueError("docker_networks exceeds 16 KiB")
+    return hashlib.sha256(
+        _PCC_DOCKER_NETWORK_DOMAIN + canonical
+    ).hexdigest()
+
+
+def pcc_boot_transition_chain_sha256(
+    boundary_chain: Sequence[PCCBootTransitionHopV1],
+) -> str:
+    """Hash the complete canonical protected boot-transition hop chain."""
+    from .contracts import PCCBootTransitionHopV1
+
+    raw_hops = _pcc_exact_sequence(boundary_chain, "boundary_chain")
+    if not 1 <= len(raw_hops) <= _PCC_MAX_BOOT_TRANSITION_HOPS:
+        raise ValueError("boundary_chain must contain 1..1024 hops")
+    normalized: list[PCCBootTransitionHopV1] = []
+    for hop in raw_hops:
+        if type(hop) is not PCCBootTransitionHopV1:
+            raise TypeError(
+                "boundary_chain must contain exact PCCBootTransitionHopV1 models"
+            )
+        normalized.append(
+            PCCBootTransitionHopV1.model_validate(
+                hop.model_dump(mode="python", exclude_none=True),
+                strict=True,
+            )
+        )
+    payload = tuple(normalized)
+    event_ids: set[str] = set()
+    seen_boot_ids = {payload[0].previous_boot_id}
+    prior_hop: PCCBootTransitionHopV1 | None = None
+    prior_end_sequence = 0
+    for hop in payload:
+        hop_event_ids: tuple[str, ...] = (hop.event_id,)
+        if hop.rotation_companion_event_id is not None:
+            hop_event_ids += (hop.rotation_companion_event_id,)
+        if event_ids.intersection(hop_event_ids):
+            raise ValueError("boundary_chain contains a duplicate event ID")
+        event_ids.update(hop_event_ids)
+        if hop.boot_id in seen_boot_ids:
+            raise ValueError("boundary_chain contains a repeated boot ID")
+        seen_boot_ids.add(hop.boot_id)
+        if prior_hop is not None and (
+            hop.previous_boot_id != prior_hop.boot_id
+            or hop.source_sequence <= prior_end_sequence
+            or hop.previous_source_sequence < prior_end_sequence
+        ):
+            raise ValueError("boundary_chain is reordered or disconnected")
+        prior_hop = hop
+        prior_end_sequence = max(
+            hop.source_sequence,
+            hop.rotation_companion_source_sequence or 0,
+        )
+    return hashlib.sha256(
+        _PCC_BOOT_TRANSITION_CHAIN_DOMAIN + canonical_json(payload)
+    ).hexdigest()
 
 
 def _document(value: BaseModel | Mapping[str, object]) -> dict[str, Any]:

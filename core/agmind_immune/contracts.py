@@ -10,9 +10,16 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
@@ -31,6 +38,9 @@ MAX_INT64 = 2**63 - 1
 MAX_EVIDENCE_SEGMENT_BYTES = 64 * 1024 * 1024
 ZERO_SHA256 = "0" * 64
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+PCC_SPECIAL_USE_REGISTRY_SHA256 = (
+    "e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73"
+)
 SUCCESS_RESULTS = {"EINPROGRESS", "EINPROGRESS(115)"}
 FALCO_SENSOR_REQUIRED_FIELDS = {
     "destination_ipv4",
@@ -219,6 +229,111 @@ def _repo_digests(values: list[str]) -> list[str]:
     _sorted_unique(values, "repo_digests")
     for item in values:
         _utf8(item, "repo digest", 256)
+    return values
+
+
+def _pcc_wire_tuple(value: object) -> tuple[object, ...]:
+    if type(value) is list:
+        return tuple(value)
+    if type(value) is tuple:
+        return value
+    raise TypeError("PCC array must be an exact list or immutable tuple")
+
+
+PCCStringTuple = Annotated[
+    tuple[str, ...],
+    BeforeValidator(_pcc_wire_tuple),
+]
+
+
+def _pcc_sorted_unique(values: tuple[str, ...], field: str) -> tuple[str, ...]:
+    if values != tuple(sorted(set(values))):
+        raise ValueError(f"{field} must be unique and sorted")
+    return values
+
+
+def _pcc_canonical_network(value: str, field: str) -> str:
+    _ascii(value, field, 64)
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError as error:
+        raise ValueError(f"{field} must be a canonical IP network") from error
+    if str(network) != value:
+        raise ValueError(f"{field} must be a canonical IP network")
+    return value
+
+
+def _pcc_canonical_address(value: str, field: str) -> str:
+    _ascii(value, field, 64)
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as error:
+        raise ValueError(f"{field} must be a canonical IP address") from error
+    if str(address) != value:
+        raise ValueError(f"{field} must be a canonical IP address")
+    return value
+
+
+def _pcc_network_tuple(
+    values: tuple[str, ...],
+    field: str,
+) -> tuple[str, ...]:
+    _pcc_sorted_unique(values, field)
+    for value in values:
+        _pcc_canonical_network(value, field)
+    return values
+
+
+def _pcc_address_tuple(
+    values: tuple[str, ...],
+    field: str,
+) -> tuple[str, ...]:
+    _pcc_sorted_unique(values, field)
+    for value in values:
+        _pcc_canonical_address(value, field)
+    return values
+
+
+def _pcc_ipv4_network_tuple(
+    values: tuple[str, ...],
+    field: str,
+) -> tuple[str, ...]:
+    _pcc_sorted_unique(values, field)
+    for value in values:
+        _ascii(value, field, 18)
+        try:
+            network = ipaddress.IPv4Network(value, strict=True)
+        except ValueError as error:
+            raise ValueError(f"{field} must contain canonical IPv4 networks") from error
+        if str(network) != value:
+            raise ValueError(f"{field} must contain canonical IPv4 networks")
+    return values
+
+
+def _pcc_ipv4_address_tuple(
+    values: tuple[str, ...],
+    field: str,
+) -> tuple[str, ...]:
+    _pcc_sorted_unique(values, field)
+    for value in values:
+        _ascii(value, field, 15)
+        try:
+            address = ipaddress.IPv4Address(value)
+        except ValueError as error:
+            raise ValueError(f"{field} must contain canonical IPv4 addresses") from error
+        if str(address) != value:
+            raise ValueError(f"{field} must contain canonical IPv4 addresses")
+    return values
+
+
+def _pcc_ascii_tuple(
+    values: tuple[str, ...],
+    field: str,
+    maximum: int = 64,
+) -> tuple[str, ...]:
+    _pcc_sorted_unique(values, field)
+    for value in values:
+        _ascii(value, field, maximum)
     return values
 
 
@@ -560,6 +675,711 @@ class FalcoConnectV1(ContractModel):
                 raise ValueError("candidate-capable event cannot report missing fields")
         if not self.successful_connect and not self.investigation_only:
             raise ValueError("hard errors must be investigation-only")
+        return self
+
+
+class _FrozenPCCContract(ContractModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+
+class PCCCorrelationSnapshotRequestV1(_FrozenPCCContract):
+    schema_version: Literal["agmind.pcc-correlation-snapshot-request.v1"]
+    trigger_event_id: str
+    trigger_content_sha256: str
+    trigger_source_sequence: int = Field(ge=1, le=MAX_UINT64)
+    requested_ttl_seconds: int = Field(ge=30, le=300)
+
+    @field_validator("trigger_event_id")
+    @classmethod
+    def trigger_event_is_exact(cls, value: str) -> str:
+        if not re.fullmatch(r"evt_[0-9a-f]{64}", value):
+            raise ValueError("trigger_event_id must be an exact event ID")
+        return value
+
+    @field_validator("trigger_content_sha256")
+    @classmethod
+    def trigger_content_hash_is_exact(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("trigger_content_sha256 must be 64 lowercase hex")
+        return value
+
+
+class PCCFalcoTriggerProjectionV1(_FrozenPCCContract):
+    schema_version: Literal["agmind.pcc-falco-trigger-projection.v1"]
+    event_id: str
+    content_sha256: str
+    normalized_fields_sha256: str
+    source_sequence: int = Field(ge=1, le=MAX_UINT64)
+    source_id: Literal["agmind-observerd"]
+    source_version: str
+    host_id: str
+    boot_id: str
+    event_time: str
+    ingest_time: str
+    clock_uncertainty_ms: int = Field(ge=0, le=2_000)
+    inventory_generation: int = Field(ge=1, le=MAX_UINT64)
+    inventory_revision: int = Field(ge=1, le=MAX_UINT64)
+    container_id: str
+    container_start_time: str
+    release_id: str
+    detector_rule: Literal["AGmind PCC Suspicious Process Outbound Connect"]
+    detector_rule_version: Literal["agmind-pcc-rules-v1"]
+    falco_version: Literal["0.44.1"]
+    evt_rawres: int | None = Field(default=None, ge=MIN_INT64, le=MAX_INT64)
+    evt_res: str
+    successful_connect: Literal[True]
+    investigation_only: Literal[False]
+    image_id: str
+    repo_digests: PCCStringTuple = Field(max_length=16)
+    immutable_spec_sha256: str
+    proc_name: str | None = None
+    proc_exe_path: str | None = None
+    proc_parent_name: str | None = None
+    destination_ipv4: str
+    destination_port: int = Field(ge=1, le=65_535)
+    l4_protocol: str
+    missing_required_fields: PCCStringTuple = Field(max_length=32)
+    coverage_flags: PCCStringTuple = Field(max_length=64)
+    raw_event_sha256: str
+
+    @field_validator("event_id")
+    @classmethod
+    def event_is_exact(cls, value: str) -> str:
+        if not re.fullmatch(r"evt_[0-9a-f]{64}", value):
+            raise ValueError("event_id must be an exact event ID")
+        return value
+
+    @field_validator(
+        "content_sha256",
+        "normalized_fields_sha256",
+        "immutable_spec_sha256",
+        "raw_event_sha256",
+    )
+    @classmethod
+    def digest_is_exact(cls, value: str, info: Any) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be 64 lowercase hex")
+        return value
+
+    @field_validator("source_version", "evt_res", "l4_protocol")
+    @classmethod
+    def enum_is_ascii(cls, value: str, info: Any) -> str:
+        return _ascii(value, info.field_name)
+
+    @field_validator("successful_connect", "investigation_only", mode="before")
+    @classmethod
+    def booleans_are_exact(cls, value: object, info: Any) -> object:
+        if type(value) is not bool:
+            raise ValueError(f"{info.field_name} must be an exact Boolean")
+        return value
+
+    @field_validator("host_id", "boot_id")
+    @classmethod
+    def host_identity_is_exact(cls, value: str, info: Any) -> str:
+        if not UUID4.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be a lowercase UUIDv4")
+        return value
+
+    @field_validator("event_time", "ingest_time", "container_start_time")
+    @classmethod
+    def time_is_exact(cls, value: str) -> str:
+        return _valid_timestamp(value)
+
+    @field_validator("container_id")
+    @classmethod
+    def container_is_exact(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("container_id must be 64 lowercase hex")
+        return value
+
+    @field_validator("release_id")
+    @classmethod
+    def release_is_exact(cls, value: str) -> str:
+        if not re.fullmatch(r"rel_[0-9a-f]{32}", value):
+            raise ValueError("release_id must be an exact release ID")
+        return value
+
+    @field_validator("detector_rule", "proc_name", "proc_exe_path", "proc_parent_name")
+    @classmethod
+    def untrusted_fragment_is_bounded(
+        cls,
+        value: str | None,
+        info: Any,
+    ) -> str | None:
+        return None if value is None else _utf8(value, info.field_name, 512)
+
+    @field_validator("image_id")
+    @classmethod
+    def image_is_exact(cls, value: str) -> str:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValueError("image_id must be an immutable Docker image ID")
+        return value
+
+    @field_validator("repo_digests")
+    @classmethod
+    def repositories_are_canonical(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        _pcc_sorted_unique(values, "repo_digests")
+        for value in values:
+            _utf8(value, "repo_digests", 256)
+        return values
+
+    @field_validator("destination_ipv4")
+    @classmethod
+    def destination_is_exact(cls, value: str) -> str:
+        return _valid_ipv4(value)
+
+    @field_validator("missing_required_fields", "coverage_flags")
+    @classmethod
+    def flags_are_canonical(
+        cls,
+        values: tuple[str, ...],
+        info: Any,
+    ) -> tuple[str, ...]:
+        return _pcc_ascii_tuple(values, info.field_name)
+
+    @model_validator(mode="after")
+    def candidate_projection_is_self_consistent(self) -> PCCFalcoTriggerProjectionV1:
+        from .canonicaljson import release_id
+
+        if self.evt_res == "SUCCESS":
+            result_valid = self.evt_rawres is not None and self.evt_rawres >= 0
+        elif self.evt_res in SUCCESS_RESULTS:
+            result_valid = self.evt_rawres is None or self.evt_rawres < 0
+        else:
+            result_valid = False
+        if not result_valid:
+            raise ValueError("retained trigger does not describe a successful connect")
+        if self.evt_rawres is None and "evt_rawres" in self.model_fields_set:
+            raise ValueError("optional evt_rawres must be absent rather than null")
+        if any(
+            value is None
+            for value in (
+                self.proc_name,
+                self.proc_exe_path,
+                self.proc_parent_name,
+            )
+        ):
+            raise ValueError("candidate-capable trigger lacks a sensor process fact")
+        if self.missing_required_fields:
+            raise ValueError("candidate-capable trigger cannot report missing fields")
+        if release_id(self.image_id, self.immutable_spec_sha256) != self.release_id:
+            raise ValueError("release_id does not bind image_id and immutable spec")
+        return self
+
+
+class PCCDockerNetworkV1(_FrozenPCCContract):
+    network_id: str
+    driver: str
+    subnet_cidrs: PCCStringTuple = Field(max_length=32)
+    gateway_addresses: PCCStringTuple = Field(max_length=32)
+
+    @field_validator("network_id")
+    @classmethod
+    def network_id_is_exact(cls, value: str) -> str:
+        if not HEX64.fullmatch(value):
+            raise ValueError("network_id must be 64 lowercase hex")
+        return value
+
+    @field_validator("driver")
+    @classmethod
+    def driver_is_bounded(cls, value: str) -> str:
+        return _ascii(value, "driver")
+
+    @field_validator("subnet_cidrs")
+    @classmethod
+    def subnets_are_canonical(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        return _pcc_network_tuple(values, "subnet_cidrs")
+
+    @field_validator("gateway_addresses")
+    @classmethod
+    def gateways_are_canonical(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        return _pcc_address_tuple(values, "gateway_addresses")
+
+
+_PCC_ROTATION_EVENT_TYPES = {
+    "observer_key_transition",
+    "observer_key_epoch_start",
+}
+_PCC_ROTATION_COMPANION_FIELDS = (
+    "rotation_companion_event_type",
+    "rotation_companion_event_id",
+    "rotation_companion_content_sha256",
+    "rotation_companion_source_sequence",
+    "rotation_companion_boot_id",
+)
+
+
+class PCCBootTransitionHopV1(_FrozenPCCContract):
+    boundary_event_type: Literal[
+        "observer_boot_boundary",
+        "observer_key_transition",
+        "observer_key_epoch_start",
+    ]
+    event_id: str
+    content_sha256: str
+    source_sequence: int = Field(ge=1, le=MAX_UINT64)
+    boot_id: str
+    previous_boot_id: str
+    previous_source_sequence: int = Field(ge=0, le=MAX_UINT64)
+    rotation_companion_event_type: Literal[
+        "observer_key_transition",
+        "observer_key_epoch_start",
+    ] | None = None
+    rotation_companion_event_id: str | None = None
+    rotation_companion_content_sha256: str | None = None
+    rotation_companion_source_sequence: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_UINT64,
+    )
+    rotation_companion_boot_id: str | None = None
+
+    @field_validator("event_id", "rotation_companion_event_id")
+    @classmethod
+    def event_id_is_exact(cls, value: str | None, info: Any) -> str | None:
+        if value is not None and not re.fullmatch(r"evt_[0-9a-f]{64}", value):
+            raise ValueError(f"{info.field_name} must be an exact event ID")
+        return value
+
+    @field_validator("content_sha256", "rotation_companion_content_sha256")
+    @classmethod
+    def digest_is_exact(cls, value: str | None, info: Any) -> str | None:
+        if value is not None and not HEX64.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be 64 lowercase hex")
+        return value
+
+    @field_validator("boot_id", "previous_boot_id", "rotation_companion_boot_id")
+    @classmethod
+    def boot_id_is_exact(cls, value: str | None, info: Any) -> str | None:
+        if value is not None and not UUID4.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be a lowercase UUIDv4")
+        return value
+
+    @model_validator(mode="after")
+    def boundary_and_rotation_pair_are_exact(self) -> PCCBootTransitionHopV1:
+        companion_present = tuple(
+            field in self.model_fields_set and getattr(self, field) is not None
+            for field in _PCC_ROTATION_COMPANION_FIELDS
+        )
+        if any(
+            field in self.model_fields_set and getattr(self, field) is None
+            for field in _PCC_ROTATION_COMPANION_FIELDS
+        ):
+            raise ValueError("rotation companion fields must be absent rather than null")
+        if self.boot_id == self.previous_boot_id:
+            raise ValueError("boot-transition hop must change boot_id")
+        if self.source_sequence <= self.previous_source_sequence:
+            raise ValueError("boot-transition hop must follow its predecessor")
+        if self.boundary_event_type == "observer_boot_boundary":
+            if any(companion_present):
+                raise ValueError("dedicated boot boundary cannot carry a rotation companion")
+            return self
+        if not all(companion_present):
+            raise ValueError("rotation boundary requires every companion field")
+        if self.boundary_event_type not in _PCC_ROTATION_EVENT_TYPES:
+            raise ValueError("invalid rotation boundary event type")
+        if self.rotation_companion_event_id == self.event_id:
+            raise ValueError("boundary and companion event IDs must be distinct")
+        if self.boundary_event_type == "observer_key_transition":
+            if (
+                self.rotation_companion_event_type != "observer_key_epoch_start"
+                or self.rotation_companion_source_sequence != self.source_sequence + 1
+                or self.rotation_companion_boot_id != self.boot_id
+            ):
+                raise ValueError("new-boot transition companion is not exact adjacent start")
+        elif (
+            self.rotation_companion_event_type != "observer_key_transition"
+            or self.rotation_companion_source_sequence is None
+            or self.rotation_companion_source_sequence + 1 != self.source_sequence
+            or self.rotation_companion_boot_id != self.previous_boot_id
+        ):
+            raise ValueError("new-boot epoch start companion is not exact prior transition")
+        return self
+
+
+PCC_FAILURE_REASONS = frozenset(
+    {
+        "mutation_read_only",
+        "reconcile_required",
+        "docker_reconcile_gap",
+        "routine_drop_pending",
+        "inventory_stale",
+        "docker_network_snapshot_unavailable",
+        "docker_network_snapshot_overflow",
+        "detector_bundle_unavailable",
+        "special_use_registry_unavailable",
+        "operator_denylist_unavailable",
+        "management_denylist_unavailable",
+        "container_not_running",
+        "container_identity_changed",
+        "observer_boot_changed",
+    }
+)
+PCCFailureReason = Literal[
+    "mutation_read_only",
+    "reconcile_required",
+    "docker_reconcile_gap",
+    "routine_drop_pending",
+    "inventory_stale",
+    "docker_network_snapshot_unavailable",
+    "docker_network_snapshot_overflow",
+    "detector_bundle_unavailable",
+    "special_use_registry_unavailable",
+    "operator_denylist_unavailable",
+    "management_denylist_unavailable",
+    "container_not_running",
+    "container_identity_changed",
+    "observer_boot_changed",
+]
+PCCFailureReasonTuple = Annotated[
+    tuple[PCCFailureReason, ...],
+    BeforeValidator(_pcc_wire_tuple),
+]
+
+_PCC_COMPLETE_FIELDS = frozenset(
+    {
+        "detector_bundle_sha256",
+        "special_use_registry_sha256",
+        "operator_denied_networks",
+        "operator_denied_addresses",
+        "operator_denylist_sha256",
+        "management_denied_networks",
+        "management_denied_addresses",
+        "management_denylist_sha256",
+        "docker_networks",
+        "docker_network_snapshot_sha256",
+        "docker_container_id",
+        "docker_started_at",
+        "image_id",
+        "repo_digests",
+        "immutable_spec_sha256",
+        "inventory_generation",
+        "inventory_revision",
+        "inventory_observed_at",
+        "network_mode",
+        "network_driver",
+        "privileged",
+        "configured_cap_add",
+        "configured_cap_drop",
+        "effective_cap_net_admin",
+        "running",
+    }
+)
+_PCC_FAILED_FIELDS = frozenset(
+    {
+        "failure_reasons",
+        "boot_transition_hop_count",
+        "boot_transition_chain_sha256",
+    }
+)
+_PCC_DOCKER_NETWORKS_MAX_BYTES = 16 * 1024
+_PCC_COMPLETE_NORMALIZED_MAX_BYTES = 24 * 1024
+
+
+class PCCCorrelationSnapshotV1(_FrozenPCCContract):
+    schema_version: Literal["agmind.pcc-correlation-snapshot.v1"]
+    outcome: Literal["complete", "failed"]
+    request_sha256: str
+    trigger: PCCFalcoTriggerProjectionV1
+    decision_time: str
+    detector_bundle_sha256: str | None = None
+    requested_ttl_seconds: int = Field(ge=30, le=300)
+    special_use_registry_sha256: Literal[
+        "e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73"
+    ] | None = None
+    operator_denied_networks: PCCStringTuple | None = None
+    operator_denied_addresses: PCCStringTuple | None = None
+    operator_denylist_sha256: str | None = None
+    management_denied_networks: PCCStringTuple | None = None
+    management_denied_addresses: PCCStringTuple | None = None
+    management_denylist_sha256: str | None = None
+    docker_networks: Annotated[
+        tuple[PCCDockerNetworkV1, ...],
+        BeforeValidator(_pcc_wire_tuple),
+    ] | None = None
+    docker_network_snapshot_sha256: str | None = None
+    docker_container_id: str | None = None
+    docker_started_at: str | None = None
+    image_id: str | None = None
+    repo_digests: PCCStringTuple | None = None
+    immutable_spec_sha256: str | None = None
+    inventory_generation: int | None = Field(default=None, ge=1, le=MAX_UINT64)
+    inventory_revision: int | None = Field(default=None, ge=1, le=MAX_UINT64)
+    inventory_observed_at: str | None = None
+    network_mode: str | None = None
+    network_driver: str | None = None
+    privileged: bool | None = None
+    configured_cap_add: PCCStringTuple | None = None
+    configured_cap_drop: PCCStringTuple | None = None
+    effective_cap_net_admin: bool | None = None
+    running: bool | None = None
+    failure_reasons: PCCFailureReasonTuple | None = None
+    coverage_through_sequence: int = Field(ge=1, le=MAX_UINT64)
+    hard_limits_version: Literal["pcc-hard-limits-v1"]
+    boot_transition_hop_count: int | None = Field(default=None, ge=1, le=1_024)
+    boot_transition_chain_sha256: str | None = None
+
+    @field_validator(
+        "request_sha256",
+        "detector_bundle_sha256",
+        "special_use_registry_sha256",
+        "operator_denylist_sha256",
+        "management_denylist_sha256",
+        "docker_network_snapshot_sha256",
+        "immutable_spec_sha256",
+        "boot_transition_chain_sha256",
+    )
+    @classmethod
+    def digest_is_exact(cls, value: str | None, info: Any) -> str | None:
+        if value is not None and not HEX64.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be 64 lowercase hex")
+        return value
+
+    @field_validator("decision_time")
+    @classmethod
+    def decision_time_is_microsecond_exact(cls, value: str) -> str:
+        _valid_timestamp(value)
+        fraction = value.partition(".")[2].removesuffix("Z")
+        if "." in value and len(fraction) > 6:
+            raise ValueError("decision_time exceeds microsecond precision")
+        return value
+
+    @field_validator(
+        "operator_denied_networks",
+        "management_denied_networks",
+    )
+    @classmethod
+    def denied_networks_are_canonical(
+        cls,
+        values: tuple[str, ...] | None,
+        info: Any,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
+        if len(values) > 128:
+            raise ValueError(f"{info.field_name} exceeds 128 entries")
+        return _pcc_ipv4_network_tuple(values, info.field_name)
+
+    @field_validator(
+        "operator_denied_addresses",
+        "management_denied_addresses",
+    )
+    @classmethod
+    def denied_addresses_are_canonical(
+        cls,
+        values: tuple[str, ...] | None,
+        info: Any,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
+        if len(values) > 128:
+            raise ValueError(f"{info.field_name} exceeds 128 entries")
+        return _pcc_ipv4_address_tuple(values, info.field_name)
+
+    @field_validator("docker_networks")
+    @classmethod
+    def docker_networks_are_canonical(
+        cls,
+        values: tuple[PCCDockerNetworkV1, ...] | None,
+    ) -> tuple[PCCDockerNetworkV1, ...] | None:
+        if values is None:
+            return None
+        if len(values) > 64:
+            raise ValueError("docker_networks exceeds 64 networks")
+        network_ids = tuple(network.network_id for network in values)
+        if network_ids != tuple(sorted(set(network_ids))):
+            raise ValueError("docker_networks must have unique sorted network IDs")
+        subnet_count = sum(len(network.subnet_cidrs) for network in values)
+        gateway_count = sum(len(network.gateway_addresses) for network in values)
+        if subnet_count > 128 or gateway_count > 128:
+            raise ValueError("Docker network address totals exceed 128")
+        return values
+
+    @field_validator("docker_container_id")
+    @classmethod
+    def docker_container_is_exact(cls, value: str | None) -> str | None:
+        if value is not None and not HEX64.fullmatch(value):
+            raise ValueError("docker_container_id must be 64 lowercase hex")
+        return value
+
+    @field_validator("docker_started_at", "inventory_observed_at")
+    @classmethod
+    def inventory_time_is_exact(cls, value: str | None) -> str | None:
+        return None if value is None else _valid_timestamp(value)
+
+    @field_validator("image_id")
+    @classmethod
+    def image_is_exact(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValueError("image_id must be an immutable Docker image ID")
+        return value
+
+    @field_validator("repo_digests")
+    @classmethod
+    def repositories_are_canonical(
+        cls,
+        values: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
+        if len(values) > 16:
+            raise ValueError("repo_digests exceeds 16 entries")
+        _pcc_sorted_unique(values, "repo_digests")
+        for value in values:
+            _utf8(value, "repo_digests", 256)
+        return values
+
+    @field_validator("network_mode")
+    @classmethod
+    def network_mode_is_bounded(cls, value: str | None) -> str | None:
+        return None if value is None else _ascii(value, "network_mode", 128)
+
+    @field_validator("network_driver")
+    @classmethod
+    def network_driver_is_bounded(cls, value: str | None) -> str | None:
+        return None if value is None else _ascii(value, "network_driver")
+
+    @field_validator("configured_cap_add", "configured_cap_drop")
+    @classmethod
+    def capabilities_are_canonical(
+        cls,
+        values: tuple[str, ...] | None,
+        info: Any,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
+        if len(values) > 128:
+            raise ValueError(f"{info.field_name} exceeds 128 entries")
+        return _pcc_ascii_tuple(values, info.field_name)
+
+    @field_validator("failure_reasons")
+    @classmethod
+    def failure_reasons_are_canonical(
+        cls,
+        values: tuple[PCCFailureReason, ...] | None,
+    ) -> tuple[PCCFailureReason, ...] | None:
+        if values is None:
+            return None
+        if not values:
+            raise ValueError("failure_reasons must be nonempty")
+        if values != tuple(sorted(set(values))):
+            raise ValueError("failure_reasons must be unique and sorted")
+        return values
+
+    @model_validator(mode="after")
+    def outcome_and_cross_bindings_are_exact(self) -> PCCCorrelationSnapshotV1:
+        from .canonicaljson import (
+            canonical_json,
+            pcc_correlation_request_sha256,
+            pcc_docker_network_snapshot_sha256,
+            pcc_management_denylist_sha256,
+            pcc_operator_denylist_sha256,
+        )
+
+        for field in _PCC_COMPLETE_FIELDS | _PCC_FAILED_FIELDS:
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} must be absent rather than null")
+
+        request = PCCCorrelationSnapshotRequestV1(
+            schema_version="agmind.pcc-correlation-snapshot-request.v1",
+            trigger_event_id=self.trigger.event_id,
+            trigger_content_sha256=self.trigger.content_sha256,
+            trigger_source_sequence=self.trigger.source_sequence,
+            requested_ttl_seconds=self.requested_ttl_seconds,
+        )
+        if pcc_correlation_request_sha256(request) != self.request_sha256:
+            raise ValueError("request_sha256 does not bind the exact narrow request")
+        if self.coverage_through_sequence < self.trigger.source_sequence:
+            raise ValueError("coverage prefix ends before the retained trigger")
+
+        fields_set = self.model_fields_set
+        if self.outcome == "complete":
+            missing = _PCC_COMPLETE_FIELDS - fields_set
+            forbidden = _PCC_FAILED_FIELDS & fields_set
+            if missing or forbidden:
+                raise ValueError("complete snapshot has an inexact discriminated shape")
+            if any(getattr(self, field) is None for field in _PCC_COMPLETE_FIELDS):
+                raise ValueError("complete snapshot lacks an authoritative field")
+
+            assert self.operator_denied_networks is not None
+            assert self.operator_denied_addresses is not None
+            assert self.operator_denylist_sha256 is not None
+            assert self.management_denied_networks is not None
+            assert self.management_denied_addresses is not None
+            assert self.management_denylist_sha256 is not None
+            assert self.docker_networks is not None
+            assert self.docker_network_snapshot_sha256 is not None
+            if (
+                pcc_operator_denylist_sha256(
+                    self.operator_denied_networks,
+                    self.operator_denied_addresses,
+                )
+                != self.operator_denylist_sha256
+            ):
+                raise ValueError("operator_denylist_sha256 does not bind its arrays")
+            if (
+                pcc_management_denylist_sha256(
+                    self.management_denied_networks,
+                    self.management_denied_addresses,
+                )
+                != self.management_denylist_sha256
+            ):
+                raise ValueError("management_denylist_sha256 does not bind its arrays")
+            if (
+                pcc_docker_network_snapshot_sha256(self.docker_networks)
+                != self.docker_network_snapshot_sha256
+            ):
+                raise ValueError("docker_network_snapshot_sha256 does not bind networks")
+            if len(canonical_json(self.docker_networks)) > _PCC_DOCKER_NETWORKS_MAX_BYTES:
+                raise ValueError("docker_networks exceeds 16 KiB")
+
+            trigger_bindings = (
+                (self.docker_container_id, self.trigger.container_id),
+                (self.docker_started_at, self.trigger.container_start_time),
+                (self.image_id, self.trigger.image_id),
+                (self.repo_digests, self.trigger.repo_digests),
+                (self.immutable_spec_sha256, self.trigger.immutable_spec_sha256),
+                (self.inventory_generation, self.trigger.inventory_generation),
+                (self.inventory_revision, self.trigger.inventory_revision),
+            )
+            if any(left != right for left, right in trigger_bindings):
+                raise ValueError("snapshot inventory does not bind retained trigger")
+            normalized = canonical_json(self.model_dump(exclude_none=True))
+            if len(normalized) > _PCC_COMPLETE_NORMALIZED_MAX_BYTES:
+                raise ValueError("complete correlation snapshot exceeds 24 KiB")
+            return self
+
+        missing_failed = {"failure_reasons"} - fields_set
+        forbidden_complete = _PCC_COMPLETE_FIELDS & fields_set
+        if missing_failed or forbidden_complete:
+            raise ValueError("failed snapshot has an inexact discriminated shape")
+        if self.failure_reasons == ("observer_boot_changed",):
+            required_boot = {
+                "boot_transition_hop_count",
+                "boot_transition_chain_sha256",
+            }
+            if not required_boot <= fields_set:
+                raise ValueError("cross-boot failure lacks transition-chain proof")
+        elif (
+            self.failure_reasons is None
+            or "observer_boot_changed" in self.failure_reasons
+            or {"boot_transition_hop_count", "boot_transition_chain_sha256"} & fields_set
+        ):
+            raise ValueError("ordinary failed snapshot has cross-boot authority")
+        if self.boot_transition_chain_sha256 is not None:
+            try:
+                bytes.fromhex(self.boot_transition_chain_sha256)
+            except ValueError as error:
+                raise ValueError("invalid boot transition chain digest") from error
         return self
 
 
