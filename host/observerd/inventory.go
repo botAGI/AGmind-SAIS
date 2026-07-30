@@ -92,6 +92,12 @@ type ContainerIdentityV1 struct {
 	AttachedNetworks     []AttachedNetworkV1 `json:"attached_networks"`
 }
 
+type CorrelationInventorySnapshot struct {
+	Generation     uint64
+	Identity       ContainerIdentityV1
+	DockerNetworks []contracts.PCCDockerNetworkV1
+}
+
 // NetNSUniquenessV1 records the inventory generation and live namespace inode
 // over which a root-only uniqueness decision was made.
 type NetNSUniquenessV1 struct {
@@ -133,6 +139,7 @@ type inventoryDiskState struct {
 	DockerReconcileGap bool                           `json:"docker_reconcile_gap"`
 	Records            []inventoryRecord              `json:"records"`
 	RevisionLedger     []inventoryRevisionLedgerEntry `json:"revision_ledger"`
+	DockerNetworks     []contracts.PCCDockerNetworkV1 `json:"docker_networks"`
 }
 
 type Inventory struct {
@@ -142,6 +149,7 @@ type Inventory struct {
 	docker         DockerReader
 	processes      processIdentityReader
 	now            func() time.Time
+	persist        func(string, inventoryDiskState) error
 	state          inventoryDiskState
 	records        map[string]inventoryRecord
 }
@@ -297,6 +305,11 @@ func (state inventoryDiskState) Validate() error {
 		len(state.RevisionLedger) > inventoryRevisionLedgerMaxEntries {
 		return fmt.Errorf("invalid Docker inventory state")
 	}
+	if _, err := contracts.PCCDockerNetworkSnapshotSHA256(
+		state.DockerNetworks,
+	); err != nil {
+		return err
+	}
 	ledgerByID := make(
 		map[string]inventoryRevisionLedgerEntry,
 		len(state.RevisionLedger),
@@ -329,7 +342,8 @@ func (state inventoryDiskState) Validate() error {
 		}
 		priorID = record.Identity.FullContainerID
 	}
-	if state.Generation == 0 && len(state.Records) != 0 {
+	if state.Generation == 0 &&
+		(len(state.Records) != 0 || len(state.DockerNetworks) != 0) {
 		return fmt.Errorf("unreconciled inventory cannot contain records")
 	}
 	return nil
@@ -361,6 +375,24 @@ func cloneContainerIdentity(identity ContainerIdentityV1) ContainerIdentityV1 {
 func cloneInventoryRecord(record inventoryRecord) inventoryRecord {
 	cloned := record
 	cloned.Identity = cloneContainerIdentity(record.Identity)
+	return cloned
+}
+
+func cloneDockerNetworks(
+	networks []contracts.PCCDockerNetworkV1,
+) []contracts.PCCDockerNetworkV1 {
+	cloned := make([]contracts.PCCDockerNetworkV1, len(networks))
+	for index, dockerNetwork := range networks {
+		cloned[index] = dockerNetwork
+		cloned[index].SubnetCIDRs = append(
+			[]string{},
+			dockerNetwork.SubnetCIDRs...,
+		)
+		cloned[index].GatewayAddresses = append(
+			[]string{},
+			dockerNetwork.GatewayAddresses...,
+		)
+	}
 	return cloned
 }
 
@@ -432,6 +464,7 @@ func openInventory(
 			DockerReconcileGap: true,
 			Records:            []inventoryRecord{},
 			RevisionLedger:     []inventoryRevisionLedgerEntry{},
+			DockerNetworks:     []contracts.PCCDockerNetworkV1{},
 		}
 		if err := persistInventoryState(path, state); err != nil {
 			return nil, err
@@ -444,6 +477,7 @@ func openInventory(
 		docker:    docker,
 		processes: processes,
 		now:       now,
+		persist:   persistInventoryState,
 		state:     state,
 		records:   inventoryRecordsMap(state.Records),
 	}, nil
@@ -600,6 +634,102 @@ func (inventory *Inventory) attachedNetworks(
 	}
 }
 
+func (inventory *Inventory) globalDockerNetworks(
+	ctx context.Context,
+) ([]contracts.PCCDockerNetworkV1, error) {
+	listed, err := inventory.docker.NetworkList(
+		ctx,
+		client.NetworkListOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	networkIDs := make([]string, 0, len(listed.Items))
+	seen := make(map[string]struct{}, len(listed.Items))
+	for _, summary := range listed.Items {
+		networkID := summary.ID
+		if !dockerIDPattern.MatchString(networkID) {
+			return nil, fmt.Errorf("invalid Docker network list identity")
+		}
+		if _, duplicate := seen[networkID]; duplicate {
+			return nil, fmt.Errorf("duplicate Docker network list identity")
+		}
+		seen[networkID] = struct{}{}
+		networkIDs = append(networkIDs, networkID)
+	}
+	networks := make(
+		[]contracts.PCCDockerNetworkV1,
+		0,
+		len(networkIDs),
+	)
+	for _, networkID := range networkIDs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		inspected, err := inventory.docker.NetworkInspect(
+			ctx,
+			networkID,
+			client.NetworkInspectOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+		if inspected.Network.ID != networkID {
+			return nil, fmt.Errorf("Docker network identity mismatch")
+		}
+		subnets := make(
+			[]string,
+			0,
+			len(inspected.Network.IPAM.Config),
+		)
+		gateways := make(
+			[]string,
+			0,
+			len(inspected.Network.IPAM.Config),
+		)
+		for _, configuration := range inspected.Network.IPAM.Config {
+			if configuration.Subnet.IsValid() {
+				if configuration.Subnet.Addr().Is4In6() ||
+					configuration.Subnet != configuration.Subnet.Masked() {
+					return nil, fmt.Errorf(
+						"invalid Docker network subnet",
+					)
+				}
+				subnets = append(
+					subnets,
+					configuration.Subnet.String(),
+				)
+			}
+			if configuration.Gateway.IsValid() {
+				if configuration.Gateway.Is4In6() {
+					return nil, fmt.Errorf(
+						"invalid Docker network gateway",
+					)
+				}
+				gateways = append(
+					gateways,
+					configuration.Gateway.String(),
+				)
+			}
+		}
+		networks = append(networks, contracts.PCCDockerNetworkV1{
+			NetworkID:        networkID,
+			Driver:           inspected.Network.Driver,
+			SubnetCIDRs:      normalizeSortedUnique(subnets),
+			GatewayAddresses: normalizeSortedUnique(gateways),
+		})
+	}
+	sort.Slice(networks, func(left, right int) bool {
+		return networks[left].NetworkID < networks[right].NetworkID
+	})
+	if _, err := contracts.PCCDockerNetworkSnapshotSHA256(
+		networks,
+	); err != nil {
+		return nil, err
+	}
+	return networks, nil
+}
+
 func (inventory *Inventory) inspectRunningContainer(
 	ctx context.Context,
 	fullID string,
@@ -698,7 +828,7 @@ func revisionHash(record inventoryRecord) (string, error) {
 func (inventory *Inventory) persistAndAdopt(
 	next inventoryDiskState,
 ) error {
-	err := persistInventoryState(inventory.path, next)
+	err := inventory.persist(inventory.path, next)
 	if errors.Is(err, durablefile.ErrCommitUncertain) {
 		expected, canonicalErr := contracts.CanonicalJSON(next)
 		actual, readErr := readSingleLinkRegular(
@@ -783,6 +913,10 @@ func (inventory *Inventory) Reconcile(ctx context.Context) error {
 			nextRecords = append(nextRecords, record)
 		}
 	}
+	nextDockerNetworks, err := inventory.globalDockerNetworks(ctx)
+	if err != nil {
+		return err
+	}
 
 	inventory.mutex.Lock()
 	defer inventory.mutex.Unlock()
@@ -849,8 +983,34 @@ func (inventory *Inventory) Reconcile(ctx context.Context) error {
 		DockerReconcileGap: false,
 		Records:            nextRecords,
 		RevisionLedger:     nextLedger,
+		DockerNetworks:     nextDockerNetworks,
 	}
 	return inventory.persistAndAdopt(next)
+}
+
+func (inventory *Inventory) SnapshotForCorrelation(
+	fullContainerID string,
+) (CorrelationInventorySnapshot, error) {
+	inventory.mutex.RLock()
+	defer inventory.mutex.RUnlock()
+	if inventory.state.DockerReconcileGap {
+		return CorrelationInventorySnapshot{}, ErrInventoryReconcileRequired
+	}
+	if !dockerIDPattern.MatchString(fullContainerID) {
+		return CorrelationInventorySnapshot{}, ErrContainerNotFound
+	}
+	record, ok := inventory.records[fullContainerID]
+	if !ok || !record.Identity.Running {
+		return CorrelationInventorySnapshot{}, ErrContainerNotFound
+	}
+	if record.Identity.InventoryGeneration != inventory.state.Generation {
+		return CorrelationInventorySnapshot{}, ErrInventoryStale
+	}
+	return CorrelationInventorySnapshot{
+		Generation:     inventory.state.Generation,
+		Identity:       cloneContainerIdentity(record.Identity),
+		DockerNetworks: cloneDockerNetworks(inventory.state.DockerNetworks),
+	}, nil
 }
 
 func (inventory *Inventory) resolve(

@@ -54,6 +54,10 @@ type DockerReader interface {
 		string,
 		client.NetworkInspectOptions,
 	) (client.NetworkInspectResult, error)
+	NetworkList(
+		context.Context,
+		client.NetworkListOptions,
+	) (client.NetworkListResult, error)
 	Events(
 		context.Context,
 		client.EventsListOptions,
@@ -210,6 +214,13 @@ func (reader *mobyDockerReader) NetworkInspect(
 	options client.NetworkInspectOptions,
 ) (client.NetworkInspectResult, error) {
 	return reader.client.NetworkInspect(ctx, networkID, options)
+}
+
+func (reader *mobyDockerReader) NetworkList(
+	ctx context.Context,
+	options client.NetworkListOptions,
+) (client.NetworkListResult, error) {
+	return reader.client.NetworkList(ctx, options)
 }
 
 func (reader *mobyDockerReader) Events(
