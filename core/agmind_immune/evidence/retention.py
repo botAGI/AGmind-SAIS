@@ -13,6 +13,7 @@ from decimal import Decimal
 from itertools import pairwise
 from threading import Lock
 from typing import Any, Literal, Never, Protocol, SupportsIndex, cast, final
+from uuid import uuid4
 
 from pydantic import (
     ConfigDict,
@@ -57,6 +58,9 @@ _RUN_DOMAIN = b"AGMIND_RETENTION_RUN_V2\x00"
 _RECORD_BINDING_DOMAIN = b"agmind.retention-record-binding.v1\x00"
 _FACT_BINDING_DOMAIN = b"agmind.retention-fact-binding.v1\x00"
 _ACCEPTED_BINDING_DOMAIN = b"agmind.retention-accepted-binding.v1\x00"
+_ACCEPTED_BLOCKED_BINDING_DOMAIN = (
+    b"agmind.retention-accepted-blocked-binding.v1\x00"
+)
 _SNAPSHOT_BINDING_DOMAIN = b"agmind.retention-snapshot-binding.v1\x00"
 _RUN_BINDING_DOMAIN = b"agmind.retention-run-binding.v1\x00"
 _DECISION_BINDING_DOMAIN = b"agmind.retention-decision-binding.v1\x00"
@@ -83,6 +87,7 @@ _RequestKind = Literal["tombstone", "blocked"]
 _RECORD_FACTORY = object()
 _FACT_FACTORY = object()
 _ACCEPTED_FACTORY = object()
+_ACCEPTED_BLOCKED_FACTORY = object()
 _SNAPSHOT_FACTORY = object()
 _RUN_FACTORY = object()
 _DECISION_FACTORY = object()
@@ -354,12 +359,20 @@ def _prefix_chain_head_sha256(manifest: SegmentManifestV1) -> str:
 def _record_binding_values(
     event_type: object,
     evidence_priority: object,
+    source_sequence: object,
+    event_id: object,
+    content_sha256: object,
+    frame_size: object,
 ) -> bytes:
     try:
         document = canonical_json(
             {
                 "event_type": event_type,
                 "evidence_priority": evidence_priority,
+                "source_sequence": source_sequence,
+                "event_id": event_id,
+                "content_sha256": content_sha256,
+                "frame_size": frame_size,
             }
         )
     except (TypeError, ValueError) as error:
@@ -373,12 +386,20 @@ class FrozenRetentionRecord:
 
     event_type: str
     evidence_priority: EvidencePriorityName
+    source_sequence: int
+    event_id: str
+    content_sha256: str
+    frame_size: int
 
     def __init__(
         self,
         *,
         event_type: str,
         evidence_priority: EvidencePriorityName,
+        source_sequence: int,
+        event_id: str,
+        content_sha256: str,
+        frame_size: int,
         _factory: object,
     ) -> None:
         if _factory is not _RECORD_FACTORY:
@@ -390,11 +411,44 @@ class FrozenRetentionRecord:
             "protected",
         }:
             raise RetentionCorruption("retention record priority is invalid")
+        if (
+            type(source_sequence) is not int
+            or not 1 <= source_sequence <= MAX_UINT64
+        ):
+            raise RetentionCorruption(
+                "retention record source sequence is invalid"
+            )
+        if type(event_id) is not str or _EVENT_ID.fullmatch(event_id) is None:
+            raise RetentionCorruption(
+                "retention record event identity is invalid"
+            )
+        if (
+            type(content_sha256) is not str
+            or HEX64.fullmatch(content_sha256) is None
+        ):
+            raise RetentionCorruption(
+                "retention record content identity is invalid"
+            )
+        if type(frame_size) is not int or not 1 <= frame_size <= MAX_UINT64:
+            raise RetentionCorruption(
+                "retention record frame size is invalid"
+            )
         object.__setattr__(self, "event_type", event_type)
         object.__setattr__(self, "evidence_priority", evidence_priority)
+        object.__setattr__(self, "source_sequence", source_sequence)
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "content_sha256", content_sha256)
+        object.__setattr__(self, "frame_size", frame_size)
         _register_identity(
             self,
-            _record_binding_values(event_type, evidence_priority),
+            _record_binding_values(
+                event_type,
+                evidence_priority,
+                source_sequence,
+                event_id,
+                content_sha256,
+                frame_size,
+            ),
         )
 
 
@@ -402,10 +456,18 @@ def _freeze_retention_record(
     *,
     event_type: str,
     evidence_priority: EvidencePriorityName,
+    source_sequence: int,
+    event_id: str,
+    content_sha256: str,
+    frame_size: int,
 ) -> FrozenRetentionRecord:
     return FrozenRetentionRecord(
         event_type=event_type,
         evidence_priority=evidence_priority,
+        source_sequence=source_sequence,
+        event_id=event_id,
+        content_sha256=content_sha256,
+        frame_size=frame_size,
         _factory=_RECORD_FACTORY,
     )
 
@@ -416,6 +478,10 @@ def _record_binding(record: FrozenRetentionRecord) -> bytes:
     binding = _record_binding_values(
         record.event_type,
         record.evidence_priority,
+        record.source_sequence,
+        record.event_id,
+        record.content_sha256,
+        record.frame_size,
     )
     _require_identity(record, binding, "retention record")
     return binding
@@ -531,6 +597,17 @@ class FrozenRetentionFact:
             raise RetentionCorruption("retention fact manifest exceeds its byte bound")
         if validated.record_count != len(records):
             raise RetentionCorruption("retention record count differs from manifest")
+        frame_bytes = 0
+        for record in records:
+            frame_bytes = _checked_add(
+                frame_bytes,
+                record.frame_size,
+                "retention record frame bytes",
+            )
+        if frame_bytes != validated.segment_size_bytes:
+            raise RetentionCorruption(
+                "retention record frame bytes differ from manifest"
+            )
         object.__setattr__(self, "manifest_canonical", raw)
         object.__setattr__(self, "manifest_sha256", validated.manifest_sha256)
         object.__setattr__(
@@ -746,6 +823,151 @@ def _accepted_binding(accepted: AcceptedRetentionTombstone) -> bytes:
     return binding
 
 
+def _accepted_blocked_binding_values(
+    sequence: object,
+    event_id: object,
+    content_sha256: object,
+    request_canonical: object,
+) -> bytes:
+    if type(request_canonical) is not bytes:
+        raise RetentionCorruption("prior blocked request binding changed")
+    try:
+        outer = canonical_json(
+            {
+                "sequence": sequence,
+                "event_id": event_id,
+                "content_sha256": content_sha256,
+            }
+        )
+    except (TypeError, ValueError) as error:
+        raise RetentionCorruption(
+            "prior blocked outer binding is invalid"
+        ) from error
+    return hashlib.sha256(
+        _ACCEPTED_BLOCKED_BINDING_DOMAIN
+        + _framed(outer)
+        + _framed(request_canonical)
+    ).digest()
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
+class AcceptedRetentionBlocked:
+    """Deep-frozen authenticated blocked outer identity and request."""
+
+    sequence: int
+    event_id: str
+    content_sha256: str
+    request_canonical: bytes
+
+    def __init__(
+        self,
+        *,
+        sequence: int,
+        event_id: str,
+        content_sha256: str,
+        request: RetentionBlockedV1,
+        _factory: object = None,
+    ) -> None:
+        if _factory is not _ACCEPTED_BLOCKED_FACTORY:
+            raise TypeError("accepted retention blocked records are factory-only")
+        if type(sequence) is not int or not 1 <= sequence <= MAX_UINT64:
+            raise RetentionCorruption("prior blocked sequence is invalid")
+        if type(event_id) is not str or _EVENT_ID.fullmatch(event_id) is None:
+            raise RetentionCorruption("prior blocked event identity is invalid")
+        if (
+            type(content_sha256) is not str
+            or HEX64.fullmatch(content_sha256) is None
+        ):
+            raise RetentionCorruption(
+                "prior blocked content identity is invalid"
+            )
+        if type(request) is not RetentionBlockedV1:
+            raise RetentionCorruption("prior blocked request type is invalid")
+        try:
+            validated = RetentionBlockedV1.model_validate(
+                request.model_dump(mode="python"),
+                strict=True,
+            )
+            raw = canonical_json(validated.model_dump(mode="python"))
+        except (TypeError, ValueError) as error:
+            raise RetentionCorruption(
+                "prior blocked request is invalid"
+            ) from error
+        if len(raw) > _TOMBSTONE_MAX_BYTES:
+            raise RetentionCorruption(
+                "prior blocked request exceeds its byte bound"
+            )
+        object.__setattr__(self, "sequence", sequence)
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "content_sha256", content_sha256)
+        object.__setattr__(self, "request_canonical", raw)
+        _register_identity(
+            self,
+            _accepted_blocked_binding_values(
+                sequence,
+                event_id,
+                content_sha256,
+                raw,
+            ),
+        )
+
+    @property
+    def request(self) -> RetentionBlockedV1:
+        binding = _accepted_blocked_binding_values(
+            self.sequence,
+            self.event_id,
+            self.content_sha256,
+            self.request_canonical,
+        )
+        _require_identity(self, binding, "accepted retention blocked")
+        request = decode_strict(
+            self.request_canonical,
+            RetentionBlockedV1,
+            _TOMBSTONE_MAX_BYTES,
+        )
+        if (
+            canonical_json(request.model_dump(mode="python"))
+            != self.request_canonical
+        ):
+            raise RetentionCorruption(
+                "prior blocked request is not canonical"
+            )
+        return request
+
+
+def _freeze_accepted_retention_blocked(
+    *,
+    sequence: int,
+    event_id: str,
+    content_sha256: str,
+    request: RetentionBlockedV1,
+) -> AcceptedRetentionBlocked:
+    return AcceptedRetentionBlocked(
+        sequence=sequence,
+        event_id=event_id,
+        content_sha256=content_sha256,
+        request=request,
+        _factory=_ACCEPTED_BLOCKED_FACTORY,
+    )
+
+
+def _accepted_blocked_binding(
+    accepted: AcceptedRetentionBlocked,
+) -> bytes:
+    if type(accepted) is not AcceptedRetentionBlocked:
+        raise RetentionCorruption(
+            "accepted retention blocked type changed"
+        )
+    binding = _accepted_blocked_binding_values(
+        accepted.sequence,
+        accepted.event_id,
+        accepted.content_sha256,
+        accepted.request_canonical,
+    )
+    _require_identity(accepted, binding, "accepted retention blocked")
+    return binding
+
+
 def _decimal_document(value: Decimal) -> dict[str, object]:
     parts = value.as_tuple()
     if type(parts.exponent) is not int:
@@ -784,12 +1006,14 @@ def _snapshot_binding_values(
     facts: object,
     clock: object,
     prior_tombstones: object,
+    prior_blocked: object,
     prior_index_through_sequence: object,
 ) -> bytes:
     if (
         type(facts) is not tuple
         or type(clock) is not CoreClockSample
         or type(prior_tombstones) is not tuple
+        or type(prior_blocked) is not tuple
         or type(prior_index_through_sequence) is not int
         or not 0 <= prior_index_through_sequence <= MAX_UINT64
     ):
@@ -808,6 +1032,14 @@ def _snapshot_binding_values(
             raise RetentionCorruption("retention snapshot prior identity changed")
         preimage.extend(id(accepted).to_bytes(8, "big", signed=False))
         preimage.extend(_accepted_binding(accepted))
+    preimage.extend(len(prior_blocked).to_bytes(8, "big"))
+    for accepted in prior_blocked:
+        if type(accepted) is not AcceptedRetentionBlocked:
+            raise RetentionCorruption(
+                "retention snapshot blocked identity changed"
+            )
+        preimage.extend(id(accepted).to_bytes(8, "big", signed=False))
+        preimage.extend(_accepted_blocked_binding(accepted))
     preimage.extend(prior_index_through_sequence.to_bytes(8, "big"))
     return hashlib.sha256(preimage).digest()
 
@@ -819,6 +1051,7 @@ class RetentionSnapshot:
     facts: tuple[FrozenRetentionFact, ...]
     clock: CoreClockSample
     prior_tombstones: tuple[AcceptedRetentionTombstone, ...] = ()
+    prior_blocked: tuple[AcceptedRetentionBlocked, ...] = ()
     prior_index_through_sequence: int = 0
 
     def __init__(
@@ -827,6 +1060,7 @@ class RetentionSnapshot:
         facts: tuple[FrozenRetentionFact, ...],
         clock: CoreClockSample,
         prior_tombstones: tuple[AcceptedRetentionTombstone, ...] = (),
+        prior_blocked: tuple[AcceptedRetentionBlocked, ...] = (),
         prior_index_through_sequence: int,
         _factory: object,
     ) -> None:
@@ -843,6 +1077,13 @@ class RetentionSnapshot:
             for item in prior_tombstones
         ):
             raise RetentionCorruption("retention prior authority is not exact")
+        if type(prior_blocked) is not tuple or any(
+            type(item) is not AcceptedRetentionBlocked
+            for item in prior_blocked
+        ):
+            raise RetentionCorruption(
+                "retention prior blocked authority is not exact"
+            )
         if (
             type(prior_index_through_sequence) is not int
             or not 0 <= prior_index_through_sequence <= MAX_UINT64
@@ -850,9 +1091,17 @@ class RetentionSnapshot:
             raise RetentionCorruption(
                 "retention prior-index prefix is not exact"
             )
-        if prior_tombstones and max(
-            item.sequence for item in prior_tombstones
-        ) > prior_index_through_sequence:
+        latest_prior_sequence = max(
+            max(
+                (item.sequence for item in prior_tombstones),
+                default=0,
+            ),
+            max(
+                (item.sequence for item in prior_blocked),
+                default=0,
+            ),
+        )
+        if latest_prior_sequence > prior_index_through_sequence:
             raise RetentionCorruption(
                 "retention prior-index prefix precedes prior authority"
             )
@@ -868,9 +1117,11 @@ class RetentionSnapshot:
             raise RetentionCorruption("retention snapshot clock is invalid") from error
         frozen_facts = tuple(facts)
         frozen_prior = tuple(prior_tombstones)
+        frozen_blocked = tuple(prior_blocked)
         object.__setattr__(self, "facts", frozen_facts)
         object.__setattr__(self, "clock", frozen_clock)
         object.__setattr__(self, "prior_tombstones", frozen_prior)
+        object.__setattr__(self, "prior_blocked", frozen_blocked)
         object.__setattr__(
             self,
             "prior_index_through_sequence",
@@ -882,6 +1133,7 @@ class RetentionSnapshot:
                 frozen_facts,
                 frozen_clock,
                 frozen_prior,
+                frozen_blocked,
                 prior_index_through_sequence,
             ),
         )
@@ -894,6 +1146,7 @@ class RetentionSnapshot:
                 self.facts,
                 self.clock,
                 self.prior_tombstones,
+                self.prior_blocked,
                 self.prior_index_through_sequence,
             ),
             "retention snapshot",
@@ -908,12 +1161,14 @@ def _freeze_retention_snapshot(
     facts: tuple[FrozenRetentionFact, ...],
     clock: CoreClockSample,
     prior_tombstones: tuple[AcceptedRetentionTombstone, ...] = (),
+    prior_blocked: tuple[AcceptedRetentionBlocked, ...] = (),
     prior_index_through_sequence: int,
 ) -> RetentionSnapshot:
     return RetentionSnapshot(
         facts=facts,
         clock=clock,
         prior_tombstones=prior_tombstones,
+        prior_blocked=prior_blocked,
         prior_index_through_sequence=prior_index_through_sequence,
         _factory=_SNAPSHOT_FACTORY,
     )
@@ -926,6 +1181,7 @@ def _snapshot_binding(snapshot: RetentionSnapshot) -> bytes:
         snapshot.facts,
         snapshot.clock,
         snapshot.prior_tombstones,
+        snapshot.prior_blocked,
         snapshot.prior_index_through_sequence,
     )
     _require_identity(snapshot, binding, "retention snapshot")
@@ -1078,6 +1334,7 @@ def _decision_binding_values(
     request_kind: object,
     request_canonical: object,
     run: object,
+    reused_blocked: object,
     decision_utc: object,
     clock_healthy: object,
     age_selection_enabled: object,
@@ -1102,6 +1359,13 @@ def _decision_binding_values(
         raise RetentionCorruption("retention decision request bytes changed")
     if run is not None and type(run) is not RetentionRun:
         raise RetentionCorruption("retention decision run identity changed")
+    if (
+        reused_blocked is not None
+        and type(reused_blocked) is not AcceptedRetentionBlocked
+    ):
+        raise RetentionCorruption(
+            "retention decision reused blocked identity changed"
+        )
     if type(snapshot) is not RetentionSnapshot:
         raise RetentionCorruption("retention decision snapshot identity changed")
     if type(removable_event_types) is not tuple or type(run_domain) is not bytes:
@@ -1111,6 +1375,11 @@ def _decision_binding_values(
     if run is not None:
         run_identity = id(run)
         run_binding = _run_binding(run)
+    reused_identity = None
+    reused_binding = b""
+    if reused_blocked is not None:
+        reused_identity = id(reused_blocked)
+        reused_binding = _accepted_blocked_binding(reused_blocked)
     try:
         document = canonical_json(
             {
@@ -1122,6 +1391,7 @@ def _decision_binding_values(
                     else None
                 ),
                 "run_identity": run_identity,
+                "reused_blocked_identity": reused_identity,
                 "decision_utc": decision_utc,
                 "clock_healthy": clock_healthy,
                 "age_selection_enabled": age_selection_enabled,
@@ -1154,6 +1424,7 @@ def _decision_binding_values(
         + _framed(request_canonical or b"")
         + _framed(run_domain)
         + run_binding
+        + reused_binding
     ).digest()
 
 
@@ -1165,6 +1436,7 @@ class RetentionDecision:
     _request_kind: _RequestKind | None
     _request_canonical: bytes | None
     _run: RetentionRun | None
+    _reused_blocked: AcceptedRetentionBlocked | None
     _decision_utc: str
     _clock_healthy: bool
     _age_selection_enabled: bool
@@ -1192,6 +1464,7 @@ class RetentionDecision:
         request_kind: _RequestKind | None,
         request_canonical: bytes | None,
         run: RetentionRun | None,
+        reused_blocked: AcceptedRetentionBlocked | None,
         decision_utc: str,
         clock_healthy: bool,
         age_selection_enabled: bool,
@@ -1229,6 +1502,7 @@ class RetentionDecision:
         object.__setattr__(self, "_request_kind", request_kind)
         object.__setattr__(self, "_request_canonical", request_canonical)
         object.__setattr__(self, "_run", run)
+        object.__setattr__(self, "_reused_blocked", reused_blocked)
         object.__setattr__(self, "_decision_utc", decision_utc)
         object.__setattr__(self, "_clock_healthy", clock_healthy)
         object.__setattr__(
@@ -1281,6 +1555,11 @@ class RetentionDecision:
     def run(self) -> RetentionRun | None:
         self._request()
         return self._run
+
+    @property
+    def reused_blocked(self) -> AcceptedRetentionBlocked | None:
+        self._request()
+        return self._reused_blocked
 
     @property
     def decision_utc(self) -> str:
@@ -1360,6 +1639,7 @@ def _decision_binding(
         request_kind=decision._request_kind,
         request_canonical=decision._request_canonical,
         run=decision._run,
+        reused_blocked=decision._reused_blocked,
         decision_utc=decision._decision_utc,
         clock_healthy=decision._clock_healthy,
         age_selection_enabled=decision._age_selection_enabled,
@@ -1462,14 +1742,73 @@ def _validated_decision_request(
 
     raw = decision._request_canonical
     if decision._request_kind is None:
+        reused = decision._reused_blocked
+        if raw is not None or decision._run is not None:
+            raise RetentionCorruption(
+                "empty retention decision is inconsistent"
+            )
+        if reused is None:
+            if decision._age_pressure or decision._size_pressure:
+                raise RetentionCorruption(
+                    "empty retention decision is inconsistent"
+                )
+            return None
         if (
-            raw is not None
-            or decision._run is not None
+            type(reused) is not AcceptedRetentionBlocked
             or decision._age_pressure
-            or decision._size_pressure
+            or not decision._size_pressure
+            or not any(
+                item is reused
+                for item in decision._snapshot.prior_blocked
+            )
         ):
-            raise RetentionCorruption("empty retention decision is inconsistent")
+            raise RetentionCorruption(
+                "reused blocked decision is inconsistent"
+            )
+        outcomes = _validated_retention_outcomes(
+            tuple(
+                _validate_fact(
+                    fact,
+                    removable_event_types=frozenset(
+                        decision._removable_event_types
+                    ),
+                )
+                for fact in decision._snapshot.facts
+            ),
+            decision._snapshot.prior_tombstones,
+            decision._snapshot.prior_blocked,
+            through_sequence=(
+                decision._snapshot.prior_index_through_sequence
+            ),
+        )
+        if not outcomes or outcomes[-1] is not reused:
+            raise RetentionCorruption(
+                "reused blocked decision is not the latest outcome"
+            )
+        reused_request = reused.request
+        if (
+            _blocked_episode_key(reused_request)
+            != (
+                decision._target_bytes,
+                decision._routine_bytes,
+                decision._protected_bytes,
+                decision._total_bytes - decision._target_bytes,
+                "protected_evidence",
+            )
+            or reused_request.current_chain_head_sha256
+            not in {
+                fact.prefix_chain_head_sha256
+                for fact in decision._snapshot.facts
+            }
+        ):
+            raise RetentionCorruption(
+                "reused blocked decision changed its episode"
+            )
         return None
+    if decision._reused_blocked is not None:
+        raise RetentionCorruption(
+            "published retention decision also reuses blocked authority"
+        )
     if type(raw) is not bytes or not raw or len(raw) > _TOMBSTONE_MAX_BYTES:
         raise RetentionCorruption("retention decision request bytes are invalid")
     try:
@@ -1551,6 +1890,7 @@ def _freeze_retention_decision(
     request_kind: _RequestKind | None,
     request_canonical: bytes | None,
     run: RetentionRun | None,
+    reused_blocked: AcceptedRetentionBlocked | None,
     decision_utc: str,
     clock_healthy: bool,
     age_selection_enabled: bool,
@@ -1576,6 +1916,7 @@ def _freeze_retention_decision(
         request_kind=request_kind,
         request_canonical=request_canonical,
         run=run,
+        reused_blocked=reused_blocked,
         decision_utc=decision_utc,
         clock_healthy=clock_healthy,
         age_selection_enabled=age_selection_enabled,
@@ -1602,6 +1943,15 @@ def _freeze_retention_decision(
 
 
 @dataclass(frozen=True, slots=True)
+class _ValidatedRetentionRecord:
+    event_type: str
+    source_sequence: int
+    event_id: str
+    content_sha256: str
+    frame_size: int
+
+
+@dataclass(frozen=True, slots=True)
 class _ValidatedFact:
     manifest_sha256: str
     previous_manifest_sha256: str
@@ -1615,6 +1965,7 @@ class _ValidatedFact:
     original_inode: int
     closed_ns: int
     removable: bool
+    records: tuple[_ValidatedRetentionRecord, ...]
 
 
 def _validate_clock(sample: CoreClockSample) -> CoreClockSample:
@@ -1688,6 +2039,8 @@ def _validate_fact(
         raise RetentionCorruption("retention fact record tuple is invalid")
     if len(fact.records) != fact.record_count:
         raise RetentionCorruption("retention fact record count changed")
+    validated_records: list[_ValidatedRetentionRecord] = []
+    frame_bytes = 0
     for record in fact.records:
         if not _is_printable_ascii(record.event_type):
             raise RetentionCorruption("retention record event type changed")
@@ -1702,6 +2055,62 @@ def _validate_fact(
             )
         if record.evidence_priority != fact.evidence_priority:
             raise RetentionCorruption("record priority differs from manifest priority")
+        if (
+            type(record.source_sequence) is not int
+            or not 1 <= record.source_sequence <= MAX_UINT64
+            or type(record.event_id) is not str
+            or _EVENT_ID.fullmatch(record.event_id) is None
+            or type(record.content_sha256) is not str
+            or HEX64.fullmatch(record.content_sha256) is None
+            or type(record.frame_size) is not int
+            or not 1 <= record.frame_size <= MAX_UINT64
+        ):
+            raise RetentionCorruption(
+                "retention record outer identity or frame size changed"
+            )
+        frame_bytes = _checked_add(
+            frame_bytes,
+            record.frame_size,
+            "retention record frame bytes",
+        )
+        validated_records.append(
+            _ValidatedRetentionRecord(
+                event_type=record.event_type,
+                source_sequence=record.source_sequence,
+                event_id=record.event_id,
+                content_sha256=record.content_sha256,
+                frame_size=record.frame_size,
+            )
+        )
+    if frame_bytes != fact.segment_size_bytes:
+        raise RetentionCorruption(
+            "retention record frame bytes differ from manifest"
+        )
+    record_outers = {
+        (
+            record.source_sequence,
+            record.event_id,
+            record.content_sha256,
+        )
+        for record in validated_records
+    }
+    if (
+        not validated_records
+        or len(record_outers) != len(validated_records)
+        or validated_records[0].source_sequence
+        != manifest.first_source_sequence
+        or validated_records[-1].source_sequence
+        != manifest.last_source_sequence
+        or validated_records[0].event_id != manifest.first_event_id
+        or validated_records[-1].event_id != manifest.last_event_id
+        or any(
+            left.source_sequence >= right.source_sequence
+            for left, right in pairwise(validated_records)
+        )
+    ):
+        raise RetentionCorruption(
+            "retention record order or endpoints differ from manifest"
+        )
     removable = (
         fact.evidence_priority == "routine"
         and (
@@ -1728,6 +2137,7 @@ def _validate_fact(
         original_inode=fact.original_inode,
         closed_ns=_timestamp_ns(fact.closed_at),
         removable=removable,
+        records=tuple(validated_records),
     )
 
 
@@ -1740,11 +2150,16 @@ def _validate_snapshot(
     tuple[_ValidatedFact, ...],
     CoreClockSample,
     tuple[AcceptedRetentionTombstone, ...],
+    tuple[AcceptedRetentionBlocked, ...],
 ]:
     if type(snapshot) is not RetentionSnapshot:
         raise RetentionCorruption("retention snapshot type is invalid")
     _snapshot_binding(snapshot)
-    if type(snapshot.facts) is not tuple or type(snapshot.prior_tombstones) is not tuple:
+    if (
+        type(snapshot.facts) is not tuple
+        or type(snapshot.prior_tombstones) is not tuple
+        or type(snapshot.prior_blocked) is not tuple
+    ):
         raise RetentionCorruption("retention snapshot collections changed")
     clock = _validate_clock(snapshot.clock)
     validated: list[_ValidatedFact] = []
@@ -1753,6 +2168,7 @@ def _validate_snapshot(
     prefix_heads: set[str] = set()
     segment_ids: set[str] = set()
     segment_paths: set[str] = set()
+    record_outers: set[tuple[int, str, str]] = set()
     for fact in snapshot.facts:
         item = _validate_fact(
             fact,
@@ -1768,6 +2184,17 @@ def _validate_snapshot(
             raise RetentionCorruption("retention segment identity is not unique")
         if item.segment_relative_path in segment_paths:
             raise RetentionCorruption("retention segment path is not unique")
+        for record in item.records:
+            outer = (
+                record.source_sequence,
+                record.event_id,
+                record.content_sha256,
+            )
+            if outer in record_outers:
+                raise RetentionCorruption(
+                    "retention record outer identity is not unique"
+                )
+            record_outers.add(outer)
         manifest_hashes.add(item.manifest_sha256)
         prefix_heads.add(item.prefix_chain_head_sha256)
         segment_ids.add(item.segment_id)
@@ -1779,7 +2206,23 @@ def _validate_snapshot(
         for item in snapshot.prior_tombstones
     ):
         raise RetentionCorruption("retention prior authority changed")
-    return tuple(validated), clock, tuple(snapshot.prior_tombstones)
+    if any(
+        type(item) is not AcceptedRetentionBlocked
+        for item in snapshot.prior_blocked
+    ):
+        raise RetentionCorruption(
+            "retention prior blocked authority changed"
+        )
+    facts = tuple(validated)
+    prior = tuple(snapshot.prior_tombstones)
+    blocked = tuple(snapshot.prior_blocked)
+    _validated_retention_outcomes(
+        facts,
+        prior,
+        blocked,
+        through_sequence=snapshot.prior_index_through_sequence,
+    )
+    return facts, clock, prior, blocked
 
 
 def _validated_prior(
@@ -1813,6 +2256,160 @@ def _validated_prior(
         accepted.request_canonical,
         (accepted.sequence, accepted.event_id, accepted.content_sha256),
     )
+
+
+def _validated_prior_blocked(
+    accepted: AcceptedRetentionBlocked,
+) -> tuple[RetentionBlockedV1, bytes, tuple[int, str, str]]:
+    if type(accepted) is not AcceptedRetentionBlocked:
+        raise RetentionCorruption(
+            "prior blocked runtime type changed"
+        )
+    _accepted_blocked_binding(accepted)
+    if (
+        type(accepted.sequence) is not int
+        or not 1 <= accepted.sequence <= MAX_UINT64
+        or type(accepted.event_id) is not str
+        or _EVENT_ID.fullmatch(accepted.event_id) is None
+        or type(accepted.content_sha256) is not str
+        or HEX64.fullmatch(accepted.content_sha256) is None
+        or type(accepted.request_canonical) is not bytes
+    ):
+        raise RetentionCorruption("prior blocked outer identity changed")
+    try:
+        request = decode_strict(
+            accepted.request_canonical,
+            RetentionBlockedV1,
+            _TOMBSTONE_MAX_BYTES,
+        )
+    except (TypeError, ValueError) as error:
+        raise RetentionCorruption(
+            "prior blocked request bytes changed"
+        ) from error
+    if (
+        canonical_json(request.model_dump(mode="python"))
+        != accepted.request_canonical
+    ):
+        raise RetentionCorruption(
+            "prior blocked request is not canonical"
+        )
+    return (
+        request,
+        accepted.request_canonical,
+        (
+            accepted.sequence,
+            accepted.event_id,
+            accepted.content_sha256,
+        ),
+    )
+
+
+def _validated_retention_outcomes(
+    facts: tuple[_ValidatedFact, ...],
+    prior: tuple[AcceptedRetentionTombstone, ...],
+    blocked: tuple[AcceptedRetentionBlocked, ...],
+    *,
+    through_sequence: int,
+) -> tuple[AcceptedRetentionTombstone | AcceptedRetentionBlocked, ...]:
+    if (
+        type(through_sequence) is not int
+        or not 0 <= through_sequence <= MAX_UINT64
+    ):
+        raise RetentionCorruption(
+            "retention outcome prefix is invalid"
+        )
+    prefix_heads = {
+        fact.prefix_chain_head_sha256 for fact in facts
+    }
+    prefix_heads.add("0" * 64)
+    outcomes: list[
+        AcceptedRetentionTombstone | AcceptedRetentionBlocked
+    ] = []
+    seen_sequences: dict[
+        int,
+        tuple[str, bytes, tuple[int, str, str]],
+    ] = {}
+    seen_ids: dict[
+        str,
+        tuple[str, bytes, tuple[int, str, str]],
+    ] = {}
+
+    def register(
+        accepted: AcceptedRetentionTombstone | AcceptedRetentionBlocked,
+        *,
+        kind: Literal["tombstone", "blocked"],
+        request_id: str,
+        request_raw: bytes,
+        outer: tuple[int, str, str],
+        h0: str,
+    ) -> None:
+        if accepted.sequence > through_sequence:
+            raise RetentionCorruption(
+                "retention outcome exceeds its authenticated prefix"
+            )
+        if h0 not in prefix_heads:
+            raise RetentionCorruption(
+                "retention outcome H0 is not a historical prefix"
+            )
+        exact = (kind, request_raw, outer)
+        existing_sequence = seen_sequences.get(accepted.sequence)
+        if existing_sequence is not None:
+            if existing_sequence != exact:
+                raise RetentionCorruption(
+                    "retention outcomes conflict at one source sequence"
+                )
+            return
+        existing_id = seen_ids.get(request_id)
+        if existing_id is not None:
+            if existing_id != exact:
+                raise RetentionCorruption(
+                    "retention outcome ID has conflicting authority"
+                )
+            return
+        seen_sequences[accepted.sequence] = exact
+        seen_ids[request_id] = exact
+        outcomes.append(accepted)
+
+    previous = 0
+    for accepted in prior:
+        request, request_raw, outer = _validated_prior(accepted)
+        if accepted.sequence <= previous:
+            raise RetentionCorruption(
+                "prior tombstone evidence order is invalid"
+            )
+        previous = accepted.sequence
+        register(
+            accepted,
+            kind="tombstone",
+            request_id=request.tombstone_id,
+            request_raw=request_raw,
+            outer=outer,
+            h0=request.current_chain_head_sha256,
+        )
+
+    previous = 0
+    for blocked_accepted in blocked:
+        blocked_request, blocked_raw, blocked_outer = (
+            _validated_prior_blocked(
+                blocked_accepted
+            )
+        )
+        if blocked_accepted.sequence <= previous:
+            raise RetentionCorruption(
+                "prior blocked evidence order is invalid"
+            )
+        previous = blocked_accepted.sequence
+        register(
+            blocked_accepted,
+            kind="blocked",
+            request_id=blocked_request.blocked_id,
+            request_raw=blocked_raw,
+            outer=blocked_outer,
+            h0=blocked_request.current_chain_head_sha256,
+        )
+
+    outcomes.sort(key=lambda item: item.sequence)
+    return tuple(outcomes)
 
 
 def _prior_index_commitment(
@@ -2028,11 +2625,37 @@ def _request_bytes(request: RetentionRequest | None) -> tuple[_RequestKind | Non
     return kind, canonical_json(request.model_dump(mode="python"))
 
 
+def _blocked_episode_key(
+    request: RetentionBlockedV1,
+) -> tuple[int, int, int, int, str]:
+    if type(request) is not RetentionBlockedV1:
+        raise RetentionCorruption(
+            "blocked episode requires an exact request"
+        )
+    try:
+        validated = RetentionBlockedV1.model_validate(
+            request.model_dump(mode="python"),
+            strict=True,
+        )
+    except (TypeError, ValueError, ValidationError) as error:
+        raise RetentionCorruption(
+            "blocked episode request is invalid"
+        ) from error
+    return (
+        validated.target_bytes,
+        validated.routine_bytes,
+        validated.protected_bytes,
+        validated.blocked_bytes,
+        validated.reason,
+    )
+
+
 def _decision(
     *,
     snapshot: RetentionSnapshot,
     request: RetentionRequest | None,
     run: RetentionRun | None,
+    reused_blocked: AcceptedRetentionBlocked | None,
     clock: CoreClockSample,
     age_enabled: bool,
     uncertainty_ns: int | None,
@@ -2057,6 +2680,7 @@ def _decision(
         request_kind=kind,
         request_canonical=raw,
         run=run,
+        reused_blocked=reused_blocked,
         decision_utc=_decision_utc_text(clock.decision_utc),
         clock_healthy=clock.healthy,
         age_selection_enabled=age_enabled,
@@ -2081,10 +2705,16 @@ def _decision(
     )
 
 
+def _validated_retention_request_id(candidate: object) -> str:
+    if type(candidate) is not str or UUID4.fullmatch(candidate) is None:
+        raise RetentionCorruption("retention request ID must be lowercase UUIDv4")
+    return candidate
+
+
 def _select_retention(
     snapshot: RetentionSnapshot,
     *,
-    request_id: str,
+    request_id_factory: Callable[[], object],
     target_bytes: int,
     maximum_age_ns: int,
     maximum_run_manifests: int,
@@ -2093,9 +2723,15 @@ def _select_retention(
     run_domain: bytes,
     zero_sha256: str,
 ) -> RetentionDecision:
-    if type(request_id) is not str or UUID4.fullmatch(request_id) is None:
-        raise RetentionCorruption("retention request ID must be lowercase UUIDv4")
-    facts, clock, prior = _validate_snapshot(
+    request_id: str | None = None
+
+    def materialize_request_id() -> str:
+        nonlocal request_id
+        if request_id is None:
+            request_id = _validated_retention_request_id(request_id_factory())
+        return request_id
+
+    facts, clock, prior, prior_blocked = _validate_snapshot(
         snapshot,
         removable_event_types=removable_event_types,
         genesis_manifest_sha256=zero_sha256,
@@ -2122,6 +2758,38 @@ def _select_retention(
         else None
     )
 
+    prior_blocked_outer_counts: dict[tuple[int, str, str], int] = {}
+    for accepted in prior_blocked:
+        outer = (
+            accepted.sequence,
+            accepted.event_id,
+            accepted.content_sha256,
+        )
+        prior_blocked_outer_counts[outer] = (
+            prior_blocked_outer_counts.get(outer, 0) + 1
+        )
+    report_outer_counts: dict[tuple[int, str, str], int] = {}
+    for item in facts:
+        if item.evidence_priority != "protected":
+            continue
+        for record in item.records:
+            if (
+                record.event_type
+                != "retention_blocked_priority_evidence"
+            ):
+                continue
+            outer = (
+                record.source_sequence,
+                record.event_id,
+                record.content_sha256,
+            )
+            report_outer_counts[outer] = report_outer_counts.get(outer, 0) + 1
+    neutral_report_outers = {
+        outer
+        for outer, count in report_outer_counts.items()
+        if count == 1 and prior_blocked_outer_counts.get(outer) == 1
+    }
+
     routine_bytes = 0
     protected_bytes = 0
     for index, item in enumerate(facts):
@@ -2134,9 +2802,26 @@ def _select_retention(
                 "routine bytes",
             )
         else:
+            pressure_bytes = item.segment_size_bytes
+            for record in item.records:
+                outer = (
+                    record.source_sequence,
+                    record.event_id,
+                    record.content_sha256,
+                )
+                if (
+                    record.event_type
+                    == "retention_blocked_priority_evidence"
+                    and outer in neutral_report_outers
+                ):
+                    pressure_bytes = _checked_sub(
+                        pressure_bytes,
+                        record.frame_size,
+                        "protected report frame bytes",
+                    )
             protected_bytes = _checked_add(
                 protected_bytes,
-                item.segment_size_bytes,
+                pressure_bytes,
                 "protected bytes",
             )
     total_bytes = _checked_add(routine_bytes, protected_bytes, "closed payload bytes")
@@ -2218,7 +2903,7 @@ def _select_retention(
         hash_list = list(manifest_hashes)
         request = RetentionTombstoneV2(
             schema_version="agmind.retention-tombstone.v2",
-            tombstone_id=request_id,
+            tombstone_id=materialize_request_id(),
             removed_manifest_hashes=hash_list,
             first_removed_manifest_sha256=hash_list[0],
             last_removed_manifest_sha256=hash_list[-1],
@@ -2235,6 +2920,7 @@ def _select_retention(
             snapshot=snapshot,
             request=request,
             run=run,
+            reused_blocked=None,
             clock=clock,
             age_enabled=age_enabled,
             uncertainty_ns=uncertainty_ns,
@@ -2255,25 +2941,48 @@ def _select_retention(
         )
 
     blocked: RetentionBlockedV1 | None = None
+    reused_blocked: AcceptedRetentionBlocked | None = None
     if total_bytes > target_bytes:
-        blocked = RetentionBlockedV1(
-            schema_version="agmind.retention-blocked.v1",
-            blocked_id=request_id,
-            target_bytes=target_bytes,
-            routine_bytes=routine_bytes,
-            protected_bytes=protected_bytes,
-            blocked_bytes=_checked_sub(
-                total_bytes,
-                target_bytes,
-                "blocked bytes",
-            ),
-            reason="protected_evidence",
-            current_chain_head_sha256=current_head,
+        blocked_bytes = _checked_sub(
+            total_bytes,
+            target_bytes,
+            "blocked bytes",
         )
+        outcomes = _validated_retention_outcomes(
+            facts,
+            prior,
+            prior_blocked,
+            through_sequence=snapshot.prior_index_through_sequence,
+        )
+        if (
+            outcomes
+            and type(outcomes[-1]) is AcceptedRetentionBlocked
+            and _blocked_episode_key(outcomes[-1].request)
+            == (
+                target_bytes,
+                routine_bytes,
+                protected_bytes,
+                blocked_bytes,
+                "protected_evidence",
+            )
+        ):
+            reused_blocked = outcomes[-1]
+        else:
+            blocked = RetentionBlockedV1(
+                schema_version="agmind.retention-blocked.v1",
+                blocked_id=materialize_request_id(),
+                target_bytes=target_bytes,
+                routine_bytes=routine_bytes,
+                protected_bytes=protected_bytes,
+                blocked_bytes=blocked_bytes,
+                reason="protected_evidence",
+                current_chain_head_sha256=current_head,
+            )
     return _decision(
         snapshot=snapshot,
         request=blocked,
         run=None,
+        reused_blocked=reused_blocked,
         clock=clock,
         age_enabled=age_enabled,
         uncertainty_ns=uncertainty_ns,
@@ -2294,12 +3003,12 @@ def _select_retention(
     )
 
 
-class _RetentionSelector(Protocol):
+class _LazyRetentionSelector(Protocol):
     def __call__(
         self,
         snapshot: RetentionSnapshot,
         *,
-        request_id: str,
+        request_id_factory: Callable[[], object],
     ) -> RetentionDecision: ...
 
 
@@ -2312,7 +3021,7 @@ def _make_retention_selector(
     policy_version: Literal["agmind-retention-v1"],
     run_domain: bytes,
     zero_sha256: str,
-) -> _RetentionSelector:
+) -> _LazyRetentionSelector:
     if (
         type(target_bytes) is not int
         or not 1 <= target_bytes <= MAX_UINT64
@@ -2334,11 +3043,11 @@ def _make_retention_selector(
     def selector(
         snapshot: RetentionSnapshot,
         *,
-        request_id: str,
+        request_id_factory: Callable[[], object],
     ) -> RetentionDecision:
         return _select_retention(
             snapshot,
-            request_id=request_id,
+            request_id_factory=request_id_factory,
             target_bytes=target_bytes,
             maximum_age_ns=maximum_age_ns,
             maximum_run_manifests=maximum_run_manifests,
@@ -2351,7 +3060,7 @@ def _make_retention_selector(
     return selector
 
 
-select_retention: _RetentionSelector = _make_retention_selector(
+_production_retention_selector = _make_retention_selector(
     target_bytes=5 * 1024**3,
     maximum_age_ns=7 * 24 * 60 * 60 * 1_000_000_000,
     maximum_run_manifests=128,
@@ -2360,6 +3069,35 @@ select_retention: _RetentionSelector = _make_retention_selector(
     run_domain=b"AGMIND_RETENTION_RUN_V2\x00",
     zero_sha256="0" * 64,
 )
+
+
+def select_retention(
+    snapshot: RetentionSnapshot,
+    *,
+    request_id: str,
+) -> RetentionDecision:
+    """Select retention with an eagerly validated caller-owned request ID."""
+    validated_request_id = _validated_retention_request_id(request_id)
+    return _production_retention_selector(
+        snapshot,
+        request_id_factory=lambda: validated_request_id,
+    )
+
+
+def _new_retention_request_id() -> str:
+    return str(uuid4())
+
+
+def _select_retention_lazily(
+    snapshot: RetentionSnapshot,
+    *,
+    request_id_factory: Callable[[], object] = _new_retention_request_id,
+) -> RetentionDecision:
+    """Select retention without minting an ID for empty or reused output."""
+    return _production_retention_selector(
+        snapshot,
+        request_id_factory=request_id_factory,
+    )
 
 
 class RetentionBoundaryEntryV1(ContractModel):
@@ -2533,7 +3271,7 @@ def _retention_boundary_cache_bytes(
         raise RetentionCorruption(
             "retention boundary source evidence head is invalid"
         )
-    facts, _clock, prior = _validate_snapshot(
+    facts, _clock, prior, _prior_blocked = _validate_snapshot(
         snapshot,
         removable_event_types=frozenset({"falco_connect"}),
         genesis_manifest_sha256="0" * 64,
@@ -2956,7 +3694,7 @@ def selected_retention_state(
 ) -> RetentionStateV1:
     request = _require_production_decision(decision)
     snapshot = decision._snapshot
-    facts, _, _ = _validate_snapshot(
+    facts, _, _, _ = _validate_snapshot(
         snapshot,
         removable_event_types=frozenset({"falco_connect"}),
         genesis_manifest_sha256="0" * 64,
@@ -3708,10 +4446,12 @@ def _authenticate_store_retention_tombstone(
             "final retention proof target envelope is invalid"
         ) from error
 
-    facts, final_clock, current_prior = _validate_snapshot(
-        snapshot,
-        removable_event_types=frozenset({"falco_connect"}),
-        genesis_manifest_sha256="0" * 64,
+    facts, final_clock, current_prior, _current_blocked = (
+        _validate_snapshot(
+            snapshot,
+            removable_event_types=frozenset({"falco_connect"}),
+            genesis_manifest_sha256="0" * 64,
+        )
     )
     h0_matches = tuple(
         index
@@ -3851,11 +4591,16 @@ def _authenticate_store_retention_tombstone(
         facts=tuple(snapshot.facts[: h0_tip + 1]),
         clock=persisted_clock,
         prior_tombstones=tuple(selector_prior),
+        prior_blocked=tuple(
+            accepted
+            for accepted in snapshot.prior_blocked
+            if accepted.sequence <= through
+        ),
         prior_index_through_sequence=through,
     )
     rerun = _select_retention(
         selector_snapshot,
-        request_id=request.tombstone_id,
+        request_id_factory=lambda: request.tombstone_id,
         target_bytes=5 * 1024**3,
         maximum_age_ns=7 * 24 * 60 * 60 * 1_000_000_000,
         maximum_run_manifests=128,

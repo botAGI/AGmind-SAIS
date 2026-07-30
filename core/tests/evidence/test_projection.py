@@ -10,12 +10,14 @@ from typing import Any
 import pytest
 from agmind_immune.canonicaljson import canonical_json, release_id
 from agmind_immune.contracts import ObserverTrustRootV1
+from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.segments import (
     EvidencePriority,
     EvidenceRef,
     SegmentStore,
     StoredEvidenceRecord,
 )
+from agmind_immune.ingest import service as service_module
 from agmind_immune.ingest.ack_journal import AckJournal
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
@@ -572,3 +574,347 @@ def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
     assert interrupt._healthy
     interrupt.close()
     interrupt_store.close()
+
+
+def test_projection_open_rejects_corruption_without_retired_ranges(
+    tmp_path: Path,
+) -> None:
+    projection = _projection()
+    coordinator, store, acknowledgements = _system(
+        tmp_path / "ordinary" / "evidence"
+    )
+    projection_path = tmp_path / "ordinary" / "projection.sqlite3"
+    cache = None
+    try:
+        ref = _accept(coordinator, boot_boundary(private_key(11)))
+        _confirm(acknowledgements, ref)
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=store,
+            acknowledgements=acknowledgements,
+        )
+        cache.apply(ref)
+        cache.close()
+        cache = None
+
+        with sqlite3.connect(projection_path) as connection:
+            connection.execute(
+                "UPDATE events SET event_type='tampered' WHERE event_id=?",
+                (ref.event_id,),
+            )
+
+        with pytest.raises(
+            projection.ProjectionConflict,
+            match="does not match authenticated prefix",
+        ):
+            projection.ProjectionStore.open(
+                projection_path,
+                evidence=store,
+                acknowledgements=acknowledgements,
+            )
+    finally:
+        if cache is not None:
+            cache.close()
+        acknowledgements.close()
+        store.close(flush=False)
+
+
+def test_projection_open_rejects_surviving_tamper_after_retention(
+    tmp_path: Path,
+) -> None:
+    from tests.evidence.test_retention_unlink import _issued_case
+
+    projection = _projection()
+    case, capability = _issued_case(tmp_path / "retained")
+    acknowledgements = case.store._ack_journal_owner
+    assert type(acknowledgements) is AckJournal
+    projection_path = tmp_path / "retained" / "projection.sqlite3"
+    cache = None
+    try:
+        refs = tuple(
+            record.ref
+            for record in case.store.iter_authenticated_records()
+        )
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+        for ref in refs:
+            cache.apply(ref)
+        case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        assert cache._connection is not None
+        cache._connection.execute(
+            "UPDATE events SET event_type='tampered' WHERE source_sequence=?",
+            (projection._uint64(1),),
+        )
+        cache.close()
+        cache = None
+
+        with pytest.raises(
+            projection.ProjectionConflict,
+            match="authenticated surviving evidence",
+        ):
+            projection.ProjectionStore.open(
+                projection_path,
+                evidence=case.store,
+                acknowledgements=acknowledgements,
+            )
+    finally:
+        if cache is not None:
+            cache.close()
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def _retention_case_with_surviving_falco(
+    path: Path,
+    *,
+    raw_hash: str,
+) -> tuple[Any, object, AckJournal, tuple[EvidenceRef, ...]]:
+    from tests.evidence.test_retention import (
+        _proof_clock,
+        _retention_proof_case,
+    )
+
+    path.parent.mkdir(parents=True, mode=0o700)
+    path.parent.chmod(0o700)
+    case = _retention_proof_case(path, acknowledge=True)
+    verifier = case.store._bound_verifier
+    assert type(verifier) is EnvelopeVerifier
+    acceptance = AcceptanceCoordinator(
+        verifier,
+        case.store,
+        _factory=service_module._COORDINATOR_FACTORY,
+    )
+    survivor = _accept(
+        acceptance,
+        envelope_value(
+            private_key(11),
+            sequence=4,
+            event_type="falco_connect",
+            normalized_fields=_falco_fields(raw_hash),
+            source_payload_hash=raw_hash,
+            container_id="a" * 64,
+            container_start_time=NOW,
+            release_id=release_id(f"sha256:{'b' * 64}", "d" * 64),
+            inventory_revision=2**63,
+        ),
+    )
+    case.coverage._apply_live_accepted(case.store, survivor, None)
+    acknowledgements = case.store._ack_journal_owner
+    assert type(acknowledgements) is AckJournal
+    _confirm(acknowledgements, survivor)
+    final_snapshot = case.store._freeze_retention_snapshot(
+        _proof_clock(seconds=2),
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    capability = case.store._authenticate_retention_tombstone(
+        case.journal,
+        final_snapshot,
+        case.target_ref,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    refs = tuple(
+        record.ref
+        for record in case.store.iter_authenticated_records()
+    )
+    assert [ref.source_sequence for ref in refs] == [1, 2, 3, 4]
+    return case, capability, acknowledgements, refs
+
+
+def test_projection_open_promotes_surviving_duplicate_after_primary_retired(
+    tmp_path: Path,
+) -> None:
+    projection = _projection()
+    raw_hash = hashlib.sha256(b"retention proof routine").hexdigest()
+    case, capability, acknowledgements, refs = (
+        _retention_case_with_surviving_falco(
+            tmp_path / "dedup-promotion" / "evidence",
+            raw_hash=raw_hash,
+        )
+    )
+    projection_path = (
+        tmp_path / "dedup-promotion" / "projection.sqlite3"
+    )
+    cache = None
+    reopened = None
+    try:
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+        for ref in refs:
+            cache.apply(ref)
+        assert cache._connection is not None
+        assert tuple(
+            cache._connection.execute(
+                "SELECT duplicate_of_event_id FROM events "
+                "WHERE source_sequence=?",
+                (projection._uint64(4),),
+            ).fetchone()
+        ) == (refs[1].event_id,)
+
+        case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        cache.close()
+        cache = None
+        reopened = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+
+        assert reopened._connection is not None
+        assert tuple(
+            reopened._connection.execute(
+                "SELECT duplicate_of_event_id FROM events "
+                "WHERE source_sequence=?",
+                (projection._uint64(4),),
+            ).fetchone()
+        ) == (None,)
+        assert tuple(
+            reopened._connection.execute(
+                "SELECT primary_event_id,is_primary FROM projection_dedup "
+                "WHERE event_id=?",
+                (refs[3].event_id,),
+            ).fetchone()
+        ) == (refs[3].event_id, 1)
+        assert reopened.status().healthy is True
+    finally:
+        if reopened is not None:
+            reopened.close()
+        if cache is not None:
+            cache.close()
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_projection_open_rebuilds_container_with_retired_first_event(
+    tmp_path: Path,
+) -> None:
+    projection = _projection()
+    raw_hash = hashlib.sha256(b"post-retention survivor").hexdigest()
+    case, capability, acknowledgements, refs = (
+        _retention_case_with_surviving_falco(
+            tmp_path / "container-rebuild" / "evidence",
+            raw_hash=raw_hash,
+        )
+    )
+    projection_path = (
+        tmp_path / "container-rebuild" / "projection.sqlite3"
+    )
+    cache = None
+    reopened = None
+    try:
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+        for ref in refs:
+            cache.apply(ref)
+        assert cache._connection is not None
+        assert tuple(
+            cache._connection.execute(
+                "SELECT first_source_sequence,last_source_sequence "
+                "FROM containers",
+            ).fetchone()
+        ) == (
+            projection._uint64(2),
+            projection._uint64(4),
+        )
+
+        case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        cache.close()
+        cache = None
+        reopened = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+
+        assert reopened._connection is not None
+        assert tuple(
+            reopened._connection.execute(
+                "SELECT first_event_id,first_source_sequence,"
+                "last_event_id,last_source_sequence FROM containers",
+            ).fetchone()
+        ) == (
+            refs[3].event_id,
+            projection._uint64(4),
+            refs[3].event_id,
+            projection._uint64(4),
+        )
+        assert reopened.status().healthy is True
+    finally:
+        if reopened is not None:
+            reopened.close()
+        if cache is not None:
+            cache.close()
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_projection_open_rejects_container_tamper_with_retired_first_event(
+    tmp_path: Path,
+) -> None:
+    projection = _projection()
+    raw_hash = hashlib.sha256(b"post-retention tamper survivor").hexdigest()
+    case, capability, acknowledgements, refs = (
+        _retention_case_with_surviving_falco(
+            tmp_path / "container-tamper" / "evidence",
+            raw_hash=raw_hash,
+        )
+    )
+    projection_path = (
+        tmp_path / "container-tamper" / "projection.sqlite3"
+    )
+    cache = None
+    try:
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+        for ref in refs:
+            cache.apply(ref)
+        case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        assert cache._connection is not None
+        cache._connection.execute(
+            "UPDATE containers SET image_id=?",
+            (f"sha256:{'c' * 64}",),
+        )
+        cache.close()
+        cache = None
+
+        with pytest.raises(
+            projection.ProjectionConflict,
+            match="authenticated surviving evidence",
+        ):
+            projection.ProjectionStore.open(
+                projection_path,
+                evidence=case.store,
+                acknowledgements=acknowledgements,
+            )
+    finally:
+        if cache is not None:
+            cache.close()
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)

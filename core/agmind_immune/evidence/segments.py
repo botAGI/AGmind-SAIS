@@ -81,6 +81,7 @@ from agmind_immune.ingest.envelope import (
 
 if TYPE_CHECKING:
     from agmind_immune.evidence.retention import (
+        AcceptedRetentionBlocked,
         AcceptedRetentionTombstone,
         AuthenticatedRetentionTombstone,
         AuthenticatedRetentionUnlinkCompletion,
@@ -148,6 +149,7 @@ _RETENTION_BOUNDARY_TEMP_NAME = re.compile(
 )
 _RETENTION_STATE_AUTHORITY_FACTORY = object()
 _RETENTION_PROOF_FACTORY = object()
+_RETENTION_BLOCKED_CLEAR_FACTORY = object()
 _RETENTION_ACK_RECOVERY_FACTORY = object()
 _RETENTION_ACK_GATE_FACTORY = object()
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -2370,6 +2372,9 @@ class SegmentStore:
             tuple[int, int],
             ...,
         ] = ()
+        self._projection_reconciliation_completed_state_raw: (
+            bytes | None
+        ) = None
         self._chain_head: SegmentChainHeadV1 | None = None
         self._records: list[StoredEvidenceRecord] = []
         self._index: dict[tuple[str, int], tuple[bytes, EvidenceRef]] = {}
@@ -2927,17 +2932,22 @@ class SegmentStore:
                 "retention segment payload verification failed"
             ) from error
 
-    def _retention_prior_tombstones(
+    def _retention_prior_controls(
         self,
         verifier: EnvelopeVerifier,
         *,
         through_sequence: int,
-    ) -> tuple[AcceptedRetentionTombstone, ...]:
+    ) -> tuple[
+        tuple[AcceptedRetentionTombstone, ...],
+        tuple[AcceptedRetentionBlocked, ...],
+    ]:
         from agmind_immune.evidence.retention import (
+            _freeze_accepted_retention_blocked,
             _freeze_accepted_retention_tombstone,
         )
 
         accepted_tombstones: list[AcceptedRetentionTombstone] = []
+        accepted_blocked: list[AcceptedRetentionBlocked] = []
         for record in self.iter_authenticated_records(
             after=0,
             through=through_sequence,
@@ -2999,7 +3009,27 @@ class SegmentStore:
                     raise EvidenceCorrupt(
                         "authenticated retention blocked record is not exact"
                     )
-        return tuple(accepted_tombstones)
+                accepted_blocked.append(
+                    _freeze_accepted_retention_blocked(
+                        sequence=record.ref.source_sequence,
+                        event_id=record.ref.event_id,
+                        content_sha256=record.ref.content_sha256,
+                        request=blocked,
+                    )
+                )
+        return tuple(accepted_tombstones), tuple(accepted_blocked)
+
+    def _retention_prior_tombstones(
+        self,
+        verifier: EnvelopeVerifier,
+        *,
+        through_sequence: int,
+    ) -> tuple[AcceptedRetentionTombstone, ...]:
+        prior, _blocked = self._retention_prior_controls(
+            verifier,
+            through_sequence=through_sequence,
+        )
+        return prior
 
     def _freeze_retention_snapshot(
         self,
@@ -3074,6 +3104,10 @@ class SegmentStore:
                     _freeze_retention_record(
                         event_type=envelope.event_type,
                         evidence_priority=record.priority.value,
+                        source_sequence=record.ref.source_sequence,
+                        event_id=record.ref.event_id,
+                        content_sha256=record.ref.content_sha256,
+                        frame_size=record.ref.frame_size,
                     )
                 )
             facts.append(
@@ -3086,7 +3120,7 @@ class SegmentStore:
             )
             payload_identities.append(scan.identity)
 
-        prior = self._retention_prior_tombstones(
+        prior, prior_blocked = self._retention_prior_controls(
             verifier,
             through_sequence=status_before.evidence_head,
         )
@@ -3095,6 +3129,7 @@ class SegmentStore:
             facts=tuple(facts),
             clock=clock,
             prior_tombstones=prior,
+            prior_blocked=prior_blocked,
             prior_index_through_sequence=status_before.evidence_head,
         )
         binding_digest = _snapshot_binding(snapshot)
@@ -4156,14 +4191,19 @@ class SegmentStore:
                     raise EvidenceSealError(
                         "retention unlink lost its exact journal"
                     )
+                selected_max_sequence = (
+                    self._retention_selected_max_sequence(
+                        journal.state
+                    )
+                )
+                if selected_max_sequence >= MAX_UINT64:
+                    raise EvidenceSealError(
+                        "retention unlink has no surviving ACK position"
+                    )
                 candidate_ack_owner = self._ack_journal_owner
                 ack_boundary_lease = self._acquire_retention_ack_boundary(
                     candidate_ack_owner,
-                    confirmed_through=(
-                        self._retention_selected_max_sequence(
-                            journal.state
-                        )
-                    ),
+                    confirmed_through=selected_max_sequence + 1,
                 )
                 ack_boundary_owner = candidate_ack_owner
                 if phase == "evidence_appended":
@@ -4754,6 +4794,345 @@ class SegmentStore:
                 raise
             raise EvidenceCorrupt(
                 "retention completion finalization is uncertain"
+            ) from error
+
+    def _clear_authenticated_retention_blocked(
+        self,
+        journal: object,
+        target_ref: object,
+        *,
+        _factory: object,
+    ) -> None:
+        """Clear only a fully authenticated blocked-retention state gate."""
+        from agmind_immune.coverage.state import CoverageState
+        from agmind_immune.evidence.retention import (
+            RetentionStateJournal,
+            RetentionStateV1,
+            RetentionTargetV1,
+            encode_retention_state,
+        )
+        from agmind_immune.ingest.envelope import (
+            CoreEventV1,
+            IngestVerificationError,
+            VerifierCommitError,
+        )
+
+        if (
+            _factory is not _RETENTION_BLOCKED_CLEAR_FACTORY
+            or type(self) is not SegmentStore
+        ):
+            raise TypeError(
+                "retention blocked clear requires its exact private factory"
+            )
+        if type(journal) is not RetentionStateJournal:
+            raise TypeError(
+                "retention blocked clear requires the exact state journal"
+            )
+        if type(target_ref) is not EvidenceRef:
+            raise TypeError(
+                "retention blocked clear requires the exact evidence ref"
+            )
+
+        state_descriptor = -1
+        mutation_started = False
+        state_unlink_attempted = False
+        try:
+            with self._retention_tombstone_lock:
+                authority = journal._authority
+                state = journal._state
+                state_raw = journal._raw
+                state_binding = self._retention_state_binding
+                verifier = self._require_authenticated_recovered()
+                status = self.status()
+                coverage = self._coverage_state_owner
+                if (
+                    type(authority) is not _RetentionStateAuthority
+                    or authority._store is not self
+                    or authority._lifecycle_identity
+                    is not self._lifecycle_identity
+                    or authority._retention_journal is not journal
+                    or self._retention_state_authority is not authority
+                    or type(state) is not RetentionStateV1
+                    or type(state_raw) is not bytes
+                    or state_binding is None
+                    or state_binding.name != _RETENTION_STATE_NAME
+                    or state_binding.raw != state_raw
+                    or self._retention_state_temporary is not None
+                    or self._retention_commit_uncertain_latched
+                    or self._retention_finalization_uncertain_latched
+                    or self._retention_state_namespace_uncertain
+                    or self._authenticated_retention_tombstone is not None
+                    or self._authenticated_retention_unlink_completion
+                    is not None
+                ):
+                    raise EvidenceSealError(
+                        "retention blocked state is not exact live authority"
+                    )
+                if (
+                    state.operation != "blocked"
+                    or state.phase != "evidence_appended"
+                    or type(state.request) is not RetentionBlockedV1
+                    or type(state.target) is not RetentionTargetV1
+                    or state.entries
+                    or encode_retention_state(state) != state_raw
+                ):
+                    raise EvidenceSealError(
+                        "retention blocked clear requires exact "
+                        "evidence-appended state"
+                    )
+                target = state.target
+                if (
+                    target.sequence != target_ref.source_sequence
+                    or target.event_id != target_ref.event_id
+                    or target.content_sha256
+                    != target_ref.content_sha256
+                ):
+                    raise EvidenceSealError(
+                        "retention blocked target differs from durable authority"
+                    )
+                if (
+                    type(status) is not EvidenceStatus
+                    or status.healthy is not True
+                    or status.key_healthy is not True
+                    or status.repair_pending is not False
+                    or status.retention_pending is not True
+                    or self._closed
+                    or self._authority_state != "ready"
+                    or self._repair_mode
+                    or self._repair_pending
+                    or self._read_only_reason is not None
+                    or self._append_uncertain
+                    or self._pending_durable_commit is not None
+                    or verifier is not self._bound_verifier
+                    or verifier._bound_lifecycle
+                    is not self._lifecycle_identity
+                    or verifier._staged
+                    or verifier._authorizations
+                ):
+                    raise EvidenceSealError(
+                        "retention blocked clear requires one healthy "
+                        "ordinary lifecycle"
+                    )
+                if (
+                    type(coverage) is not CoverageState
+                    or coverage._evidence is not self
+                    or coverage._lifecycle_identity
+                    is not self._lifecycle_identity
+                    or coverage._capability_token is None
+                    or coverage._healthy is not True
+                    or coverage._closed is not False
+                ):
+                    raise EvidenceSealError(
+                        "retention blocked clear requires exact live coverage"
+                    )
+                coverage_snapshot = coverage._snapshot
+                coverage_head = self._validate_coverage_state_owner(
+                    coverage,
+                    coverage._lifecycle_identity,
+                    reducer_head=coverage_snapshot.head_ref,
+                )
+                if (
+                    coverage_head is not coverage_snapshot.head_ref
+                    or coverage_snapshot.head_sequence
+                    != status.evidence_head
+                    or coverage_snapshot.head_sequence
+                    < target_ref.source_sequence
+                ):
+                    raise EvidenceSealError(
+                        "retention blocked coverage does not include target"
+                    )
+
+                try:
+                    record = self.resolve_authenticated_ref(target_ref)
+                    item = CoreEventV1.model_validate(
+                        {
+                            "sequence": target_ref.source_sequence,
+                            "event_id": target_ref.event_id,
+                            "content_sha256": target_ref.content_sha256,
+                            "envelope": record.envelope,
+                        },
+                        strict=True,
+                    )
+                    canonical_envelope = canonical_json(item.envelope)
+                    request_canonical = canonical_json(
+                        state.request.model_dump(mode="python")
+                    )
+                    normalized_canonical = canonical_json(
+                        item.envelope.get("normalized_fields")
+                    )
+                except (
+                    EvidenceStoreError,
+                    TypeError,
+                    ValueError,
+                    ValidationError,
+                ) as error:
+                    raise EvidenceSealError(
+                        "retention blocked target is not exact authenticated "
+                        "evidence"
+                    ) from error
+                if (
+                    record.ref is not target_ref
+                    or record.priority is not EvidencePriority.PROTECTED
+                    or record.canonical_envelope != canonical_envelope
+                    or hashlib.sha256(canonical_envelope).hexdigest()
+                    != target_ref.content_sha256
+                    or item.envelope.get("source_sequence")
+                    != target_ref.source_sequence
+                    or item.envelope.get("event_id")
+                    != target_ref.event_id
+                    or item.envelope.get("event_type")
+                    != "retention_blocked_priority_evidence"
+                    or normalized_canonical != request_canonical
+                    or verifier.accepted_ref(target_ref.source_sequence)
+                    is not target_ref
+                ):
+                    raise EvidenceSealError(
+                        "retention blocked target differs from exact "
+                        "authenticated evidence"
+                    )
+
+                accepted_before = _retention_accepted_authority_binding(
+                    verifier
+                )
+                verifier_authority_before = verifier._authority
+                verifier_generation_before = (
+                    verifier._authority.generation
+                )
+                transient_before = verifier._repair_transient_generation
+                coverage_token = coverage._capability_token
+                journal_identity = journal._identity
+                try:
+                    replayed = (
+                        verifier._restricted_historical_retention_replay(
+                            (item, target_ref),
+                            state.request,
+                        )
+                    )
+                except (
+                    IngestVerificationError,
+                    VerifierCommitError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    raise EvidenceSealError(
+                        "retention blocked historical replay failed"
+                    ) from error
+                if (
+                    replayed.event_type
+                    != "retention_blocked_priority_evidence"
+                    or replayed.evidence_priority != "protected"
+                    or replayed.is_retry is not True
+                    or replayed.sequence != target_ref.source_sequence
+                    or replayed.event_id != target_ref.event_id
+                    or replayed.content_sha256
+                    != target_ref.content_sha256
+                    or replayed._normalized_fields_canonical
+                    != request_canonical
+                    or journal._identity is not journal_identity
+                    or journal._state is not state
+                    or journal._raw is not state_raw
+                    or self._retention_state_binding is not state_binding
+                    or verifier is not self._bound_verifier
+                    or verifier._authority is not verifier_authority_before
+                    or verifier._authority.generation
+                    != verifier_generation_before
+                    or verifier._repair_transient_generation
+                    != transient_before
+                    or not _same_retention_accepted_authority(
+                        verifier,
+                        accepted_before,
+                    )
+                    or self.status() != status
+                    or self._coverage_state_owner is not coverage
+                    or coverage._snapshot is not coverage_snapshot
+                    or coverage._capability_token is not coverage_token
+                    or coverage._healthy is not True
+                    or coverage._closed is not False
+                ):
+                    raise EvidenceSealError(
+                        "retention blocked replay changed live authority"
+                    )
+
+                journal._prove_publication(state_raw)
+                state_descriptor, state_opened = _open_regular_at(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    self.root / _RETENTION_STATE_NAME,
+                    maximum=_MAX_RETENTION_STATE_BYTES,
+                )
+                _validate_identity(
+                    state_opened,
+                    state_binding.identity,
+                    self.root / _RETENTION_STATE_NAME,
+                )
+                _validate_published_from_held(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    self.root / _RETENTION_STATE_NAME,
+                    descriptor=state_descriptor,
+                    identity=state_binding.identity,
+                    expected_sha256=hashlib.sha256(state_raw).hexdigest(),
+                )
+                journal._prove_publication(state_raw)
+
+                mutation_started = True
+                state_unlink_attempted = True
+                self._retention_finalization_uncertain_latched = True
+                self._retention_state_namespace_uncertain = True
+                descriptor = state_descriptor
+                state_descriptor = -1
+                _conditionally_unlink_held_at(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    self.root / _RETENTION_STATE_NAME,
+                    descriptor=descriptor,
+                    identity=state_binding.identity,
+                )
+
+                authority._retention_journal = None
+                journal._state = None
+                journal._raw = None
+                self._retention_state_binding = None
+                self._retention_state_temporary = None
+                self._retention_state_authority = None
+                self._retention_snapshot_binding = None
+                self._retention_finalization_uncertain_latched = False
+                self._retention_state_namespace_uncertain = False
+                self._clear_retention_pending_latch()
+                return
+        except BaseException as error:
+            if mutation_started:
+                self._retention_finalization_uncertain_latched = True
+            if state_unlink_attempted:
+                self._retention_state_namespace_uncertain = True
+            if state_descriptor >= 0:
+                descriptor = state_descriptor
+                state_descriptor = -1
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:  # noqa: BLE001
+                    error.add_note(
+                        "retention blocked state descriptor close failed: "
+                        f"{close_error}"
+                    )
+            if state_unlink_attempted:
+                try:
+                    os.fsync(self._root_descriptor)
+                except BaseException as fsync_error:  # noqa: BLE001
+                    error.add_note(
+                        "retention blocked uncertainty root fsync failed: "
+                        f"{fsync_error}"
+                    )
+            if isinstance(error, EvidenceStoreError):
+                raise
+            if not isinstance(error, Exception):
+                raise
+            if mutation_started:
+                raise EvidenceCorrupt(
+                    "retention blocked finalization is uncertain"
+                ) from error
+            raise EvidenceSealError(
+                "retention blocked clear authority is invalid"
             ) from error
 
     def _require_repair_lifecycle(self) -> None:
@@ -7208,13 +7587,15 @@ class SegmentStore:
         confirmed_through: int,
     ) -> None:
         self._ack_recovery_verifier(owner, lifecycle_identity)
-        if any(
-            end > confirmed_through
-            for _start, end in self._authenticated_retired_ranges
-        ):
-            raise _AckAuthorityError(
-                "ACK confirmation lags authenticated retired evidence"
-            )
+        for _start, end in self._authenticated_retired_ranges:
+            if end >= MAX_UINT64:
+                raise _AckAuthorityError(
+                    "authenticated retired evidence has no surviving ACK position"
+                )
+            if confirmed_through < end + 1:
+                raise _AckAuthorityError(
+                    "ACK confirmation lags authenticated retired evidence"
+                )
 
     def _acquire_retention_ack_boundary(
         self,
@@ -10358,11 +10739,16 @@ class SegmentStore:
         ack_boundary_lease: _AckRetentionBoundaryLease | None = None
         primary_error: BaseException | None = None
         try:
+            selected_max_sequence = (
+                self._retention_selected_max_sequence(state)
+            )
+            if selected_max_sequence >= MAX_UINT64:
+                raise EvidenceCorrupt(
+                    "retention recovery has no surviving ACK position"
+                )
             ack_boundary_lease = self._acquire_retention_ack_boundary(
                 ack_journal,
-                confirmed_through=(
-                    self._retention_selected_max_sequence(state)
-                ),
+                confirmed_through=selected_max_sequence + 1,
             )
             if state.phase == "evidence_appended":
                 in_progress, _uncertain, _completed = (
@@ -10538,7 +10924,6 @@ class SegmentStore:
                         "retention recovery lost advanced state"
                     )
         if state.phase in {
-            "evidence_appended",
             "retention_unlink_in_progress",
             "retention_commit_uncertain",
         }:
@@ -10556,9 +10941,21 @@ class SegmentStore:
             self._reconcile_retention_boundary_cache(
                 recovery.boundary_raw
             )
+            state_binding = self._retention_state_binding
+            if state_binding is None:
+                raise EvidenceCorrupt(
+                    "completed retention recovery lost durable state"
+                )
+            self._projection_reconciliation_completed_state_raw = (
+                state_binding.raw
+            )
             self._clear_recovered_retention_state(journal)
             self._require_retention_directory_bindings()
-        elif state.phase in {"selected", "target_bound"}:
+        elif state.phase in {
+            "selected",
+            "target_bound",
+            "evidence_appended",
+        }:
             payloads, _directories = (
                 self._prepare_recovered_retention_payloads(state)
             )
@@ -10592,15 +10989,10 @@ class SegmentStore:
             and (
                 state.phase
                 in {
-                    "evidence_appended",
                     "retention_unlink_in_progress",
                     "retention_commit_uncertain",
                     "completed",
                 }
-                or (
-                    state.phase == "target_bound"
-                    and recovery.current_target_ref is not None
-                )
             )
         )
 

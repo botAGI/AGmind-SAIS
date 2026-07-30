@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import os
 import pickle
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
@@ -19,7 +21,13 @@ from agmind_immune.contracts import (
 from agmind_immune.coverage import CoverageState
 from agmind_immune.evidence import retention as retention_module
 from agmind_immune.evidence import segments as segments_module
-from agmind_immune.evidence.segments import SegmentStore
+from agmind_immune.evidence.manifest import chain_head_for
+from agmind_immune.evidence.segments import (
+    EvidenceCorrupt,
+    EvidenceRef,
+    EvidenceSealError,
+    SegmentStore,
+)
 from agmind_immune.ingest import envelope as envelope_module
 from agmind_immune.ingest import service as service_module
 from agmind_immune.ingest.ack_journal import AckJournal
@@ -352,6 +360,123 @@ def _bound_retention_delivery(
     journal = retention_module._open_retention_state_journal(store)
     assert journal.state == _selected_retention_state(request)
     return delivery, store, verifier, acknowledgements, journal
+
+
+def _production_blocked(store: SegmentStore) -> RetentionBlockedV1:
+    target_bytes = 5 * 1024**3
+    protected_bytes = target_bytes + 17
+    return RetentionBlockedV1(
+        schema_version="agmind.retention-blocked.v1",
+        blocked_id=REQUEST_ID,
+        target_bytes=target_bytes,
+        routine_bytes=0,
+        protected_bytes=protected_bytes,
+        blocked_bytes=17,
+        reason="protected_evidence",
+        current_chain_head_sha256=hashlib.sha256(
+            canonical_json(chain_head_for(store.manifests[-1]))
+        ).hexdigest(),
+    )
+
+
+def _selected_blocked_retention_state(
+    request: RetentionBlockedV1,
+) -> retention_module.RetentionStateV1:
+    return retention_module.RetentionStateV1.model_validate(
+        {
+            "schema_version": "agmind.retention-state.v1",
+            "operation": "blocked",
+            "phase": "selected",
+            "request": request.model_dump(mode="python"),
+            "target": None,
+            "h0": request.current_chain_head_sha256,
+            "entries": [],
+            "selection_witness": {
+                "policy_version": "agmind-retention-v1",
+                "maximum_age_ns": (
+                    7 * 24 * 60 * 60 * 1_000_000_000
+                ),
+                "target_bytes": request.target_bytes,
+                "maximum_run_manifests": 128,
+                "removable_event_types": ["falco_connect"],
+                "decision_utc": "2026-07-29T12:00:00Z",
+                "clock_healthy": True,
+                "age_selection_enabled": True,
+                "uncertainty_ns": 0,
+                "routine_bytes": request.routine_bytes,
+                "protected_bytes": request.protected_bytes,
+                "total_bytes": (
+                    request.routine_bytes + request.protected_bytes
+                ),
+                "age_pressure": False,
+                "size_pressure": True,
+                "prior_index_count": 0,
+                "prior_index_through_sequence": 1,
+                "prior_index_sha256": hashlib.sha256(
+                    b"agmind.retention-prior-index.v1\0"
+                ).hexdigest(),
+            },
+        },
+        strict=True,
+    )
+
+
+def _bound_blocked_evidence_appended(
+    path: Path,
+) -> tuple[
+    DeliveryCoordinator,
+    SegmentStore,
+    EnvelopeVerifier,
+    AckJournal,
+    retention_module.RetentionStateJournal,
+    EvidenceRef,
+    _RetentionTransport,
+]:
+    key = private_key(11)
+    transport = _RetentionTransport()
+    delivery, store, verifier, acknowledgements = _bound_delivery(
+        path,
+        transport,
+    )
+    request = _production_blocked(store)
+    authority = store._open_retention_state_authority(
+        _factory=segments_module._RETENTION_STATE_AUTHORITY_FACTORY,
+    )
+    authority.publish_initial_retention_state(
+        retention_module.encode_retention_state(
+            _selected_blocked_retention_state(request)
+        )
+    )
+    journal = retention_module._open_retention_state_journal(store)
+    item = _item(
+        envelope_value(
+            key,
+            sequence=2,
+            event_type="retention_blocked_priority_evidence",
+            normalized_fields=request.model_dump(mode="python"),
+        )
+    )
+    target_ref = delivery.acceptance.accept(item)
+    delivery._coverage_adapter.apply_live_accepted(target_ref, None)
+    store.flush_security_boundary()
+    target = retention_module.RetentionTargetV1(
+        sequence=item.sequence,
+        event_id=item.event_id,
+        content_sha256=item.content_sha256,
+    )
+    journal.bind_target(target)
+    journal.advance_evidence_appended(target)
+    assert journal.state is not None
+    assert journal.state.phase == "evidence_appended"
+    return (
+        delivery,
+        store,
+        verifier,
+        acknowledgements,
+        journal,
+        target_ref,
+        transport,
+    )
 
 
 class _OneChunk(httpx.AsyncByteStream):
@@ -1458,3 +1583,462 @@ async def test_retention_target_delivery_advances_exact_historical_target_once(
     assert journal.state.phase == "evidence_appended"
     await delivery.close()
     store.close(flush=False)
+
+
+@pytest.mark.asyncio
+async def test_retention_target_locked_reuses_scope_without_reposting(
+    tmp_path: Path,
+) -> None:
+    (
+        delivery,
+        store,
+        _verifier,
+        acknowledgements,
+        journal,
+        target_ref,
+        transport,
+    ) = _bound_blocked_evidence_appended(tmp_path)
+    ack_before = acknowledgements.snapshot()
+    ack_body_before = acknowledgements.pending_request_body()
+    state_path = tmp_path / "retention-state.json"
+    state_before = state_path.read_bytes()
+    epoch_before = delivery._lock._epoch
+    try:
+        async with delivery._retention_preflight_scope(
+            _factory=service_module._RETENTION_DELIVERY_FACTORY,
+        ) as lock_authority:
+            locked_epoch = delivery._lock._epoch
+            result = await delivery._deliver_retention_target_locked(
+                journal,
+                _factory=service_module._RETENTION_DELIVERY_FACTORY,
+                _lock_authority=lock_authority,
+            )
+            assert delivery._lock._epoch == locked_epoch
+
+        assert result == target_ref
+        assert delivery._lock._epoch == epoch_before + 2
+        assert transport.posts == []
+        assert transport.fetches == []
+        assert acknowledgements.snapshot() == ack_before
+        assert acknowledgements.pending_request_body() == ack_body_before
+        assert state_path.read_bytes() == state_before
+        assert journal.state is not None
+        assert journal.state.phase == "evidence_appended"
+    finally:
+        await delivery.close()
+        store.close(flush=False)
+
+
+@pytest.mark.asyncio
+async def test_retention_target_wrapper_opens_one_scope_and_delegates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        delivery,
+        store,
+        _verifier,
+        _acknowledgements,
+        journal,
+        target_ref,
+        transport,
+    ) = _bound_blocked_evidence_appended(tmp_path)
+    calls: list[object] = []
+    epoch_before = delivery._lock._epoch
+
+    async def deliver_locked(
+        owner: DeliveryCoordinator,
+        exact_journal: retention_module.RetentionStateJournal,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> EvidenceRef:
+        task = asyncio.current_task()
+        assert owner is delivery
+        assert exact_journal is journal
+        assert _factory is service_module._RETENTION_DELIVERY_FACTORY
+        assert task is not None
+        assert owner._lock._owner is task
+        assert owner._retention_lock_owner is task
+        assert (
+            _lock_authority
+            is owner._retention_lock_authority
+        )
+        calls.append(_lock_authority)
+        return target_ref
+
+    monkeypatch.setattr(
+        DeliveryCoordinator,
+        "_deliver_retention_target_locked",
+        deliver_locked,
+    )
+    try:
+        result = await delivery._deliver_retention_target(
+            journal,
+            _factory=service_module._RETENTION_DELIVERY_FACTORY,
+        )
+
+        assert result == target_ref
+        assert len(calls) == 1
+        assert delivery._lock._epoch == epoch_before + 2
+        assert delivery._retention_lock_owner is None
+        assert delivery._retention_lock_authority is None
+        assert transport.posts == []
+        assert transport.fetches == []
+    finally:
+        await delivery.close()
+        store.close(flush=False)
+
+
+@pytest.mark.asyncio
+async def test_retention_blocked_clear_locked_requires_exact_delivery_scope(
+    tmp_path: Path,
+) -> None:
+    (
+        delivery,
+        store,
+        _verifier,
+        acknowledgements,
+        journal,
+        target_ref,
+        transport,
+    ) = _bound_blocked_evidence_appended(tmp_path / "owner")
+    (
+        foreign_delivery,
+        foreign_store,
+        _foreign_verifier,
+        _foreign_acknowledgements,
+        _foreign_journal,
+        _foreign_target_ref,
+        _foreign_transport,
+    ) = _bound_blocked_evidence_appended(tmp_path / "foreign")
+    state_path = tmp_path / "owner" / "retention-state.json"
+    state_before = state_path.read_bytes()
+    ack_before = acknowledgements.snapshot()
+    ack_body_before = acknowledgements.pending_request_body()
+    epoch_before = delivery._lock._epoch
+    try:
+        with pytest.raises(TypeError, match="locked scope"):
+            delivery._clear_retention_blocked_locked(
+                journal,
+                target_ref,
+                _factory=service_module._RETENTION_DELIVERY_FACTORY,
+                _lock_authority=object(),
+            )
+        assert delivery._lock._epoch == epoch_before
+        assert state_path.read_bytes() == state_before
+
+        async with foreign_delivery._retention_preflight_scope(
+            _factory=service_module._RETENTION_DELIVERY_FACTORY,
+        ) as foreign_authority:
+            with pytest.raises(TypeError, match="locked scope"):
+                delivery._clear_retention_blocked_locked(
+                    journal,
+                    target_ref,
+                    _factory=service_module._RETENTION_DELIVERY_FACTORY,
+                    _lock_authority=foreign_authority,
+                )
+        assert delivery._lock._epoch == epoch_before
+        assert state_path.read_bytes() == state_before
+
+        async with delivery._retention_preflight_scope(
+            _factory=service_module._RETENTION_DELIVERY_FACTORY,
+        ) as lock_authority:
+            locked_epoch = delivery._lock._epoch
+            delivery._clear_retention_blocked_locked(
+                journal,
+                target_ref,
+                _factory=service_module._RETENTION_DELIVERY_FACTORY,
+                _lock_authority=lock_authority,
+            )
+            assert delivery._lock._epoch == locked_epoch
+
+        assert delivery._lock._epoch == epoch_before + 2
+        assert not state_path.exists()
+        assert journal.state is None
+        assert store.status().retention_pending is False
+        assert acknowledgements.snapshot() == ack_before
+        assert acknowledgements.pending_request_body() == ack_body_before
+        assert transport.posts == []
+        assert transport.fetches == []
+    finally:
+        await foreign_delivery.close()
+        foreign_store.close(flush=False)
+        await delivery.close()
+        store.close(flush=False)
+
+
+@pytest.mark.asyncio
+async def test_authenticated_blocked_clear_changes_only_retention_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        delivery,
+        store,
+        verifier,
+        acknowledgements,
+        journal,
+        target_ref,
+        transport,
+    ) = _bound_blocked_evidence_appended(tmp_path)
+    state_path = tmp_path / "retention-state.json"
+    boundary_path = tmp_path / "retention-boundary.json"
+    manifests_before = store.manifests
+    records_before = tuple(store.iter_authenticated_records())
+    payloads_before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in (tmp_path / "segments").rglob("*.agseg")
+    }
+    boundary_before = (
+        boundary_path.read_bytes() if boundary_path.exists() else None
+    )
+    ack_before = acknowledgements.snapshot()
+    ack_body_before = acknowledgements.pending_request_body()
+    verifier_before = verifier._authority
+    coverage = delivery._coverage_adapter._coverage
+    coverage_before = coverage._snapshot
+    unlinked: list[str] = []
+    fsynced: list[int] = []
+    original_unlink = segments_module.os.unlink
+    original_fsync = segments_module.os.fsync
+
+    def trace_unlink(
+        name: str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        unlinked.append(os.fspath(name))
+        original_unlink(name, dir_fd=dir_fd)
+
+    def trace_fsync(descriptor: int) -> None:
+        fsynced.append(descriptor)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(segments_module.os, "unlink", trace_unlink)
+    monkeypatch.setattr(segments_module.os, "fsync", trace_fsync)
+    try:
+        store._clear_authenticated_retention_blocked(
+            journal,
+            target_ref,
+            _factory=segments_module._RETENTION_BLOCKED_CLEAR_FACTORY,
+        )
+
+        assert not state_path.exists()
+        assert journal.state is None
+        assert store.status().retention_pending is False
+        assert len(unlinked) == 1
+        assert unlinked[0].startswith(".retention-state.json.")
+        assert unlinked[0].endswith(".tmp")
+        assert fsynced == [store._root_descriptor]
+        assert store.manifests == manifests_before
+        assert tuple(store.iter_authenticated_records()) == records_before
+        assert {
+            path.relative_to(tmp_path): path.read_bytes()
+            for path in (tmp_path / "segments").rglob("*.agseg")
+        } == payloads_before
+        assert (
+            boundary_path.read_bytes()
+            if boundary_path.exists()
+            else None
+        ) == boundary_before
+        assert acknowledgements.snapshot() == ack_before
+        assert acknowledgements.pending_request_body() == ack_body_before
+        assert verifier._authority is verifier_before
+        assert coverage._snapshot is coverage_before
+        assert transport.posts == []
+        assert transport.fetches == []
+    finally:
+        await delivery.close()
+        store.close(flush=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidate_kind", ["wrong", "foreign"])
+async def test_authenticated_blocked_clear_rejects_inexact_target(
+    tmp_path: Path,
+    candidate_kind: str,
+) -> None:
+    (
+        delivery,
+        store,
+        verifier,
+        _acknowledgements,
+        journal,
+        _target_ref,
+        transport,
+    ) = _bound_blocked_evidence_appended(tmp_path / "owner")
+    foreign_delivery = None
+    foreign_store = None
+    state_path = tmp_path / "owner" / "retention-state.json"
+    state_before = state_path.read_bytes()
+    try:
+        if candidate_kind == "wrong":
+            candidate = verifier.accepted_ref(1)
+            assert type(candidate) is EvidenceRef
+        else:
+            (
+                foreign_delivery,
+                foreign_store,
+                _foreign_verifier,
+                _foreign_acknowledgements,
+                _foreign_journal,
+                candidate,
+                _foreign_transport,
+            ) = _bound_blocked_evidence_appended(
+                tmp_path / "foreign"
+            )
+
+        with pytest.raises(
+            EvidenceSealError,
+            match="target|authority|evidence",
+        ):
+            store._clear_authenticated_retention_blocked(
+                journal,
+                candidate,
+                _factory=(
+                    segments_module._RETENTION_BLOCKED_CLEAR_FACTORY
+                ),
+            )
+
+        assert state_path.read_bytes() == state_before
+        assert journal.state is not None
+        assert journal.state.phase == "evidence_appended"
+        assert store.status().retention_pending is True
+        assert transport.posts == []
+        assert transport.fetches == []
+    finally:
+        if foreign_delivery is not None:
+            await foreign_delivery.close()
+        if foreign_store is not None:
+            foreign_store.close(flush=False)
+        await delivery.close()
+        store.close(flush=False)
+
+
+@pytest.mark.asyncio
+async def test_authenticated_blocked_clear_rejects_coverage_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        delivery,
+        store,
+        verifier,
+        _acknowledgements,
+        journal,
+        target_ref,
+        transport,
+    ) = _bound_blocked_evidence_appended(tmp_path)
+    coverage = delivery._coverage_adapter._coverage
+    boot_ref = verifier.accepted_ref(1)
+    assert type(boot_ref) is EvidenceRef
+    state_path = tmp_path / "retention-state.json"
+    state_before = state_path.read_bytes()
+    try:
+        with monkeypatch.context() as mismatch:
+            mismatch.setattr(
+                coverage,
+                "_snapshot",
+                replace(coverage._snapshot, head_ref=boot_ref),
+            )
+            with pytest.raises(
+                EvidenceSealError,
+                match="coverage",
+            ):
+                store._clear_authenticated_retention_blocked(
+                    journal,
+                    target_ref,
+                    _factory=(
+                        segments_module._RETENTION_BLOCKED_CLEAR_FACTORY
+                    ),
+                )
+
+        assert state_path.read_bytes() == state_before
+        assert journal.state is not None
+        assert journal.state.phase == "evidence_appended"
+        assert store.status().retention_pending is True
+        assert transport.posts == []
+        assert transport.fetches == []
+    finally:
+        await delivery.close()
+        store.close(flush=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unlink", "root_fsync"])
+async def test_authenticated_blocked_clear_ambiguity_latches_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    (
+        delivery,
+        store,
+        _verifier,
+        acknowledgements,
+        journal,
+        target_ref,
+        transport,
+    ) = _bound_blocked_evidence_appended(tmp_path)
+    state_path = tmp_path / "retention-state.json"
+    ack_before = acknowledgements.snapshot()
+    ack_body_before = acknowledgements.pending_request_body()
+    original_unlink = segments_module.os.unlink
+    original_fsync = segments_module.os.fsync
+    injected = False
+
+    def fail_unlink(
+        name: str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal injected
+        text = os.fspath(name)
+        if (
+            failure == "unlink"
+            and text.startswith(".retention-state.json.")
+            and not injected
+        ):
+            injected = True
+            raise OSError("injected blocked state unlink ambiguity")
+        original_unlink(name, dir_fd=dir_fd)
+
+    def fail_root_fsync(descriptor: int) -> None:
+        nonlocal injected
+        if (
+            failure == "root_fsync"
+            and descriptor == store._root_descriptor
+            and not state_path.exists()
+            and not injected
+        ):
+            injected = True
+            raise OSError("injected blocked state root fsync ambiguity")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(segments_module.os, "unlink", fail_unlink)
+    monkeypatch.setattr(segments_module.os, "fsync", fail_root_fsync)
+    try:
+        with pytest.raises(
+            EvidenceCorrupt,
+            match="blocked|uncertain",
+        ):
+            store._clear_authenticated_retention_blocked(
+                journal,
+                target_ref,
+                _factory=(
+                    segments_module._RETENTION_BLOCKED_CLEAR_FACTORY
+                ),
+            )
+
+        assert injected is True
+        assert store.status().retention_pending is True
+        assert journal.state is not None
+        assert journal.state.phase == "evidence_appended"
+        assert acknowledgements.snapshot() == ack_before
+        assert acknowledgements.pending_request_body() == ack_body_before
+        assert transport.posts == []
+        assert transport.fetches == []
+    finally:
+        await delivery.close()
+        store.close(flush=False)

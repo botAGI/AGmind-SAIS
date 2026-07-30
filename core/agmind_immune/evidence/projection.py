@@ -23,9 +23,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 
+from cryptography.exceptions import InvalidSignature
 from pydantic import ValidationError
 
-from agmind_immune.canonicaljson import canonical_json
+from agmind_immune.canonicaljson import canonical_json, verify_event_signature
 from agmind_immune.contracts import (
     HEX64,
     UUID4,
@@ -34,11 +35,14 @@ from agmind_immune.contracts import (
     FalcoConnectV1,
 )
 from agmind_immune.evidence.segments import (
+    EvidenceCorrupt,
+    EvidencePriority,
     EvidenceRef,
     SegmentStore,
     StoredEvidenceRecord,
 )
 from agmind_immune.ingest.ack_journal import AckJournal, AckJournalSnapshot
+from agmind_immune.ingest.envelope import EnvelopeVerifier, KeyMetadataError
 
 _UINT64 = re.compile(r"^[0-9]{20}$")
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
@@ -193,6 +197,7 @@ _REBUILD_STEPS = (
     "parent_fsync",
     "reopen_verify",
 )
+_RETENTION_REBUILD_FACTORY = object()
 
 
 class ProjectionError(RuntimeError):
@@ -284,6 +289,29 @@ def _decode_uint64(value: object) -> int:
 
 def _optional_uint64(value: int | None) -> str | None:
     return None if value is None else _uint64(value)
+
+
+def _validated_retired_ranges(
+    value: object,
+) -> tuple[tuple[int, int], ...]:
+    if type(value) is not tuple or not value:
+        raise ProjectionConflict("authenticated retired ranges are unavailable")
+    validated: list[tuple[int, int]] = []
+    prior_end = 0
+    for item in value:
+        if type(item) is not tuple or len(item) != 2:
+            raise ProjectionConflict("authenticated retired range is invalid")
+        start, end = item
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not 1 <= start <= end < 2**64
+            or start <= prior_end
+        ):
+            raise ProjectionConflict("authenticated retired range is invalid")
+        validated.append((start, end))
+        prior_end = end
+    return tuple(validated)
 
 
 def _validate_regular(info: os.stat_result, *, label: str) -> None:
@@ -616,6 +644,193 @@ def _prepare(record: StoredEvidenceRecord) -> _PreparedRecord:
     return _PreparedRecord(record, envelope, kind, logical_hash, falco, coverage)
 
 
+def _retired_record_from_projection_event(
+    row: tuple[object, ...],
+    verifier: EnvelopeVerifier,
+) -> StoredEvidenceRecord:
+    columns = _TABLE_LAYOUT[1][1]
+    if len(row) != len(columns):
+        raise ProjectionConflict("retired projection event shape is invalid")
+    values = dict(zip(columns, row, strict=True))
+
+    def required_text(name: str) -> str:
+        value = values[name]
+        if type(value) is not str:
+            raise ProjectionConflict(
+                f"retired projection event {name} is not exact text"
+            )
+        return value
+
+    def optional_text(name: str) -> str | None:
+        value = values[name]
+        if value is not None and type(value) is not str:
+            raise ProjectionConflict(
+                f"retired projection event {name} is not exact optional text"
+            )
+        return value
+
+    def canonical_json_value(
+        name: str,
+    ) -> object:
+        encoded = required_text(name)
+        try:
+            decoded = json.loads(encoded)
+            rebuilt = canonical_json(decoded).decode("utf-8")
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise ProjectionConflict(
+                f"retired projection event {name} is not canonical JSON"
+            ) from error
+        if rebuilt != encoded:
+            raise ProjectionConflict(
+                f"retired projection event {name} is not exact canonical JSON"
+            )
+        return decoded
+
+    normalized_fields = canonical_json_value("normalized_fields_json")
+    redaction_flags = canonical_json_value("redaction_flags_json")
+    coverage_flags = canonical_json_value("coverage_flags_json")
+    if (
+        type(normalized_fields) is not dict
+        or type(redaction_flags) is not list
+        or type(coverage_flags) is not list
+    ):
+        raise ProjectionConflict(
+            "retired projection event canonical JSON types are invalid"
+        )
+    clock_uncertainty_ms = values["clock_uncertainty_ms"]
+    if type(clock_uncertainty_ms) is not int:
+        raise ProjectionConflict(
+            "retired projection event clock uncertainty is invalid"
+        )
+    envelope_value: dict[str, object] = {
+        "schema_version": "agmind.event-envelope.v1",
+        "event_id": required_text("event_id"),
+        "event_type": required_text("event_type"),
+        "source_id": required_text("source_id"),
+        "source_version": required_text("source_version"),
+        "key_id": required_text("key_id"),
+        "key_epoch": _decode_uint64(values["key_epoch"]),
+        "host_id": required_text("host_id"),
+        "boot_id": required_text("boot_id"),
+        "source_sequence": _decode_uint64(values["source_sequence"]),
+        "event_time": required_text("event_time"),
+        "ingest_time": required_text("ingest_time"),
+        "clock_uncertainty_ms": clock_uncertainty_ms,
+        "inventory_generation": _decode_uint64(
+            values["inventory_generation"]
+        ),
+        "normalized_fields": normalized_fields,
+        "normalized_fields_sha256": required_text(
+            "normalized_fields_sha256"
+        ),
+        "redaction_flags": redaction_flags,
+        "coverage_flags": coverage_flags,
+        "source_payload_hash": required_text("source_payload_hash"),
+        "source_signature": required_text("source_signature"),
+    }
+    for name in (
+        "container_id",
+        "container_start_time",
+        "release_id",
+    ):
+        value = optional_text(name)
+        if value is not None:
+            envelope_value[name] = value
+    inventory_revision = values["inventory_revision"]
+    if inventory_revision is not None:
+        envelope_value["inventory_revision"] = _decode_uint64(
+            inventory_revision
+        )
+    try:
+        EnvelopeVerifier._precheck_signed_content(envelope_value)
+        envelope = EventEnvelopeV1.model_validate(
+            envelope_value,
+            strict=True,
+        )
+        FalcoConnectV1.model_validate(
+            envelope.normalized_fields,
+            strict=True,
+        )
+        verifier._validate_special_semantics(envelope)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise ProjectionConflict(
+            "retired projection event is not an exact routine Falco envelope"
+        ) from error
+    if (
+        envelope.event_type != "falco_connect"
+        or envelope.host_id != verifier.root.host_id
+        or envelope.source_id != "agmind-observerd"
+    ):
+        raise ProjectionConflict(
+            "retired projection event is outside routine Falco authority"
+        )
+    canonical = canonical_json(envelope)
+    digest = hashlib.sha256(canonical).hexdigest()
+    if (
+        required_text("canonical_sha256") != digest
+        or required_text("content_sha256") != digest
+    ):
+        raise ProjectionConflict(
+            "retired projection event does not bind its canonical digest"
+        )
+    try:
+        public_key = verifier.key_chain.key(
+            envelope.key_epoch,
+            envelope.key_id,
+        )
+        verify_event_signature(envelope, public_key)
+    except (
+        InvalidSignature,
+        KeyMetadataError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise ProjectionConflict(
+            "retired projection event signature is not anchored"
+        ) from error
+
+    segment_id = required_text("segment_id")
+    segment_relative_path = required_text("segment_relative_path")
+    frame_sha256 = required_text("frame_sha256")
+    if (
+        UUID4.fullmatch(segment_id) is None
+        or not segment_relative_path.startswith("segments/")
+        or not segment_relative_path.endswith(f"-{segment_id}.agseg")
+        or HEX64.fullmatch(frame_sha256) is None
+    ):
+        raise ProjectionConflict(
+            "retired projection event frame reference is invalid"
+        )
+    ref = EvidenceRef(
+        segment_id=segment_id,
+        segment_relative_path=segment_relative_path,
+        frame_offset=_decode_uint64(values["frame_offset"]),
+        frame_size=_decode_uint64(values["frame_size"]),
+        frame_sha256=frame_sha256,
+        event_id=envelope.event_id,
+        source_sequence=envelope.source_sequence,
+        content_sha256=digest,
+    )
+    record = StoredEvidenceRecord(
+        envelope=envelope.model_dump(exclude_none=True),
+        canonical_envelope=canonical,
+        priority=EvidencePriority.ROUTINE,
+        accepted_at=envelope.ingest_time,
+        ref=ref,
+    )
+    try:
+        prepared = _prepare(record)
+    except ProjectionValidationError as error:
+        raise ProjectionConflict(
+            "retired projection event cannot be replayed exactly"
+        ) from error
+    if prepared.falco is None or prepared.coverage is not None:
+        raise ProjectionConflict(
+            "retired projection event is not routine Falco reducer input"
+        )
+    return record
+
+
 class ProjectionStore:
     """Factory-opened projection bound to one recovered evidence/ACK lifecycle."""
 
@@ -665,12 +880,27 @@ class ProjectionStore:
         store._lock_fd = -1
         store._lock_name = f".{path.name}.projection.lock"
         store._connection = None
+        reconciliation_handoff: bytes | None = None
         try:
             if getattr(acknowledgements, "_store", None) is not evidence:
                 raise ProjectionAuthorityError(
                     "ACK journal is not bound to the retained evidence store"
                 )
             _ = evidence.acceptance_cursor
+            handoff_value = getattr(
+                evidence,
+                "_projection_reconciliation_completed_state_raw",
+                None,
+            )
+            if handoff_value is not None:
+                if (
+                    type(evidence) is not SegmentStore
+                    or type(handoff_value) is not bytes
+                ):
+                    raise ProjectionAuthorityError(
+                        "projection reconciliation handoff is invalid"
+                    )
+                reconciliation_handoff = handoff_value
             snapshot = acknowledgements.snapshot()
             if not snapshot.healthy:
                 raise ProjectionAuthorityError("ACK journal is unhealthy at projection open")
@@ -700,11 +930,51 @@ class ProjectionStore:
             store._validate_sidecars(permit_nonempty=True)
             store._verify_namespace_bindings()
             if not new:
-                records = store._records_for_current_cursor(
-                    store._connection,
-                    snapshot,
+                try:
+                    records = store._records_for_current_cursor(
+                        store._connection,
+                        snapshot,
+                    )
+                    store._validate_logical_prefix(
+                        store._connection,
+                        records,
+                    )
+                except ProjectionConflict:
+                    if (
+                        type(evidence) is not SegmentStore
+                        or not getattr(
+                            evidence,
+                            "_authenticated_retired_ranges",
+                            (),
+                        )
+                    ):
+                        raise
+                    retired_ranges = _validated_retired_ranges(
+                        evidence._authenticated_retired_ranges,
+                    )
+                    store._validate_retention_rebuild_source(
+                        store._connection,
+                        snapshot,
+                        retired_ranges,
+                    )
+                    store._rebuild(
+                        require_existing_prefix=False,
+                    )
+            if (
+                getattr(
+                    evidence,
+                    "_projection_reconciliation_completed_state_raw",
+                    None,
                 )
-                store._validate_logical_prefix(store._connection, records)
+                is not reconciliation_handoff
+            ):
+                raise ProjectionConflict(
+                    "projection reconciliation handoff changed during open"
+                )
+            if reconciliation_handoff is not None:
+                evidence._projection_reconciliation_completed_state_raw = (
+                    None
+                )
         except BaseException:
             store.close()
             raise
@@ -977,6 +1247,268 @@ class ProjectionStore:
                     )
         finally:
             expected.close()
+
+    def _validate_retention_rebuild_source(
+        self,
+        connection: sqlite3.Connection,
+        snapshot: AckJournalSnapshot,
+        retired_ranges: tuple[tuple[int, int], ...],
+    ) -> None:
+        from agmind_immune.evidence.retention import (
+            RetentionStateCorrupt,
+            RetentionStateV1,
+            decode_retention_state,
+        )
+
+        state_binding = self._evidence._retention_state_binding
+        reconciliation_handoff = (
+            self._evidence
+            ._projection_reconciliation_completed_state_raw
+        )
+        if (
+            self._evidence._retention_state_temporary is not None
+            or self._evidence._retention_state_namespace_uncertain
+        ):
+            raise ProjectionConflict(
+                "projection reconciliation lacks exact completed retention state"
+            )
+        if state_binding is None:
+            if type(reconciliation_handoff) is not bytes:
+                raise ProjectionConflict(
+                    "projection reconciliation lacks completed-state handoff"
+                )
+            state_raw = reconciliation_handoff
+        else:
+            if (
+                state_binding.name != "retention-state.json"
+                or type(state_binding.raw) is not bytes
+                or (
+                    reconciliation_handoff is not None
+                    and reconciliation_handoff is not state_binding.raw
+                )
+            ):
+                raise ProjectionConflict(
+                    "projection reconciliation completed state is ambiguous"
+                )
+            state_raw = state_binding.raw
+        try:
+            state = decode_retention_state(state_raw)
+            manifests = (
+                self._evidence
+                ._retention_state_selected_manifests(state)
+            )
+        except (
+            EvidenceCorrupt,
+            RetentionStateCorrupt,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ProjectionConflict(
+                "projection reconciliation retention state is invalid"
+            ) from error
+        if (
+            type(state) is not RetentionStateV1
+            or state.operation != "tombstone"
+            or state.phase != "completed"
+            or not manifests
+            or (
+                state_binding is not None
+                and self._evidence._retention_state_binding
+                is not state_binding
+            )
+            or (
+                state_binding is None
+                and (
+                    self._evidence._retention_state_binding is not None
+                    or self._evidence
+                    ._projection_reconciliation_completed_state_raw
+                    is not state_raw
+                )
+            )
+            or self._evidence._retention_state_temporary is not None
+            or self._evidence._retention_state_namespace_uncertain
+        ):
+            raise ProjectionConflict(
+                "projection reconciliation retention state is not completed"
+            )
+        current_retired_ranges = tuple(
+            (
+                manifest.first_source_sequence,
+                manifest.last_source_sequence,
+            )
+            for manifest in manifests
+        )
+        if any(
+            not any(
+                retired_start <= start
+                and end <= retired_end
+                for retired_start, retired_end in retired_ranges
+            )
+            for start, end in current_retired_ranges
+        ):
+            raise ProjectionConflict(
+                "completed retention ranges lack authenticated retirement"
+            )
+        cursor_ref = _current_cursor_ref(connection)
+        cursor_sequence = (
+            0
+            if cursor_ref is None
+            else cursor_ref.source_sequence
+        )
+        if (
+            cursor_ref is not None
+            and (
+                snapshot.confirmed is None
+                or cursor_sequence > snapshot.confirmed.sequence
+            )
+        ):
+            raise ProjectionConflict(
+                "projection cursor exceeds frozen confirmed ACK"
+            )
+        confirmed_records = self._records_for_snapshot(snapshot)
+        surviving_records = tuple(
+            record
+            for record in confirmed_records
+            if record.ref.source_sequence <= cursor_sequence
+        )
+        retired_prefix_ranges = tuple(
+            (start, min(end, cursor_sequence))
+            for start, end in retired_ranges
+            if start <= cursor_sequence
+        )
+        required_retired_prefix_ranges = tuple(
+            (start, min(end, cursor_sequence))
+            for start, end in current_retired_ranges
+            if start <= cursor_sequence
+        )
+        if any(
+            start <= record.ref.source_sequence <= end
+            for record in surviving_records
+            for start, end in retired_prefix_ranges
+        ):
+            raise ProjectionConflict(
+                "authenticated retired ranges overlap surviving evidence"
+            )
+        verifier = self._evidence._bound_verifier
+        if (
+            type(verifier) is not EnvelopeVerifier
+            or not self._evidence._is_bound_verifier(verifier)
+        ):
+            raise ProjectionConflict(
+                "retired projection reconstruction lacks verifier authority"
+            )
+        event_columns = _TABLE_LAYOUT[1][1]
+        sequence_index = event_columns.index("source_sequence")
+        retired_records = tuple(
+            _retired_record_from_projection_event(row, verifier)
+            for row in self._ordered_table_rows(connection, "events")
+            if any(
+                start <= _decode_uint64(row[sequence_index]) <= end
+                for start, end in retired_prefix_ranges
+            )
+        )
+        required_retired_sequences = tuple(
+            sorted(
+                record.ref.source_sequence
+                for record in retired_records
+                if any(
+                    start <= record.ref.source_sequence <= end
+                    for start, end in required_retired_prefix_ranges
+                )
+            )
+        )
+        retired_record_count = sum(
+            end - start + 1
+            for start, end in required_retired_prefix_ranges
+        )
+        if len(required_retired_sequences) != retired_record_count:
+            raise ProjectionConflict(
+                "retired projection reconstruction is not dense"
+            )
+        position = 0
+        for start, end in required_retired_prefix_ranges:
+            for expected_sequence in range(start, end + 1):
+                if required_retired_sequences[position] != expected_sequence:
+                    raise ProjectionConflict(
+                        "retired projection reconstruction has a sequence gap"
+                    )
+                position += 1
+        replay_records = tuple(
+            sorted(
+                (*surviving_records, *retired_records),
+                key=lambda record: record.ref.source_sequence,
+            )
+        )
+        terminal_ref = (
+            None
+            if not replay_records
+            else replay_records[-1].ref
+        )
+        if terminal_ref != cursor_ref:
+            raise ProjectionConflict(
+                "signed pre-retention replay does not bind old cursor"
+            )
+        sequences = tuple(
+            record.ref.source_sequence
+            for record in replay_records
+        )
+        if len(sequences) != len(set(sequences)):
+            raise ProjectionConflict(
+                "retired projection reconstruction has duplicate sequences"
+            )
+
+        expected = sqlite3.connect(":memory:", isolation_level=None)
+        expected.row_factory = sqlite3.Row
+        try:
+            expected.execute("PRAGMA foreign_keys=ON")
+            expected.execute("PRAGMA trusted_schema=OFF")
+            _create_schema(expected)
+            for record in replay_records:
+                self._apply_prepared(
+                    expected,
+                    _prepare(record),
+                    invoke_hook=False,
+                )
+            for table, _columns, _primary_key in _TABLE_LAYOUT:
+                actual_rows = self._ordered_table_rows(
+                    connection,
+                    table,
+                )
+                replayed_rows = self._ordered_table_rows(
+                    expected,
+                    table,
+                )
+                if actual_rows != replayed_rows:
+                    raise ProjectionConflict(
+                        f"projection {table} does not match authenticated "
+                        "surviving evidence under exact signed "
+                        "pre-retention replay"
+                    )
+        finally:
+            expected.close()
+
+    @staticmethod
+    def _ordered_table_rows(
+        connection: sqlite3.Connection,
+        table: str,
+    ) -> list[tuple[object, ...]]:
+        layout = next(
+            item
+            for item in _TABLE_LAYOUT
+            if item[0] == table
+        )
+        _table, columns, primary_key = layout
+        selected = ",".join(columns)
+        order = ",".join(
+            f"{column} COLLATE BINARY"
+            for column in primary_key
+        )
+        return [
+            tuple(row)
+            for row in connection.execute(
+                f"SELECT {selected} FROM {table} ORDER BY {order}"
+            )
+        ]
 
     def _exact_retry(
         self,
@@ -1331,12 +1863,69 @@ class ProjectionStore:
         return self._records_for_snapshot(snapshot), snapshot
 
     def rebuild(self) -> RebuildReport:
+        return self._rebuild(require_existing_prefix=True)
+
+    def _rebuild_after_authenticated_retention(
+        self,
+        completion: object,
+        *,
+        _factory: object,
+    ) -> RebuildReport:
+        if (
+            _factory is not _RETENTION_REBUILD_FACTORY
+            or type(self) is not ProjectionStore
+        ):
+            raise TypeError(
+                "retention projection rebuild requires its exact factory"
+            )
+        with self._mutex:
+            binding = (
+                self._evidence
+                ._authenticated_retention_unlink_completion
+            )
+            if binding is None or binding.capability is not completion:
+                raise ProjectionAuthorityError(
+                    "retention projection rebuild lacks exact completion authority"
+                )
+            self._evidence._validate_authenticated_retention_completion(
+                completion,
+                binding,
+            )
+            report = self._rebuild(require_existing_prefix=False)
+            current = (
+                self._evidence
+                ._authenticated_retention_unlink_completion
+            )
+            if current is not binding:
+                self._healthy = False
+                raise ProjectionAuthorityError(
+                    "retention completion changed during projection rebuild"
+                )
+            self._evidence._validate_authenticated_retention_completion(
+                completion,
+                binding,
+            )
+            return report
+
+    def _rebuild(
+        self,
+        *,
+        require_existing_prefix: bool,
+    ) -> RebuildReport:
         with self._mutex:
             old_connection = self._require_usable()
             self._verify_live_connection(old_connection)
             records, snapshot = self._rebuild_records()
-            old_records = self._records_for_current_cursor(old_connection, snapshot)
-            self._validate_logical_prefix(old_connection, old_records)
+            old_records: tuple[StoredEvidenceRecord, ...] | None = None
+            if require_existing_prefix:
+                old_records = self._records_for_current_cursor(
+                    old_connection,
+                    snapshot,
+                )
+                self._validate_logical_prefix(
+                    old_connection,
+                    old_records,
+                )
             temp_name = f"{self._temp_prefix()}{uuid.uuid4()}.tmp"
             temp_path = self._path.parent / temp_name
             temp_connection: sqlite3.Connection | None = None
@@ -1483,6 +2072,7 @@ class ProjectionStore:
                     reopened_hash != report.snapshot_hash
                     or reopened_counts != report.table_counts
                     or reopened_cursor != report.cursor
+                    or self._acknowledgements.snapshot() != snapshot
                 ):
                     reopened_connection.close()
                     reopened_connection = None
@@ -1540,7 +2130,11 @@ class ProjectionStore:
                             )
                             _verify_schema(reopened_old)
                             self._validate_sidecars(permit_nonempty=True)
-                            self._validate_logical_prefix(reopened_old, old_records)
+                            if old_records is not None:
+                                self._validate_logical_prefix(
+                                    reopened_old,
+                                    old_records,
+                                )
                         except BaseException as recovery_error:  # noqa: BLE001
                             self._healthy = False
                             if reopened_old is not None:

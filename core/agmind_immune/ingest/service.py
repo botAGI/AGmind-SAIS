@@ -26,6 +26,7 @@ from agmind_immune.evidence.retention import (
     RetentionTargetV1,
 )
 from agmind_immune.evidence.segments import (
+    _RETENTION_BLOCKED_CLEAR_FACTORY,
     EvidencePriority,
     EvidenceRef,
     EvidenceStatus,
@@ -2430,76 +2431,129 @@ class DeliveryCoordinator:
         async with self._retention_preflight_scope(
             _factory=_RETENTION_DELIVERY_FACTORY,
         ) as lock_authority:
-            self._require_retention_delivery(
+            return await self._deliver_retention_target_locked(
+                journal,
                 _factory=_factory,
                 _lock_authority=lock_authority,
             )
-            state = self._retention_journal_state(journal)
-            ack_before = self._ack_journal.snapshot()
-            ack_body_before = self._ack_journal.pending_request_body()
-            local = self._local_state(apply_coverage_barrier=False)
-            if local.pending is not None:
-                raise DeliveryRetryableError(
-                    "retention target delivery requires pending ACK recovery"
+
+    async def _deliver_retention_target_locked(
+        self,
+        journal: RetentionStateJournal,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> EvidenceRef:
+        """Commit one target inside an already-held retention transaction."""
+        self._require_retention_delivery(
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        state = self._retention_journal_state(journal)
+        ack_before = self._ack_journal.snapshot()
+        ack_body_before = self._ack_journal.pending_request_body()
+        local = self._local_state(apply_coverage_barrier=False)
+        if local.pending is not None:
+            raise DeliveryRetryableError(
+                "retention target delivery requires pending ACK recovery"
+            )
+        try:
+            target = state.target
+            if (
+                state.phase == "target_bound"
+                and type(target) is RetentionTargetV1
+                and target.sequence <= local.evidence_head
+            ):
+                result = self._deliver_historical_retention_target(
+                    journal,
+                    state,
+                    _factory=_RETENTION_DELIVERY_FACTORY,
+                    _lock_authority=_lock_authority,
                 )
-            try:
-                target = state.target
-                if (
-                    state.phase == "target_bound"
-                    and type(target) is RetentionTargetV1
-                    and target.sequence <= local.evidence_head
-                ):
-                    result = self._deliver_historical_retention_target(
-                        journal,
-                        state,
-                        _factory=_RETENTION_DELIVERY_FACTORY,
-                        _lock_authority=lock_authority,
-                    )
-                elif state.phase in {"selected", "target_bound"}:
-                    result = await self._deliver_future_retention_target(
-                        journal,
-                        state,
-                        _factory=_RETENTION_DELIVERY_FACTORY,
-                        _lock_authority=lock_authority,
-                    )
-                elif (
-                    state.phase == "evidence_appended"
-                    and type(target) is RetentionTargetV1
-                ):
-                    _item, result = (
-                        self._exact_authenticated_retention_target(
-                            target,
-                            state.request,
-                        )
-                    )
-                    self._require_retention_coverage(
-                        result,
-                        allow_later=True,
-                    )
-                else:
-                    raise self._latch(
-                        "retention state phase cannot deliver a target"
-                    )
-            except BaseException as primary:
-                if self._retention_ack_changed(
-                    self._ack_journal,
-                    ack_before,
-                    ack_body_before,
-                ):
-                    raise self._latch(
-                        "retention target delivery changed ACK authority",
-                        primary,
-                    )
-                raise
+            elif state.phase in {"selected", "target_bound"}:
+                result = await self._deliver_future_retention_target(
+                    journal,
+                    state,
+                    _factory=_RETENTION_DELIVERY_FACTORY,
+                    _lock_authority=_lock_authority,
+                )
+            elif (
+                state.phase == "evidence_appended"
+                and type(target) is RetentionTargetV1
+            ):
+                _item, result = self._exact_authenticated_retention_target(
+                    target,
+                    state.request,
+                )
+                self._require_retention_coverage(
+                    result,
+                    allow_later=True,
+                )
+            else:
+                raise self._latch(
+                    "retention state phase cannot deliver a target"
+                )
+        except BaseException as primary:
             if self._retention_ack_changed(
                 self._ack_journal,
                 ack_before,
                 ack_body_before,
             ):
                 raise self._latch(
-                    "retention target delivery changed ACK authority"
+                    "retention target delivery changed ACK authority",
+                    primary,
                 )
-            return result
+            raise
+        if self._retention_ack_changed(
+            self._ack_journal,
+            ack_before,
+            ack_body_before,
+        ):
+            raise self._latch(
+                "retention target delivery changed ACK authority"
+            )
+        return result
+
+    def _clear_retention_blocked_locked(
+        self,
+        journal: RetentionStateJournal,
+        target_ref: EvidenceRef,
+        *,
+        _factory: object,
+        _lock_authority: object,
+    ) -> None:
+        """Clear one blocked gate inside the exact delivery transaction."""
+        self._require_retention_delivery(
+            _factory=_factory,
+            _lock_authority=_lock_authority,
+        )
+        ack_before = self._ack_journal.snapshot()
+        ack_body_before = self._ack_journal.pending_request_body()
+        try:
+            self._store._clear_authenticated_retention_blocked(
+                journal,
+                target_ref,
+                _factory=_RETENTION_BLOCKED_CLEAR_FACTORY,
+            )
+        except BaseException as primary:
+            if self._retention_ack_changed(
+                self._ack_journal,
+                ack_before,
+                ack_body_before,
+            ):
+                raise self._latch(
+                    "retention blocked clear changed ACK authority",
+                    primary,
+                )
+            raise
+        if self._retention_ack_changed(
+            self._ack_journal,
+            ack_before,
+            ack_body_before,
+        ):
+            raise self._latch(
+                "retention blocked clear changed ACK authority"
+            )
 
     @staticmethod
     def _repair_target_bytes(expected: CoreEventV1) -> bytes:

@@ -85,6 +85,22 @@ class _FactSpec:
     record_priorities: tuple[Literal["routine", "protected"], ...] | None = None
 
 
+def _record_outer(
+    sequence: int,
+    event_type: str,
+) -> tuple[str, str]:
+    if event_type == "retention_blocked_priority_evidence":
+        event_seed = f"blocked-outer-{sequence}"
+        content_seed = f"blocked-content-{sequence}"
+    else:
+        event_seed = f"record-outer-{sequence}-{event_type}"
+        content_seed = f"record-content-{sequence}-{event_type}"
+    return (
+        "evt_" + hashlib.sha256(event_seed.encode()).hexdigest(),
+        hashlib.sha256(content_seed.encode()).hexdigest(),
+    )
+
+
 def _clock(
     *,
     healthy: bool = True,
@@ -133,7 +149,11 @@ def _manifest(
     sequence = index * 100 + 1
     segment_id = f"{sequence:08x}-0000-4000-8000-{sequence:012x}"
     seed = f"{sequence}|{spec!r}"
-    event_hash = hashlib.sha256(f"event-{seed}".encode()).hexdigest()
+    first_event_id, _ = _record_outer(sequence, spec.event_types[0])
+    last_event_id, _ = _record_outer(
+        sequence + len(spec.event_types) - 1,
+        spec.event_types[-1],
+    )
     value: dict[str, object] = {
         "schema_version": "agmind.segment-manifest.v1",
         "segment_id": segment_id,
@@ -142,8 +162,8 @@ def _manifest(
         ),
         "host_id": HOST_ID,
         "evidence_priority": spec.priority,
-        "first_event_id": f"evt_{event_hash}",
-        "last_event_id": f"evt_{event_hash}",
+        "first_event_id": first_event_id,
+        "last_event_id": last_event_id,
         "first_source_sequence": sequence,
         "last_source_sequence": sequence + len(spec.event_types) - 1,
         "record_count": len(spec.event_types),
@@ -164,12 +184,19 @@ def _snapshot(
     *specs: _FactSpec,
     clock: CoreClockSample | None = None,
     prior: tuple[AcceptedRetentionTombstone, ...] = (),
+    prior_blocked: tuple[object, ...] = (),
     prior_index_through_sequence: int | None = None,
 ) -> RetentionSnapshot:
     facts: list[FrozenRetentionFact] = []
     previous = ZERO_SHA256
     for index, spec in enumerate(specs):
         manifest = _manifest(index, spec, previous)
+        frame_base, frame_extra = divmod(
+            spec.size,
+            len(spec.event_types),
+        )
+        if frame_base < 1:
+            raise ValueError("synthetic retention frames require positive sizes")
         facts.append(
             _freeze_retention_fact(
                 manifest=manifest,
@@ -181,6 +208,19 @@ def _snapshot(
                             if spec.record_priorities is None
                             else spec.record_priorities[position]
                         ),
+                        source_sequence=index * 100 + position + 1,
+                        event_id=_record_outer(
+                            index * 100 + position + 1,
+                            event_type,
+                        )[0],
+                        content_sha256=_record_outer(
+                            index * 100 + position + 1,
+                            event_type,
+                        )[1],
+                        frame_size=(
+                            frame_base
+                            + (1 if position < frame_extra else 0)
+                        ),
                     )
                     for position, event_type in enumerate(spec.event_types)
                 ),
@@ -189,16 +229,22 @@ def _snapshot(
             )
         )
         previous = manifest.manifest_sha256
-    return _freeze_retention_snapshot(
-        facts=tuple(facts),
-        clock=_clock() if clock is None else clock,
-        prior_tombstones=prior,
-        prior_index_through_sequence=(
-            max((item.sequence for item in prior), default=0)
+    snapshot_arguments: dict[str, object] = {
+        "facts": tuple(facts),
+        "clock": _clock() if clock is None else clock,
+        "prior_tombstones": prior,
+        "prior_index_through_sequence": (
+            max(
+                (item.sequence for item in (*prior, *prior_blocked)),
+                default=0,
+            )
             if prior_index_through_sequence is None
             else prior_index_through_sequence
         ),
-    )
+    }
+    if prior_blocked:
+        snapshot_arguments["prior_blocked"] = prior_blocked
+    return _freeze_retention_snapshot(**snapshot_arguments)
 
 
 def _run_hash(manifest_hashes: list[str]) -> str:
@@ -247,6 +293,43 @@ def _accepted(
         sequence=sequence,
         event_id="evt_" + hashlib.sha256(f"outer-{sequence}".encode()).hexdigest(),
         content_sha256=hashlib.sha256(f"content-{sequence}".encode()).hexdigest(),
+        request=request,
+    )
+
+
+def _blocked_request(
+    snapshot: RetentionSnapshot,
+    *,
+    blocked_id: str = REQUEST_ID,
+    routine_bytes: int = 0,
+    protected_bytes: int = RETENTION_TARGET_BYTES + 17,
+    reason: Literal[
+        "protected_evidence",
+        "required_key_proof",
+    ] = "protected_evidence",
+) -> RetentionBlockedV1:
+    return RetentionBlockedV1(
+        schema_version="agmind.retention-blocked.v1",
+        blocked_id=blocked_id,
+        target_bytes=RETENTION_TARGET_BYTES,
+        routine_bytes=routine_bytes,
+        protected_bytes=protected_bytes,
+        blocked_bytes=(routine_bytes + protected_bytes - RETENTION_TARGET_BYTES),
+        reason=reason,
+        current_chain_head_sha256=snapshot.current_chain_head_sha256,
+    )
+
+
+def _accepted_blocked(
+    request: RetentionBlockedV1,
+    *,
+    sequence: int = 80,
+) -> object:
+    factory = retention_module._freeze_accepted_retention_blocked
+    return factory(
+        sequence=sequence,
+        event_id=("evt_" + hashlib.sha256(f"blocked-outer-{sequence}".encode()).hexdigest()),
+        content_sha256=hashlib.sha256(f"blocked-content-{sequence}".encode()).hexdigest(),
         request=request,
     )
 
@@ -353,6 +436,11 @@ def _retention_proof_case(
         )
         target_ref = acceptance.accept(target_item)
         coverage._apply_live_accepted(store, target_ref, None)
+        if acknowledge:
+            acknowledgements = store._ack_journal_owner
+            assert type(acknowledgements) is AckJournal
+            acknowledgements.record_pending(target_ref)
+            acknowledgements.record_confirmed(target_ref)
         target = retention_module.RetentionTargetV1(
             sequence=target_item.sequence,
             event_id=target_item.event_id,
@@ -890,6 +978,443 @@ def test_selection_age_only_protected_pressure_does_not_fabricate_blocked() -> N
     )
 
     assert decision.request is None
+
+
+@pytest.mark.parametrize(
+    ("scenario", "generated_id", "expected_calls", "expected_outcome"),
+    [
+        ("no_op", "not-a-uuid", 0, "no_op"),
+        ("reused_blocked", "not-a-uuid", 0, "reused_blocked"),
+        ("new_tombstone", REQUEST_ID, 1, "tombstone"),
+        ("new_blocked", REQUEST_ID, 1, "blocked"),
+        (
+            "invalid_generated_id",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            1,
+            "error",
+        ),
+    ],
+)
+def test_c2e2a_lazy_selection_materializes_id_only_for_new_request(
+    scenario: str,
+    generated_id: str,
+    expected_calls: int,
+    expected_outcome: str,
+) -> None:
+    if scenario == "no_op":
+        snapshot = _snapshot(_FactSpec(FRESH, 1))
+    elif scenario == "new_tombstone" or scenario == "invalid_generated_id":
+        snapshot = _snapshot(_FactSpec(EXPIRED, 1))
+    else:
+        spec = _FactSpec(
+            FRESH,
+            RETENTION_TARGET_BYTES + 17,
+            priority="protected",
+            event_types=("coverage",),
+        )
+        base = _snapshot(spec)
+        snapshot = (
+            _snapshot(
+                spec,
+                prior_blocked=(_accepted_blocked(_blocked_request(base)),),
+            )
+            if scenario == "reused_blocked"
+            else base
+        )
+    calls = 0
+
+    def request_id_factory() -> str:
+        nonlocal calls
+        calls += 1
+        return generated_id
+
+    if expected_outcome == "error":
+        with pytest.raises(
+            RetentionCorruption,
+            match="lowercase UUIDv4",
+        ):
+            retention_module._select_retention_lazily(
+                snapshot,
+                request_id_factory=request_id_factory,
+            )
+        assert calls == expected_calls
+        return
+
+    decision = retention_module._select_retention_lazily(
+        snapshot,
+        request_id_factory=request_id_factory,
+    )
+
+    assert calls == expected_calls
+    if expected_outcome == "no_op":
+        assert decision.request is None
+        assert decision.reused_blocked is None
+    elif expected_outcome == "reused_blocked":
+        assert decision.request is None
+        assert decision.reused_blocked is snapshot.prior_blocked[-1]
+    elif expected_outcome == "tombstone":
+        assert type(decision.request) is RetentionTombstoneV2
+        assert decision.request.tombstone_id == generated_id
+    else:
+        assert expected_outcome == "blocked"
+        assert type(decision.request) is RetentionBlockedV1
+        assert decision.request.blocked_id == generated_id
+
+
+def test_c2e2a_exact_blocked_report_frames_do_not_amplify_pressure() -> None:
+    pressure = _FactSpec(
+        FRESH,
+        RETENTION_TARGET_BYTES + 17,
+        priority="protected",
+        event_types=("coverage",),
+    )
+    base = _snapshot(pressure)
+    accepted = _accepted_blocked(
+        _blocked_request(base),
+        sequence=101,
+    )
+    generated_ids = 0
+
+    def request_id_factory() -> str:
+        nonlocal generated_ids
+        generated_ids += 1
+        return OTHER_REQUEST_ID
+
+    pure_report = retention_module._select_retention_lazily(
+        _snapshot(
+            pressure,
+            _FactSpec(
+                FRESH,
+                29,
+                priority="protected",
+                event_types=("retention_blocked_priority_evidence",),
+            ),
+            prior_blocked=(accepted,),
+        ),
+        request_id_factory=request_id_factory,
+    )
+
+    assert pure_report.request is None
+    assert pure_report.reused_blocked is accepted
+    assert pure_report.protected_bytes == RETENTION_TARGET_BYTES + 17
+    assert generated_ids == 0
+
+    mixed_report = retention_module._select_retention_lazily(
+        _snapshot(
+            pressure,
+            _FactSpec(
+                FRESH,
+                30,
+                priority="protected",
+                event_types=(
+                    "retention_blocked_priority_evidence",
+                    "retention_blocked_priority_evidence",
+                    "coverage",
+                ),
+            ),
+            prior_blocked=(accepted,),
+        ),
+        request_id_factory=request_id_factory,
+    )
+
+    assert type(mixed_report.request) is RetentionBlockedV1
+    assert mixed_report.request.blocked_id == OTHER_REQUEST_ID
+    assert mixed_report.request.protected_bytes == (
+        RETENTION_TARGET_BYTES + 37
+    )
+    assert mixed_report.request.blocked_bytes == 37
+    assert mixed_report.reused_blocked is None
+    assert mixed_report.protected_bytes == RETENTION_TARGET_BYTES + 37
+    assert generated_ids == 1
+
+
+def test_c2e2a_accepted_retention_blocked_is_factory_only_and_outer_bound() -> None:
+    snapshot = _snapshot(
+        _FactSpec(
+            FRESH,
+            RETENTION_TARGET_BYTES + 17,
+            priority="protected",
+            event_types=("coverage",),
+        )
+    )
+    request = _blocked_request(snapshot)
+    accepted_type = retention_module.AcceptedRetentionBlocked
+    accepted = _accepted_blocked(request)
+
+    with pytest.raises(TypeError, match="factory"):
+        accepted_type(
+            sequence=accepted.sequence,
+            event_id=accepted.event_id,
+            content_sha256=accepted.content_sha256,
+            request=request,
+        )
+
+    assert type(accepted) is accepted_type
+    assert accepted.sequence == 80
+    assert accepted.request == request
+    assert accepted.event_id.startswith("evt_")
+    assert len(accepted.content_sha256) == 64
+
+
+def test_c2e2a_snapshot_binds_exact_prior_blocked_identity() -> None:
+    spec = _FactSpec(
+        FRESH,
+        RETENTION_TARGET_BYTES + 17,
+        priority="protected",
+        event_types=("coverage",),
+    )
+    base = _snapshot(spec)
+    request = _blocked_request(base)
+    accepted = _accepted_blocked(request)
+    substitute = _accepted_blocked(request)
+    snapshot = _snapshot(spec, prior_blocked=(accepted,))
+
+    assert snapshot.prior_blocked == (accepted,)
+    assert snapshot.prior_blocked[0] is accepted
+    assert substitute is not accepted
+    assert substitute == accepted
+
+    object.__setattr__(
+        snapshot,
+        "prior_blocked",
+        (substitute,),
+    )
+    with pytest.raises(
+        RetentionCorruption,
+        match="construction authority|snapshot",
+    ):
+        _ = snapshot.current_chain_head_sha256
+
+
+def test_c2e2a_latest_matching_blocked_key_and_h0_coalesces_exact_prior() -> None:
+    spec = _FactSpec(
+        FRESH,
+        RETENTION_TARGET_BYTES + 17,
+        priority="protected",
+        event_types=("coverage",),
+    )
+    base = _snapshot(spec)
+    accepted = _accepted_blocked(_blocked_request(base))
+    snapshot = _snapshot(spec, prior_blocked=(accepted,))
+
+    decision = select_retention(
+        snapshot,
+        request_id=OTHER_REQUEST_ID,
+    )
+
+    assert decision.request is None
+    assert decision.reused_blocked is accepted
+    assert decision.size_pressure
+    assert decision.protected_bytes == RETENTION_TARGET_BYTES + 17
+
+
+def test_c2e2a_a_b_a_blocked_episode_mints_new_request() -> None:
+    spec = _FactSpec(
+        FRESH,
+        RETENTION_TARGET_BYTES + 17,
+        priority="protected",
+        event_types=("coverage",),
+    )
+    base = _snapshot(spec)
+    accepted_a = _accepted_blocked(
+        _blocked_request(base),
+        sequence=80,
+    )
+    accepted_b = _accepted_blocked(
+        _blocked_request(
+            base,
+            blocked_id="33333333-3333-4333-8333-333333333333",
+            protected_bytes=RETENTION_TARGET_BYTES + 23,
+        ),
+        sequence=81,
+    )
+    snapshot = _snapshot(
+        spec,
+        prior_blocked=(accepted_a, accepted_b),
+    )
+
+    decision = select_retention(
+        snapshot,
+        request_id=OTHER_REQUEST_ID,
+    )
+
+    assert type(decision.request) is RetentionBlockedV1
+    assert decision.request.blocked_id == OTHER_REQUEST_ID
+    assert decision.request.blocked_bytes == 17
+    assert decision.request.current_chain_head_sha256 == (
+        accepted_a.request.current_chain_head_sha256
+    )
+    assert decision.reused_blocked is None
+
+
+def test_c2e2a_later_tombstone_closes_matching_blocked_episode() -> None:
+    specs = (
+        _FactSpec(EXPIRED, 1),
+        _FactSpec(
+            FRESH,
+            RETENTION_TARGET_BYTES + 17,
+            priority="protected",
+            event_types=("coverage",),
+        ),
+    )
+    base = _snapshot(*specs)
+    accepted_a = _accepted_blocked(
+        _blocked_request(base),
+        sequence=80,
+    )
+    accepted_tombstone = _accepted(
+        _tombstone(
+            base,
+            (0,),
+            tombstone_id="33333333-3333-4333-8333-333333333333",
+        ),
+        sequence=81,
+    )
+    snapshot = _snapshot(
+        *specs,
+        prior=(accepted_tombstone,),
+        prior_blocked=(accepted_a,),
+    )
+
+    decision = select_retention(
+        snapshot,
+        request_id=OTHER_REQUEST_ID,
+    )
+
+    assert type(decision.request) is RetentionBlockedV1
+    assert decision.request.blocked_id == OTHER_REQUEST_ID
+    assert decision.request.blocked_bytes == 17
+    assert decision.reused_blocked is None
+
+
+def test_c2e2a_selected_state_rejects_coalesced_blocked_decision() -> None:
+    spec = _FactSpec(
+        FRESH,
+        RETENTION_TARGET_BYTES + 17,
+        priority="protected",
+        event_types=("coverage",),
+    )
+    base = _snapshot(spec)
+    accepted = _accepted_blocked(_blocked_request(base))
+    decision = select_retention(
+        _snapshot(spec, prior_blocked=(accepted,)),
+        request_id=OTHER_REQUEST_ID,
+    )
+
+    assert decision.request is None
+    assert decision.reused_blocked is accepted
+    with pytest.raises(
+        retention_module.RetentionProtocolError,
+        match="coalesced|publication",
+    ):
+        retention_module.selected_retention_state(decision)
+
+
+@pytest.mark.parametrize(
+    ("attack", "message"),
+    [
+        ("foreign_h0", "historical prefix"),
+        ("cross_kind_id", "ID has conflicting authority"),
+        ("cross_kind_sequence", "conflict at one source sequence"),
+        ("mutated_blocked", "construction authority"),
+    ],
+)
+def test_c2e2a_prior_blocked_authority_rejects_cross_binding_attacks(
+    attack: str,
+    message: str,
+) -> None:
+    specs = (
+        _FactSpec(EXPIRED, 1),
+        _FactSpec(
+            FRESH,
+            RETENTION_TARGET_BYTES + 17,
+            priority="protected",
+            event_types=("coverage",),
+        ),
+    )
+    base = _snapshot(*specs)
+    blocked_id = REQUEST_ID if attack == "cross_kind_id" else OTHER_REQUEST_ID
+    blocked_request = _blocked_request(base, blocked_id=blocked_id)
+    if attack == "foreign_h0":
+        blocked_request = RetentionBlockedV1.model_validate(
+            {
+                **blocked_request.model_dump(mode="python"),
+                "current_chain_head_sha256": hashlib.sha256(
+                    b"foreign-blocked-h0"
+                ).hexdigest(),
+            },
+            strict=True,
+        )
+    blocked_sequence = 80 if attack == "cross_kind_sequence" else 81
+    accepted_blocked = _accepted_blocked(
+        blocked_request,
+        sequence=blocked_sequence,
+    )
+    prior = (
+        (_accepted(_tombstone(base, (0,)), sequence=80),)
+        if attack in {"cross_kind_id", "cross_kind_sequence"}
+        else ()
+    )
+    snapshot = _snapshot(
+        *specs,
+        prior=prior,
+        prior_blocked=(accepted_blocked,),
+    )
+    if attack == "mutated_blocked":
+        object.__setattr__(
+            accepted_blocked,
+            "content_sha256",
+            hashlib.sha256(b"mutated-blocked-outer").hexdigest(),
+        )
+
+    with pytest.raises(RetentionCorruption, match=message):
+        select_retention(snapshot, request_id="33333333-3333-4333-8333-333333333333")
+
+
+def test_c2e2a_store_snapshot_retains_exact_blocked_outer_identity(
+    tmp_path: Path,
+) -> None:
+    key, acceptance, store, coverage = _live_store_with_active_routine(tmp_path)
+    try:
+        store.flush_security_boundary()
+        current_h0 = hashlib.sha256(canonical_json(chain_head_for(store.manifests[-1]))).hexdigest()
+        request = RetentionBlockedV1(
+            schema_version="agmind.retention-blocked.v1",
+            blocked_id=REQUEST_ID,
+            target_bytes=RETENTION_TARGET_BYTES,
+            routine_bytes=0,
+            protected_bytes=RETENTION_TARGET_BYTES + 17,
+            blocked_bytes=17,
+            reason="protected_evidence",
+            current_chain_head_sha256=current_h0,
+        )
+        blocked_ref = acceptance.accept(
+            _item(
+                envelope_value(
+                    key,
+                    sequence=3,
+                    event_type="retention_blocked_priority_evidence",
+                    normalized_fields=request.model_dump(mode="python"),
+                )
+            )
+        )
+        coverage._apply_live_accepted(store, blocked_ref, None)
+
+        snapshot = store._freeze_retention_snapshot(
+            _proof_clock(),
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+
+        assert len(snapshot.prior_blocked) == 1
+        accepted = snapshot.prior_blocked[0]
+        assert type(accepted) is retention_module.AcceptedRetentionBlocked
+        assert accepted.sequence == blocked_ref.source_sequence
+        assert accepted.event_id == blocked_ref.event_id
+        assert accepted.content_sha256 == blocked_ref.content_sha256
+        assert accepted.request == request
+    finally:
+        coverage.close()
+        store.close(flush=False)
 
 
 def test_state_selection_witness_is_canonical_bounded_and_complete() -> None:

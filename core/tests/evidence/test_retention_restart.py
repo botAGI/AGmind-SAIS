@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -25,6 +28,7 @@ from agmind_immune.evidence.segments import (
     SegmentStore,
 )
 from agmind_immune.ingest import envelope as envelope_module
+from agmind_immune.ingest.ack_journal import AckJournal
 from agmind_immune.ingest.envelope import EnvelopeVerifier, VerifierCommitError
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from tests.evidence.test_retention import (
@@ -34,6 +38,7 @@ from tests.evidence.test_retention import (
     _FactSpec,
     _live_store_with_active_routine,
     _manifest,
+    _record_outer,
 )
 from tests.evidence.test_retention_unlink import (
     _completed_case,
@@ -137,21 +142,40 @@ def test_missing_payload_without_signed_tombstone_rejects(
 def test_sparse_routine_manifest_is_not_retention_removable() -> None:
     dense = _manifest(
         0,
-        _FactSpec(EXPIRED, 1),
+        _FactSpec(
+            EXPIRED,
+            2,
+            event_types=("falco_connect", "falco_connect"),
+        ),
         ZERO_SHA256,
     )
     sparse_value = dense.model_dump(mode="python")
     sparse_value["last_source_sequence"] = dense.last_source_sequence + 1
+    sparse_value["last_event_id"] = _record_outer(
+        dense.last_source_sequence + 1,
+        "falco_connect",
+    )[0]
     sparse_value["manifest_sha256"] = ZERO_SHA256
     sparse_value["manifest_sha256"] = segment_manifest_hash(sparse_value)
     sparse = SegmentManifestV1.model_validate(sparse_value, strict=True)
     fact = _freeze_retention_fact(
         manifest=sparse,
-        records=(
+        records=tuple(
             _freeze_retention_record(
                 event_type="falco_connect",
                 evidence_priority="routine",
-            ),
+                source_sequence=sequence,
+                event_id=_record_outer(sequence, "falco_connect")[0],
+                content_sha256=_record_outer(
+                    sequence,
+                    "falco_connect",
+                )[1],
+                frame_size=1,
+            )
+            for sequence in (
+                dense.first_source_sequence,
+                dense.last_source_sequence + 1,
+            )
         ),
         original_device=100,
         original_inode=1_000,
@@ -237,31 +261,379 @@ def test_restart_completed_state_rebuilds_cache_and_clears_state(
         restarted_store.close(flush=False)
 
 
-def test_restart_evidence_appended_finishes_unlink(
+def test_retention_unlink_defers_when_ack_equals_selected_end(
     tmp_path: Path,
 ) -> None:
-    case, _capability = _issued_case(tmp_path)
+    case, capability = _issued_case(
+        tmp_path,
+        acknowledge=False,
+    )
+    acknowledgements = AckJournal.create_new(case.store)
     state = case.journal.state
     assert state is not None
     assert state.phase == "evidence_appended"
     selected_paths = tuple(
         tmp_path / entry.segment_relative_path for entry in state.entries
     )
-    selected_manifest_hashes = {
-        entry.manifest_sha256 for entry in state.entries
-    }
-    retired_sequences = tuple(
-        sequence
-        for manifest in case.store._manifests
-        if manifest.manifest_sha256 in selected_manifest_hashes
-        for sequence in range(
-            manifest.first_source_sequence,
-            manifest.last_source_sequence + 1,
+    refs = tuple(
+        record.ref for record in case.store.iter_authenticated_records()
+    )
+    assert [ref.source_sequence for ref in refs] == [1, 2, 3]
+    assert selected_paths
+    assert all(path.exists() for path in selected_paths)
+    try:
+        for ref in refs[:2]:
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
+        assert acknowledgements.snapshot().confirmed_through == 2
+        assert acknowledgements.snapshot().pending is None
+
+        with pytest.raises(EvidenceSealError, match="ACK|ack"):
+            case.store._execute_authenticated_retention_unlink(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+
+        durable = case.journal.state
+        assert durable is not None
+        assert durable.phase == "evidence_appended"
+        assert all(path.exists() for path in selected_paths)
+    finally:
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_retention_unlink_permits_ack_strictly_after_selected_end(
+    tmp_path: Path,
+) -> None:
+    case, capability = _issued_case(
+        tmp_path,
+        acknowledge=False,
+    )
+    acknowledgements = AckJournal.create_new(case.store)
+    state = case.journal.state
+    assert state is not None
+    selected_paths = tuple(
+        tmp_path / entry.segment_relative_path for entry in state.entries
+    )
+    refs = tuple(
+        record.ref for record in case.store.iter_authenticated_records()
+    )
+    assert [ref.source_sequence for ref in refs] == [1, 2, 3]
+    try:
+        for ref in refs:
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
+        assert acknowledgements.snapshot().confirmed_through == 3
+        assert acknowledgements.snapshot().pending is None
+
+        case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+
+        durable = case.journal.state
+        assert durable is not None
+        assert durable.phase == "completed"
+        assert all(not path.exists() for path in selected_paths)
+    finally:
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
+    tmp_path: Path,
+) -> None:
+    projection = importlib.import_module(
+        "agmind_immune.evidence.projection"
+    )
+    evidence_path = tmp_path / "evidence"
+    projection_path = tmp_path / "projection.sqlite3"
+    case, capability = _issued_case(
+        evidence_path,
+        acknowledge=False,
+    )
+    acknowledgements = AckJournal.create_new(case.store)
+    cache = None
+    reopened = None
+    try:
+        refs = tuple(
+            record.ref
+            for record in case.store.iter_authenticated_records()
+        )
+        assert [ref.source_sequence for ref in refs] == [1, 2, 3]
+        for ref in refs:
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
+        confirmed_before = acknowledgements.snapshot()
+
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+        for ref in refs:
+            cache.apply(ref)
+        with closing(sqlite3.connect(projection_path)) as connection:
+            assert connection.execute(
+                "SELECT source_sequence FROM events "
+                "ORDER BY source_sequence"
+            ).fetchall() == [
+                (projection._uint64(1),),
+                (projection._uint64(2),),
+                (projection._uint64(3),),
+            ]
+            assert connection.execute(
+                "SELECT count(*) FROM network_observations"
+            ).fetchone() == (1,)
+
+        completion = (
+            case.store._execute_authenticated_retention_unlink(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+        )
+        assert [
+            record.ref.source_sequence
+            for record in case.store.iter_authenticated_records()
+        ] == [1, 3]
+
+        cache._rebuild_after_authenticated_retention(
+            completion,
+            _factory=projection._RETENTION_REBUILD_FACTORY,
+        )
+
+        assert acknowledgements.snapshot() == confirmed_before
+        assert cache.status().cursor is not None
+        assert cache.status().cursor.source_sequence == 3
+        with closing(sqlite3.connect(projection_path)) as connection:
+            assert connection.execute(
+                "SELECT source_sequence FROM events "
+                "ORDER BY source_sequence"
+            ).fetchall() == [
+                (projection._uint64(1),),
+                (projection._uint64(3),),
+            ]
+            assert connection.execute(
+                "SELECT count(*) FROM projection_dedup"
+            ).fetchone() == (2,)
+            assert connection.execute(
+                "SELECT count(*) FROM network_observations"
+            ).fetchone() == (0,)
+
+        cache.close()
+        cache = None
+        reopened = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+        reopened_status = reopened.status()
+        assert reopened_status.healthy is True
+        assert reopened_status.cursor is not None
+        assert reopened_status.cursor.source_sequence == 3
+        assert acknowledgements.snapshot() == confirmed_before
+    finally:
+        if reopened is not None:
+            reopened.close()
+        if cache is not None:
+            cache.close()
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_projection_open_reconciles_authenticated_retention_crash_window(
+    tmp_path: Path,
+) -> None:
+    projection = importlib.import_module(
+        "agmind_immune.evidence.projection"
+    )
+    evidence_path = tmp_path / "evidence"
+    projection_path = tmp_path / "projection.sqlite3"
+    case, capability = _issued_case(
+        evidence_path,
+        acknowledge=False,
+    )
+    acknowledgements = AckJournal.create_new(case.store)
+    cache = None
+    try:
+        refs = tuple(
+            record.ref
+            for record in case.store.iter_authenticated_records()
+        )
+        for ref in refs:
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+        for ref in refs:
+            cache.apply(ref)
+        case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        cache.close()
+        cache = None
+    finally:
+        if cache is not None:
+            cache.close()
+        case.coverage.close()
+        case.store.close(flush=False)
+
+    restarted_store = SegmentStore(evidence_path)
+    restarted_acknowledgements = None
+    restarted_projection = None
+    try:
+        AcceptanceCoordinator.open_and_recover(
+            _fresh_verifier(),
+            restarted_store,
+        )
+        restarted_acknowledgements = AckJournal.open_and_recover(
+            restarted_store
+        )
+        restarted_projection = projection.ProjectionStore.open(
+            projection_path,
+            evidence=restarted_store,
+            acknowledgements=restarted_acknowledgements,
+        )
+
+        status = restarted_projection.status()
+        assert status.healthy is True
+        assert status.cursor is not None
+        assert status.cursor.source_sequence == 3
+        with closing(sqlite3.connect(projection_path)) as connection:
+            assert connection.execute(
+                "SELECT source_sequence FROM events "
+                "ORDER BY source_sequence"
+            ).fetchall() == [
+                (projection._uint64(1),),
+                (projection._uint64(3),),
+            ]
+    finally:
+        if restarted_projection is not None:
+            restarted_projection.close()
+        if restarted_acknowledgements is not None:
+            restarted_acknowledgements.close()
+        restarted_store.close(flush=False)
+
+
+def test_projection_open_reconciles_retired_projection_cursor(
+    tmp_path: Path,
+) -> None:
+    from tests.evidence.test_projection import (
+        _retention_case_with_surviving_falco,
+    )
+
+    projection = importlib.import_module(
+        "agmind_immune.evidence.projection"
+    )
+    case_path = tmp_path / "retired-cursor"
+    evidence_path = case_path / "evidence"
+    projection_path = case_path / "projection.sqlite3"
+    raw_hash = hashlib.sha256(b"survivor after retired cursor").hexdigest()
+    case, capability, acknowledgements, refs = (
+        _retention_case_with_surviving_falco(
+            evidence_path,
+            raw_hash=raw_hash,
         )
     )
+    cache = None
+    try:
+        assert [ref.source_sequence for ref in refs] == [1, 2, 3, 4]
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=case.store,
+            acknowledgements=acknowledgements,
+        )
+        for ref in refs[:2]:
+            cache.apply(ref)
+        status = cache.status()
+        assert status.cursor is not None
+        assert status.cursor.source_sequence == 2
+
+        case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        cache.close()
+        cache = None
+    finally:
+        if cache is not None:
+            cache.close()
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)
+
+    restarted_store = SegmentStore(evidence_path)
+    restarted_acknowledgements = None
+    restarted_projection = None
+    try:
+        AcceptanceCoordinator.open_and_recover(
+            _fresh_verifier(),
+            restarted_store,
+        )
+        restarted_acknowledgements = AckJournal.open_and_recover(
+            restarted_store
+        )
+        restarted_projection = projection.ProjectionStore.open(
+            projection_path,
+            evidence=restarted_store,
+            acknowledgements=restarted_acknowledgements,
+        )
+
+        status = restarted_projection.status()
+        assert status.healthy is True
+        assert status.cursor is not None
+        assert status.cursor.source_sequence == 4
+        with closing(sqlite3.connect(projection_path)) as connection:
+            assert connection.execute(
+                "SELECT source_sequence FROM events "
+                "ORDER BY source_sequence"
+            ).fetchall() == [
+                (projection._uint64(1),),
+                (projection._uint64(3),),
+                (projection._uint64(4),),
+            ]
+    finally:
+        if restarted_projection is not None:
+            restarted_projection.close()
+        if restarted_acknowledgements is not None:
+            restarted_acknowledgements.close()
+        restarted_store.close(flush=False)
+
+
+def test_restart_evidence_appended_with_ack_lag_is_ready_and_pending(
+    tmp_path: Path,
+) -> None:
+    case, _capability = _issued_case(
+        tmp_path,
+        acknowledge=False,
+    )
+    acknowledgements = AckJournal.create_new(case.store)
+    refs = tuple(
+        record.ref for record in case.store.iter_authenticated_records()
+    )
+    for ref in refs[:2]:
+        acknowledgements.record_pending(ref)
+        acknowledgements.record_confirmed(ref)
+    state = case.journal.state
+    assert state is not None
+    assert state.phase == "evidence_appended"
+    selected_paths = tuple(
+        tmp_path / entry.segment_relative_path for entry in state.entries
+    )
+    ack_snapshot = acknowledgements.snapshot()
+    assert ack_snapshot.confirmed_through == 2
+    assert ack_snapshot.pending is None
+    assert case.target_ref.source_sequence == 3
     expected_target = case.target_ref
     assert selected_paths
-    assert retired_sequences
     assert all(path.exists() for path in selected_paths)
     try:
         case.coverage.close()
@@ -280,21 +652,17 @@ def test_restart_evidence_appended_finishes_unlink(
         assert restarted.verifier.fsm.last_sequence == (
             expected_target.source_sequence
         )
-        assert restarted_store.status().healthy is True
-        assert all(not path.exists() for path in selected_paths)
-        assert not (tmp_path / "retention-state.json").exists()
-        assert all(
-            fresh_verifier.accepted_ref(sequence) is None
-            for sequence in retired_sequences
+        status = restarted_store.status()
+        assert status.healthy is True
+        assert status.retention_pending is True
+        assert all(path.exists() for path in selected_paths)
+        state_path = tmp_path / "retention-state.json"
+        assert state_path.exists()
+        durable = retention_module.decode_retention_state(
+            state_path.read_bytes()
         )
-        assert (
-            restarted_store.authenticated_refs(
-                after_sequence=min(retired_sequences) - 1,
-                through_sequence=max(retired_sequences),
-                limit=100,
-            )
-            == ()
-        )
+        assert durable.phase == "evidence_appended"
+        assert fresh_verifier.accepted_ref(2) is not None
     finally:
         restarted_store.close(flush=False)
 
@@ -372,6 +740,94 @@ def test_restart_in_progress_with_payload_present_finishes_unlink(
         assert [entry.sequence for entry in boundary.tombstones] == [
             expected_target.source_sequence
         ]
+    finally:
+        restarted_store.close(flush=False)
+
+
+def test_restart_in_progress_rejects_ack_rollback_to_selected_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case, capability = _issued_case(
+        tmp_path,
+        acknowledge=False,
+    )
+    acknowledgements = AckJournal.create_new(case.store)
+    refs = tuple(
+        record.ref for record in case.store.iter_authenticated_records()
+    )
+    assert [ref.source_sequence for ref in refs] == [1, 2, 3]
+    for ref in refs[:2]:
+        acknowledgements.record_pending(ref)
+        acknowledgements.record_confirmed(ref)
+    ack_rollback = {
+        name: (tmp_path / name).read_bytes()
+        for name in ("ack-commitment.json", "ack-journal.agf")
+    }
+    acknowledgements.record_pending(refs[2])
+    acknowledgements.record_confirmed(refs[2])
+
+    binding = case.store._authenticated_retention_tombstone
+    assert binding is not None
+    in_progress_raw = binding.unlink_in_progress_state_raw
+    journal_type = type(case.journal)
+    original_prove = journal_type._prove_publication
+
+    def crash_after_in_progress_publication(
+        owner: object,
+        expected: bytes | None,
+    ) -> None:
+        original_prove(owner, expected)
+        if expected == in_progress_raw:
+            raise EvidenceSealError(
+                "injected crash after durable retention unlink intent"
+            )
+
+    with monkeypatch.context() as crash_cut:
+        crash_cut.setattr(
+            journal_type,
+            "_prove_publication",
+            crash_after_in_progress_publication,
+        )
+        with pytest.raises(EvidenceSealError, match="injected crash"):
+            case.store._execute_authenticated_retention_unlink(
+                capability,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+
+    in_progress = retention_module.decode_retention_state(
+        (tmp_path / "retention-state.json").read_bytes()
+    )
+    assert in_progress.phase == "retention_unlink_in_progress"
+    selected_paths = tuple(
+        tmp_path / entry.segment_relative_path
+        for entry in in_progress.entries
+    )
+    assert selected_paths
+    assert all(path.exists() for path in selected_paths)
+    acknowledgements.close()
+    case.coverage.close()
+    case.store.close(flush=False)
+    for name, raw in ack_rollback.items():
+        (tmp_path / name).write_bytes(raw)
+
+    restarted_store = SegmentStore(tmp_path)
+    try:
+        with pytest.raises(
+            EvidenceCorrupt,
+            match="retention|ACK|authenticated",
+        ):
+            AcceptanceCoordinator.open_and_recover(
+                _fresh_verifier(),
+                restarted_store,
+            )
+
+        assert all(path.exists() for path in selected_paths)
+        durable = retention_module.decode_retention_state(
+            (tmp_path / "retention-state.json").read_bytes()
+        )
+        assert durable.phase == "retention_unlink_in_progress"
+        assert restarted_store.status().healthy is False
     finally:
         restarted_store.close(flush=False)
 
@@ -576,6 +1032,13 @@ def test_restart_unlink_rejects_canonical_date_directory_swap(
     assert state is not None
     assert state.phase == "evidence_appended"
     assert state.entries
+    binding = case.store._authenticated_retention_tombstone
+    assert binding is not None
+    case.journal._transition(
+        retention_module.decode_retention_state(
+            binding.unlink_in_progress_state_raw
+        )
+    )
     selected_entry = state.entries[0]
     _, date_name, selected_name = (
         selected_entry.segment_relative_path.split("/")
