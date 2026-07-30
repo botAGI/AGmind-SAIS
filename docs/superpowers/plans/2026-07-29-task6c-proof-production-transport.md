@@ -243,7 +243,7 @@ Run:
 
 ```sh
 go test ./host/observerd -run 'TestPCCSafetyPinSnapshot' -count=1
-go test ./internal/contracts -run 'TestTask6A.*(Detector|Denylist|SpecialUse)' -count=1
+go test ./internal/contracts -run '^TestTask6AHashParityAndCanonicalInputValidation$' -count=1
 ```
 
 Expected: PASS with no configurable trust path.
