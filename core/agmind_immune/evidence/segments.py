@@ -137,6 +137,7 @@ _RETENTION_STATE_TEMP_NAME = re.compile(
     rf"^\.retention-state\.json\.{_UUID4_TEXT}\.tmp$"
 )
 _MAX_RETENTION_STATE_BYTES = 128 * 1024
+_RETENTION_BOUNDARY_NAME = "retention-boundary.json"
 _RETENTION_STATE_AUTHORITY_FACTORY = object()
 _RETENTION_PROOF_FACTORY = object()
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -1845,6 +1846,268 @@ def _atomic_replace_at(
         )
 
 
+def _moved_held_identity(
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    descriptor: int,
+    identity: _FileIdentity,
+) -> _FileIdentity:
+    held = _file_identity(os.fstat(descriptor))
+    _validate_post_rename_identity(held, identity, display_path)
+    named = _file_identity(
+        _regular_stat_at(parent_descriptor, name, display_path)
+    )
+    if named != held:
+        raise EvidenceCorrupt(
+            f"moved evidence is not the held source: {display_path}"
+        )
+    return held
+
+
+def _publish_retention_boundary_at(
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+    raw: bytes,
+    *,
+    existing_descriptor: int,
+    existing_identity: _FileIdentity | None,
+) -> tuple[int, _FileIdentity]:
+    if (existing_descriptor >= 0) != (existing_identity is not None):
+        raise EvidenceSealError(
+            "retention boundary replacement lost its held source"
+        )
+    temporary_name = f".{name}.{uuid.uuid4()}.tmp"
+    temporary_path = display_path.with_name(temporary_name)
+    expected_sha256 = hashlib.sha256(raw).hexdigest()
+    descriptor = -1
+    old_descriptor = existing_descriptor
+    try:
+        descriptor, identity = _write_temporary_at(
+            parent_descriptor,
+            temporary_name,
+            raw,
+        )
+        with _post_authentication_namespace(display_path):
+            _bind_held_source(
+                parent_descriptor,
+                temporary_name,
+                temporary_path,
+                descriptor=descriptor,
+                identity=identity,
+            )
+            moved_old_identity: _FileIdentity | None = None
+            if existing_identity is None:
+                _rename_noreplace(
+                    temporary_name,
+                    name,
+                    source_dir_fd=parent_descriptor,
+                    destination_dir_fd=parent_descriptor,
+                )
+            else:
+                _bind_held_source(
+                    parent_descriptor,
+                    name,
+                    display_path,
+                    descriptor=old_descriptor,
+                    identity=existing_identity,
+                )
+                _rename_exchange(
+                    temporary_name,
+                    name,
+                    parent_descriptor=parent_descriptor,
+                )
+                try:
+                    moved_old_identity = _moved_held_identity(
+                        parent_descriptor,
+                        temporary_name,
+                        temporary_path,
+                        descriptor=old_descriptor,
+                        identity=existing_identity,
+                    )
+                except BaseException as error:
+                    try:
+                        _validate_published_from_held(
+                            parent_descriptor,
+                            name,
+                            display_path,
+                            descriptor=descriptor,
+                            identity=identity,
+                            expected_sha256=expected_sha256,
+                        )
+                        os.fsync(parent_descriptor)
+                    except BaseException as publication_error:
+                        raise EvidenceCorrupt(
+                            "retention boundary publication is uncertain"
+                        ) from publication_error
+                    raise EvidenceCorrupt(
+                        "retention boundary source changed at exchange"
+                    ) from error
+            _validate_published_from_held(
+                parent_descriptor,
+                name,
+                display_path,
+                descriptor=descriptor,
+                identity=identity,
+                expected_sha256=expected_sha256,
+            )
+            published_identity = _file_identity(os.fstat(descriptor))
+            os.fsync(parent_descriptor)
+            if existing_identity is not None:
+                if moved_old_identity is None:
+                    raise EvidenceSealError(
+                        "retention boundary old source is unbound"
+                    )
+                _bind_held_source(
+                    parent_descriptor,
+                    temporary_name,
+                    temporary_path,
+                    descriptor=old_descriptor,
+                    identity=moved_old_identity,
+                )
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+                unlinked = os.fstat(old_descriptor)
+                if (
+                    unlinked.st_dev != existing_identity.device
+                    or unlinked.st_ino != existing_identity.inode
+                    or unlinked.st_size != existing_identity.size
+                    or unlinked.st_mode != existing_identity.mode
+                    or unlinked.st_uid != existing_identity.owner
+                    or unlinked.st_nlink != 0
+                    or _entry_stat_at(parent_descriptor, temporary_name)
+                    is not None
+                ):
+                    raise EvidenceCorrupt(
+                        "retention boundary old source unlink is uncertain"
+                    )
+                closed = old_descriptor
+                old_descriptor = -1
+                os.close(closed)
+                os.fsync(parent_descriptor)
+            elif (
+                _entry_stat_at(parent_descriptor, temporary_name)
+                is not None
+            ):
+                raise EvidenceCorrupt(
+                    "retention boundary temporary survived publication"
+                )
+        published = descriptor
+        descriptor = -1
+        return published, published_identity
+    except BaseException as error:
+        if descriptor >= 0:
+            closing = descriptor
+            descriptor = -1
+            try:
+                os.close(closing)
+            except BaseException as close_error:  # noqa: BLE001
+                error.add_note(
+                    "retention boundary publication descriptor close failed: "
+                    f"{close_error}"
+                )
+        if old_descriptor >= 0:
+            closing = old_descriptor
+            old_descriptor = -1
+            try:
+                os.close(closing)
+            except BaseException as close_error:  # noqa: BLE001
+                error.add_note(
+                    "retention boundary old descriptor close failed: "
+                    f"{close_error}"
+                )
+        raise
+
+
+def _conditionally_unlink_held_at(
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    descriptor: int,
+    identity: _FileIdentity,
+) -> None:
+    temporary_name = f".{name}.{uuid.uuid4()}.tmp"
+    temporary_path = display_path.with_name(temporary_name)
+    moved = False
+    held_descriptor = descriptor
+    try:
+        with _post_authentication_namespace(display_path):
+            _bind_held_source(
+                parent_descriptor,
+                name,
+                display_path,
+                descriptor=held_descriptor,
+                identity=identity,
+            )
+            _rename_noreplace(
+                name,
+                temporary_name,
+                source_dir_fd=parent_descriptor,
+                destination_dir_fd=parent_descriptor,
+            )
+            moved = True
+            moved_identity = _moved_held_identity(
+                parent_descriptor,
+                temporary_name,
+                temporary_path,
+                descriptor=held_descriptor,
+                identity=identity,
+            )
+            if _entry_stat_at(parent_descriptor, name) is not None:
+                raise EvidenceCorrupt(
+                    f"retention finalization source reappeared: {display_path}"
+                )
+            _bind_held_source(
+                parent_descriptor,
+                temporary_name,
+                temporary_path,
+                descriptor=held_descriptor,
+                identity=moved_identity,
+            )
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            unlinked = os.fstat(held_descriptor)
+            if (
+                unlinked.st_dev != identity.device
+                or unlinked.st_ino != identity.inode
+                or unlinked.st_size != identity.size
+                or unlinked.st_mode != identity.mode
+                or unlinked.st_uid != identity.owner
+                or unlinked.st_nlink != 0
+                or _entry_stat_at(parent_descriptor, temporary_name)
+                is not None
+                or _entry_stat_at(parent_descriptor, name) is not None
+            ):
+                raise EvidenceCorrupt(
+                    f"retention finalization unlink is uncertain: {display_path}"
+                )
+        closing = held_descriptor
+        held_descriptor = -1
+        os.close(closing)
+        os.fsync(parent_descriptor)
+    except BaseException as error:
+        if held_descriptor >= 0:
+            closing = held_descriptor
+            held_descriptor = -1
+            try:
+                os.close(closing)
+            except BaseException as close_error:  # noqa: BLE001
+                error.add_note(
+                    "retention finalization descriptor close failed: "
+                    f"{close_error}"
+                )
+        if moved:
+            try:
+                os.fsync(parent_descriptor)
+            except BaseException as fsync_error:  # noqa: BLE001
+                error.add_note(
+                    "retention finalization move fsync failed: "
+                    f"{fsync_error}"
+                )
+        raise
+
+
 def _publish_without_replacement_at(
     parent_descriptor: int,
     name: str,
@@ -2039,6 +2302,7 @@ class SegmentStore:
         ) = None
         self._retention_tombstone_lock = Lock()
         self._retention_commit_uncertain_latched = False
+        self._retention_finalization_uncertain_latched = False
         self._retention_state_namespace_uncertain = False
         self._repair_authorization: _RepairAuthorizationBinding | None = None
         self._repair_completion_authorization: (
@@ -3553,15 +3817,16 @@ class SegmentStore:
                 "retention unlink payload postcondition is uncertain"
             )
 
-    def _require_retention_post_unlink_namespace(
+    def _require_retention_post_unlink_paths(
         self,
-        lease: _RetentionUnlinkLease,
+        binding: _AuthenticatedRetentionTombstoneBinding,
+        selected: frozenset[str],
     ) -> tuple[bytes, ...]:
-        binding = lease.binding
         snapshot_binding = self._retention_snapshot_binding
         if (
             snapshot_binding is None
             or snapshot_binding.snapshot is not binding.snapshot
+            or not selected
         ):
             raise EvidenceSealError(
                 "retention unlink snapshot authority disappeared"
@@ -3572,11 +3837,13 @@ class SegmentStore:
             raise EvidenceCorrupt(
                 "retention unlink changed immutable manifests"
             )
-        selected = {
-            payload.manifest.segment_relative_path
-            for group in lease.groups
-            for payload in group.payloads
+        chain_paths = {
+            manifest.segment_relative_path for manifest in chain
         }
+        if not selected.issubset(chain_paths):
+            raise EvidenceCorrupt(
+                "retention unlink selected paths left the manifest chain"
+            )
         expected: dict[str, set[str]] = {}
         for manifest in chain:
             parts = manifest.segment_relative_path.split("/")
@@ -3646,6 +3913,19 @@ class SegmentStore:
             )
         self._require_retention_directory_bindings()
         return canonical
+
+    def _require_retention_post_unlink_namespace(
+        self,
+        lease: _RetentionUnlinkLease,
+    ) -> tuple[bytes, ...]:
+        return self._require_retention_post_unlink_paths(
+            lease.binding,
+            frozenset(
+                payload.manifest.segment_relative_path
+                for group in lease.groups
+                for payload in group.payloads
+            ),
+        )
 
     def _attempt_retention_commit_uncertain(
         self,
@@ -3890,6 +4170,402 @@ class SegmentStore:
                 raise
             raise EvidenceCorrupt(
                 "retention unlink execution is uncertain"
+            ) from error
+
+    def _validate_authenticated_retention_completion(
+        self,
+        capability: object,
+        binding: _AuthenticatedRetentionUnlinkCompletionBinding,
+    ) -> tuple[frozenset[str], bytes | None]:
+        from agmind_immune.evidence.retention import (
+            _AUTHENTICATED_RETENTION_UNLINK_COMPLETION_FACTORY,
+            AuthenticatedRetentionUnlinkCompletion,
+            RetentionCorruption,
+            RetentionSnapshot,
+            RetentionStateJournal,
+            RetentionStateV1,
+            _retention_boundary_cache_bytes,
+            decode_retention_state,
+        )
+
+        tombstone = binding.tombstone
+        journal = binding.journal
+        snapshot = tombstone.snapshot
+        authority = getattr(journal, "_authority", None)
+        state_binding = self._retention_state_binding
+        snapshot_binding = self._retention_snapshot_binding
+        if (
+            type(capability) is not AuthenticatedRetentionUnlinkCompletion
+            or getattr(capability, "_factory_marker", None)
+            is not _AUTHENTICATED_RETENTION_UNLINK_COMPLETION_FACTORY
+            or self._authenticated_retention_unlink_completion is not binding
+            or binding.capability is not capability
+            or tombstone.completion_capability is not capability
+            or type(journal) is not RetentionStateJournal
+            or binding.journal is not tombstone.journal
+            or binding.journal_identity is not tombstone.journal_identity
+            or binding.journal_identity is not journal._identity
+            or binding.lifecycle_identity is not self._lifecycle_identity
+            or tombstone.lifecycle_identity is not self._lifecycle_identity
+            or binding.completed_state_raw != tombstone.completed_state_raw
+            or type(binding.completed_state_raw) is not bytes
+            or type(snapshot) is not RetentionSnapshot
+            or snapshot_binding is None
+            or snapshot_binding.snapshot is not snapshot
+            or binding.manifest_canonical
+            != snapshot_binding.manifest_canonical
+            or state_binding is None
+            or state_binding.name != _RETENTION_STATE_NAME
+            or state_binding.raw != binding.completed_state_raw
+            or self._retention_state_temporary is not None
+            or self._authenticated_retention_tombstone is not None
+            or self._retention_commit_uncertain_latched
+            or self._retention_finalization_uncertain_latched
+            or self._retention_state_namespace_uncertain
+            or type(authority) is not _RetentionStateAuthority
+            or authority._store is not self
+            or authority._lifecycle_identity is not self._lifecycle_identity
+            or authority._retention_journal is not journal
+            or self._retention_state_authority is not authority
+            or self._closed
+        ):
+            raise EvidenceSealError(
+                "retention completion is not exact live store authority"
+            )
+        try:
+            journal._assert_consistent()
+            completed = decode_retention_state(
+                binding.completed_state_raw
+            )
+            journal._prove_publication(binding.completed_state_raw)
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise EvidenceSealError(
+                "retention completion lost exact durable state"
+            ) from error
+        if (
+            type(completed) is not RetentionStateV1
+            or journal._raw != binding.completed_state_raw
+            or journal._state != completed
+            or completed.operation != "tombstone"
+            or completed.phase != "completed"
+            or completed.target is None
+            or completed.target.sequence
+            != tombstone.target_ref.source_sequence
+            or completed.target.event_id != tombstone.target_ref.event_id
+            or completed.target.content_sha256
+            != tombstone.target_ref.content_sha256
+            or not completed.entries
+        ):
+            raise EvidenceSealError(
+                "retention completion state is not exact"
+            )
+        selected = frozenset(
+            entry.segment_relative_path for entry in completed.entries
+        )
+        if len(selected) != len(completed.entries):
+            raise EvidenceCorrupt(
+                "retention completion selected paths are not unique"
+            )
+        canonical = self._require_retention_post_unlink_paths(
+            tombstone,
+            selected,
+        )
+        if canonical != binding.manifest_canonical:
+            raise EvidenceCorrupt(
+                "retention completion manifest authority changed"
+            )
+        verifier = self._require_authenticated_recovered()
+        through = tombstone.status.evidence_head
+        if snapshot.prior_index_through_sequence != through:
+            raise EvidenceSealError(
+                "retention completion snapshot prefix changed"
+            )
+        try:
+            current_prior = self._retention_prior_tombstones(
+                verifier,
+                through_sequence=through,
+            )
+            frozen_prior = snapshot.prior_tombstones
+            current_projection = tuple(
+                (
+                    item.sequence,
+                    item.event_id,
+                    item.content_sha256,
+                    item.request_canonical,
+                )
+                for item in current_prior
+            )
+            frozen_projection = tuple(
+                (
+                    item.sequence,
+                    item.event_id,
+                    item.content_sha256,
+                    item.request_canonical,
+                )
+                for item in frozen_prior
+            )
+            if current_projection != frozen_projection:
+                raise RetentionCorruption(
+                    "retention boundary source prefix changed"
+                )
+            boundary_raw = _retention_boundary_cache_bytes(
+                snapshot,
+                source_evidence_head=through,
+            )
+        except RetentionCorruption as error:
+            raise EvidenceCorrupt(
+                "retention completion cache authority is corrupt"
+            ) from error
+        return selected, boundary_raw
+
+    def _finalize_authenticated_retention_completion(
+        self,
+        capability: object,
+        *,
+        _factory: object,
+    ) -> None:
+        from agmind_immune.evidence.retention import (
+            MAX_RETENTION_BOUNDARY_BYTES,
+            RetentionCorruption,
+        )
+
+        if (
+            _factory is not _RETENTION_PROOF_FACTORY
+            or type(self) is not SegmentStore
+        ):
+            raise TypeError(
+                "retention completion requires the exact private factory"
+            )
+
+        state_descriptor = -1
+        boundary_descriptor = -1
+        mutation_started = False
+        state_unlink_attempted = False
+        binding: _AuthenticatedRetentionUnlinkCompletionBinding | None = None
+        try:
+            with self._retention_tombstone_lock:
+                if self._retention_finalization_uncertain_latched:
+                    raise EvidenceSealError(
+                        "retention completion finalization is uncertain"
+                    )
+                binding = self._authenticated_retention_unlink_completion
+                if binding is None or binding.capability is not capability:
+                    raise EvidenceSealError(
+                        "retention completion is not the exact registered authority"
+                    )
+                _selected, boundary_raw = (
+                    self._validate_authenticated_retention_completion(
+                        capability,
+                        binding,
+                    )
+                )
+                journal = cast("RetentionStateJournal", binding.journal)
+                authority = journal._authority
+                state_binding = self._retention_state_binding
+                if state_binding is None:
+                    raise EvidenceSealError(
+                        "retention completion lost its durable state binding"
+                    )
+                state_descriptor, state_opened = _open_regular_at(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    self.root / _RETENTION_STATE_NAME,
+                    maximum=_MAX_RETENTION_STATE_BYTES,
+                )
+                _validate_identity(
+                    state_opened,
+                    state_binding.identity,
+                    self.root / _RETENTION_STATE_NAME,
+                )
+                _validate_published_from_held(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    self.root / _RETENTION_STATE_NAME,
+                    descriptor=state_descriptor,
+                    identity=state_binding.identity,
+                    expected_sha256=hashlib.sha256(
+                        binding.completed_state_raw
+                    ).hexdigest(),
+                )
+
+                boundary_path = self.root / _RETENTION_BOUNDARY_NAME
+                boundary_info = _entry_stat_at(
+                    self._root_descriptor,
+                    _RETENTION_BOUNDARY_NAME,
+                )
+                boundary_identity: _FileIdentity | None = None
+                if boundary_info is not None:
+                    boundary_identity = _file_identity(
+                        _regular_stat_at(
+                            self._root_descriptor,
+                            _RETENTION_BOUNDARY_NAME,
+                            boundary_path,
+                        )
+                    )
+                    boundary_descriptor, boundary_opened = _open_regular_at(
+                        self._root_descriptor,
+                        _RETENTION_BOUNDARY_NAME,
+                        boundary_path,
+                    )
+                    _validate_identity(
+                        boundary_opened,
+                        boundary_identity,
+                        boundary_path,
+                    )
+
+                if boundary_raw is not None:
+                    mutation_started = True
+                    self._retention_finalization_uncertain_latched = True
+                    existing_descriptor = boundary_descriptor
+                    boundary_descriptor = -1
+                    boundary_descriptor, boundary_identity = (
+                        _publish_retention_boundary_at(
+                            self._root_descriptor,
+                            _RETENTION_BOUNDARY_NAME,
+                            boundary_path,
+                            boundary_raw,
+                            existing_descriptor=existing_descriptor,
+                            existing_identity=boundary_identity,
+                        )
+                    )
+                elif boundary_identity is not None:
+                    mutation_started = True
+                    self._retention_finalization_uncertain_latched = True
+                    existing_descriptor = boundary_descriptor
+                    boundary_descriptor = -1
+                    _conditionally_unlink_held_at(
+                        self._root_descriptor,
+                        _RETENTION_BOUNDARY_NAME,
+                        boundary_path,
+                        descriptor=existing_descriptor,
+                        identity=boundary_identity,
+                    )
+                    boundary_identity = None
+
+                if boundary_raw is None:
+                    if (
+                        _entry_stat_at(
+                            self._root_descriptor,
+                            _RETENTION_BOUNDARY_NAME,
+                        )
+                        is not None
+                    ):
+                        raise EvidenceCorrupt(
+                            "oversize retention boundary was not omitted"
+                        )
+                else:
+                    if (
+                        boundary_identity is None
+                        or boundary_descriptor < 0
+                    ):
+                        raise EvidenceSealError(
+                            "retention boundary publication lost its binding"
+                        )
+                    _validate_published_from_held(
+                        self._root_descriptor,
+                        _RETENTION_BOUNDARY_NAME,
+                        boundary_path,
+                        descriptor=boundary_descriptor,
+                        identity=boundary_identity,
+                        expected_sha256=hashlib.sha256(
+                            boundary_raw
+                        ).hexdigest(),
+                    )
+                    if (
+                        _read_regular_at(
+                            self._root_descriptor,
+                            _RETENTION_BOUNDARY_NAME,
+                            boundary_path,
+                            MAX_RETENTION_BOUNDARY_BYTES,
+                        )
+                        != boundary_raw
+                    ):
+                        raise EvidenceCorrupt(
+                            "retention boundary publication changed"
+                        )
+                    descriptor = boundary_descriptor
+                    boundary_descriptor = -1
+                    os.close(descriptor)
+
+                _bind_held_source(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    self.root / _RETENTION_STATE_NAME,
+                    descriptor=state_descriptor,
+                    identity=state_binding.identity,
+                )
+                mutation_started = True
+                state_unlink_attempted = True
+                self._retention_finalization_uncertain_latched = True
+                self._retention_state_namespace_uncertain = True
+                descriptor = state_descriptor
+                state_descriptor = -1
+                _conditionally_unlink_held_at(
+                    self._root_descriptor,
+                    _RETENTION_STATE_NAME,
+                    self.root / _RETENTION_STATE_NAME,
+                    descriptor=descriptor,
+                    identity=state_binding.identity,
+                )
+
+                authority._retention_journal = None
+                journal._state = None
+                journal._raw = None
+                self._retention_state_binding = None
+                self._retention_state_temporary = None
+                self._retention_state_authority = None
+                self._retention_snapshot_binding = None
+                self._authenticated_retention_unlink_completion = None
+                self._retention_finalization_uncertain_latched = False
+                self._retention_state_namespace_uncertain = False
+                return
+        except BaseException as error:
+            if mutation_started:
+                self._retention_finalization_uncertain_latched = True
+            if state_unlink_attempted:
+                self._retention_state_namespace_uncertain = True
+            if boundary_descriptor >= 0:
+                descriptor = boundary_descriptor
+                boundary_descriptor = -1
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:  # noqa: BLE001
+                    error.add_note(
+                        "retention boundary descriptor close failed: "
+                        f"{close_error}"
+                    )
+            if state_descriptor >= 0:
+                descriptor = state_descriptor
+                state_descriptor = -1
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:  # noqa: BLE001
+                    error.add_note(
+                        "retention state descriptor close failed: "
+                        f"{close_error}"
+                    )
+            if state_unlink_attempted:
+                try:
+                    os.fsync(self._root_descriptor)
+                except BaseException as fsync_error:  # noqa: BLE001
+                    error.add_note(
+                        "retention state uncertainty root fsync failed: "
+                        f"{fsync_error}"
+                    )
+            if isinstance(error, EvidenceStoreError):
+                raise
+            if isinstance(error, RetentionCorruption):
+                raise EvidenceCorrupt(
+                    "retention completion authority is corrupt"
+                ) from error
+            if not isinstance(error, Exception):
+                raise
+            raise EvidenceCorrupt(
+                "retention completion finalization is uncertain"
             ) from error
 
     def _require_repair_lifecycle(self) -> None:

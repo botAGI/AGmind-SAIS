@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import os
 import pickle
+import stat
 from pathlib import Path
 
 import pytest
+from agmind_immune.evidence import retention as retention_module
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.segments import EvidenceCorrupt, EvidenceSealError
 from tests.evidence.test_retention import _retention_proof_case
@@ -20,6 +22,15 @@ def _issued_case(path: Path) -> tuple[object, object]:
         _factory=segments_module._RETENTION_PROOF_FACTORY,
     )
     return case, capability
+
+
+def _completed_case(path: Path) -> tuple[object, object]:
+    case, capability = _issued_case(path)
+    completion = case.store._execute_authenticated_retention_unlink(
+        capability,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    return case, completion
 
 
 def test_authenticated_retention_unlink_is_ordered_and_payload_only(
@@ -350,6 +361,268 @@ def test_retention_unlink_uncertain_persist_failure_keeps_intent_and_latch(
                 _factory=segments_module._RETENTION_PROOF_FACTORY,
             )
         assert payload_unlink_calls == 1
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+def test_retention_completion_publishes_exact_cache_then_clears_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case, completion = _completed_case(tmp_path)
+    state_path = tmp_path / "retention-state.json"
+    cache_path = tmp_path / "retention-boundary.json"
+    payload_unlinks = 0
+    original_unlink = segments_module.os.unlink
+
+    def trace_payload_unlink(
+        name: str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal payload_unlinks
+        if os.fspath(name).endswith(".agseg"):
+            payload_unlinks += 1
+        original_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        segments_module.os,
+        "unlink",
+        trace_payload_unlink,
+    )
+    try:
+        lookalike = object.__new__(type(completion))
+        with pytest.raises(EvidenceSealError, match="completion|retention|exact"):
+            case.store._finalize_authenticated_retention_completion(
+                lookalike,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+        assert state_path.exists()
+
+        assert (
+            case.store._finalize_authenticated_retention_completion(
+                completion,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+            is None
+        )
+
+        assert not state_path.exists()
+        assert cache_path.exists()
+        assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
+        boundary = retention_module.decode_retention_boundary(
+            cache_path.read_bytes()
+        )
+        assert boundary.source_evidence_head == case.store.status().evidence_head
+        assert len(boundary.tombstones) == 1
+        entry = boundary.tombstones[0]
+        assert entry.sequence == case.target_ref.source_sequence
+        assert entry.event_id == case.target_ref.event_id
+        assert entry.content_sha256 == case.target_ref.content_sha256
+        assert entry.tombstone_id == case.request.tombstone_id
+        assert payload_unlinks == 0
+        with pytest.raises(EvidenceSealError, match="completion|retention|exact"):
+            case.store._finalize_authenticated_retention_completion(
+                completion,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+@pytest.mark.parametrize("existing_cache", ["malformed", "oversize"])
+def test_retention_completion_cache_is_optional_and_never_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_cache: str,
+) -> None:
+    case, completion = _completed_case(tmp_path)
+    cache_path = tmp_path / "retention-boundary.json"
+    cache_path.write_bytes(b'{"stale":')
+    cache_path.chmod(0o600)
+    if existing_cache == "oversize":
+        monkeypatch.setattr(
+            retention_module,
+            "MAX_RETENTION_BOUNDARY_BYTES",
+            1,
+        )
+    try:
+        case.store._finalize_authenticated_retention_completion(
+            completion,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+
+        assert not (tmp_path / "retention-state.json").exists()
+        if existing_cache == "oversize":
+            assert not cache_path.exists()
+        else:
+            boundary = retention_module.decode_retention_boundary(
+                cache_path.read_bytes()
+            )
+            assert boundary.tombstones
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+@pytest.mark.parametrize("unsafe_cache", ["symlink", "hardlink", "mode"])
+def test_retention_completion_rejects_unsafe_cache_namespace(
+    tmp_path: Path,
+    unsafe_cache: str,
+) -> None:
+    case, completion = _completed_case(tmp_path / "root")
+    cache_path = tmp_path / "root" / "retention-boundary.json"
+    outside_path = tmp_path / "outside-cache"
+    outside_path.write_bytes(b"outside")
+    outside_path.chmod(0o600)
+    if unsafe_cache == "symlink":
+        cache_path.symlink_to(outside_path)
+    else:
+        cache_path.write_bytes(b"safe bytes, unsafe metadata")
+        cache_path.chmod(0o600)
+        if unsafe_cache == "hardlink":
+            os.link(cache_path, tmp_path / "outside-link")
+        else:
+            cache_path.chmod(0o640)
+    try:
+        with pytest.raises(EvidenceCorrupt, match="unsafe|retention|cache"):
+            case.store._finalize_authenticated_retention_completion(
+                completion,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+
+        assert (tmp_path / "root" / "retention-state.json").exists()
+        assert (
+            case.store._retention_finalization_uncertain_latched
+            is False
+        )
+    finally:
+        case.coverage.close()
+        case.store.close(flush=False)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["cache_publish", "state_unlink", "state_root_fsync"],
+)
+def test_retention_completion_failure_keeps_c2d_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    case, completion = _completed_case(tmp_path)
+    state_path = tmp_path / "retention-state.json"
+    original_boundary_publish = (
+        segments_module._publish_retention_boundary_at
+    )
+    original_rename_noreplace = segments_module._rename_noreplace
+    original_unlink = segments_module.os.unlink
+    original_fsync = segments_module.os.fsync
+    payload_unlinks = 0
+    injected = False
+
+    def fail_cache_publish(
+        parent_descriptor: int,
+        name: str,
+        display_path: Path,
+        raw: bytes,
+        *,
+        existing_descriptor: int,
+        existing_identity: object | None,
+    ) -> tuple[int, object]:
+        nonlocal injected
+        if failure == "cache_publish" and name == "retention-boundary.json":
+            injected = True
+            raise OSError("injected retention cache publication ambiguity")
+        return original_boundary_publish(
+            parent_descriptor,
+            name,
+            display_path,
+            raw,
+            existing_descriptor=existing_descriptor,
+            existing_identity=existing_identity,
+        )
+
+    def trace_unlink(
+        name: str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal payload_unlinks
+        text = os.fspath(name)
+        if text.endswith(".agseg"):
+            payload_unlinks += 1
+        original_unlink(name, dir_fd=dir_fd)
+
+    def fail_state_move(
+        source_name: str,
+        destination_name: str,
+        *,
+        source_dir_fd: int,
+        destination_dir_fd: int,
+    ) -> None:
+        nonlocal injected
+        if (
+            failure == "state_unlink"
+            and source_name == "retention-state.json"
+            and not injected
+        ):
+            injected = True
+            raise OSError("injected retention-state move ambiguity")
+        original_rename_noreplace(
+            source_name,
+            destination_name,
+            source_dir_fd=source_dir_fd,
+            destination_dir_fd=destination_dir_fd,
+        )
+
+    def fail_state_root_fsync(descriptor: int) -> None:
+        nonlocal injected
+        if (
+            failure == "state_root_fsync"
+            and descriptor == case.store._root_descriptor
+            and not state_path.exists()
+            and not injected
+        ):
+            injected = True
+            raise OSError("injected retention-state root fsync ambiguity")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        segments_module,
+        "_publish_retention_boundary_at",
+        fail_cache_publish,
+    )
+    monkeypatch.setattr(
+        segments_module,
+        "_rename_noreplace",
+        fail_state_move,
+    )
+    monkeypatch.setattr(segments_module.os, "unlink", trace_unlink)
+    monkeypatch.setattr(segments_module.os, "fsync", fail_state_root_fsync)
+    try:
+        with pytest.raises(EvidenceCorrupt, match="retention|completion|uncertain"):
+            case.store._finalize_authenticated_retention_completion(
+                completion,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+
+        assert injected
+        if failure != "state_root_fsync":
+            assert state_path.exists()
+            completed = case.journal.state
+            assert completed is not None
+            assert completed.phase == "completed"
+        assert case.store._retention_finalization_uncertain_latched is True
+        assert payload_unlinks == 0
+        with pytest.raises(EvidenceSealError, match="uncertain|completion|retention"):
+            case.store._finalize_authenticated_retention_completion(
+                completion,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+        assert payload_unlinks == 0
     finally:
         case.coverage.close()
         case.store.close(flush=False)

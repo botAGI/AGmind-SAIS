@@ -919,6 +919,82 @@ def test_state_selection_witness_is_canonical_bounded_and_complete() -> None:
         retention_module.decode_retention_state(b"x" * (128 * 1024 + 1))
 
 
+def test_boundary_cache_is_complete_ordered_and_expands_exact_runs() -> None:
+    specs = (
+        _FactSpec(EXPIRED, 3),
+        _FactSpec(EXPIRED, 5),
+        _FactSpec(EXPIRED, 7),
+        _FactSpec(EXPIRED, 11),
+    )
+    base = _snapshot(*specs)
+    first = _accepted(_tombstone(base, (0,)), sequence=80)
+    second = _accepted(
+        _tombstone(base, (2,), tombstone_id=OTHER_REQUEST_ID),
+        sequence=90,
+    )
+    snapshot = _snapshot(
+        *specs,
+        prior=(first, second),
+        prior_index_through_sequence=100,
+    )
+
+    raw = retention_module._retention_boundary_cache_bytes(
+        snapshot,
+        source_evidence_head=100,
+    )
+
+    assert raw is not None
+    boundary = retention_module.decode_retention_boundary(raw)
+    assert boundary.source_evidence_head == 100
+    assert [entry.sequence for entry in boundary.tombstones] == [80, 90]
+    for entry, accepted in zip(
+        boundary.tombstones,
+        (first, second),
+        strict=True,
+    ):
+        request = accepted.request
+        assert entry.model_dump(mode="python") == {
+            "sequence": accepted.sequence,
+            "event_id": accepted.event_id,
+            "content_sha256": accepted.content_sha256,
+            "tombstone_id": request.tombstone_id,
+            "h0": request.current_chain_head_sha256,
+            "first_removed_manifest_sha256": (
+                request.first_removed_manifest_sha256
+            ),
+            "last_removed_manifest_sha256": (
+                request.last_removed_manifest_sha256
+            ),
+            "first_retained_manifest_sha256": (
+                request.first_retained_manifest_sha256
+            ),
+            "removed_manifest_count": len(
+                request.removed_manifest_hashes
+            ),
+            "removed_bytes": request.removed_bytes,
+            "manifest_run_sha256": request.manifest_run_sha256,
+        }
+
+    overlapping = _accepted(
+        _tombstone(
+            base,
+            (0,),
+            tombstone_id="33333333-3333-4333-8333-333333333333",
+        ),
+        sequence=95,
+    )
+    corrupt = _snapshot(
+        *specs,
+        prior=(first, overlapping),
+        prior_index_through_sequence=100,
+    )
+    with pytest.raises(RetentionCorruption, match="overlap"):
+        retention_module._retention_boundary_cache_bytes(
+            corrupt,
+            source_evidence_head=100,
+        )
+
+
 def test_state_target_binding_historical_advance_and_exact_cas(
     tmp_path: Path,
 ) -> None:

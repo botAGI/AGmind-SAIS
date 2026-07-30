@@ -14,7 +14,13 @@ from itertools import pairwise
 from threading import Lock
 from typing import Any, Literal, Never, Protocol, SupportsIndex, cast, final
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.clock import CoreClockSample, CoreClockValidationError
@@ -57,6 +63,7 @@ _DECISION_BINDING_DOMAIN = b"agmind.retention-decision-binding.v1\x00"
 _PRIOR_INDEX_DOMAIN = b"agmind.retention-prior-index.v1\x00"
 _RETENTION_STATE_JOURNAL_FACTORY = object()
 MAX_RETENTION_STATE_BYTES = 128 * 1024
+MAX_RETENTION_BOUNDARY_BYTES = 256 * 1024
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
 _SEGMENT_RELATIVE_PATH = re.compile(
     r"^segments/(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})/"
@@ -93,6 +100,10 @@ class RetentionCorruption(RetentionError):
 
 class RetentionStateCorrupt(RetentionError):
     """The durable retention gate is malformed or contradictory."""
+
+
+class RetentionBoundaryCorrupt(RetentionError):
+    """The optional retention acceleration cache is malformed."""
 
 
 class RetentionStateConflict(RetentionError):
@@ -2343,6 +2354,242 @@ select_retention: _RetentionSelector = _make_retention_selector(
     run_domain=b"AGMIND_RETENTION_RUN_V2\x00",
     zero_sha256="0" * 64,
 )
+
+
+class RetentionBoundaryEntryV1(ContractModel):
+    """One compact authenticated tombstone in the optional boundary cache."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    sequence: int = Field(ge=1, le=MAX_UINT64)
+    event_id: str
+    content_sha256: str
+    tombstone_id: str
+    h0: str
+    first_removed_manifest_sha256: str
+    last_removed_manifest_sha256: str
+    first_retained_manifest_sha256: str
+    removed_manifest_count: int = Field(ge=1, le=128)
+    removed_bytes: int = Field(gt=0, le=MAX_UINT64)
+    manifest_run_sha256: str
+
+    @field_validator("event_id")
+    @classmethod
+    def event_id_is_exact(cls, value: str) -> str:
+        if _EVENT_ID.fullmatch(value) is None:
+            raise ValueError("retention boundary event_id is invalid")
+        return value
+
+    @field_validator("tombstone_id")
+    @classmethod
+    def tombstone_id_is_exact(cls, value: str) -> str:
+        if UUID4.fullmatch(value) is None:
+            raise ValueError("retention boundary tombstone_id is invalid")
+        return value
+
+    @field_validator(
+        "content_sha256",
+        "h0",
+        "first_removed_manifest_sha256",
+        "last_removed_manifest_sha256",
+        "first_retained_manifest_sha256",
+        "manifest_run_sha256",
+    )
+    @classmethod
+    def digest_is_exact(cls, value: str) -> str:
+        if HEX64.fullmatch(value) is None:
+            raise ValueError("retention boundary digest is invalid")
+        return value
+
+
+class RetentionBoundaryV1(ContractModel):
+    """Complete bounded cache of authenticated retention tombstones."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    schema_version: Literal["agmind.retention-boundary.v1"]
+    source_evidence_head: int = Field(ge=0, le=MAX_UINT64)
+    tombstones: list[RetentionBoundaryEntryV1] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def tombstones_are_strictly_ordered(self) -> RetentionBoundaryV1:
+        previous_sequence = 0
+        tombstone_ids: set[str] = set()
+        for entry in self.tombstones:
+            if (
+                entry.sequence <= previous_sequence
+                or entry.sequence > self.source_evidence_head
+            ):
+                raise ValueError(
+                    "retention boundary tombstones are outside strict "
+                    "evidence order"
+                )
+            if entry.tombstone_id in tombstone_ids:
+                raise ValueError(
+                    "retention boundary tombstone identity is duplicated"
+                )
+            previous_sequence = entry.sequence
+            tombstone_ids.add(entry.tombstone_id)
+        return self
+
+
+def _validated_retention_boundary(
+    boundary: RetentionBoundaryV1,
+) -> RetentionBoundaryV1:
+    if type(boundary) is not RetentionBoundaryV1:
+        raise TypeError(
+            "retention boundary must use the exact runtime type"
+        )
+    try:
+        return RetentionBoundaryV1.model_validate(
+            boundary.model_dump(mode="python"),
+            strict=True,
+        )
+    except (TypeError, ValueError, ValidationError) as error:
+        raise RetentionBoundaryCorrupt(
+            "retention boundary is not coherent"
+        ) from error
+
+
+def _retention_boundary_canonical(
+    boundary: RetentionBoundaryV1,
+) -> bytes:
+    validated = _validated_retention_boundary(boundary)
+    return canonical_json(validated.model_dump(mode="python"))
+
+
+def encode_retention_boundary(boundary: RetentionBoundaryV1) -> bytes:
+    raw = _retention_boundary_canonical(boundary)
+    if not raw or len(raw) > MAX_RETENTION_BOUNDARY_BYTES:
+        raise RetentionBoundaryCorrupt(
+            "canonical retention boundary exceeds 256 KiB"
+        )
+    return raw
+
+
+def decode_retention_boundary(raw: bytes) -> RetentionBoundaryV1:
+    if (
+        type(raw) is not bytes
+        or not raw
+        or len(raw) > MAX_RETENTION_BOUNDARY_BYTES
+    ):
+        raise RetentionBoundaryCorrupt(
+            "retention boundary exceeds its exact 256 KiB bound"
+        )
+    try:
+        text = raw.decode("utf-8", "strict")
+        _validate_json_depth(text)
+        decoder = json.JSONDecoder(
+            object_pairs_hook=_unique_object,
+            parse_int=_parse_integer,
+            parse_float=_reject_float,
+            parse_constant=_reject_constant,
+        )
+        start = 0
+        while start < len(text) and text[start] in " \t\r\n":
+            start += 1
+        value, end = decoder.raw_decode(text, start)
+        while end < len(text) and text[end] in " \t\r\n":
+            end += 1
+        if end != len(text) or type(value) is not dict:
+            raise ValueError(
+                "retention boundary must be exactly one object"
+            )
+        _validate_unicode(value)
+        boundary = RetentionBoundaryV1.model_validate(
+            value,
+            strict=True,
+        )
+        if encode_retention_boundary(boundary) != raw:
+            raise ValueError("retention boundary is not canonical")
+        return boundary
+    except RetentionBoundaryCorrupt:
+        raise
+    except (
+        RecursionError,
+        TypeError,
+        ValueError,
+        ValidationError,
+    ) as error:
+        raise RetentionBoundaryCorrupt(
+            "retention boundary is not canonical or coherent"
+        ) from error
+
+
+def _retention_boundary_cache_bytes(
+    snapshot: RetentionSnapshot,
+    source_evidence_head: int,
+) -> bytes | None:
+    if (
+        type(source_evidence_head) is not int
+        or not 0 <= source_evidence_head <= MAX_UINT64
+    ):
+        raise RetentionCorruption(
+            "retention boundary source evidence head is invalid"
+        )
+    facts, _clock, prior = _validate_snapshot(
+        snapshot,
+        removable_event_types=frozenset({"falco_connect"}),
+        genesis_manifest_sha256="0" * 64,
+    )
+    if source_evidence_head != snapshot.prior_index_through_sequence:
+        raise RetentionCorruption(
+            "retention boundary source differs from snapshot authority"
+        )
+    _prior_coverage(
+        facts,
+        prior,
+        zero_sha256="0" * 64,
+    )
+
+    tombstones: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for accepted in prior:
+        request, _request_raw, _outer = _validated_prior(accepted)
+        if request.tombstone_id in seen_ids:
+            continue
+        tombstones.append(
+            {
+                "sequence": accepted.sequence,
+                "event_id": accepted.event_id,
+                "content_sha256": accepted.content_sha256,
+                "tombstone_id": request.tombstone_id,
+                "h0": request.current_chain_head_sha256,
+                "first_removed_manifest_sha256": (
+                    request.first_removed_manifest_sha256
+                ),
+                "last_removed_manifest_sha256": (
+                    request.last_removed_manifest_sha256
+                ),
+                "first_retained_manifest_sha256": (
+                    request.first_retained_manifest_sha256
+                ),
+                "removed_manifest_count": len(
+                    request.removed_manifest_hashes
+                ),
+                "removed_bytes": request.removed_bytes,
+                "manifest_run_sha256": request.manifest_run_sha256,
+            }
+        )
+        seen_ids.add(request.tombstone_id)
+
+    try:
+        boundary = RetentionBoundaryV1.model_validate(
+            {
+                "schema_version": "agmind.retention-boundary.v1",
+                "source_evidence_head": source_evidence_head,
+                "tombstones": tombstones,
+            },
+            strict=True,
+        )
+        raw = _retention_boundary_canonical(boundary)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise RetentionCorruption(
+            "authenticated retention boundary cannot be encoded"
+        ) from error
+    if len(raw) > MAX_RETENTION_BOUNDARY_BYTES:
+        return None
+    return raw
 
 
 RetentionPhase = Literal[
