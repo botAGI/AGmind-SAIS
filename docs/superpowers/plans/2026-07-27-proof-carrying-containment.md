@@ -1920,6 +1920,17 @@ git commit -m "feat: add tamper-evident evidence store"
 
 ### Task 6: Deterministic Incident and Containment Candidate Correlation
 
+> **Security amendment (2026-07-29):** the original live-enrichment shape
+> below is superseded by
+> [`2026-07-29-task6-correlation-proof.md`](2026-07-29-task6-correlation-proof.md).
+> A candidate now requires a protected observer-signed correlation snapshot
+> carrying the retained Falco projection, a same-generation complete global
+> Docker-network snapshot, root-owned safety pins, and historical coverage.
+> Implementation is split into 6A contracts, 6B pure correlation, 6C
+> producer/transport, and 6D replayable projection. Live Docker data,
+> `MutationReadiness`, model output, and SQLite-only facts cannot create or
+> preserve a candidate.
+
 **Files:**
 - Create: `core/agmind_immune/incidents/{__init__,models,service}.py`
 - Create: `core/agmind_immune/correlation/{__init__,pcc}.py`

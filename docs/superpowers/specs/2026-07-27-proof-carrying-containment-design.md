@@ -559,6 +559,12 @@ Identity fields may be absent only when the source cannot observe them. Missing 
 
 ## 8. Deterministic M1 correlation
 
+The proof-bearing refinement of this section is frozen in
+[`2026-07-29-task6-correlation-proof.md`](2026-07-29-task6-correlation-proof.md).
+Where the original text below speaks of fresh observer enrichment, the
+authoritative input is a protected signed `pcc_correlation_snapshot`; live
+inventory is never replay authority.
+
 The first containment candidate requires both:
 
 1. A curated Falco event such as a shell/downloader process opening an outbound connection, including an exact destination IPv4 address.
