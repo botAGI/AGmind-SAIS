@@ -15,12 +15,20 @@
 
 ## 6B — Pure correlation
 
-1. Add RED immutable model and incident-ID vectors.
-2. Add one table-driven ordered gate/boundary/result suite, including absence of
-   any model parameter, duplicate evidence separation, and cooldown boundary.
-3. Implement models, context/result variants, and side-effect-free
-   `correlate_pcc`.
-4. Run only `core/tests/incidents` and `core/tests/correlation`.
+1. Add the locked incident-ID vector and strict, frozen, deeply immutable
+   incident/candidate/context/result models.
+2. Add a post-durable-commit `AuthenticatedPCCInput` capability; never accept a
+   caller-constructed `VerifiedEnvelope` or public facts object as correlation
+   authority.
+3. Add a strict digest-checked IANA loader and exact integer-nanosecond timestamp
+   arithmetic.
+4. Add one table-driven ordered gate/boundary/result suite, including absence of
+   `now` and model parameters, proof/direct evidence separation, capability
+   normalization, active-duplicate precedence, immutable first-candidate
+   port/protocol/TTL, and the half-open cooldown boundary.
+5. Implement the side-effect-free reducer. Defensive states excluded by the
+   signed contracts stay contract tests rather than forged authority fixtures.
+6. Run only `core/tests/incidents` and the Task 6 correlation tests.
 
 ## 6C — Producer and transport
 

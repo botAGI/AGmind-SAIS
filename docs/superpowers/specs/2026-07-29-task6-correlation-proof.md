@@ -86,9 +86,17 @@ equal the repository-pinned digest.
 ```text
 adapter_schema_version_ascii = "agmind.falco-connect.v1"
 falco_version_ascii = "0.44.1"
+special_use_registry_sha256 =
+  "e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73"
 ```
 
 Both values are exact deployment pins, not caller input.
+
+Core loads the special-use CSV through a bounded strict loader. It hashes the
+raw bytes before parsing, requires the pinned digest and exact IANA header,
+rejects malformed/duplicate/non-IPv4 prefixes or unrecognized reachability
+values, and never skips a row. A permissive best-effort CSV parse is not
+candidate authority.
 
 Operator and management hashes use separate domains with the same canonical
 payload:
@@ -581,6 +589,22 @@ candidate-evidence row identifies the protected snapshot carrying the retained
 trigger projection. The retired routine trigger need not remain an `events`
 foreign key.
 
+A direct investigation incident has `evidence_ids = (trigger_event_id,)` and
+`authority_event_id = trigger_event_id`. Every proof-backed result has the
+sorted unique pair `(snapshot_event_id, trigger_event_id)` and names the
+snapshot as `authority_event_id`. Coverage records are bound by
+`coverage_snapshot_sha256` and later invalidation rows; they never enter the
+candidate's immutable `evidence_ids`.
+
+`VerifiedEnvelope` is only a staged presentation and is publicly constructible,
+so it is not correlation authority. Production correlation accepts an opaque,
+deeply immutable `AuthenticatedPCCInput` capability issued by the
+verifier/store coordinator only after the exact PCC record is durably committed
+or authenticated during recovery. The capability binds the canonical snapshot,
+its retained trigger projection, exact request, and durable `EvidenceRef`.
+There is no public facts-to-capability constructor. Tests use a separate
+module-private factory that is absent from production call paths.
+
 ## Exact result and gate semantics
 
 `CorrelationResult` is exactly one of:
@@ -596,6 +620,52 @@ The correlator is invoked only for an exact verified `falco_connect`; another
 event type is a typed caller error before a result exists. Every valid Falco
 input therefore returns its incident in every result variant.
 
+`CorrelationReasonCode` is the closed union:
+
+```text
+detector_not_pinned
+connect_not_successful
+sensor_fields_incomplete
+authoritative_identity_incomplete
+investigation_only
+detector_bundle_not_pinned
+mutation_read_only
+reconcile_required
+docker_reconcile_gap
+routine_drop_pending
+inventory_stale
+docker_network_snapshot_unavailable
+docker_network_snapshot_overflow
+detector_bundle_unavailable
+special_use_registry_unavailable
+operator_denylist_unavailable
+management_denylist_unavailable
+container_not_running
+container_identity_changed
+observer_boot_changed
+event_stale
+clock_uncertain
+historical_coverage_incomplete
+critical_coverage_gap
+correlation_proof_mismatch
+destination_not_public
+docker_destination
+operator_destination
+management_destination
+target_not_running
+shared_network_namespace
+unsupported_network_mode
+unsupported_network_driver
+privileged_target
+target_cap_net_admin
+ttl_out_of_bounds
+candidate_cooldown
+```
+
+Failed-snapshot reasons are preserved in their contract-sorted order. Every
+other ordered security gate emits exactly one reason. Unknown strings are
+contract errors, never projection data.
+
 Gate order is:
 
 1. exact verified envelope/schema/source and pinned rule/bundle;
@@ -610,26 +680,28 @@ Gate order is:
 10. running bridge target with no shared/host/none network namespace;
 11. non-privileged and neither configured nor effective `CAP_NET_ADMIN`;
 12. TTL in `30..300`;
-13. ten-minute terminal cooldown;
-14. deterministic duplicate lookup.
+13. deterministic active-duplicate lookup;
+14. ten-minute terminal cooldown when no active duplicate exists.
 
 The first failing security gate wins. Failed connect, sensor omissions,
 investigation-only input, and unresolved identity produce `InvestigationOnly`.
 Stale/conflicting proof, unsafe target, coverage failure, TTL failure, and
 cooldown produce `Rejected`.
 
-The signature remains:
+The production signature is:
 
 ```python
 correlate_pcc(
-    event: VerifiedEnvelope,
-    now: datetime,
+    authenticated: AuthenticatedPCCInput,
     context: CorrelationContext,
 ) -> CorrelationResult
 ```
 
-`now` exactly equals signed snapshot decision time. The context has no model
-field, and the function performs no I/O.
+There is no `now` or model parameter. Signed `decision_time` is the only
+correlation clock. The context is deeply immutable, has no model field, and
+contains only the exact detector pin, strict pinned special-use registry,
+authenticated historical-coverage assessment, and key-bound read-only
+duplicate/cooldown observations. The function performs no I/O.
 
 Rebuild never fabricates a `VerifiedEnvelope`. The live wrapper and projection
 call one internal pure kernel:
@@ -645,6 +717,11 @@ correlate_pcc_facts(
 `incident_from_verified_falco` handles the live no-proof investigation path.
 `incident_from_retained_trigger` handles the protected retained projection.
 
+All timestamp subtraction uses canonical RFC3339Nano-to-integer-nanosecond
+parsing. `datetime.fromisoformat()`, `timestamp()`, floating-point seconds, and
+microsecond truncation are forbidden in gate arithmetic. Values with seven to
+nine fractional digits retain every digit.
+
 ## Duplicate ordering and cooldown
 
 The logical duplicate key is:
@@ -658,11 +735,28 @@ Authenticated stream order is authoritative. The lower
 `(source_sequence,event_id)` is primary; later matches add only
 `candidate_evidence` and never change candidate bytes or ID.
 
+The reducer is fed in authenticated source order and never retroactively
+replaces a primary candidate. Encountering an existing primary with a greater
+source-order tuple is projection corruption. The duplicate key deliberately
+excludes destination port, L4 protocol, and TTL: a later otherwise-safe proof
+with different values is supporting evidence for the existing candidate; the
+first candidate's immutable values remain authoritative.
+
 Cooldown uses the same key and covers
 `[terminal_at, terminal_at + 10 minutes)`. Equality at the upper boundary is
 expired. Task 6 accepts no arbitrary terminal setter: terminal observations
 must later derive from verified actuator action records. Until then production
 cooldown state is read-only/empty and unit tests use a repository test double.
+The only terminal states are `VERIFIED`, `EXPIRED`, `STALE_ABORT`, `REJECTED`,
+`FAILED_DIRTY`, and `EXPIRED_UNAPPLIED`. If an active duplicate and a terminal
+observation are both presented, the active duplicate wins and cooldown is not
+evaluated.
+
+Configured capability names are normalized case-insensitively. `NET_ADMIN`,
+`CAP_NET_ADMIN`, or `ALL` in `configured_cap_add` fails the capability gate;
+`configured_cap_drop` never grants authority and cannot make an unsafe
+`configured_cap_add` acceptable. `effective_cap_net_admin = true` always
+fails.
 
 ## Projection V2 and retention
 
