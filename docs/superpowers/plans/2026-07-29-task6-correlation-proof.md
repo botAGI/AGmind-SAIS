@@ -36,16 +36,27 @@
    a complete unfiltered list plus exact-ID inspect walk, and atomically persist
    one bounded global-network snapshot in the same generation as container
    identities.
-2. Add RED producer tests for exact retry, two-hash receipt, conflict fence,
+2. Advance observer state once from V4 to V5 with exact boundary/receipt
+   count-byte-head anchors. Permit migration only when both fixed journals are
+   absent; use `spool/pcc-boundaries.agf` (1,024 records, 64 MiB, 128 KiB
+   payload) and `spool/pcc-receipts.agf` (4,096 records, 16 MiB, 128 KiB
+   payload), without increasing the 16-epoch public-key metadata cap.
+3. Add RED producer tests for exact retry, two-hash receipt, conflict fence,
    stale/mismatched trigger, inventory race, complete/overflow networks,
    root-owned pins, failed proof form, protected quota, crash recovery, and
    exact source-sequence binding. Include list/inspect disagreement and
    disappearance cases.
-3. Implement the specialized observer route and durable publication receipt
-   under the frozen lock order.
-4. Add the bounded fsynced correlation-request journal and Core transport call
-   between durable trigger append and trigger ACK, including exact retry.
-5. Add a restart interleaving test: after durable trigger/request selection but
+4. Implement the specialized observer route and durable publication receipt
+   under the frozen lock order. Treat persistent `mutation_read_only` as an
+   absolute typed-unavailable/no-publication fence; keep its enum decodable but
+   never synthesize it locally from the hard fence.
+5. Add the evidence-root `correlation-requests.agf` journal (4,096 records,
+   16 MiB verified bytes, 64 KiB frame payload) and async Core transport call
+   between durable trigger append and trigger ACK. Core owns the exact
+   `requested_ttl_seconds=120`; the four-field request has no deadline,
+   selection-time, or bytes field, and restart reuses the byte-identical
+   canonical request re-derived from its nested request.
+6. Add a restart interleaving test: after durable trigger/request selection but
    before proof publication, restart under a new kernel boot, then require the
    strict `Rejected(observer_boot_changed)` proof with a recomputed protected
    boot-boundary-chain hash and source-order ACK recovery. Cover more than one

@@ -48,8 +48,12 @@ trigger_source_sequence
 requested_ttl_seconds
 ```
 
-It is a request, not evidence or authority. TTL is constrained to `30..300`.
-The operation key is
+It is a request, not evidence or authority. TTL is constrained to `30..300`;
+the Task 6C production path always sets `requested_ttl_seconds = 120`. That
+value is Core-owned and is not caller, model, policy, operator, or
+configuration input. The request has exactly its schema version and four
+request facts above; it has no deadline, selection-time, or canonical-bytes
+field. The operation key is
 `pcc_correlation_snapshot:<trigger_event_id>`. An exact retry returns the
 receipt-bound publication. Different canonical request bytes under the same key
 are a security conflict and fence mutation readiness.
@@ -424,6 +428,45 @@ Producer lock order is:
 7. form fields with `coverage_through_sequence = S - 1`;
 8. reserve, sign, atomically append event plus receipt, and publish state.
 
+Persistent `mutation_read_only` is an absolute no-publication fence. The local
+producer checks it before trigger lookup, sequence reservation, signing, spool
+append, or receipt append and returns a typed unavailable result. Core keeps the
+exact `selected` request and trigger unacknowledged and retries the same bytes
+only after external recovery. `mutation_read_only` remains a decodable failed
+snapshot reason for compatibility and replay, but the local producer never
+synthesizes that failed proof from its own persistent hard fence.
+
+Observer state advances once from V4 to V5 and adds these exact journal anchors:
+
+```text
+pcc_boundary_count
+pcc_boundary_bytes
+pcc_boundary_head_sha256
+pcc_receipt_count
+pcc_receipt_bytes
+pcc_receipt_head_sha256
+```
+
+V4-to-V5 migration is legal only when both
+`<state>/spool/pcc-boundaries.agf` and
+`<state>/spool/pcc-receipts.agf` are absent. A pre-existing unanchored file
+fails closed and is never adopted as migrated history.
+
+`<state>/spool/pcc-boundaries.agf` contains at most 1,024
+`agmind.pcc-boundary-archive-record.v1` records, at most 64 MiB of verified
+framed bytes, and at most 128 KiB per frame payload. Each record contains one
+exact authenticated `boundary_event` and an optional exact
+`rotation_companion_event`; A/B/C is derived, never stored as caller data.
+Recovery revalidates signatures, event/content IDs, flags, key epochs,
+source-sequence adjacency, boot linkage, and the complete A/B/C grammar.
+Existing public-key metadata remains capped at 16 epochs.
+
+`<state>/spool/pcc-receipts.agf` contains at most 4,096
+`agmind.pcc-publication-receipt-record.v1` records, at most 16 MiB of verified
+framed bytes, and at most 128 KiB per frame payload. The nested receipt has
+exactly the five fields frozen above, carries no source sequence, and rebinds
+the spool event by event ID and content hash.
+
 Core durably appends the trigger without ACK, requests the snapshot, fetches and
 durably appends every intervening event plus the snapshot, then advances ACKs in
 source order. A crash retries the exact persisted request bytes.
@@ -442,8 +485,12 @@ snapshot_content_sha256?
 ```
 
 The journal is capped at 4,096 records and 16 MiB. Trigger identity and TTL are
-therefore byte-stable across restart or configuration changes. The journal is
-operational authority, never a SQLite projection.
+therefore byte-stable across restart or configuration changes. Each frame
+payload is capped at 64 KiB. Recovery strictly decodes the nested four-field
+request, re-derives its canonical bytes, and verifies `request_sha256`; the
+record has no canonical-bytes, deadline, or selection-time field. The journal
+is the exact evidence-root operational artifact `correlation-requests.agf` and
+is operational authority, never a SQLite projection.
 
 ## Historical coverage proof
 
