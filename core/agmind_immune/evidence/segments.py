@@ -17,11 +17,13 @@ import uuid
 from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from threading import Lock
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -87,7 +89,10 @@ if TYPE_CHECKING:
         RetentionSnapshot,
         RetentionStateJournal,
     )
-    from agmind_immune.ingest.ack_journal import AckJournal
+    from agmind_immune.ingest.ack_journal import (
+        AckJournal,
+        _AckRetentionBoundaryLease,
+    )
 
 MAX_EVIDENCE_RECORD_BYTES = 128 * 1024
 MAX_SEGMENT_BYTES = 64 * 1024 * 1024
@@ -138,8 +143,13 @@ _RETENTION_STATE_TEMP_NAME = re.compile(
 )
 _MAX_RETENTION_STATE_BYTES = 128 * 1024
 _RETENTION_BOUNDARY_NAME = "retention-boundary.json"
+_RETENTION_BOUNDARY_TEMP_NAME = re.compile(
+    rf"^\.retention-boundary\.json\.{_UUID4_TEXT}\.tmp$"
+)
 _RETENTION_STATE_AUTHORITY_FACTORY = object()
 _RETENTION_PROOF_FACTORY = object()
+_RETENTION_ACK_RECOVERY_FACTORY = object()
+_RETENTION_ACK_GATE_FACTORY = object()
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _ZERO_SHA256 = "0" * 64
 _UTC_TIMESTAMP = re.compile(
@@ -615,6 +625,26 @@ class _RetentionStateArtifactBinding:
 
 
 @dataclass(frozen=True)
+class _MissingManifestPayload:
+    chain_index: int
+    manifest: SegmentManifestV1
+    manifest_canonical: bytes
+    date_name: str
+    closed_name: str
+
+
+@dataclass(frozen=True)
+class _AuthenticatedRetentionRecovery:
+    state: object | None
+    tombstones: tuple[
+        tuple[StoredEvidenceRecord, RetentionTombstoneV2],
+        ...,
+    ]
+    current_target_ref: EvidenceRef | None
+    boundary_raw: bytes | None
+
+
+@dataclass(frozen=True)
 class _RetentionAcceptedEnvelopeBinding:
     sequence: int
     accepted: object
@@ -706,6 +736,11 @@ class _AuthenticatedRetentionUnlinkCompletionBinding:
     lifecycle_identity: object
     completed_state_raw: bytes
     manifest_canonical: tuple[bytes, ...]
+    verifier_authority: object
+    verifier_generation: int
+    transient_generation: int
+    accepted_authority: _RetentionAcceptedAuthorityBinding
+    status: EvidenceStatus
 
 
 def _retention_accepted_authority_binding(
@@ -2321,6 +2356,18 @@ class SegmentStore:
         self._closed = False
         self._active: _ActiveSegment | None = None
         self._manifests: list[SegmentManifestV1] = []
+        self._manifest_replay_records: dict[
+            str,
+            tuple[StoredEvidenceRecord, ...] | None,
+        ] = {}
+        self._missing_manifest_payloads: tuple[
+            _MissingManifestPayload,
+            ...,
+        ] = ()
+        self._authenticated_retired_ranges: tuple[
+            tuple[int, int],
+            ...,
+        ] = ()
         self._chain_head: SegmentChainHeadV1 | None = None
         self._records: list[StoredEvidenceRecord] = []
         self._index: dict[tuple[str, int], tuple[bytes, EvidenceRef]] = {}
@@ -2333,9 +2380,16 @@ class SegmentStore:
         self._date_descriptors: dict[str, int] = {}
         self._lifecycle_identity = object()
         self._bound_verifier: EnvelopeVerifier | None = None
-        self._authority_state: Literal["unbound", "recovering", "ready"] = "unbound"
+        self._authority_state: Literal[
+            "unbound",
+            "recovering",
+            "ready",
+            "retention_uncertain",
+        ] = "unbound"
         self._coverage_state_owner: object | None = None
         self._ack_journal_owner: object | None = None
+        self._retention_ack_recovery_permitted = False
+        self._ack_journal_is_retention_recovery = False
         self._ack_journal_state: Literal[
             "unknown",
             "fresh",
@@ -3821,6 +3875,9 @@ class SegmentStore:
         self,
         binding: _AuthenticatedRetentionTombstoneBinding,
         selected: frozenset[str],
+        completion: (
+            _AuthenticatedRetentionUnlinkCompletionBinding | None
+        ) = None,
     ) -> tuple[bytes, ...]:
         snapshot_binding = self._retention_snapshot_binding
         if (
@@ -3887,18 +3944,41 @@ class SegmentStore:
             )
         verifier = self._require_authenticated_recovered()
         coverage = binding.coverage
+        expected_status = (
+            binding.status if completion is None else completion.status
+        )
+        expected_authority = (
+            binding.verifier_authority
+            if completion is None
+            else completion.verifier_authority
+        )
+        expected_generation = (
+            binding.verifier_generation
+            if completion is None
+            else completion.verifier_generation
+        )
+        expected_transient_generation = (
+            binding.transient_generation
+            if completion is None
+            else completion.transient_generation
+        )
+        expected_accepted_authority = (
+            binding.accepted_authority
+            if completion is None
+            else completion.accepted_authority
+        )
         if (
-            self.status() != binding.status
+            self.status() != expected_status
             or self._active is not None
             or verifier is not binding.verifier
-            or verifier._authority is not binding.verifier_authority
+            or verifier._authority is not expected_authority
             or verifier._authority.generation
-            != binding.verifier_generation
+            != expected_generation
             or verifier._repair_transient_generation
-            != binding.transient_generation
+            != expected_transient_generation
             or not _same_retention_accepted_authority(
                 verifier,
-                binding.accepted_authority,
+                expected_accepted_authority,
             )
             or self._coverage_state_owner is not coverage
             or getattr(coverage, "_snapshot", None)
@@ -3987,6 +4067,9 @@ class SegmentStore:
         payload_unlink_attempted = False
         binding: _AuthenticatedRetentionTombstoneBinding | None = None
         attempted_groups: list[_HeldRetentionDirectory] = []
+        ack_boundary_owner: object | None = None
+        ack_boundary_lease: _AckRetentionBoundaryLease | None = None
+        primary_error: BaseException | None = None
         try:
             with self._retention_tombstone_lock:
                 if self._retention_commit_uncertain_latched:
@@ -4019,6 +4102,16 @@ class SegmentStore:
                     raise EvidenceSealError(
                         "retention unlink lost its exact journal"
                     )
+                candidate_ack_owner = self._ack_journal_owner
+                ack_boundary_lease = self._acquire_retention_ack_boundary(
+                    candidate_ack_owner,
+                    confirmed_through=(
+                        self._retention_selected_max_sequence(
+                            journal.state
+                        )
+                    ),
+                )
+                ack_boundary_owner = candidate_ack_owner
                 if phase == "evidence_appended":
                     in_progress_state = decode_retention_state(
                         binding.unlink_in_progress_state_raw
@@ -4059,20 +4152,10 @@ class SegmentStore:
                         "retention unlink intent is not durable"
                     )
                 self._bind_retention_unlink_lease(lease)
-                completion_binding = (
-                    _AuthenticatedRetentionUnlinkCompletionBinding(
-                        capability=binding.completion_capability,
-                        tombstone=binding,
-                        journal=journal,
-                        journal_identity=binding.journal_identity,
-                        lifecycle_identity=self._lifecycle_identity,
-                        completed_state_raw=binding.completed_state_raw,
-                        manifest_canonical=(
-                            self._retention_snapshot_binding.manifest_canonical
-                            if self._retention_snapshot_binding is not None
-                            else ()
-                        ),
-                    )
+                manifest_canonical = (
+                    self._retention_snapshot_binding.manifest_canonical
+                    if self._retention_snapshot_binding is not None
+                    else ()
                 )
                 completion = binding.completion_capability
                 if type(completion) is not AuthenticatedRetentionUnlinkCompletion:
@@ -4113,10 +4196,38 @@ class SegmentStore:
                 canonical = self._require_retention_post_unlink_namespace(
                     lease
                 )
-                if canonical != completion_binding.manifest_canonical:
+                if canonical != manifest_canonical:
                     raise EvidenceCorrupt(
                         "retention unlink completion manifest changed"
                     )
+                self._retire_authenticated_retention_records(
+                    journal.state
+                )
+                verifier = self._require_authenticated_recovered()
+                completion_binding = (
+                    _AuthenticatedRetentionUnlinkCompletionBinding(
+                        capability=completion,
+                        tombstone=binding,
+                        journal=journal,
+                        journal_identity=binding.journal_identity,
+                        lifecycle_identity=self._lifecycle_identity,
+                        completed_state_raw=binding.completed_state_raw,
+                        manifest_canonical=manifest_canonical,
+                        verifier_authority=verifier._authority,
+                        verifier_generation=(
+                            verifier._authority.generation
+                        ),
+                        transient_generation=(
+                            verifier._repair_transient_generation
+                        ),
+                        accepted_authority=(
+                            _retention_accepted_authority_binding(
+                                verifier
+                            )
+                        ),
+                        status=self.status(),
+                    )
+                )
                 self._close_retention_unlink_lease(lease)
                 lease_closed = True
                 journal._transition(
@@ -4128,8 +4239,10 @@ class SegmentStore:
                 self._retention_commit_uncertain_latched = False
                 return completion
         except BaseException as error:
+            primary_error = error
             if payload_unlink_attempted and binding is not None:
                 self._retention_commit_uncertain_latched = True
+                self._authority_state = "retention_uncertain"
                 self._authenticated_retention_tombstone = None
                 for group in attempted_groups:
                     if group.descriptor < 0:
@@ -4171,6 +4284,25 @@ class SegmentStore:
             raise EvidenceCorrupt(
                 "retention unlink execution is uncertain"
             ) from error
+        finally:
+            if (
+                ack_boundary_owner is not None
+                and ack_boundary_lease is not None
+            ):
+                try:
+                    self._release_retention_ack_boundary(
+                        ack_boundary_owner,
+                        ack_boundary_lease,
+                    )
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        self._retention_commit_uncertain_latched = True
+                        self._authority_state = "retention_uncertain"
+                        raise
+                    primary_error.add_note(
+                        "retention ACK-boundary release failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
 
     def _validate_authenticated_retention_completion(
         self,
@@ -4273,6 +4405,7 @@ class SegmentStore:
         canonical = self._require_retention_post_unlink_paths(
             tombstone,
             selected,
+            binding,
         )
         if canonical != binding.manifest_canonical:
             raise EvidenceCorrupt(
@@ -6411,18 +6544,31 @@ class SegmentStore:
                 "ACK commitment generation is not one exact transition ahead"
             )
         try:
-            ref = self._validate_ack_identity(
-                owner,
-                lifecycle_identity,
-                sequence=sequence,
-                event_id=event_id,
-                content_sha256=content_sha256,
-            )
+            if (
+                self._ack_journal_operation == "recover"
+                and self._ack_journal_state
+                in {"recovering", "initialization_uncertain"}
+            ):
+                ref = self._resolve_recovered_ack_identity(
+                    owner,
+                    lifecycle_identity,
+                    sequence=sequence,
+                    event_id=event_id,
+                    content_sha256=content_sha256,
+                )
+            else:
+                ref = self._validate_ack_identity(
+                    owner,
+                    lifecycle_identity,
+                    sequence=sequence,
+                    event_id=event_id,
+                    content_sha256=content_sha256,
+                )
         except _AckAuthorityError as error:
             raise _AckLifecycleCorrupt(
                 "ACK commitment does not bind authenticated evidence"
             ) from error
-        if (
+        if ref is not None and (
             ref.source_sequence != sequence
             or ref.event_id != event_id
             or ref.content_sha256 != content_sha256
@@ -6545,8 +6691,24 @@ class SegmentStore:
         owner: object,
         *,
         operation: Literal["create", "recover"],
+        _factory: object | None = None,
     ) -> tuple[int, object]:
-        self._require_ack_mutation_ready()
+        retention_recovery = (
+            _factory is _RETENTION_ACK_RECOVERY_FACTORY
+            and operation == "recover"
+            and self._retention_ack_recovery_permitted
+            and self._authority_state == "recovering"
+            and self._bound_verifier is not None
+            and self._read_only_reason is None
+            and not self._append_uncertain
+            and self._pending_durable_commit is None
+        )
+        if not retention_recovery:
+            if _factory is not None:
+                raise _AckLifecycleStateError(
+                    "ACK journal has an invalid recovery factory"
+                )
+            self._require_ack_mutation_ready()
         if self._ack_journal_owner is not None:
             raise EvidenceStoreBusy("evidence root already has one ACK-journal owner")
         state = self._ack_journal_state
@@ -6617,7 +6779,17 @@ class SegmentStore:
         duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
         if duplicate_command is None:
             root_descriptor = os.dup(self._root_descriptor)
-            os.set_inheritable(root_descriptor, False)
+            try:
+                os.set_inheritable(root_descriptor, False)
+            except BaseException as error:
+                try:
+                    os.close(root_descriptor)
+                except OSError as cleanup_error:
+                    error.add_note(
+                        "secondary ACK root descriptor cleanup failure: "
+                        f"{cleanup_error}"
+                    )
+                raise
         else:
             root_descriptor = fcntl.fcntl(
                 self._root_descriptor,
@@ -6627,6 +6799,7 @@ class SegmentStore:
         self._ack_journal_owner = owner
         self._ack_journal_operation = operation
         self._ack_journal_state = next_state
+        self._ack_journal_is_retention_recovery = retention_recovery
         return root_descriptor, self._lifecycle_identity
 
     def _ack_journal_final_name_created(
@@ -6809,7 +6982,17 @@ class SegmentStore:
         owner: object,
         lifecycle_identity: object,
     ) -> None:
-        self._require_ack_mutation_ready()
+        internal_recovery = (
+            self._ack_journal_is_retention_recovery
+            and self._retention_ack_recovery_permitted
+            and self._authority_state == "recovering"
+            and self._bound_verifier is not None
+            and self._read_only_reason is None
+            and not self._append_uncertain
+            and self._pending_durable_commit is None
+        )
+        if not internal_recovery:
+            self._require_ack_mutation_ready()
         if (
             owner is not self._ack_journal_owner
             or lifecycle_identity is not self._lifecycle_identity
@@ -6835,12 +7018,252 @@ class SegmentStore:
         ):
             raise EvidenceSealError("ACK journal release has the wrong lifecycle")
         state = self._ack_journal_state
-        if state == "creating":
+        if (
+            self._ack_journal_is_retention_recovery
+            and state == "initialized"
+        ):
+            self._ack_journal_state = "present"
+        elif state == "creating":
             self._ack_journal_state = "fresh"
         elif state == "recovering":
             self._ack_journal_state = "present"
         self._ack_journal_owner = None
         self._ack_journal_operation = None
+        self._ack_journal_is_retention_recovery = False
+
+    def _ack_recovery_verifier(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> EnvelopeVerifier:
+        self._validate_ack_journal_owner(owner, lifecycle_identity)
+        verifier = self._bound_verifier
+        if verifier is None or self._authority_state not in {
+            "recovering",
+            "ready",
+        }:
+            raise _AckLifecycleStateError(
+                "ACK recovery has no authenticated verifier"
+            )
+        if (
+            self._authority_state == "recovering"
+            and not self._ack_journal_is_retention_recovery
+        ):
+            raise _AckLifecycleStateError(
+                "ACK recovery cannot enter an unready evidence lifecycle"
+            )
+        return verifier
+
+    def _resolve_recovered_ack_identity(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        *,
+        sequence: int,
+        event_id: str,
+        content_sha256: str,
+    ) -> EvidenceRef | None:
+        verifier = self._ack_recovery_verifier(
+            owner,
+            lifecycle_identity,
+        )
+        indexed = self._index.get((verifier.fsm.host_id, sequence))
+        if indexed is not None:
+            ref = indexed[1]
+            position = self._record_positions.get(
+                (verifier.fsm.host_id, sequence)
+            )
+            if (
+                ref.event_id != event_id
+                or ref.content_sha256 != content_sha256
+            ):
+                raise _AckAuthorityError(
+                    "recovered ACK identity differs from live evidence"
+                )
+            if (
+                position is None
+                or position >= len(self._records)
+                or self._records[position].ref is not ref
+                or verifier.accepted_ref(sequence) is not ref
+            ):
+                raise EvidenceCorrupt(
+                    "recovered ACK live evidence authority changed"
+                )
+            return ref
+
+        matches = sum(
+            1
+            for start, end in self._authenticated_retired_ranges
+            if start <= sequence <= end
+        )
+        if matches != 1:
+            raise _AckAuthorityError(
+                "recovered ACK identity is outside authenticated evidence"
+            )
+        return None
+
+    def _validate_next_recovered_ack_identity(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        *,
+        sequence: int,
+        event_id: str,
+        content_sha256: str,
+        confirmed_through: int,
+    ) -> None:
+        verifier = self._ack_recovery_verifier(
+            owner,
+            lifecycle_identity,
+        )
+        self._resolve_recovered_ack_identity(
+            owner,
+            lifecycle_identity,
+            sequence=sequence,
+            event_id=event_id,
+            content_sha256=content_sha256,
+        )
+        candidates: list[int] = []
+        sequences = self._sequences_by_host.get(verifier.fsm.host_id, [])
+        live_position = bisect_right(sequences, confirmed_through)
+        if live_position < len(sequences):
+            candidates.append(sequences[live_position])
+        for start, end in self._authenticated_retired_ranges:
+            if end > confirmed_through:
+                candidates.append(max(start, confirmed_through + 1))
+        if not candidates or sequence != min(candidates):
+            raise _AckAuthorityError(
+                "recovered ACK is not the next live-or-retired position"
+            )
+        holes = verifier.fsm.unresolved_holes
+        acceptance_cursor = (
+            holes[0][0] - 1 if holes else verifier.fsm.last_sequence
+        )
+        if sequence > acceptance_cursor:
+            raise _AckAuthorityError(
+                "recovered ACK exceeds authenticated acceptance"
+            )
+
+    def _validate_recovered_ack_terminal(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        *,
+        confirmed_through: int,
+    ) -> None:
+        self._ack_recovery_verifier(owner, lifecycle_identity)
+        if any(
+            end > confirmed_through
+            for _start, end in self._authenticated_retired_ranges
+        ):
+            raise _AckAuthorityError(
+                "ACK confirmation lags authenticated retired evidence"
+            )
+
+    def _acquire_retention_ack_boundary(
+        self,
+        journal: object,
+        *,
+        confirmed_through: int,
+    ) -> _AckRetentionBoundaryLease:
+        from agmind_immune.ingest.ack_journal import (
+            AckJournal,
+            AckJournalError,
+        )
+
+        if (
+            type(journal) is not AckJournal
+            or journal is not self._ack_journal_owner
+        ):
+            raise EvidenceSealError(
+                "retention unlink has no exact ACK-journal owner"
+            )
+        try:
+            return journal._acquire_retention_boundary(
+                self,
+                confirmed_through=confirmed_through,
+                _factory=_RETENTION_ACK_GATE_FACTORY,
+            )
+        except AckJournalError as error:
+            raise EvidenceSealError(
+                "retention unlink lacks a settled ACK prefix"
+            ) from error
+
+    def _release_retention_ack_boundary(
+        self,
+        journal: object,
+        lease: _AckRetentionBoundaryLease,
+    ) -> None:
+        from agmind_immune.ingest.ack_journal import AckJournal
+
+        if type(journal) is not AckJournal:
+            raise EvidenceSealError(
+                "retention ACK boundary owner changed"
+            )
+        journal._release_retention_boundary(
+            self,
+            lease=lease,
+            _factory=_RETENTION_ACK_GATE_FACTORY,
+        )
+
+    def _open_retention_ack_recovery(
+        self,
+    ) -> AckJournal:
+        from agmind_immune.ingest.ack_journal import (
+            AckJournal,
+            AckJournalError,
+        )
+
+        if (
+            self._authority_state != "recovering"
+            or self._ack_journal_owner is not None
+            or self._retention_ack_recovery_permitted
+        ):
+            raise EvidenceCorrupt(
+                "retention ACK recovery has the wrong lifecycle"
+            )
+        self._retention_ack_recovery_permitted = True
+        try:
+            return AckJournal._open_for_retention_recovery(
+                self,
+                _factory=_RETENTION_ACK_RECOVERY_FACTORY,
+            )
+        except (AckJournalError, EvidenceStoreError) as error:
+            self._retention_ack_recovery_permitted = False
+            raise EvidenceCorrupt(
+                "retention recovery lacks authenticated ACK history"
+            ) from error
+        except BaseException:
+            self._retention_ack_recovery_permitted = False
+            raise
+
+    def _close_retention_ack_recovery(
+        self,
+        journal: object,
+    ) -> None:
+        from agmind_immune.ingest.ack_journal import AckJournal
+
+        try:
+            if (
+                type(journal) is not AckJournal
+                or journal is not self._ack_journal_owner
+                or not self._ack_journal_is_retention_recovery
+            ):
+                raise EvidenceCorrupt(
+                    "retention ACK recovery owner changed"
+                )
+            journal.close()
+        except BaseException as error:
+            try:
+                self._trip_read_only("segment_corrupt")
+            except BaseException as fence_error:  # noqa: BLE001
+                error.add_note(
+                    "secondary retention ACK recovery fence failure: "
+                    f"{type(fence_error).__name__}: {fence_error}"
+                )
+            raise
+        finally:
+            self._retention_ack_recovery_permitted = False
 
     def _validate_ack_identity(
         self,
@@ -6946,9 +7369,7 @@ class SegmentStore:
                 ),
                 delete_manifest_temporaries=plan.delete_manifest_temporaries,
                 delete_root_temporaries=plan.delete_root_temporaries,
-                delete_retention_state_temporaries=(
-                    plan.delete_retention_state_temporaries
-                ),
+                delete_retention_state_temporaries=(),
                 head_raw=plan.head_raw,
             )
             if self._read_only_reason is None:
@@ -7258,6 +7679,7 @@ class SegmentStore:
         self,
     ) -> tuple[_RecoveryPlan, set[tuple[str, str]]]:
         manifests: list[SegmentManifestV1] = []
+        manifest_raw_by_hash: dict[str, bytes] = {}
         manifest_temporaries: list[str] = []
         for name in sorted(os.listdir(self._manifests_descriptor)):
             if _MANIFEST_TEMP_NAME.fullmatch(name):
@@ -7282,12 +7704,20 @@ class SegmentStore:
                 raise EvidenceCorrupt("immutable manifest is not canonical JSON")
             if name != f"{manifest.segment_id}.json":
                 raise EvidenceCorrupt("manifest filename does not match segment_id")
+            if manifest.manifest_sha256 in manifest_raw_by_hash:
+                raise EvidenceCorrupt("duplicate immutable manifest digest")
             manifests.append(manifest)
+            manifest_raw_by_hash[manifest.manifest_sha256] = raw
         chain = self._order_manifest_chain(manifests)
         referenced_closed: set[tuple[str, str]] = set()
         manifested_open: set[tuple[str, str]] = set()
         promotions: list[_Promotion] = []
-        for manifest in chain:
+        missing_payloads: list[_MissingManifestPayload] = []
+        replay_records: dict[
+            str,
+            tuple[StoredEvidenceRecord, ...] | None,
+        ] = {}
+        for chain_index, manifest in enumerate(chain):
             _, date_name, closed_name = manifest.segment_relative_path.split("/")
             open_name = closed_name.removesuffix(".agseg") + ".open"
             date_descriptor = self._date_descriptor(date_name)
@@ -7313,7 +7743,20 @@ class SegmentStore:
                 )
                 manifested_open.add((date_name, open_name))
             elif closed_stat is None:
-                raise EvidenceCorrupt("manifest payload is missing without retention authority")
+                replay_records[manifest.manifest_sha256] = None
+                missing_payloads.append(
+                    _MissingManifestPayload(
+                        chain_index=chain_index,
+                        manifest=manifest,
+                        manifest_canonical=manifest_raw_by_hash[
+                            manifest.manifest_sha256
+                        ],
+                        date_name=date_name,
+                        closed_name=closed_name,
+                    )
+                )
+                referenced_closed.add((date_name, closed_name))
+                continue
             else:
                 scan = self._verify_segment_against_manifest(
                     date_descriptor,
@@ -7322,6 +7765,7 @@ class SegmentStore:
                     manifest,
                 )
             self._add_records(list(scan.records))
+            replay_records[manifest.manifest_sha256] = scan.records
             referenced_closed.add((date_name, closed_name))
         if promotions:
             final_closed_name = chain[-1].segment_relative_path.rsplit(
@@ -7377,6 +7821,8 @@ class SegmentStore:
                 else:
                     raise EvidenceCorrupt(f"unexpected segment artifact: {name}")
         self._manifests = chain
+        self._manifest_replay_records = replay_records
+        self._missing_manifest_payloads = tuple(missing_payloads)
         head_raw = self._scan_chain_head()
 
         root_temporaries: list[str] = []
@@ -7403,7 +7849,25 @@ class SegmentStore:
         retention_state_temporaries: list[
             _RetentionStateArtifactBinding
         ] = []
+        retention_boundary_names: list[str] = []
+        retention_boundary_temporary_names: list[str] = []
         for name in root_entries:
+            if name == _RETENTION_BOUNDARY_NAME:
+                _regular_stat_at(
+                    self._root_descriptor,
+                    name,
+                    self.root / name,
+                )
+                retention_boundary_names.append(name)
+                continue
+            if _RETENTION_BOUNDARY_TEMP_NAME.fullmatch(name):
+                _regular_stat_at(
+                    self._root_descriptor,
+                    name,
+                    self.root / name,
+                )
+                retention_boundary_temporary_names.append(name)
+                continue
             if name == _RETENTION_STATE_NAME:
                 retention_state_bindings.append(
                     _read_stable_retention_artifact(
@@ -7539,6 +8003,14 @@ class SegmentStore:
         if len(retention_state_temporaries) > 1:
             raise EvidenceCorrupt(
                 "multiple retention-state temporaries exist"
+            )
+        if len(retention_boundary_names) > 1:
+            raise EvidenceCorrupt(
+                "multiple retention-boundary artifacts exist"
+            )
+        if len(retention_boundary_temporary_names) > 1:
+            raise EvidenceCorrupt(
+                "multiple retention-boundary temporaries exist"
             )
         self._repair_state_binding = (
             repair_state_bindings[0] if repair_state_bindings else None
@@ -8357,6 +8829,55 @@ class SegmentStore:
         self._retention_state_temporary = None
         self._retention_state_namespace_uncertain = False
 
+    def _discard_retention_boundary_temporary(
+        self,
+        name: str,
+    ) -> None:
+        if _RETENTION_BOUNDARY_TEMP_NAME.fullmatch(name) is None:
+            raise EvidenceCorrupt(
+                "retention-boundary temporary name is invalid"
+            )
+        path = self.root / name
+        identity = _file_identity(
+            _regular_stat_at(
+                self._root_descriptor,
+                name,
+                path,
+            )
+        )
+        descriptor, opened = _open_regular_at(
+            self._root_descriptor,
+            name,
+            path,
+        )
+        try:
+            _validate_identity(opened, identity, path)
+            with _post_authentication_namespace(path):
+                _bind_held_source(
+                    self._root_descriptor,
+                    name,
+                    path,
+                    descriptor=descriptor,
+                    identity=identity,
+                )
+                os.unlink(name, dir_fd=self._root_descriptor)
+                unlinked = os.fstat(descriptor)
+                if (
+                    unlinked.st_dev != identity.device
+                    or unlinked.st_ino != identity.inode
+                    or unlinked.st_size != identity.size
+                    or unlinked.st_mode != identity.mode
+                    or unlinked.st_uid != identity.owner
+                    or unlinked.st_nlink != 0
+                    or _entry_stat_at(self._root_descriptor, name) is not None
+                ):
+                    raise EvidenceCorrupt(
+                        "retention-boundary temporary discard became uncertain"
+                    )
+                os.fsync(self._root_descriptor)
+        finally:
+            os.close(descriptor)
+
     def _apply_recovery_plan(self, plan: _RecoveryPlan) -> None:
         for promotion in plan.promotions:
             date_descriptor = self._date_descriptor(promotion.date_name)
@@ -8656,16 +9177,1369 @@ class SegmentStore:
             or self._manifests
             or self._chain_head is not None
             or self._active is not None
+            or self._retention_state_binding is not None
+            or self._retention_state_temporary is not None
+            or any(
+                name == _RETENTION_BOUNDARY_NAME
+                or _RETENTION_BOUNDARY_TEMP_NAME.fullmatch(name)
+                for name in os.listdir(self._root_descriptor)
+            )
         ):
             raise EvidenceReadOnly(
                 "nonempty evidence requires authenticated open-and-recover"
             )
         try:
             verifier._bind_lifecycle(self._lifecycle_identity)
+            verifier._seal_retention_recovery(
+                self._lifecycle_identity
+            )
         except VerifierCommitError as error:
             raise EvidenceSealError("verifier belongs to another store lifecycle") from error
         self._bound_verifier = verifier
         self._authority_state = "ready"
+
+    def _replay_recovered_record(
+        self,
+        verifier: EnvelopeVerifier,
+        record: StoredEvidenceRecord,
+    ) -> None:
+        ref = record.ref
+        verified = verifier.verify(
+            record.envelope,
+            sequence=ref.source_sequence,
+            event_id=ref.event_id,
+            content_sha256=ref.content_sha256,
+        )
+        authorization = verifier._authorize_append(
+            verified,
+            self._lifecycle_identity,
+            record.priority.value,
+        )
+        if authorization.canonical != record.canonical_envelope:
+            raise EvidenceCorrupt("replay canonical bytes changed")
+        verifier._commit_durable(
+            authorization,
+            self._lifecycle_identity,
+            ref,
+        )
+
+    def _replay_manifest_chain(
+        self,
+        verifier: EnvelopeVerifier,
+    ) -> None:
+        replayed: set[tuple[str, int]] = set()
+        prior_last = 0
+        for manifest in self._manifests:
+            if (
+                manifest.host_id != verifier.root.host_id
+                or manifest.first_source_sequence <= prior_last
+                or manifest.record_count
+                > manifest.last_source_sequence
+                - manifest.first_source_sequence
+                + 1
+            ):
+                raise EvidenceCorrupt(
+                    "retention replay manifest order is invalid"
+                )
+            records = self._manifest_replay_records.get(
+                manifest.manifest_sha256
+            )
+            if records is None:
+                if (
+                    manifest.evidence_priority != "routine"
+                    or manifest.record_count
+                    != manifest.last_source_sequence
+                    - manifest.first_source_sequence
+                    + 1
+                ):
+                    raise EvidenceCorrupt(
+                        "missing retention payload has no dense routine replay shape"
+                    )
+                verifier._recover_dense_routine_omission(
+                    manifest_sha256=manifest.manifest_sha256,
+                    first_sequence=manifest.first_source_sequence,
+                    last_sequence=manifest.last_source_sequence,
+                    record_count=manifest.record_count,
+                    lifecycle=self._lifecycle_identity,
+                )
+            else:
+                if len(records) != manifest.record_count:
+                    raise EvidenceCorrupt(
+                        "manifest replay record count changed"
+                    )
+                for record in records:
+                    self._replay_recovered_record(verifier, record)
+                    replayed.add(
+                        (
+                            str(record.envelope["host_id"]),
+                            record.ref.source_sequence,
+                        )
+                    )
+            prior_last = manifest.last_source_sequence
+
+        for record in self._records:
+            key = (
+                str(record.envelope["host_id"]),
+                record.ref.source_sequence,
+            )
+            if key in replayed:
+                continue
+            self._replay_recovered_record(verifier, record)
+
+    def _authenticated_retention_tombstones_for_recovery(
+        self,
+        verifier: EnvelopeVerifier,
+    ) -> tuple[tuple[StoredEvidenceRecord, RetentionTombstoneV2], ...]:
+        result: list[
+            tuple[StoredEvidenceRecord, RetentionTombstoneV2]
+        ] = []
+        for record in self._records:
+            if record.envelope.get("event_type") != "retention_tombstone":
+                continue
+            accepted = verifier._authority.accepted.get(
+                record.ref.source_sequence
+            )
+            try:
+                envelope = EventEnvelopeV1.model_validate_json(
+                    record.canonical_envelope,
+                    strict=True,
+                )
+                request = RetentionTombstoneV2.model_validate(
+                    envelope.normalized_fields,
+                    strict=True,
+                )
+            except (TypeError, ValueError, ValidationError) as error:
+                raise EvidenceCorrupt(
+                    "retention recovery tombstone is malformed"
+                ) from error
+            if (
+                record.priority is not EvidencePriority.PROTECTED
+                or accepted is None
+                or accepted.canonical != record.canonical_envelope
+                or accepted.evidence_ref is not record.ref
+                or accepted.evidence_priority != "protected"
+                or verifier.accepted_ref(record.ref.source_sequence)
+                is not record.ref
+                or envelope.event_type != "retention_tombstone"
+                or envelope.normalized_fields
+                != request.model_dump(mode="python")
+            ):
+                raise EvidenceCorrupt(
+                    "retention recovery tombstone is not exact authenticated evidence"
+                )
+            result.append((record, request))
+        return tuple(result)
+
+    def _authenticate_retention_recovery(
+        self,
+        verifier: EnvelopeVerifier,
+    ) -> _AuthenticatedRetentionRecovery:
+        from agmind_immune.evidence.retention import (
+            MAX_RETENTION_BOUNDARY_BYTES,
+            RetentionBoundaryV1,
+            RetentionStateCorrupt,
+            RetentionStateV1,
+            decode_retention_state,
+        )
+
+        positions = {
+            manifest.manifest_sha256: index
+            for index, manifest in enumerate(self._manifests)
+        }
+        h0_tips = {
+            hashlib.sha256(
+                canonical_json(chain_head_for(manifest))
+            ).hexdigest(): index
+            for index, manifest in enumerate(self._manifests)
+        }
+        covered_by: dict[str, tuple[int, RetentionTombstoneV2]] = {}
+        accepted_by_outer: dict[
+            tuple[int, str, str],
+            RetentionTombstoneV2,
+        ] = {}
+        record_by_outer: dict[
+            tuple[int, str, str],
+            StoredEvidenceRecord,
+        ] = {}
+        seen_ids: dict[str, tuple[bytes, tuple[int, str, str]]] = {}
+        previous_sequence = 0
+        previous_end = -1
+        previous_tip = -1
+
+        authenticated_tombstones = (
+            self._authenticated_retention_tombstones_for_recovery(
+                verifier
+            )
+        )
+        for record, request in authenticated_tombstones:
+            outer = (
+                record.ref.source_sequence,
+                record.ref.event_id,
+                record.ref.content_sha256,
+            )
+            request_raw = canonical_json(
+                request.model_dump(mode="python")
+            )
+            prior_id = seen_ids.get(request.tombstone_id)
+            if prior_id is not None:
+                if prior_id != (request_raw, outer):
+                    raise EvidenceCorrupt(
+                        "retention recovery tombstone identity conflicts"
+                    )
+                continue
+            if record.ref.source_sequence <= previous_sequence:
+                raise EvidenceCorrupt(
+                    "retention recovery tombstones are out of evidence order"
+                )
+            tip = h0_tips.get(request.current_chain_head_sha256)
+            if tip is None:
+                raise EvidenceCorrupt(
+                    "retention recovery tombstone H0 is not a manifest prefix"
+                )
+            try:
+                run_positions = tuple(
+                    positions[value]
+                    for value in request.removed_manifest_hashes
+                )
+            except KeyError as error:
+                raise EvidenceCorrupt(
+                    "retention recovery tombstone names an unknown manifest"
+                ) from error
+            if (
+                not run_positions
+                or any(
+                    right != left + 1
+                    for left, right in pairwise(run_positions)
+                )
+            ):
+                raise EvidenceCorrupt(
+                    "retention recovery run is not manifest-adjacent"
+                )
+            start = run_positions[0]
+            end = run_positions[-1]
+            if (
+                end > tip
+                or start <= previous_end
+                or tip < previous_tip
+                or record.ref.source_sequence
+                <= self._manifests[tip].last_source_sequence
+            ):
+                raise EvidenceCorrupt(
+                    "retention recovery run is outside ordered H0 authority"
+                )
+            successor = (
+                self._manifests[end + 1].manifest_sha256
+                if end < tip
+                else _ZERO_SHA256
+            )
+            if request.first_retained_manifest_sha256 != successor:
+                raise EvidenceCorrupt(
+                    "retention recovery successor differs from H0"
+                )
+            removed_bytes = 0
+            for position in run_positions:
+                manifest = self._manifests[position]
+                if (
+                    manifest.evidence_priority != "routine"
+                    or manifest.record_count
+                    != manifest.last_source_sequence
+                    - manifest.first_source_sequence
+                    + 1
+                ):
+                    raise EvidenceCorrupt(
+                        "retention recovery covers protected or sparse evidence"
+                    )
+                removed_bytes += manifest.segment_size_bytes
+                if removed_bytes > MAX_UINT64:
+                    raise EvidenceCorrupt(
+                        "retention recovery byte sum overflows"
+                    )
+                if manifest.manifest_sha256 in covered_by:
+                    raise EvidenceCorrupt(
+                        "authenticated retention recovery runs overlap"
+                    )
+                covered_by[manifest.manifest_sha256] = (
+                    record.ref.source_sequence,
+                    request,
+                )
+            if removed_bytes != request.removed_bytes:
+                raise EvidenceCorrupt(
+                    "retention recovery removed byte sum differs"
+                )
+            seen_ids[request.tombstone_id] = (request_raw, outer)
+            accepted_by_outer[outer] = request
+            record_by_outer[outer] = record
+            previous_sequence = record.ref.source_sequence
+            previous_end = end
+            previous_tip = tip
+
+        try:
+            state: RetentionStateV1 | None = (
+                None
+                if self._retention_state_binding is None
+                else decode_retention_state(
+                    self._retention_state_binding.raw
+                )
+            )
+        except (RetentionStateCorrupt, TypeError, ValueError) as error:
+            raise EvidenceCorrupt(
+                "retention recovery state is malformed"
+            ) from error
+        if (
+            state is not None
+            and state.operation == "tombstone"
+        ):
+            self._retention_state_selected_manifests(state)
+
+        current_hashes: frozenset[str] = frozenset()
+        current_authenticated = False
+        current_target_ref: EvidenceRef | None = None
+        if (
+            state is not None
+            and state.operation == "tombstone"
+            and type(state.request) is RetentionTombstoneV2
+        ):
+            target = state.target
+            if target is not None:
+                authenticated = accepted_by_outer.get(
+                    (
+                        target.sequence,
+                        target.event_id,
+                        target.content_sha256,
+                    )
+                )
+                current_authenticated = authenticated == state.request
+                if current_authenticated:
+                    current_target_ref = record_by_outer[
+                        (
+                            target.sequence,
+                            target.event_id,
+                            target.content_sha256,
+                        )
+                    ].ref
+            if current_authenticated:
+                current_hashes = frozenset(
+                    state.request.removed_manifest_hashes
+                )
+            if (
+                state.phase
+                in {
+                    "evidence_appended",
+                    "retention_unlink_in_progress",
+                    "retention_commit_uncertain",
+                    "completed",
+                }
+                and not current_authenticated
+            ):
+                raise EvidenceCorrupt(
+                    "advanced retention state lacks its authenticated target"
+                )
+            if (
+                state.phase == "target_bound"
+                and target is not None
+                and target.sequence <= verifier.fsm.last_sequence
+                and not current_authenticated
+            ):
+                raise EvidenceCorrupt(
+                    "target-bound retention state conflicts with evidence"
+                )
+
+        missing_hashes = {
+            item.manifest.manifest_sha256
+            for item in self._missing_manifest_payloads
+        }
+        if not missing_hashes.issubset(covered_by):
+            raise EvidenceCorrupt(
+                "manifest payload is missing without retention authority"
+            )
+        if (
+            state is not None
+            and state.operation == "tombstone"
+            and type(state.request) is RetentionTombstoneV2
+        ):
+            selected_hashes = set(
+                state.request.removed_manifest_hashes
+            )
+            selected_missing = selected_hashes & missing_hashes
+            if (
+                state.phase
+                in {"selected", "target_bound", "evidence_appended"}
+                and selected_missing
+            ) or (
+                state.phase == "completed"
+                and selected_missing != selected_hashes
+            ):
+                raise EvidenceCorrupt(
+                    "durable retention phase has an impossible payload set"
+                )
+
+        for manifest_hash in covered_by:
+            is_missing = manifest_hash in missing_hashes
+            is_current = manifest_hash in current_hashes
+            if state is None:
+                legal = is_missing
+            elif is_current:
+                if state.phase in {
+                    "selected",
+                    "target_bound",
+                    "evidence_appended",
+                }:
+                    legal = not is_missing
+                elif state.phase in {
+                    "retention_unlink_in_progress",
+                    "retention_commit_uncertain",
+                }:
+                    legal = True
+                else:
+                    legal = is_missing
+            else:
+                legal = is_missing
+            if not legal:
+                raise EvidenceCorrupt(
+                    "retention state and physical payloads are inconsistent"
+                )
+
+        self._authenticated_retired_ranges = tuple(
+            (
+                item.manifest.first_source_sequence,
+                item.manifest.last_source_sequence,
+            )
+            for item in self._missing_manifest_payloads
+        )
+        verifier._commit_retention_recovery(
+            tuple(
+                (
+                    item.manifest.manifest_sha256,
+                    item.manifest.first_source_sequence,
+                    item.manifest.last_source_sequence,
+                    item.manifest.record_count,
+                )
+                for item in self._missing_manifest_payloads
+            ),
+            self._lifecycle_identity,
+        )
+        boundary_raw: bytes | None
+        if authenticated_tombstones:
+            try:
+                boundary = RetentionBoundaryV1.model_validate(
+                    {
+                        "schema_version": "agmind.retention-boundary.v1",
+                        "source_evidence_head": verifier.fsm.last_sequence,
+                        "tombstones": [
+                            {
+                                "sequence": record.ref.source_sequence,
+                                "event_id": record.ref.event_id,
+                                "content_sha256": record.ref.content_sha256,
+                                "tombstone_id": request.tombstone_id,
+                                "h0": request.current_chain_head_sha256,
+                                "first_removed_manifest_sha256": (
+                                    request.first_removed_manifest_sha256
+                                ),
+                                "last_removed_manifest_sha256": (
+                                    request.last_removed_manifest_sha256
+                                ),
+                                "first_retained_manifest_sha256": (
+                                    request.first_retained_manifest_sha256
+                                ),
+                                "removed_manifest_count": len(
+                                    request.removed_manifest_hashes
+                                ),
+                                "removed_bytes": request.removed_bytes,
+                                "manifest_run_sha256": (
+                                    request.manifest_run_sha256
+                                ),
+                            }
+                            for record, request in authenticated_tombstones
+                        ],
+                    },
+                    strict=True,
+                )
+                encoded_boundary = canonical_json(
+                    boundary.model_dump(mode="python")
+                )
+            except (TypeError, ValueError, ValidationError) as error:
+                raise EvidenceCorrupt(
+                    "authenticated retention boundary cannot be rebuilt"
+                ) from error
+            boundary_raw = (
+                encoded_boundary
+                if len(encoded_boundary)
+                <= MAX_RETENTION_BOUNDARY_BYTES
+                else None
+            )
+        else:
+            boundary_raw = None
+        return _AuthenticatedRetentionRecovery(
+            state=state,
+            tombstones=authenticated_tombstones,
+            current_target_ref=current_target_ref,
+            boundary_raw=boundary_raw,
+        )
+
+    def _reconcile_retention_boundary_cache(
+        self,
+        raw: bytes | None,
+    ) -> None:
+        boundary_path = self.root / _RETENTION_BOUNDARY_NAME
+        descriptor = -1
+        try:
+            info = _entry_stat_at(
+                self._root_descriptor,
+                _RETENTION_BOUNDARY_NAME,
+            )
+            identity: _FileIdentity | None = None
+            current_raw: bytes | None = None
+            if info is not None:
+                identity = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        _RETENTION_BOUNDARY_NAME,
+                        boundary_path,
+                    )
+                )
+                descriptor, opened = _open_regular_at(
+                    self._root_descriptor,
+                    _RETENTION_BOUNDARY_NAME,
+                    boundary_path,
+                )
+                _validate_identity(opened, identity, boundary_path)
+                if identity.size <= MAX_CONTRACT_FILE_BYTES:
+                    current_raw = os.pread(
+                        descriptor,
+                        identity.size,
+                        0,
+                    )
+                    if len(current_raw) != identity.size:
+                        raise EvidenceCorrupt(
+                            "retention boundary cache shortened during recovery"
+                        )
+                    _bind_held_source(
+                        self._root_descriptor,
+                        _RETENTION_BOUNDARY_NAME,
+                        boundary_path,
+                        descriptor=descriptor,
+                        identity=identity,
+                    )
+
+            if raw is None:
+                if identity is not None:
+                    closing = descriptor
+                    descriptor = -1
+                    _conditionally_unlink_held_at(
+                        self._root_descriptor,
+                        _RETENTION_BOUNDARY_NAME,
+                        boundary_path,
+                        descriptor=closing,
+                        identity=identity,
+                    )
+            elif current_raw != raw:
+                existing_descriptor = descriptor
+                descriptor = -1
+                descriptor, _published_identity = (
+                    _publish_retention_boundary_at(
+                        self._root_descriptor,
+                        _RETENTION_BOUNDARY_NAME,
+                        boundary_path,
+                        raw,
+                        existing_descriptor=existing_descriptor,
+                        existing_identity=identity,
+                    )
+                )
+            if descriptor >= 0:
+                closing = descriptor
+                descriptor = -1
+                os.close(closing)
+
+            temporary_names = tuple(
+                name
+                for name in os.listdir(self._root_descriptor)
+                if _RETENTION_BOUNDARY_TEMP_NAME.fullmatch(name)
+            )
+            if len(temporary_names) > 1:
+                raise EvidenceCorrupt(
+                    "multiple retention-boundary temporaries appeared"
+                )
+            for name in temporary_names:
+                self._discard_retention_boundary_temporary(name)
+        except BaseException as error:
+            if descriptor >= 0:
+                closing = descriptor
+                descriptor = -1
+                try:
+                    os.close(closing)
+                except BaseException as close_error:  # noqa: BLE001
+                    error.add_note(
+                        "retention recovery cache close failed: "
+                        f"{close_error}"
+                    )
+            raise
+
+    def _clear_recovered_retention_state(
+        self,
+        journal: object,
+    ) -> None:
+        from agmind_immune.evidence.retention import RetentionStateJournal
+
+        binding = self._retention_state_binding
+        if (
+            type(journal) is not RetentionStateJournal
+            or binding is None
+            or journal._raw != binding.raw
+            or journal._state is None
+            or self._retention_state_temporary is not None
+        ):
+            raise EvidenceCorrupt(
+                "retention recovery cannot clear inexact durable state"
+            )
+        journal._prove_publication(binding.raw)
+        descriptor, opened = _open_regular_at(
+            self._root_descriptor,
+            _RETENTION_STATE_NAME,
+            self.root / _RETENTION_STATE_NAME,
+            maximum=_MAX_RETENTION_STATE_BYTES,
+        )
+        _validate_identity(
+            opened,
+            binding.identity,
+            self.root / _RETENTION_STATE_NAME,
+        )
+        _conditionally_unlink_held_at(
+            self._root_descriptor,
+            _RETENTION_STATE_NAME,
+            self.root / _RETENTION_STATE_NAME,
+            descriptor=descriptor,
+            identity=binding.identity,
+        )
+        authority = journal._authority
+        authority._retention_journal = None
+        journal._state = None
+        journal._raw = None
+        self._retention_state_binding = None
+        self._retention_state_authority = None
+
+    def _retention_state_selected_manifests(
+        self,
+        state: object,
+    ) -> tuple[SegmentManifestV1, ...]:
+        from agmind_immune.evidence.retention import (
+            RetentionStateEntryV1,
+            RetentionStateV1,
+        )
+
+        if (
+            type(state) is not RetentionStateV1
+            or state.operation != "tombstone"
+            or type(state.request) is not RetentionTombstoneV2
+            or not state.entries
+        ):
+            raise EvidenceCorrupt(
+                "retention state has no exact selected manifest run"
+            )
+        request = state.request
+        positions = {
+            manifest.manifest_sha256: index
+            for index, manifest in enumerate(self._manifests)
+        }
+        try:
+            run_positions = tuple(
+                positions[value]
+                for value in request.removed_manifest_hashes
+            )
+        except KeyError as error:
+            raise EvidenceCorrupt(
+                "retention state names an unknown manifest"
+            ) from error
+        h0_positions = {
+            hashlib.sha256(
+                canonical_json(chain_head_for(manifest))
+            ).hexdigest(): index
+            for index, manifest in enumerate(self._manifests)
+        }
+        tip = h0_positions.get(request.current_chain_head_sha256)
+        if (
+            tip is None
+            or not run_positions
+            or len(run_positions) != len(state.entries)
+            or any(
+                right != left + 1
+                for left, right in pairwise(run_positions)
+            )
+            or run_positions[-1] > tip
+        ):
+            raise EvidenceCorrupt(
+                "retention state run is outside its immutable H0"
+            )
+        manifests = tuple(
+            self._manifests[position]
+            for position in run_positions
+        )
+        successor = (
+            self._manifests[run_positions[-1] + 1].manifest_sha256
+            if run_positions[-1] < tip
+            else _ZERO_SHA256
+        )
+        removed_bytes = 0
+        for entry, manifest in zip(
+            state.entries,
+            manifests,
+            strict=True,
+        ):
+            if (
+                type(entry) is not RetentionStateEntryV1
+                or manifest.evidence_priority != "routine"
+                or manifest.record_count
+                != manifest.last_source_sequence
+                - manifest.first_source_sequence
+                + 1
+                or entry.manifest_sha256 != manifest.manifest_sha256
+                or entry.segment_id != manifest.segment_id
+                or entry.segment_relative_path
+                != manifest.segment_relative_path
+                or entry.segment_size_bytes
+                != manifest.segment_size_bytes
+                or entry.segment_sha256 != manifest.segment_sha256
+            ):
+                raise EvidenceCorrupt(
+                    "retention state entry differs from immutable manifest"
+                )
+            if removed_bytes > MAX_UINT64 - manifest.segment_size_bytes:
+                raise EvidenceCorrupt(
+                    "retention state removed byte sum overflows"
+                )
+            removed_bytes += manifest.segment_size_bytes
+        hashes = [manifest.manifest_sha256 for manifest in manifests]
+        if (
+            request.first_removed_manifest_sha256 != hashes[0]
+            or request.last_removed_manifest_sha256 != hashes[-1]
+            or request.first_retained_manifest_sha256 != successor
+            or request.removed_bytes != removed_bytes
+            or request.manifest_run_sha256
+            != hashlib.sha256(
+                b"AGMIND_RETENTION_RUN_V2\x00"
+                + canonical_json(hashes)
+            ).hexdigest()
+        ):
+            raise EvidenceCorrupt(
+                "retention state request differs from immutable manifest run"
+            )
+        return manifests
+
+    def _retention_selected_max_sequence(
+        self,
+        state: object,
+    ) -> int:
+        manifests = self._retention_state_selected_manifests(state)
+        return max(
+            manifest.last_source_sequence
+            for manifest in manifests
+        )
+
+    def _merge_authenticated_retired_ranges(
+        self,
+        manifests: tuple[SegmentManifestV1, ...],
+    ) -> None:
+        intervals = sorted(
+            [
+                (start, end)
+                for start, end in self._authenticated_retired_ranges
+            ]
+            + [
+                (
+                    manifest.first_source_sequence,
+                    manifest.last_source_sequence,
+                )
+                for manifest in manifests
+            ]
+        )
+        merged: list[tuple[int, int]] = []
+        for start, end in intervals:
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or not 1 <= start <= end <= MAX_UINT64
+            ):
+                raise EvidenceCorrupt(
+                    "authenticated retired range is invalid"
+                )
+            if not merged or start > merged[-1][1] + 1:
+                merged.append((start, end))
+            else:
+                merged[-1] = (
+                    merged[-1][0],
+                    max(merged[-1][1], end),
+                )
+        self._authenticated_retired_ranges = tuple(merged)
+
+    def _retire_authenticated_retention_records(
+        self,
+        state: object,
+    ) -> None:
+        manifests = self._retention_state_selected_manifests(state)
+        verifier = self._bound_verifier
+        if (
+            verifier is None
+            or self._authority_state not in {"ready", "recovering"}
+        ):
+            raise EvidenceCorrupt(
+                "retention record retirement has no authenticated verifier"
+            )
+        recovering = self._authority_state == "recovering"
+        selected_sequences: set[int] = set()
+        for manifest in manifests:
+            manifest_records = tuple(
+                record
+                for record in self._records
+                if (
+                    record.envelope["host_id"] == manifest.host_id
+                    and manifest.first_source_sequence
+                    <= record.ref.source_sequence
+                    <= manifest.last_source_sequence
+                )
+            )
+            replay_records = self._manifest_replay_records.get(
+                manifest.manifest_sha256
+            )
+            expected_count = (
+                0
+                if recovering and replay_records is None
+                else manifest.record_count
+            )
+            if len(manifest_records) != expected_count:
+                raise EvidenceCorrupt(
+                    "retention record retirement lost manifest records"
+                )
+            records_by_sequence = {
+                record.ref.source_sequence: record
+                for record in manifest_records
+            }
+            if len(records_by_sequence) != len(manifest_records):
+                raise EvidenceCorrupt(
+                    "retention record retirement found duplicate evidence"
+                )
+            for sequence in range(
+                manifest.first_source_sequence,
+                manifest.last_source_sequence + 1,
+            ):
+                selected_sequences.add(sequence)
+                record = records_by_sequence.get(sequence)
+                accepted_ref = verifier.accepted_ref(sequence)
+                if record is None:
+                    if accepted_ref is not None:
+                        raise EvidenceCorrupt(
+                            "retired omission retained verifier authority"
+                        )
+                    continue
+                indexed = self._index.get((manifest.host_id, sequence))
+                if (
+                    record.priority is not EvidencePriority.ROUTINE
+                    or indexed is None
+                    or indexed[1] is not record.ref
+                    or accepted_ref is not record.ref
+                ):
+                    raise EvidenceCorrupt(
+                        "retention record retirement found protected evidence"
+                    )
+            self._manifest_replay_records[manifest.manifest_sha256] = None
+
+        authority = verifier._authority
+        accepted = {
+            sequence: value
+            for sequence, value in authority.accepted.items()
+            if not any(
+                manifest.first_source_sequence
+                <= sequence
+                <= manifest.last_source_sequence
+                for manifest in manifests
+            )
+        }
+        verifier._authority = replace(
+            authority,
+            accepted=MappingProxyType(accepted),
+        )
+        remaining = [
+            record
+            for record in self._records
+            if not (
+                record.envelope["host_id"] == verifier.fsm.host_id
+                and record.ref.source_sequence in selected_sequences
+            )
+        ]
+        self._records = []
+        self._index = {}
+        self._record_positions = {}
+        self._sequences_by_host = {}
+        self._last_sequence_by_host = {}
+        self._add_records(remaining)
+        self._merge_authenticated_retired_ranges(manifests)
+
+    def _prepare_recovered_retention_payloads(
+        self,
+        state: object,
+    ) -> tuple[
+        tuple[_HeldRetentionPayload, ...],
+        tuple[tuple[str, int], ...],
+    ]:
+        from agmind_immune.evidence.retention import (
+            RetentionStateEntryV1,
+            RetentionStateV1,
+        )
+
+        if (
+            type(state) is not RetentionStateV1
+            or state.operation != "tombstone"
+            or type(state.request) is not RetentionTombstoneV2
+            or not state.entries
+        ):
+            raise EvidenceCorrupt(
+                "retention recovery unlink state is not exact"
+            )
+        manifests = {
+            manifest.manifest_sha256: manifest
+            for manifest in self._manifests
+        }
+        held: list[_HeldRetentionPayload] = []
+        directories: dict[str, int] = {}
+        opened: list[int] = []
+        try:
+            self._require_retention_directory_bindings()
+            for entry in state.entries:
+                if type(entry) is not RetentionStateEntryV1:
+                    raise EvidenceCorrupt(
+                        "retention recovery state entry is inexact"
+                    )
+                manifest = manifests.get(entry.manifest_sha256)
+                if (
+                    manifest is None
+                    or manifest.segment_id != entry.segment_id
+                    or manifest.segment_relative_path
+                    != entry.segment_relative_path
+                    or manifest.segment_size_bytes
+                    != entry.segment_size_bytes
+                    or manifest.segment_sha256
+                    != entry.segment_sha256
+                    or manifest.evidence_priority != "routine"
+                    or manifest.record_count
+                    != manifest.last_source_sequence
+                    - manifest.first_source_sequence
+                    + 1
+                ):
+                    raise EvidenceCorrupt(
+                        "retention recovery entry differs from its manifest"
+                    )
+                _, date_name, basename = (
+                    manifest.segment_relative_path.split("/")
+                )
+                directory_descriptor = self._date_descriptor(date_name)
+                directories[date_name] = directory_descriptor
+                if (
+                    _entry_stat_at(
+                        directory_descriptor,
+                        basename,
+                    )
+                    is None
+                ):
+                    continue
+                display_path = self.root / manifest.segment_relative_path
+                descriptor, opened_stat = _open_regular_at(
+                    directory_descriptor,
+                    basename,
+                    display_path,
+                    maximum=MAX_SEGMENT_BYTES,
+                )
+                opened.append(descriptor)
+                identity = _file_identity(opened_stat)
+                if (
+                    identity.device != entry.original_device
+                    or identity.inode != entry.original_inode
+                    or identity.size != entry.segment_size_bytes
+                ):
+                    raise EvidenceCorrupt(
+                        "retention recovery payload identity changed"
+                    )
+                scan = self._scan_held_segment_descriptor(
+                    descriptor,
+                    identity,
+                    display_path,
+                    allow_torn=False,
+                )
+                validated = self._validate_segment_scan_against_manifest(
+                    scan,
+                    basename,
+                    display_path,
+                    manifest,
+                )
+                for record in validated.records:
+                    try:
+                        envelope = EventEnvelopeV1.model_validate_json(
+                            record.canonical_envelope,
+                            strict=True,
+                        )
+                    except (TypeError, ValueError, ValidationError) as error:
+                        raise EvidenceCorrupt(
+                            "retention recovery payload record is malformed"
+                        ) from error
+                    if (
+                        record.priority is not EvidencePriority.ROUTINE
+                        or envelope.event_type != "falco_connect"
+                    ):
+                        raise EvidenceCorrupt(
+                            "retention recovery payload is not removable evidence"
+                        )
+                held.append(
+                    _HeldRetentionPayload(
+                        state_entry=entry,
+                        manifest=manifest,
+                        date_name=date_name,
+                        basename=basename,
+                        display_path=display_path,
+                        descriptor=descriptor,
+                        identity=identity,
+                    )
+                )
+            self._require_retention_directory_bindings()
+            return (
+                tuple(held),
+                tuple(sorted(directories.items())),
+            )
+        except BaseException as error:
+            for descriptor in reversed(opened):
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:  # noqa: BLE001
+                    error.add_note(
+                        "retention recovery payload close failed: "
+                        f"{close_error}"
+                    )
+            raise
+
+    @staticmethod
+    def _close_recovered_retention_payloads(
+        payloads: tuple[_HeldRetentionPayload, ...],
+    ) -> None:
+        close_errors: list[OSError] = []
+        for payload in payloads:
+            if payload.descriptor >= 0:
+                descriptor = payload.descriptor
+                payload.descriptor = -1
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    close_errors.append(error)
+        if close_errors:
+            primary = EvidenceCorrupt(
+                "retention recovery payload cleanup is uncertain"
+            )
+            for secondary in close_errors[1:]:
+                primary.add_note(
+                    "secondary retention payload close failure: "
+                    f"{secondary}"
+                )
+            raise primary from close_errors[0]
+
+    def _resume_recovered_retention_unlink(
+        self,
+        journal: object,
+        ack_journal: object,
+    ) -> None:
+        from agmind_immune.evidence.retention import (
+            RetentionStateJournal,
+            RetentionStateV1,
+            _derived_retention_state,
+            _retention_execution_states,
+        )
+
+        if type(journal) is not RetentionStateJournal:
+            raise EvidenceCorrupt(
+                "retention recovery has no exact state journal"
+            )
+        state = journal.state
+        if (
+            type(state) is not RetentionStateV1
+            or state.operation != "tombstone"
+            or state.target is None
+            or state.phase
+            not in {
+                "evidence_appended",
+                "retention_unlink_in_progress",
+                "retention_commit_uncertain",
+            }
+        ):
+            raise EvidenceCorrupt(
+                "retention recovery phase cannot resume unlink"
+            )
+        target = state.target
+        payloads, directories = (
+            self._prepare_recovered_retention_payloads(state)
+        )
+        present_paths = {
+            payload.manifest.segment_relative_path
+            for payload in payloads
+        }
+        all_paths = {
+            entry.segment_relative_path
+            for entry in state.entries
+        }
+        if (
+            len(all_paths) != len(state.entries)
+            or (
+                state.phase == "evidence_appended"
+                and present_paths != all_paths
+            )
+        ):
+            self._close_recovered_retention_payloads(payloads)
+            raise EvidenceCorrupt(
+                "retention recovery phase has an impossible payload set"
+            )
+
+        unlink_started = False
+        ack_boundary_lease: _AckRetentionBoundaryLease | None = None
+        primary_error: BaseException | None = None
+        try:
+            ack_boundary_lease = self._acquire_retention_ack_boundary(
+                ack_journal,
+                confirmed_through=(
+                    self._retention_selected_max_sequence(state)
+                ),
+            )
+            if state.phase == "evidence_appended":
+                in_progress, _uncertain, _completed = (
+                    _retention_execution_states(state)
+                )
+                journal._transition(in_progress)
+                state = in_progress
+            for payload in payloads:
+                self._require_retention_directory_bindings()
+                _bind_held_source(
+                    self._date_descriptor(payload.date_name),
+                    payload.basename,
+                    payload.display_path,
+                    descriptor=payload.descriptor,
+                    identity=payload.identity,
+                )
+            for payload in payloads:
+                self._require_retention_directory_bindings()
+                directory_descriptor = self._date_descriptor(
+                    payload.date_name
+                )
+                _bind_held_source(
+                    directory_descriptor,
+                    payload.basename,
+                    payload.display_path,
+                    descriptor=payload.descriptor,
+                    identity=payload.identity,
+                )
+                unlink_started = True
+                os.unlink(
+                    payload.basename,
+                    dir_fd=directory_descriptor,
+                )
+                if (
+                    _entry_stat_at(
+                        directory_descriptor,
+                        payload.basename,
+                    )
+                    is not None
+                    or os.fstat(payload.descriptor).st_nlink != 0
+                ):
+                    raise EvidenceCorrupt(
+                        "retention recovery payload unlink is uncertain"
+                    )
+                self._require_retention_directory_bindings()
+            for _date_name, descriptor in directories:
+                self._require_retention_directory_bindings()
+                os.fsync(descriptor)
+                self._require_retention_directory_bindings()
+            self._require_retention_directory_bindings()
+            for entry in state.entries:
+                _, date_name, basename = (
+                    entry.segment_relative_path.split("/")
+                )
+                if (
+                    _entry_stat_at(
+                        self._date_descriptor(date_name),
+                        basename,
+                    )
+                    is not None
+                ):
+                    raise EvidenceCorrupt(
+                        "retention recovery selected payload survived unlink"
+                    )
+            self._require_retention_directory_bindings()
+            self._retire_authenticated_retention_records(state)
+            completed = _derived_retention_state(
+                state,
+                phase="completed",
+                target=target,
+            )
+            journal._transition(completed)
+            self._require_retention_directory_bindings()
+        except BaseException as error:
+            primary_error = error
+            if unlink_started:
+                try:
+                    current = journal.state
+                    if (
+                        type(current) is RetentionStateV1
+                        and current.phase
+                        == "retention_unlink_in_progress"
+                        and current.target is not None
+                    ):
+                        journal._transition(
+                            _derived_retention_state(
+                                current,
+                                phase="retention_commit_uncertain",
+                                target=current.target,
+                            )
+                        )
+                except BaseException as persistence_error:  # noqa: BLE001
+                    error.add_note(
+                        "retention recovery uncertainty persistence failed: "
+                        f"{persistence_error}"
+                    )
+            raise
+        finally:
+            try:
+                if ack_boundary_lease is not None:
+                    try:
+                        self._release_retention_ack_boundary(
+                            ack_journal,
+                            ack_boundary_lease,
+                        )
+                    except BaseException as cleanup_error:
+                        if primary_error is None:
+                            raise
+                        primary_error.add_note(
+                            "retention recovery ACK-boundary release failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+            finally:
+                try:
+                    self._close_recovered_retention_payloads(payloads)
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(
+                        "retention recovery payload cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+
+    def _reconcile_authenticated_retention_recovery(
+        self,
+        recovery: _AuthenticatedRetentionRecovery,
+        ack_journal: object | None,
+    ) -> None:
+        from agmind_immune.evidence.retention import (
+            RetentionStateJournal,
+            RetentionStateV1,
+            _open_retention_state_journal,
+        )
+
+        temporary = self._retention_state_temporary
+        if temporary is not None:
+            self._discard_retention_state_temporary(temporary)
+
+        state = recovery.state
+        if state is None:
+            self._reconcile_retention_boundary_cache(
+                recovery.boundary_raw
+            )
+            return
+        if type(state) is not RetentionStateV1:
+            raise EvidenceCorrupt(
+                "authenticated retention recovery state type changed"
+            )
+        journal = _open_retention_state_journal(self)
+        if (
+            type(journal) is not RetentionStateJournal
+            or journal.state != state
+        ):
+            raise EvidenceCorrupt(
+                "retention recovery journal changed after authentication"
+            )
+        if state.operation != "tombstone":
+            self._reconcile_retention_boundary_cache(
+                recovery.boundary_raw
+            )
+            return
+
+        if state.phase == "target_bound":
+            target = state.target
+            if (
+                target is not None
+                and recovery.current_target_ref is not None
+            ):
+                journal.advance_evidence_appended(target)
+                state = journal.state
+                if type(state) is not RetentionStateV1:
+                    raise EvidenceCorrupt(
+                        "retention recovery lost advanced state"
+                    )
+        if state.phase in {
+            "evidence_appended",
+            "retention_unlink_in_progress",
+            "retention_commit_uncertain",
+        }:
+            self._resume_recovered_retention_unlink(
+                journal,
+                ack_journal,
+            )
+            state = journal.state
+            if type(state) is not RetentionStateV1:
+                raise EvidenceCorrupt(
+                    "retention recovery lost completed state"
+                )
+        if state.phase == "completed":
+            self._require_retention_directory_bindings()
+            self._reconcile_retention_boundary_cache(
+                recovery.boundary_raw
+            )
+            self._clear_recovered_retention_state(journal)
+            self._require_retention_directory_bindings()
+        elif state.phase in {"selected", "target_bound"}:
+            payloads, _directories = (
+                self._prepare_recovered_retention_payloads(state)
+            )
+            try:
+                if len(payloads) != len(state.entries):
+                    raise EvidenceCorrupt(
+                        "pre-target retention state has an absent payload"
+                    )
+            finally:
+                self._close_recovered_retention_payloads(payloads)
+            self._reconcile_retention_boundary_cache(
+                recovery.boundary_raw
+            )
+        else:
+            raise EvidenceCorrupt(
+                "retention recovery ended in an impossible phase"
+            )
+
+    def _retention_recovery_needs_ack(
+        self,
+        recovery: _AuthenticatedRetentionRecovery,
+    ) -> bool:
+        from agmind_immune.evidence.retention import RetentionStateV1
+
+        if self._authenticated_retired_ranges:
+            return True
+        state = recovery.state
+        return (
+            type(state) is RetentionStateV1
+            and state.operation == "tombstone"
+            and (
+                state.phase
+                in {
+                    "evidence_appended",
+                    "retention_unlink_in_progress",
+                    "retention_commit_uncertain",
+                    "completed",
+                }
+                or (
+                    state.phase == "target_bound"
+                    and recovery.current_target_ref is not None
+                )
+            )
+        )
 
     def _bind_and_recover(self, verifier: EnvelopeVerifier) -> None:
         if self._closed:
@@ -8674,33 +10548,81 @@ class SegmentStore:
             raise EvidenceSealError("evidence store already has verifier authority")
         try:
             verifier._bind_lifecycle(self._lifecycle_identity)
+            verifier._begin_retention_recovery(
+                self._lifecycle_identity
+            )
         except VerifierCommitError as error:
             raise EvidenceSealError("verifier belongs to another store lifecycle") from error
         self._bound_verifier = verifier
         self._authority_state = "recovering"
+        retention_ack_journal: object | None = None
+        recovery_error: BaseException | None = None
         try:
-            for record in self.iter_records():
-                ref = record.ref
-                verified = verifier.verify(
-                    record.envelope,
-                    sequence=ref.source_sequence,
-                    event_id=ref.event_id,
-                    content_sha256=ref.content_sha256,
+            try:
+                self._replay_manifest_chain(verifier)
+                retention_recovery = (
+                    self._authenticate_retention_recovery(verifier)
                 )
-                authorization = verifier._authorize_append(
-                    verified,
-                    self._lifecycle_identity,
-                    record.priority.value,
+                if self._retention_recovery_needs_ack(
+                    retention_recovery
+                ):
+                    retention_ack_journal = (
+                        self._open_retention_ack_recovery()
+                    )
+                self._reconcile_authenticated_retention_recovery(
+                    retention_recovery,
+                    retention_ack_journal,
                 )
-                if authorization.canonical != record.canonical_envelope:
-                    raise EvidenceCorrupt("replay canonical bytes changed")
-                verifier._commit_durable(
-                    authorization,
-                    self._lifecycle_identity,
-                    ref,
+            except BaseException as error:
+                recovery_error = error
+                raise
+            finally:
+                if retention_ack_journal is not None:
+                    try:
+                        self._close_retention_ack_recovery(
+                            retention_ack_journal
+                        )
+                    except BaseException as close_error:
+                        if recovery_error is None:
+                            raise
+                        recovery_error.add_note(
+                            "secondary retention ACK recovery close failure: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        )
+            self._require_retention_directory_bindings()
+        except (
+            EvidenceCorrupt,
+            IngestVerificationError,
+            VerifierCommitError,
+        ) as error:
+            try:
+                self._trip_read_only("segment_corrupt")
+            except BaseException as fence_error:  # noqa: BLE001
+                error.add_note(
+                    "secondary retention recovery fence failure: "
+                    f"{type(fence_error).__name__}: {fence_error}"
                 )
-        except (EvidenceCorrupt, IngestVerificationError, VerifierCommitError):
-            self._trip_read_only("segment_corrupt")
+            raise
+        except Exception as error:
+            wrapped = EvidenceCorrupt(
+                "authenticated retention recovery failed"
+            )
+            try:
+                self._trip_read_only("segment_corrupt")
+            except BaseException as fence_error:  # noqa: BLE001
+                wrapped.add_note(
+                    "secondary retention recovery fence failure: "
+                    f"{type(fence_error).__name__}: {fence_error}"
+                )
+            raise wrapped from error
+        except BaseException as error:
+            try:
+                self._trip_read_only("segment_corrupt")
+            except BaseException as fence_error:  # noqa: BLE001
+                error.add_note(
+                    "secondary retention recovery fence failure: "
+                    f"{type(fence_error).__name__}: {fence_error}"
+                )
             raise
         self._authority_state = "ready"
 
@@ -9038,6 +10960,13 @@ class SegmentStore:
         return active, frame
 
     def flush_security_boundary(self) -> None:
+        if (
+            self._authority_state == "retention_uncertain"
+            or self._retention_commit_uncertain_latched
+        ):
+            raise EvidenceReadOnly(
+                "retention unlink is uncertain until restart recovery"
+            )
         if self._read_only_reason is not None:
             raise EvidenceReadOnly(
                 f"evidence root is read-only: {self._read_only_reason}"

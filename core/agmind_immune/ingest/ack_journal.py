@@ -24,6 +24,8 @@ from agmind_immune.evidence.frames import (
     iter_frames,
 )
 from agmind_immune.evidence.segments import (
+    _RETENTION_ACK_GATE_FACTORY,
+    _RETENTION_ACK_RECOVERY_FACTORY,
     EvidenceRef,
     SegmentStore,
     _AckAuthorityError,
@@ -95,6 +97,27 @@ class AckDeliveryLease:
         if journal is None or self._released:
             return
         journal._release_delivery_claim(self, self._lifecycle_identity)
+
+
+class _AckRetentionBoundaryLease:
+    """Opaque ACK-mutation fence for one exact retention operation."""
+
+    _journal: AckJournal | None
+    _lifecycle_identity: object
+    _released: bool
+
+    def __init__(
+        self,
+        journal: AckJournal,
+        lifecycle_identity: object,
+        *,
+        _factory: object,
+    ) -> None:
+        if _factory is not _RETENTION_ACK_GATE_FACTORY:
+            raise TypeError("retention boundary requires its exact factory")
+        self._journal = journal
+        self._lifecycle_identity = lifecycle_identity
+        self._released = False
 
 
 class _AckJournalRecordV1(ContractModel):
@@ -222,6 +245,8 @@ class AckJournal:
     _committed_prefix_sha256: str
     _delivery_lock: LockType
     _delivery_lease: AckDeliveryLease | None
+    _retention_lock: LockType
+    _retention_gate_lease: _AckRetentionBoundaryLease | None
 
     def __init__(self) -> None:
         raise TypeError("use AckJournal.create_new() or open_and_recover()")
@@ -255,12 +280,31 @@ class AckJournal:
         )
 
     @classmethod
+    def _open_for_retention_recovery(
+        cls,
+        segment_store: SegmentStore,
+        *,
+        _factory: object,
+    ) -> AckJournal:
+        if _factory is not _RETENTION_ACK_RECOVERY_FACTORY:
+            raise TypeError(
+                "retention ACK recovery requires its exact factory"
+            )
+        return cls._open_bound(
+            segment_store,
+            create=False,
+            step_hook=None,
+            retention_recovery=True,
+        )
+
+    @classmethod
     def _open_bound(
         cls,
         segment_store: SegmentStore,
         *,
         create: bool,
         step_hook: Callable[[str], None] | None,
+        retention_recovery: bool = False,
     ) -> AckJournal:
         journal = object.__new__(cls)
         journal._store = segment_store
@@ -282,11 +326,18 @@ class AckJournal:
         journal._committed_prefix_sha256 = hashlib.sha256(b"").hexdigest()
         journal._delivery_lock = Lock()
         journal._delivery_lease = None
+        journal._retention_lock = Lock()
+        journal._retention_gate_lease = None
         try:
             root_descriptor, lifecycle_identity = (
                 segment_store._acquire_ack_journal(
                     journal,
                     operation="create" if create else "recover",
+                    _factory=(
+                        _RETENTION_ACK_RECOVERY_FACTORY
+                        if retention_recovery
+                        else None
+                    ),
                 )
             )
             journal._root_descriptor = root_descriptor
@@ -461,9 +512,39 @@ class AckJournal:
     def _recover(self, commitment: _AckCommitmentV1) -> None:
         expected = os.fstat(self._descriptor)
         _validate_journal_stat(expected)
+        try:
+            self._store._validate_recovered_ack_terminal(
+                self,
+                self._lifecycle_identity,
+                confirmed_through=(
+                    0
+                    if commitment.confirmed is None
+                    else commitment.confirmed.sequence
+                ),
+            )
+        except _AckAuthorityError as error:
+            raise AckJournalCorrupt(
+                "ACK commitment lags authenticated retired evidence"
+            ) from error
         read_descriptor = os.dup(self._descriptor)
-        os.set_inheritable(read_descriptor, False)
-        os.lseek(read_descriptor, 0, os.SEEK_SET)
+        try:
+            os.set_inheritable(read_descriptor, False)
+            os.lseek(read_descriptor, 0, os.SEEK_SET)
+            read_stream = os.fdopen(
+                read_descriptor,
+                "rb",
+                buffering=0,
+                closefd=True,
+            )
+        except BaseException as error:
+            try:
+                os.close(read_descriptor)
+            except OSError as cleanup_error:
+                error.add_note(
+                    "secondary ACK recovery descriptor cleanup failure: "
+                    f"{cleanup_error}"
+                )
+            raise
         confirmed: AckIdentity | None = None
         pending: AckIdentity | None = None
         previous_hash = bytes(32)
@@ -480,12 +561,7 @@ class AckJournal:
             )
         ]
         try:
-            with os.fdopen(
-                read_descriptor,
-                "rb",
-                buffering=0,
-                closefd=True,
-            ) as stream:
+            with read_stream as stream:
                 bounded_stream = _BoundedReader(
                     cast(BinaryIO, stream),
                     expected.st_size,
@@ -538,6 +614,18 @@ class AckJournal:
             raise AckJournalCorrupt(
                 "ACK journal changed during held-descriptor recovery"
             )
+        try:
+            self._store._validate_recovered_ack_terminal(
+                self,
+                self._lifecycle_identity,
+                confirmed_through=(
+                    0 if confirmed is None else confirmed.sequence
+                ),
+            )
+        except _AckAuthorityError as error:
+            raise AckJournalCorrupt(
+                "ACK journal lags authenticated retired evidence"
+            ) from error
 
         committed_boundary: _ConfirmedBoundary | None
         if commitment.phase == "initializing":
@@ -693,17 +781,12 @@ class AckJournal:
                 )
             confirmed_through = 0 if confirmed is None else confirmed.sequence
             try:
-                ref = self._store._validate_ack_identity(
+                self._store._validate_next_recovered_ack_identity(
                     self,
                     self._lifecycle_identity,
                     sequence=identity.sequence,
                     event_id=identity.event_id,
                     content_sha256=identity.content_sha256,
-                )
-                self._store._validate_next_ack_ref(
-                    self,
-                    self._lifecycle_identity,
-                    ref,
                     confirmed_through=confirmed_through,
                 )
             except _AckAuthorityError as error:
@@ -716,7 +799,7 @@ class AckJournal:
                 "confirmed ACK does not exactly match one pending record"
             )
         try:
-            self._store._validate_ack_identity(
+            self._store._resolve_recovered_ack_identity(
                 self,
                 self._lifecycle_identity,
                 sequence=identity.sequence,
@@ -925,9 +1008,87 @@ class AckJournal:
         self._authenticated_stat = authenticated_after
         self._authenticated_hasher = authenticated_hasher_after
 
+    def _acquire_retention_boundary(
+        self,
+        segment_store: SegmentStore,
+        *,
+        confirmed_through: int,
+        _factory: object,
+    ) -> _AckRetentionBoundaryLease:
+        if (
+            _factory is not _RETENTION_ACK_GATE_FACTORY
+            or segment_store is not self._store
+            or type(confirmed_through) is not int
+            or not 1 <= confirmed_through <= MAX_UINT64
+        ):
+            raise AckJournalAuthorityError(
+                "retention ACK boundary request is inexact"
+            )
+        with self._retention_lock:
+            if self._retention_gate_lease is not None:
+                raise AckJournalStateError(
+                    "retention ACK boundary is already held"
+                )
+            self._require_usable()
+            snapshot = self.snapshot()
+            if (
+                not snapshot.healthy
+                or snapshot.pending is not None
+                or snapshot.confirmed_through < confirmed_through
+            ):
+                raise AckJournalAuthorityError(
+                    "ACK prefix is not settled through retention selection"
+                )
+            lease = _AckRetentionBoundaryLease(
+                self,
+                self._lifecycle_identity,
+                _factory=_RETENTION_ACK_GATE_FACTORY,
+            )
+            self._retention_gate_lease = lease
+            return lease
+
+    def _release_retention_boundary(
+        self,
+        segment_store: SegmentStore,
+        *,
+        lease: _AckRetentionBoundaryLease,
+        _factory: object,
+    ) -> None:
+        with self._retention_lock:
+            if lease._released:
+                return
+            if (
+                _factory is not _RETENTION_ACK_GATE_FACTORY
+                or segment_store is not self._store
+                or lease._journal is not self
+                or lease._lifecycle_identity is not self._lifecycle_identity
+                or self._retention_gate_lease is not lease
+            ):
+                raise AckJournalStateError(
+                    "retention ACK boundary release is inexact"
+                )
+            self._retention_gate_lease = None
+            lease._released = True
+            lease._journal = None
+
+    def _require_retention_mutation_permitted(self) -> None:
+        if self._retention_gate_lease is not None:
+            raise AckJournalStateError(
+                "ACK mutation is fenced by active retention"
+            )
+
     def record_pending(self, ref: EvidenceRef) -> None:
         """Durably establish the one exact observer ACK permitted in flight."""
+        with self._retention_lock:
+            self._require_retention_mutation_permitted()
+            self._record_pending_locked(ref)
+
+    def _record_pending_locked(self, ref: EvidenceRef) -> None:
         self._require_usable()
+        if type(ref) is not EvidenceRef:
+            raise AckJournalAuthorityError(
+                "pending ACK requires an exact live EvidenceRef"
+            )
         identity = AckIdentity.from_ref(ref)
         if self._pending is not None:
             if identity == self._pending:
@@ -954,7 +1115,16 @@ class AckJournal:
 
     def record_confirmed(self, ref: EvidenceRef) -> None:
         """Durably confirm only the exact currently pending ACK identity."""
+        with self._retention_lock:
+            self._require_retention_mutation_permitted()
+            self._record_confirmed_locked(ref)
+
+    def _record_confirmed_locked(self, ref: EvidenceRef) -> None:
         self._require_usable()
+        if type(ref) is not EvidenceRef:
+            raise AckJournalAuthorityError(
+                "confirmed ACK requires an exact live EvidenceRef"
+            )
         identity = AckIdentity.from_ref(ref)
         if self._pending is None:
             if identity == self._confirmed:
@@ -1180,7 +1350,12 @@ class AckJournal:
                 )
             except Exception as error:  # noqa: BLE001
                 cleanup_errors.append(error)
-        self._closed = True
+        owner_retained = (
+            getattr(self._store, "_ack_journal_owner", None) is self
+        )
+        self._closed = not owner_retained
+        if owner_retained:
+            self._closing = True
         return cleanup_errors
 
     def _close_after_failed_open(self, primary: BaseException) -> None:
@@ -1197,13 +1372,33 @@ class AckJournal:
         self.close()
 
     def close(self) -> None:
+        with self._retention_lock:
+            self._require_retention_mutation_permitted()
+            self._close_locked()
+
+    def _close_locked(self) -> None:
+        retry_cleanup = False
         with self._delivery_lock:
             if self._closed:
                 return
             if self._closing:
-                raise AckJournalStateError("ACK journal close is already in progress")
-            self._closing = True
-            self._invalidate_delivery_claim_locked()
+                retry_cleanup = True
+            else:
+                self._closing = True
+                self._invalidate_delivery_claim_locked()
+        if retry_cleanup:
+            cleanup_errors = self._close_resources()
+            if cleanup_errors:
+                retry_error = AckJournalUnhealthy(
+                    "ACK-journal close cleanup remains uncertain"
+                )
+                for secondary in cleanup_errors[1:]:
+                    retry_error.add_note(
+                        "secondary ACK close cleanup failure: "
+                        f"{type(secondary).__name__}: {secondary}"
+                    )
+                raise retry_error from cleanup_errors[0]
+            return
         if self._healthy:
             try:
                 authenticated = self._verify_authenticated_content()

@@ -159,6 +159,74 @@ def _genesis_commitment(phase: str) -> bytes:
     )
 
 
+def test_ack_close_retries_owner_release_after_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "evidence"
+    _coordinator, store = _new_system(path)
+    journal = AckJournal.create_new(store)
+    release = store._release_ack_journal
+    calls = 0
+
+    def fail_once(owner: object, lifecycle: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected owner release failure")
+        release(owner, lifecycle)
+
+    monkeypatch.setattr(store, "_release_ack_journal", fail_once)
+    with pytest.raises(AckJournalUnhealthy, match="close"):
+        journal.close()
+    assert store._ack_journal_owner is journal
+
+    journal.close()
+    assert calls == 2
+    assert store._ack_journal_owner is None
+    store.close(flush=False)
+
+
+def test_ack_root_dup_fallback_closes_on_cloexec_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "evidence"
+    _coordinator, store = _new_system(path)
+    real_dup = segments_module.os.dup
+    duplicated = -1
+
+    def track_dup(descriptor: int) -> int:
+        nonlocal duplicated
+        duplicated = real_dup(descriptor)
+        return duplicated
+
+    def fail_cloexec(descriptor: int, inheritable: bool) -> None:
+        assert descriptor == duplicated
+        assert inheritable is False
+        raise OSError("injected cloexec failure")
+
+    monkeypatch.delattr(
+        segments_module.fcntl,
+        "F_DUPFD_CLOEXEC",
+        raising=False,
+    )
+    monkeypatch.setattr(segments_module.os, "dup", track_dup)
+    monkeypatch.setattr(
+        segments_module.os,
+        "set_inheritable",
+        fail_cloexec,
+    )
+
+    with pytest.raises(OSError, match="cloexec"):
+        AckJournal.create_new(store)
+    assert duplicated >= 0
+    with pytest.raises(OSError):
+        os.fstat(duplicated)
+    assert store._ack_journal_owner is None
+    store.close(flush=False)
+
+
 def test_ack_journal_recovers_exact_idempotent_pending_and_confirmed_state(
     tmp_path: Path,
 ) -> None:

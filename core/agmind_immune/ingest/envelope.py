@@ -1311,6 +1311,12 @@ class EnvelopeVerifier:
         self._repair_lifecycle_identity: object | None = None
         self._repair_owner_identity = object()
         self._repair_transient_generation = 0
+        self._retention_recovery_open = False
+        self._retention_recovery_consumed = False
+        self._provisional_retention_omissions: tuple[
+            tuple[str, int, int, int],
+            ...,
+        ] = ()
 
     @property
     def fsm(self) -> ObserverStreamFSM:
@@ -1333,6 +1339,112 @@ class EnvelopeVerifier:
             raise VerifierCommitError("store factories require a pristine epoch-1 verifier")
         self._bound_lifecycle = lifecycle
         self._repair_lifecycle_identity = object()
+
+    def _begin_retention_recovery(self, lifecycle: object) -> None:
+        if (
+            lifecycle is not self._bound_lifecycle
+            or self._bound_lifecycle is None
+            or self._retention_recovery_open
+            or self._retention_recovery_consumed
+            or self._provisional_retention_omissions
+            or self._staged
+            or self._authorizations
+        ):
+            raise VerifierCommitError(
+                "retention recovery cannot begin in this verifier lifecycle"
+            )
+        self._retention_recovery_open = True
+
+    def _recover_dense_routine_omission(
+        self,
+        *,
+        manifest_sha256: str,
+        first_sequence: int,
+        last_sequence: int,
+        record_count: int,
+        lifecycle: object,
+    ) -> None:
+        """Provisionally replay one dense routine manifest without fake records."""
+        authority = self._authority
+        fsm = authority.fsm
+        if (
+            lifecycle is not self._bound_lifecycle
+            or self._bound_lifecycle is None
+            or not self._retention_recovery_open
+            or self._staged
+            or self._authorizations
+            or type(manifest_sha256) is not str
+            or _HEX64.fullmatch(manifest_sha256) is None
+            or type(first_sequence) is not int
+            or type(last_sequence) is not int
+            or type(record_count) is not int
+            or not 1 <= first_sequence <= last_sequence <= MAX_UINT64
+            or record_count != last_sequence - first_sequence + 1
+            or first_sequence <= fsm.last_sequence
+            or fsm.current_boot_id is None
+            or fsm.pending_rotation is not None
+            or fsm.mutation_read_only
+            or authority.generation > MAX_UINT64 - record_count
+        ):
+            raise VerifierCommitError(
+                "dense retention omission is outside recovering verifier authority"
+            )
+        holes = list(fsm.unresolved_holes)
+        if first_sequence > fsm.last_sequence + 1:
+            holes.append((fsm.last_sequence + 1, first_sequence - 1))
+        self._authority = _VerifierAuthorityState(
+            fsm=replace(
+                fsm,
+                last_sequence=last_sequence,
+                unresolved_holes=tuple(holes),
+            ),
+            accepted=authority.accepted,
+            generation=authority.generation + record_count,
+        )
+        self._provisional_retention_omissions += (
+            (
+                manifest_sha256,
+                first_sequence,
+                last_sequence,
+                record_count,
+            ),
+        )
+
+    def _commit_retention_recovery(
+        self,
+        omissions: tuple[tuple[str, int, int, int], ...],
+        lifecycle: object,
+    ) -> None:
+        if (
+            lifecycle is not self._bound_lifecycle
+            or self._bound_lifecycle is None
+            or not self._retention_recovery_open
+            or type(omissions) is not tuple
+            or omissions != self._provisional_retention_omissions
+            or self._staged
+            or self._authorizations
+        ):
+            raise VerifierCommitError(
+                "retention recovery did not consume exact provisional omissions"
+            )
+        self._provisional_retention_omissions = ()
+        self._retention_recovery_open = False
+        self._retention_recovery_consumed = True
+
+    def _seal_retention_recovery(self, lifecycle: object) -> None:
+        if (
+            lifecycle is not self._bound_lifecycle
+            or self._bound_lifecycle is None
+            or self._retention_recovery_open
+            or self._retention_recovery_consumed
+            or self._provisional_retention_omissions
+            or self._staged
+            or self._authorizations
+        ):
+            raise VerifierCommitError(
+                "retention recovery cannot be sealed in this verifier lifecycle"
+            )
+        self._retention_recovery_consumed = True
 
     def verify(
         self,

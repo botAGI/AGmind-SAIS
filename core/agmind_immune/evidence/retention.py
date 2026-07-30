@@ -1704,6 +1704,12 @@ def _validate_fact(
             raise RetentionCorruption("record priority differs from manifest priority")
     removable = (
         fact.evidence_priority == "routine"
+        and (
+            manifest.last_source_sequence
+            - manifest.first_source_sequence
+            + 1
+            == manifest.record_count
+        )
         and all(
             record.event_type in removable_event_types
             for record in fact.records

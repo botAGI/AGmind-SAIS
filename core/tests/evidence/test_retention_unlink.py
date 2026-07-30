@@ -5,16 +5,25 @@ import os
 import pickle
 import stat
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 from agmind_immune.evidence import retention as retention_module
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.segments import EvidenceCorrupt, EvidenceSealError
+from agmind_immune.ingest.ack_journal import AckJournal
 from tests.evidence.test_retention import _retention_proof_case
 
 
-def _issued_case(path: Path) -> tuple[object, object]:
-    case = _retention_proof_case(path)
+def _issued_case(
+    path: Path,
+    *,
+    acknowledge: bool = True,
+) -> tuple[object, object]:
+    case = _retention_proof_case(
+        path,
+        acknowledge=acknowledge,
+    )
     capability = case.store._authenticate_retention_tombstone(
         case.journal,
         case.final_snapshot,
@@ -50,7 +59,23 @@ def test_authenticated_retention_unlink_is_ordered_and_payload_only(
     head_bytes = (tmp_path / "chain-head.json").read_bytes()
     manifests_before = tuple(case.store._manifests)
     records_before = tuple(case.store._records)
-    index_before = dict(case.store._index)
+    selected_manifest_hashes = {
+        entry.manifest_sha256 for entry in state.entries
+    }
+    retired_sequences = {
+        sequence
+        for manifest in manifests_before
+        if manifest.manifest_sha256 in selected_manifest_hashes
+        for sequence in range(
+            manifest.first_source_sequence,
+            manifest.last_source_sequence + 1,
+        )
+    }
+    retained_records = tuple(
+        record
+        for record in records_before
+        if record.ref.source_sequence not in retired_sequences
+    )
     active_before = case.store._active
     unlink_observations: list[tuple[str, bool]] = []
     original_unlink = segments_module.os.unlink
@@ -95,8 +120,23 @@ def test_authenticated_retention_unlink_is_ordered_and_payload_only(
         } == manifest_bytes
         assert (tmp_path / "chain-head.json").read_bytes() == head_bytes
         assert tuple(case.store._manifests) == manifests_before
-        assert tuple(case.store._records) == records_before
-        assert case.store._index == index_before
+        assert tuple(case.store._records) == retained_records
+        verifier = case.store._bound_verifier
+        assert verifier is not None
+        assert type(verifier._authority.accepted) is MappingProxyType
+        with pytest.raises(TypeError):
+            verifier._authority.accepted[min(retired_sequences)] = object()
+        assert all(
+            verifier.accepted_ref(sequence) is None
+            for sequence in retired_sequences
+        )
+        assert all(
+            sequence not in case.store._sequences_by_host.get(
+                verifier.fsm.host_id,
+                (),
+            )
+            for sequence in retired_sequences
+        )
         assert case.store._active is active_before
         assert not hasattr(completion, "__dict__")
         with pytest.raises(TypeError, match="cop"):
@@ -242,6 +282,8 @@ def test_authenticated_retention_unlink_failure_latches_uncertain(
     failure: str,
 ) -> None:
     case, capability = _issued_case(tmp_path)
+    ack_journal = case.store._ack_journal_owner
+    assert type(ack_journal) is AckJournal
     original_unlink = segments_module.os.unlink
     original_fsync = segments_module.os.fsync
     payload_unlink_calls = 0
@@ -287,6 +329,15 @@ def test_authenticated_retention_unlink_failure_latches_uncertain(
         assert uncertain is not None
         assert uncertain.phase == "retention_commit_uncertain"
         assert case.store._retention_commit_uncertain_latched is True
+        assert case.store._authority_state == "retention_uncertain"
+        assert case.store.status().healthy is False
+        with pytest.raises(
+            EvidenceSealError,
+            match="unavailable|recovery",
+        ):
+            ack_journal.record_pending(case.target_ref)
+        with pytest.raises(EvidenceSealError, match="unavailable|recovery"):
+            next(case.store.iter_authenticated_records())
         calls_before_retry = payload_unlink_calls
         with pytest.raises(EvidenceSealError, match="uncertain|retention"):
             case.store._execute_authenticated_retention_unlink(

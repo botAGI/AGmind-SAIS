@@ -17,6 +17,7 @@ from agmind_immune.clock import CoreClockSample
 from agmind_immune.contracts import (
     MAX_UINT64,
     ZERO_SHA256,
+    ObserverTrustRootV1,
     RetentionBlockedV1,
     RetentionTombstoneV2,
 )
@@ -46,7 +47,13 @@ from agmind_immune.evidence.segments import (
     EvidenceSealError,
     SegmentStore,
 )
-from agmind_immune.ingest.envelope import OuterBindingError
+from agmind_immune.ingest.ack_journal import AckJournal
+from agmind_immune.ingest.envelope import (
+    AnchoredPublicKeyChain,
+    EnvelopeVerifier,
+    OuterBindingError,
+    PinnedObserverRoot,
+)
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from tests.evidence.test_projection import _falco_fields
@@ -54,7 +61,9 @@ from tests.ingest.test_retention_delivery import _bound_verifier, _item
 from tests.phase5b_helpers import (
     NOW,
     envelope_value,
+    metadata_value,
     private_key,
+    root_value,
 )
 
 REQUEST_ID = "11111111-1111-4111-8111-111111111111"
@@ -99,6 +108,21 @@ def _proof_clock(*, seconds: int = 0) -> CoreClockSample:
         uncertainty_seconds=Decimal(0),
         max_uncertainty_seconds=Decimal(2),
     )
+
+
+def _fresh_test_verifier() -> EnvelopeVerifier:
+    key = private_key(11)
+    root = PinnedObserverRoot.from_validated_contract_for_test(
+        ObserverTrustRootV1.model_validate(
+            root_value(key),
+            strict=True,
+        )
+    )
+    chain = AnchoredPublicKeyChain.from_value(
+        root,
+        metadata_value(key),
+    )
+    return EnvelopeVerifier(root, chain)
 
 
 def _manifest(
@@ -242,6 +266,8 @@ def _selected_state(
 
 def _live_store_with_active_routine(
     path: Path,
+    *,
+    acknowledge: bool = True,
 ) -> tuple[
     Ed25519PrivateKey,
     AcceptanceCoordinator,
@@ -272,6 +298,15 @@ def _live_store_with_active_routine(
         )
     )
     coverage._apply_live_accepted(store, routine_ref, None)
+    if acknowledge:
+        acknowledgements = AckJournal.create_new(store)
+        for ref in store.authenticated_refs(
+            after_sequence=0,
+            through_sequence=routine_ref.source_sequence,
+            limit=100,
+        ):
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
     return key, acceptance, store, coverage
 
 
@@ -286,8 +321,15 @@ class _RetentionProofCase:
     request: RetentionTombstoneV2
 
 
-def _retention_proof_case(path: Path) -> _RetentionProofCase:
-    key, acceptance, store, coverage = _live_store_with_active_routine(path)
+def _retention_proof_case(
+    path: Path,
+    *,
+    acknowledge: bool = True,
+) -> _RetentionProofCase:
+    key, acceptance, store, coverage = _live_store_with_active_routine(
+        path,
+        acknowledge=acknowledge,
+    )
     try:
         selected_snapshot = store._freeze_retention_snapshot(
             _proof_clock(),
@@ -1125,6 +1167,10 @@ def test_state_temp_namespace_is_discarded_without_promotion(
     temporary.chmod(0o600)
 
     recovered = SegmentStore(temp_only)
+    AcceptanceCoordinator.open_and_recover(
+        _fresh_test_verifier(),
+        recovered,
+    )
     assert not temporary.exists()
     assert retention_module._open_retention_state_journal(recovered).state is None
     recovered.close(flush=False)
@@ -1141,9 +1187,13 @@ def test_state_temp_namespace_is_discarded_without_promotion(
     temporary.chmod(0o600)
 
     recovered = SegmentStore(final_and_temp)
-    assert not temporary.exists()
+    with pytest.raises(EvidenceCorrupt, match="retention|manifest"):
+        AcceptanceCoordinator.open_and_recover(
+            _fresh_test_verifier(),
+            recovered,
+        )
+    assert temporary.exists()
     assert final.read_bytes() == selected_raw
-    assert retention_module._open_retention_state_journal(recovered).state == selected
     recovered.close(flush=False)
 
     multiple = tmp_path / "multiple"
