@@ -474,6 +474,42 @@ def test_network_and_boot_hop_reject_noncanonical_or_partial_forms(
 
 
 @pytest.mark.parametrize(
+    ("field", "mapped_value"),
+    [
+        pytest.param(
+            "gateway_addresses",
+            "::ffff:c000:201",
+            id="hex-mapped-address",
+        ),
+        pytest.param(
+            "gateway_addresses",
+            "::ffff:192.0.2.1",
+            id="canonical-mapped-address",
+        ),
+        pytest.param(
+            "subnet_cidrs",
+            "::ffff:c000:200/120",
+            id="hex-mapped-prefix",
+        ),
+        pytest.param(
+            "subnet_cidrs",
+            "::ffff:192.0.2.0/120",
+            id="canonical-mapped-prefix",
+        ),
+    ],
+)
+def test_docker_network_rejects_ipv4_mapped_ipv6(
+    field: str,
+    mapped_value: str,
+) -> None:
+    document = _network()
+    document[field] = [mapped_value]
+
+    with pytest.raises(ValidationError, match="IPv4-mapped IPv6"):
+        contracts.PCCDockerNetworkV1.model_validate(document, strict=True)
+
+
+@pytest.mark.parametrize(
     "document",
     [
         pytest.param(
@@ -496,6 +532,13 @@ def test_network_and_boot_hop_reject_noncanonical_or_partial_forms(
                 "rotation_companion_source_sequence": 98,
             },
             id="c-nonadjacent",
+        ),
+        pytest.param(
+            {
+                **_boot_hop_c(),
+                "rotation_companion_source_sequence": 0,
+            },
+            id="c-zero-companion-sequence",
         ),
         pytest.param(
             {

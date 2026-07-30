@@ -258,6 +258,12 @@ def _pcc_canonical_network(value: str, field: str) -> str:
         network = ipaddress.ip_network(value, strict=True)
     except ValueError as error:
         raise ValueError(f"{field} must be a canonical IP network") from error
+    mapped_range = ipaddress.IPv6Network("::ffff:0:0/96")
+    if isinstance(network, ipaddress.IPv6Network) and (
+        network.network_address.ipv4_mapped is not None
+        or network == mapped_range
+    ):
+        raise ValueError(f"{field} must not contain IPv4-mapped IPv6 networks")
     if str(network) != value:
         raise ValueError(f"{field} must be a canonical IP network")
     return value
@@ -269,6 +275,11 @@ def _pcc_canonical_address(value: str, field: str) -> str:
         address = ipaddress.ip_address(value)
     except ValueError as error:
         raise ValueError(f"{field} must be a canonical IP address") from error
+    if (
+        isinstance(address, ipaddress.IPv6Address)
+        and address.ipv4_mapped is not None
+    ):
+        raise ValueError(f"{field} must not contain IPv4-mapped IPv6 addresses")
     if str(address) != value:
         raise ValueError(f"{field} must be a canonical IP address")
     return value

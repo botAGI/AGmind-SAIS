@@ -172,7 +172,9 @@ gateway_addresses[]
 ```
 
 All set-like arrays are canonical sorted unique arrays. Network entries are
-sorted by `network_id`; conflicting duplicate IDs fail closed.
+sorted by `network_id`; conflicting duplicate IDs fail closed. IPv4-mapped
+IPv6 spellings are rejected so Python and Go cannot canonicalize one Docker
+fact to different bytes.
 
 Task 6C extends the deliberately narrow read-only `DockerReader` boundary with
 the exact Moby v1.55 method:

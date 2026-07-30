@@ -64,6 +64,125 @@ type FalcoConnectV1 struct {
 	RawEventSHA256         string   `json:"raw_event_sha256"`
 }
 
+// PCCCorrelationSnapshotRequestV1 is the narrow, non-authoritative Core
+// request for one observer-generated correlation proof.
+type PCCCorrelationSnapshotRequestV1 struct {
+	SchemaVersion         string `json:"schema_version"`
+	TriggerEventID        string `json:"trigger_event_id"`
+	TriggerContentSHA256  string `json:"trigger_content_sha256"`
+	TriggerSourceSequence uint64 `json:"trigger_source_sequence"`
+	RequestedTTLSeconds   uint64 `json:"requested_ttl_seconds"`
+}
+
+// PCCFalcoTriggerProjectionV1 is the retained allowlist projection of the
+// authenticated candidate-capable Falco trigger.
+type PCCFalcoTriggerProjectionV1 struct {
+	SchemaVersion          string   `json:"schema_version"`
+	EventID                string   `json:"event_id"`
+	ContentSHA256          string   `json:"content_sha256"`
+	NormalizedFieldsSHA256 string   `json:"normalized_fields_sha256"`
+	SourceSequence         uint64   `json:"source_sequence"`
+	SourceID               string   `json:"source_id"`
+	SourceVersion          string   `json:"source_version"`
+	HostID                 string   `json:"host_id"`
+	BootID                 string   `json:"boot_id"`
+	EventTime              string   `json:"event_time"`
+	IngestTime             string   `json:"ingest_time"`
+	ClockUncertaintyMS     uint64   `json:"clock_uncertainty_ms"`
+	InventoryGeneration    uint64   `json:"inventory_generation"`
+	InventoryRevision      uint64   `json:"inventory_revision"`
+	ContainerID            string   `json:"container_id"`
+	ContainerStartTime     string   `json:"container_start_time"`
+	ReleaseID              string   `json:"release_id"`
+	DetectorRule           string   `json:"detector_rule"`
+	DetectorRuleVersion    string   `json:"detector_rule_version"`
+	FalcoVersion           string   `json:"falco_version"`
+	EvtRawres              *int64   `json:"evt_rawres,omitempty"`
+	EvtRes                 string   `json:"evt_res"`
+	SuccessfulConnect      bool     `json:"successful_connect"`
+	InvestigationOnly      bool     `json:"investigation_only"`
+	ImageID                string   `json:"image_id"`
+	RepoDigests            []string `json:"repo_digests"`
+	ImmutableSpecSHA256    string   `json:"immutable_spec_sha256"`
+	ProcName               *string  `json:"proc_name,omitempty"`
+	ProcExePath            *string  `json:"proc_exe_path,omitempty"`
+	ProcParentName         *string  `json:"proc_parent_name,omitempty"`
+	DestinationIPv4        string   `json:"destination_ipv4"`
+	DestinationPort        uint16   `json:"destination_port"`
+	L4Protocol             string   `json:"l4_protocol"`
+	MissingRequiredFields  []string `json:"missing_required_fields"`
+	CoverageFlags          []string `json:"coverage_flags"`
+	RawEventSHA256         string   `json:"raw_event_sha256"`
+}
+
+// PCCDockerNetworkV1 is one entry in the complete global Docker-network
+// snapshot retained by a correlation proof.
+type PCCDockerNetworkV1 struct {
+	NetworkID        string   `json:"network_id"`
+	Driver           string   `json:"driver"`
+	SubnetCIDRs      []string `json:"subnet_cidrs"`
+	GatewayAddresses []string `json:"gateway_addresses"`
+}
+
+// PCCBootTransitionHopV1 is one authenticated protected boot-boundary hop.
+// Rotation companion fields are an all-or-none group.
+type PCCBootTransitionHopV1 struct {
+	BoundaryEventType               string  `json:"boundary_event_type"`
+	EventID                         string  `json:"event_id"`
+	ContentSHA256                   string  `json:"content_sha256"`
+	SourceSequence                  uint64  `json:"source_sequence"`
+	BootID                          string  `json:"boot_id"`
+	PreviousBootID                  string  `json:"previous_boot_id"`
+	PreviousSourceSequence          uint64  `json:"previous_source_sequence"`
+	RotationCompanionEventType      *string `json:"rotation_companion_event_type,omitempty"`
+	RotationCompanionEventID        *string `json:"rotation_companion_event_id,omitempty"`
+	RotationCompanionContentSHA256  *string `json:"rotation_companion_content_sha256,omitempty"`
+	RotationCompanionSourceSequence *uint64 `json:"rotation_companion_source_sequence,omitempty"`
+	RotationCompanionBootID         *string `json:"rotation_companion_boot_id,omitempty"`
+}
+
+// PCCCorrelationSnapshotV1 is a discriminated complete-or-failed protected
+// proof. Pointers preserve the wire distinction between an absent union field
+// and a present false/zero/empty value.
+type PCCCorrelationSnapshotV1 struct {
+	SchemaVersion               string                      `json:"schema_version"`
+	Outcome                     string                      `json:"outcome"`
+	RequestSHA256               string                      `json:"request_sha256"`
+	Trigger                     PCCFalcoTriggerProjectionV1 `json:"trigger"`
+	DecisionTime                string                      `json:"decision_time"`
+	DetectorBundleSHA256        *string                     `json:"detector_bundle_sha256,omitempty"`
+	RequestedTTLSeconds         uint64                      `json:"requested_ttl_seconds"`
+	SpecialUseRegistrySHA256    *string                     `json:"special_use_registry_sha256,omitempty"`
+	OperatorDeniedNetworks      *[]string                   `json:"operator_denied_networks,omitempty"`
+	OperatorDeniedAddresses     *[]string                   `json:"operator_denied_addresses,omitempty"`
+	OperatorDenylistSHA256      *string                     `json:"operator_denylist_sha256,omitempty"`
+	ManagementDeniedNetworks    *[]string                   `json:"management_denied_networks,omitempty"`
+	ManagementDeniedAddresses   *[]string                   `json:"management_denied_addresses,omitempty"`
+	ManagementDenylistSHA256    *string                     `json:"management_denylist_sha256,omitempty"`
+	DockerNetworks              *[]PCCDockerNetworkV1       `json:"docker_networks,omitempty"`
+	DockerNetworkSnapshotSHA256 *string                     `json:"docker_network_snapshot_sha256,omitempty"`
+	DockerContainerID           *string                     `json:"docker_container_id,omitempty"`
+	DockerStartedAt             *string                     `json:"docker_started_at,omitempty"`
+	ImageID                     *string                     `json:"image_id,omitempty"`
+	RepoDigests                 *[]string                   `json:"repo_digests,omitempty"`
+	ImmutableSpecSHA256         *string                     `json:"immutable_spec_sha256,omitempty"`
+	InventoryGeneration         *uint64                     `json:"inventory_generation,omitempty"`
+	InventoryRevision           *uint64                     `json:"inventory_revision,omitempty"`
+	InventoryObservedAt         *string                     `json:"inventory_observed_at,omitempty"`
+	NetworkMode                 *string                     `json:"network_mode,omitempty"`
+	NetworkDriver               *string                     `json:"network_driver,omitempty"`
+	Privileged                  *bool                       `json:"privileged,omitempty"`
+	ConfiguredCapAdd            *[]string                   `json:"configured_cap_add,omitempty"`
+	ConfiguredCapDrop           *[]string                   `json:"configured_cap_drop,omitempty"`
+	EffectiveCapNetAdmin        *bool                       `json:"effective_cap_net_admin,omitempty"`
+	Running                     *bool                       `json:"running,omitempty"`
+	FailureReasons              *[]string                   `json:"failure_reasons,omitempty"`
+	CoverageThroughSequence     uint64                      `json:"coverage_through_sequence"`
+	HardLimitsVersion           string                      `json:"hard_limits_version"`
+	BootTransitionHopCount      *uint64                     `json:"boot_transition_hop_count,omitempty"`
+	BootTransitionChainSHA256   *string                     `json:"boot_transition_chain_sha256,omitempty"`
+}
+
 // CoverageEventV1 is a bounded normalized coverage interval.
 type CoverageEventV1 struct {
 	Component                   string  `json:"component"`

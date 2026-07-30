@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -373,6 +374,554 @@ func (event FalcoConnectV1) Validate() error {
 	}
 	if !event.SuccessfulConnect && !event.InvestigationOnly {
 		return fmt.Errorf("hard errors must be investigation-only")
+	}
+	return nil
+}
+
+func (request PCCCorrelationSnapshotRequestV1) Validate() error {
+	if request.SchemaVersion != pccCorrelationRequestSchema ||
+		!regexp.MustCompile(`^evt_[0-9a-f]{64}$`).MatchString(
+			request.TriggerEventID,
+		) ||
+		!hex64.MatchString(request.TriggerContentSHA256) ||
+		request.TriggerSourceSequence == 0 ||
+		request.RequestedTTLSeconds < 30 ||
+		request.RequestedTTLSeconds > 300 {
+		return fmt.Errorf("invalid PCC correlation snapshot request")
+	}
+	return nil
+}
+
+func (trigger PCCFalcoTriggerProjectionV1) Validate() error {
+	if trigger.SchemaVersion != pccFalcoTriggerProjectionSchema ||
+		!regexp.MustCompile(`^evt_[0-9a-f]{64}$`).MatchString(trigger.EventID) ||
+		!hex64.MatchString(trigger.ContentSHA256) ||
+		!hex64.MatchString(trigger.NormalizedFieldsSHA256) ||
+		trigger.SourceSequence == 0 ||
+		trigger.SourceID != "agmind-observerd" ||
+		!boundedASCII(trigger.SourceVersion, 1, 64) ||
+		!uuid4.MatchString(trigger.HostID) ||
+		!uuid4.MatchString(trigger.BootID) {
+		return fmt.Errorf("invalid retained PCC trigger identity")
+	}
+	if !validUTC(trigger.EventTime) ||
+		!validUTC(trigger.IngestTime) ||
+		trigger.ClockUncertaintyMS > 2_000 ||
+		trigger.InventoryGeneration == 0 ||
+		trigger.InventoryRevision == 0 ||
+		!hex64.MatchString(trigger.ContainerID) ||
+		!validUTC(trigger.ContainerStartTime) ||
+		!regexp.MustCompile(`^rel_[0-9a-f]{32}$`).MatchString(
+			trigger.ReleaseID,
+		) {
+		return fmt.Errorf("invalid retained PCC trigger authority")
+	}
+	if trigger.DetectorRule != pccDetectorRule ||
+		trigger.DetectorRuleVersion != pccDetectorRuleVersion ||
+		trigger.FalcoVersion != pccFalcoVersion ||
+		!regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(
+			trigger.ImageID,
+		) ||
+		!hex64.MatchString(trigger.ImmutableSpecSHA256) ||
+		!validRepoDigests(trigger.RepoDigests) {
+		return fmt.Errorf("invalid retained PCC trigger detector or release")
+	}
+	expectedRelease, err := ReleaseID(
+		trigger.ImageID,
+		trigger.ImmutableSpecSHA256,
+	)
+	if err != nil || expectedRelease != trigger.ReleaseID {
+		return fmt.Errorf("retained PCC trigger release_id mismatch")
+	}
+	completedSuccess := trigger.EvtRes == "SUCCESS" &&
+		trigger.EvtRawres != nil && *trigger.EvtRawres >= 0
+	nonblockingSuccess := (trigger.EvtRes == "EINPROGRESS" ||
+		trigger.EvtRes == "EINPROGRESS(115)") &&
+		(trigger.EvtRawres == nil || *trigger.EvtRawres < 0)
+	if !trigger.SuccessfulConnect ||
+		trigger.InvestigationOnly ||
+		!completedSuccess && !nonblockingSuccess {
+		return fmt.Errorf("retained PCC trigger is not candidate-capable")
+	}
+	for _, value := range []*string{
+		trigger.ProcName,
+		trigger.ProcExePath,
+		trigger.ProcParentName,
+	} {
+		if value == nil || !boundedUTF8(*value, 1, 512) {
+			return fmt.Errorf("retained PCC trigger lacks process identity")
+		}
+	}
+	if !canonicalIPv4(trigger.DestinationIPv4) ||
+		trigger.DestinationPort == 0 ||
+		!boundedASCII(trigger.L4Protocol, 1, 64) ||
+		trigger.MissingRequiredFields == nil ||
+		len(trigger.MissingRequiredFields) != 0 ||
+		trigger.CoverageFlags == nil ||
+		len(trigger.CoverageFlags) > 64 ||
+		!sortedUnique(trigger.CoverageFlags) ||
+		!hex64.MatchString(trigger.RawEventSHA256) {
+		return fmt.Errorf("invalid retained PCC trigger observation")
+	}
+	for _, flag := range trigger.CoverageFlags {
+		if !boundedASCII(flag, 1, 64) {
+			return fmt.Errorf("invalid retained PCC trigger coverage flag")
+		}
+	}
+	return nil
+}
+
+func validCanonicalIP(value string) bool {
+	address, err := netip.ParseAddr(value)
+	return err == nil &&
+		!address.Is4In6() &&
+		address.String() == value
+}
+
+func validCanonicalNetwork(value string) bool {
+	prefix, err := netip.ParsePrefix(value)
+	return err == nil &&
+		!prefix.Addr().Is4In6() &&
+		prefix.String() == value &&
+		prefix.Masked() == prefix
+}
+
+func (network PCCDockerNetworkV1) Validate() error {
+	if !hex64.MatchString(network.NetworkID) ||
+		!boundedASCII(network.Driver, 1, 64) ||
+		network.SubnetCIDRs == nil ||
+		network.GatewayAddresses == nil ||
+		len(network.SubnetCIDRs) > 32 ||
+		len(network.GatewayAddresses) > 32 ||
+		!sortedUnique(network.SubnetCIDRs) ||
+		!sortedUnique(network.GatewayAddresses) {
+		return fmt.Errorf("invalid PCC Docker network")
+	}
+	for _, subnet := range network.SubnetCIDRs {
+		if !validCanonicalNetwork(subnet) {
+			return fmt.Errorf("invalid canonical PCC Docker subnet")
+		}
+	}
+	for _, gateway := range network.GatewayAddresses {
+		if !validCanonicalIP(gateway) {
+			return fmt.Errorf("invalid canonical PCC Docker gateway")
+		}
+	}
+	return nil
+}
+
+func validatePCCDockerNetworks(networks []PCCDockerNetworkV1) error {
+	if networks == nil || len(networks) > 64 {
+		return fmt.Errorf("PCC Docker network count exceeds bound")
+	}
+	totalSubnets := 0
+	totalGateways := 0
+	var previousID string
+	for index, network := range networks {
+		if err := network.Validate(); err != nil {
+			return err
+		}
+		if index > 0 && network.NetworkID <= previousID {
+			return fmt.Errorf("PCC Docker networks must be unique and sorted")
+		}
+		previousID = network.NetworkID
+		totalSubnets += len(network.SubnetCIDRs)
+		totalGateways += len(network.GatewayAddresses)
+	}
+	if totalSubnets > 128 || totalGateways > 128 {
+		return fmt.Errorf("PCC Docker network address totals exceed bounds")
+	}
+	canonical, err := CanonicalJSON(networks)
+	if err != nil {
+		return err
+	}
+	if len(canonical) > 16*1024 {
+		return fmt.Errorf("PCC Docker network snapshot exceeds 16 KiB")
+	}
+	return nil
+}
+
+func validatePCCDenylist(
+	deniedNetworks,
+	deniedAddresses []string,
+) error {
+	if deniedNetworks == nil ||
+		deniedAddresses == nil ||
+		len(deniedNetworks) > 128 ||
+		len(deniedAddresses) > 128 ||
+		!sortedUnique(deniedNetworks) ||
+		!sortedUnique(deniedAddresses) {
+		return fmt.Errorf("PCC denylist arrays must be present, unique, and sorted")
+	}
+	for _, network := range deniedNetworks {
+		prefix, err := netip.ParsePrefix(network)
+		if err != nil ||
+			!prefix.Addr().Is4() ||
+			prefix.String() != network ||
+			prefix.Masked() != prefix {
+			return fmt.Errorf("invalid canonical PCC deny network")
+		}
+	}
+	for _, address := range deniedAddresses {
+		if !canonicalIPv4(address) {
+			return fmt.Errorf("invalid canonical PCC deny address")
+		}
+	}
+	return nil
+}
+
+func (hop PCCBootTransitionHopV1) Validate() error {
+	if !regexp.MustCompile(
+		`^(observer_boot_boundary|observer_key_transition|observer_key_epoch_start)$`,
+	).MatchString(hop.BoundaryEventType) ||
+		!regexp.MustCompile(`^evt_[0-9a-f]{64}$`).MatchString(hop.EventID) ||
+		!hex64.MatchString(hop.ContentSHA256) ||
+		hop.SourceSequence <= hop.PreviousSourceSequence ||
+		!uuid4.MatchString(hop.BootID) ||
+		!uuid4.MatchString(hop.PreviousBootID) ||
+		hop.BootID == hop.PreviousBootID {
+		return fmt.Errorf("invalid PCC boot-transition hop")
+	}
+	companions := []any{
+		hop.RotationCompanionEventType,
+		hop.RotationCompanionEventID,
+		hop.RotationCompanionContentSHA256,
+		hop.RotationCompanionSourceSequence,
+		hop.RotationCompanionBootID,
+	}
+	present := 0
+	for _, companion := range companions {
+		if !reflect.ValueOf(companion).IsNil() {
+			present++
+		}
+	}
+	if present != 0 && present != len(companions) {
+		return fmt.Errorf("PCC rotation companion fields are all-or-none")
+	}
+	if hop.BoundaryEventType == "observer_boot_boundary" {
+		if present != 0 {
+			return fmt.Errorf("dedicated PCC boot boundary forbids companion")
+		}
+		return nil
+	}
+	if present != len(companions) ||
+		!regexp.MustCompile(`^evt_[0-9a-f]{64}$`).MatchString(
+			*hop.RotationCompanionEventID,
+		) ||
+		*hop.RotationCompanionEventID == hop.EventID ||
+		!hex64.MatchString(*hop.RotationCompanionContentSHA256) ||
+		!uuid4.MatchString(*hop.RotationCompanionBootID) {
+		return fmt.Errorf("invalid PCC rotation companion identity")
+	}
+	switch hop.BoundaryEventType {
+	case "observer_key_transition":
+		if *hop.RotationCompanionEventType != "observer_key_epoch_start" ||
+			hop.SourceSequence == ^uint64(0) ||
+			*hop.RotationCompanionSourceSequence != hop.SourceSequence+1 ||
+			*hop.RotationCompanionBootID != hop.BootID {
+			return fmt.Errorf("invalid new-boot PCC rotation pair")
+		}
+	case "observer_key_epoch_start":
+		if *hop.RotationCompanionEventType != "observer_key_transition" ||
+			*hop.RotationCompanionSourceSequence == 0 ||
+			*hop.RotationCompanionSourceSequence == ^uint64(0) ||
+			*hop.RotationCompanionSourceSequence+1 != hop.SourceSequence ||
+			*hop.RotationCompanionBootID != hop.PreviousBootID {
+			return fmt.Errorf("invalid old-boot PCC rotation pair")
+		}
+	}
+	return nil
+}
+
+func validatePCCBootTransitionChain(
+	hops []PCCBootTransitionHopV1,
+) error {
+	if len(hops) < 1 || len(hops) > 1_024 {
+		return fmt.Errorf("PCC boot-transition chain must contain 1..1024 hops")
+	}
+	eventIDs := make(map[string]bool, len(hops)*2)
+	bootIDs := map[string]bool{hops[0].PreviousBootID: true}
+	var previousBoot string
+	var priorLastSequence uint64
+	for index, hop := range hops {
+		if err := hop.Validate(); err != nil {
+			return err
+		}
+		hopEventIDs := []string{hop.EventID}
+		if hop.RotationCompanionEventID != nil {
+			hopEventIDs = append(
+				hopEventIDs,
+				*hop.RotationCompanionEventID,
+			)
+		}
+		for _, eventID := range hopEventIDs {
+			if eventIDs[eventID] {
+				return fmt.Errorf(
+					"PCC boot-transition chain contains duplicate event ID",
+				)
+			}
+			eventIDs[eventID] = true
+		}
+		if bootIDs[hop.BootID] {
+			return fmt.Errorf(
+				"PCC boot-transition chain contains repeated boot ID",
+			)
+		}
+		bootIDs[hop.BootID] = true
+		if index > 0 &&
+			(hop.PreviousBootID != previousBoot ||
+				hop.PreviousSourceSequence < priorLastSequence) {
+			return fmt.Errorf("disconnected PCC boot-transition chain")
+		}
+		previousBoot = hop.BootID
+		priorLastSequence = hop.SourceSequence
+		if hop.BoundaryEventType == "observer_key_transition" {
+			priorLastSequence = *hop.RotationCompanionSourceSequence
+		}
+	}
+	return nil
+}
+
+func validMicrosecondUTC(value string) bool {
+	if !validUTC(value) {
+		return false
+	}
+	withoutZulu := strings.TrimSuffix(value, "Z")
+	point := strings.LastIndexByte(withoutZulu, '.')
+	return point < 0 || len(withoutZulu)-point-1 <= 6
+}
+
+func validPCCCapabilities(values []string) bool {
+	if values == nil || len(values) > 128 || !sortedUnique(values) {
+		return false
+	}
+	for _, value := range values {
+		if !boundedASCII(value, 1, 64) {
+			return false
+		}
+	}
+	return true
+}
+
+func (snapshot PCCCorrelationSnapshotV1) Validate() error {
+	if snapshot.SchemaVersion != pccCorrelationSnapshotSchema ||
+		!hex64.MatchString(snapshot.RequestSHA256) ||
+		!validMicrosecondUTC(snapshot.DecisionTime) ||
+		snapshot.RequestedTTLSeconds < 30 ||
+		snapshot.RequestedTTLSeconds > 300 ||
+		snapshot.CoverageThroughSequence < snapshot.Trigger.SourceSequence ||
+		snapshot.HardLimitsVersion != "pcc-hard-limits-v1" {
+		return fmt.Errorf("invalid PCC correlation snapshot header")
+	}
+	if err := snapshot.Trigger.Validate(); err != nil {
+		return err
+	}
+	expectedRequestHash, err := PCCCorrelationRequestSHA256(
+		PCCCorrelationSnapshotRequestV1{
+			SchemaVersion:         pccCorrelationRequestSchema,
+			TriggerEventID:        snapshot.Trigger.EventID,
+			TriggerContentSHA256:  snapshot.Trigger.ContentSHA256,
+			TriggerSourceSequence: snapshot.Trigger.SourceSequence,
+			RequestedTTLSeconds:   snapshot.RequestedTTLSeconds,
+		},
+	)
+	if err != nil || expectedRequestHash != snapshot.RequestSHA256 {
+		return fmt.Errorf("PCC snapshot request hash mismatch")
+	}
+	switch snapshot.Outcome {
+	case "complete":
+		return snapshot.validateComplete()
+	case "failed":
+		return snapshot.validateFailed()
+	default:
+		return fmt.Errorf("invalid PCC correlation snapshot outcome")
+	}
+}
+
+func (snapshot PCCCorrelationSnapshotV1) validateComplete() error {
+	if snapshot.DetectorBundleSHA256 == nil ||
+		snapshot.SpecialUseRegistrySHA256 == nil ||
+		snapshot.OperatorDeniedNetworks == nil ||
+		snapshot.OperatorDeniedAddresses == nil ||
+		snapshot.OperatorDenylistSHA256 == nil ||
+		snapshot.ManagementDeniedNetworks == nil ||
+		snapshot.ManagementDeniedAddresses == nil ||
+		snapshot.ManagementDenylistSHA256 == nil ||
+		snapshot.DockerNetworks == nil ||
+		snapshot.DockerNetworkSnapshotSHA256 == nil ||
+		snapshot.DockerContainerID == nil ||
+		snapshot.DockerStartedAt == nil ||
+		snapshot.ImageID == nil ||
+		snapshot.RepoDigests == nil ||
+		snapshot.ImmutableSpecSHA256 == nil ||
+		snapshot.InventoryGeneration == nil ||
+		snapshot.InventoryRevision == nil ||
+		snapshot.InventoryObservedAt == nil ||
+		snapshot.NetworkMode == nil ||
+		snapshot.NetworkDriver == nil ||
+		snapshot.Privileged == nil ||
+		snapshot.ConfiguredCapAdd == nil ||
+		snapshot.ConfiguredCapDrop == nil ||
+		snapshot.EffectiveCapNetAdmin == nil ||
+		snapshot.Running == nil ||
+		snapshot.FailureReasons != nil ||
+		snapshot.BootTransitionHopCount != nil ||
+		snapshot.BootTransitionChainSHA256 != nil {
+		return fmt.Errorf("incomplete or mixed PCC complete snapshot form")
+	}
+	if *snapshot.OperatorDeniedNetworks == nil ||
+		*snapshot.OperatorDeniedAddresses == nil ||
+		*snapshot.ManagementDeniedNetworks == nil ||
+		*snapshot.ManagementDeniedAddresses == nil ||
+		*snapshot.DockerNetworks == nil ||
+		*snapshot.RepoDigests == nil ||
+		*snapshot.ConfiguredCapAdd == nil ||
+		*snapshot.ConfiguredCapDrop == nil {
+		return fmt.Errorf("PCC complete snapshot arrays must be present")
+	}
+	for _, digest := range []string{
+		*snapshot.DetectorBundleSHA256,
+		*snapshot.SpecialUseRegistrySHA256,
+		*snapshot.OperatorDenylistSHA256,
+		*snapshot.ManagementDenylistSHA256,
+		*snapshot.DockerNetworkSnapshotSHA256,
+		*snapshot.ImmutableSpecSHA256,
+	} {
+		if !hex64.MatchString(digest) {
+			return fmt.Errorf("invalid PCC complete snapshot digest")
+		}
+	}
+	if *snapshot.SpecialUseRegistrySHA256 != pccSpecialUseRegistrySHA256 {
+		return fmt.Errorf("PCC special-use registry pin mismatch")
+	}
+	operatorHash, err := PCCOperatorDenylistSHA256(
+		*snapshot.OperatorDeniedNetworks,
+		*snapshot.OperatorDeniedAddresses,
+	)
+	if err != nil || operatorHash != *snapshot.OperatorDenylistSHA256 {
+		return fmt.Errorf("PCC operator denylist hash mismatch")
+	}
+	managementHash, err := PCCManagementDenylistSHA256(
+		*snapshot.ManagementDeniedNetworks,
+		*snapshot.ManagementDeniedAddresses,
+	)
+	if err != nil || managementHash != *snapshot.ManagementDenylistSHA256 {
+		return fmt.Errorf("PCC management denylist hash mismatch")
+	}
+	networkHash, err := PCCDockerNetworkSnapshotSHA256(
+		*snapshot.DockerNetworks,
+	)
+	if err != nil || networkHash != *snapshot.DockerNetworkSnapshotSHA256 {
+		return fmt.Errorf("PCC Docker network snapshot hash mismatch")
+	}
+	if !hex64.MatchString(*snapshot.DockerContainerID) ||
+		!validUTC(*snapshot.DockerStartedAt) ||
+		!regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(
+			*snapshot.ImageID,
+		) ||
+		!validRepoDigests(*snapshot.RepoDigests) ||
+		*snapshot.InventoryGeneration == 0 ||
+		*snapshot.InventoryRevision == 0 ||
+		!validUTC(*snapshot.InventoryObservedAt) ||
+		!boundedASCII(*snapshot.NetworkMode, 1, 128) ||
+		!boundedASCII(*snapshot.NetworkDriver, 1, 64) ||
+		!validPCCCapabilities(*snapshot.ConfiguredCapAdd) ||
+		!validPCCCapabilities(*snapshot.ConfiguredCapDrop) {
+		return fmt.Errorf("invalid PCC complete inventory snapshot")
+	}
+	trigger := snapshot.Trigger
+	if *snapshot.DockerContainerID != trigger.ContainerID ||
+		*snapshot.DockerStartedAt != trigger.ContainerStartTime ||
+		*snapshot.ImageID != trigger.ImageID ||
+		!reflect.DeepEqual(*snapshot.RepoDigests, trigger.RepoDigests) ||
+		*snapshot.ImmutableSpecSHA256 != trigger.ImmutableSpecSHA256 ||
+		*snapshot.InventoryGeneration != trigger.InventoryGeneration ||
+		*snapshot.InventoryRevision != trigger.InventoryRevision {
+		return fmt.Errorf("PCC complete snapshot does not bind retained trigger")
+	}
+	canonical, err := CanonicalJSON(snapshot)
+	if err != nil {
+		return err
+	}
+	if len(canonical) > 24*1024 {
+		return fmt.Errorf("PCC complete normalized snapshot exceeds 24 KiB")
+	}
+	return nil
+}
+
+func (snapshot PCCCorrelationSnapshotV1) validateFailed() error {
+	if snapshot.DetectorBundleSHA256 != nil ||
+		snapshot.SpecialUseRegistrySHA256 != nil ||
+		snapshot.OperatorDeniedNetworks != nil ||
+		snapshot.OperatorDeniedAddresses != nil ||
+		snapshot.OperatorDenylistSHA256 != nil ||
+		snapshot.ManagementDeniedNetworks != nil ||
+		snapshot.ManagementDeniedAddresses != nil ||
+		snapshot.ManagementDenylistSHA256 != nil ||
+		snapshot.DockerNetworks != nil ||
+		snapshot.DockerNetworkSnapshotSHA256 != nil ||
+		snapshot.DockerContainerID != nil ||
+		snapshot.DockerStartedAt != nil ||
+		snapshot.ImageID != nil ||
+		snapshot.RepoDigests != nil ||
+		snapshot.ImmutableSpecSHA256 != nil ||
+		snapshot.InventoryGeneration != nil ||
+		snapshot.InventoryRevision != nil ||
+		snapshot.InventoryObservedAt != nil ||
+		snapshot.NetworkMode != nil ||
+		snapshot.NetworkDriver != nil ||
+		snapshot.Privileged != nil ||
+		snapshot.ConfiguredCapAdd != nil ||
+		snapshot.ConfiguredCapDrop != nil ||
+		snapshot.EffectiveCapNetAdmin != nil ||
+		snapshot.Running != nil ||
+		snapshot.FailureReasons == nil ||
+		*snapshot.FailureReasons == nil ||
+		len(*snapshot.FailureReasons) == 0 ||
+		!sortedUnique(*snapshot.FailureReasons) {
+		return fmt.Errorf("incomplete or mixed PCC failed snapshot form")
+	}
+	allowed := map[string]bool{
+		"mutation_read_only":                  true,
+		"reconcile_required":                  true,
+		"docker_reconcile_gap":                true,
+		"routine_drop_pending":                true,
+		"inventory_stale":                     true,
+		"docker_network_snapshot_unavailable": true,
+		"docker_network_snapshot_overflow":    true,
+		"detector_bundle_unavailable":         true,
+		"special_use_registry_unavailable":    true,
+		"operator_denylist_unavailable":       true,
+		"management_denylist_unavailable":     true,
+		"container_not_running":               true,
+		"container_identity_changed":          true,
+		"observer_boot_changed":               true,
+	}
+	for _, reason := range *snapshot.FailureReasons {
+		if !allowed[reason] {
+			return fmt.Errorf("invalid PCC snapshot failure reason")
+		}
+	}
+	crossBoot := len(*snapshot.FailureReasons) == 1 &&
+		(*snapshot.FailureReasons)[0] == "observer_boot_changed"
+	if crossBoot {
+		if snapshot.BootTransitionHopCount == nil ||
+			*snapshot.BootTransitionHopCount < 1 ||
+			*snapshot.BootTransitionHopCount > 1_024 ||
+			snapshot.BootTransitionChainSHA256 == nil ||
+			!hex64.MatchString(*snapshot.BootTransitionChainSHA256) {
+			return fmt.Errorf("invalid PCC cross-boot terminal proof")
+		}
+		return nil
+	}
+	for _, reason := range *snapshot.FailureReasons {
+		if reason == "observer_boot_changed" {
+			return fmt.Errorf("observer_boot_changed must be the only reason")
+		}
+	}
+	if snapshot.BootTransitionHopCount != nil ||
+		snapshot.BootTransitionChainSHA256 != nil {
+		return fmt.Errorf("ordinary PCC failure forbids boot-transition proof")
 	}
 	return nil
 }
