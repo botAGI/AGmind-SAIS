@@ -6,7 +6,7 @@
 
 **Architecture:** Observerd first extends its atomic Docker inventory and fixed root-owned pin inputs, then adds two separately anchored append-only journals for boot-boundary evidence and PCC publication receipts. The observer producer composes those substrates under the existing publication mutex, while Core persists one exact four-field request in its evidence-root operational namespace and resumes the `selected -> proof_observed -> completed` delivery state machine across crashes.
 
-**Tech Stack:** Go 1.25 observerd, Moby client API v1.55, Python 3.14, Pydantic v2 strict contracts, AGF1 framed journals, Ed25519 envelopes, HTTPX over the existing Core-only Unix-domain socket, pytest.
+**Tech Stack:** Go 1.26.5 observerd, Moby client API v1.55, Python 3.14, Pydantic v2 strict contracts, AGF1 framed journals, Ed25519 envelopes, HTTPX over the existing Core-only Unix-domain socket, pytest.
 
 ## Global Constraints
 
@@ -640,7 +640,7 @@ Reserve exactly `S`, sign with the sampled timestamp, append at `PriorityTier`, 
 PCCPublicationReceipt{
     OperationKey:             "pcc_correlation_snapshot:" + request.TriggerEventID,
     RequestSHA256:            requestSHA256,
-    SnapshotNormalizedSHA256: event.NormalizedFieldsSHA256,
+    SnapshotNormalizedSHA256: event.Envelope.NormalizedFieldsSHA256,
     SnapshotEventID:          event.EventID,
     SnapshotContentSHA256:    item.ContentSHA256,
 }
@@ -933,15 +933,19 @@ async def publish_correlation_snapshot(
     self,
     canonical_body: bytes,
 ) -> bytes:
-    return await self._publish_core_event(
-        path="/v1/events/pcc-correlation-snapshot",
-        canonical_body=canonical_body,
-        request_limit=64 * 1024,
-        unavailable_retryable=True,
+    return await self._publish_control(
+        "/v1/events/pcc-correlation-snapshot",
+        canonical_body,
+        operation="PCC correlation snapshot",
+        request_limit=4 * 1024,
+        request_limit_label="4 KiB",
     )
 ```
 
-The shared helper must preserve exact bytes, accept only 200/201 exact JSON, bound response to `MAX_CORE_EVENT_RESPONSE_BYTES`, map typed 503 to `DeliveryRetryableError`, and map 409 to `DeliveryFatalError`.
+The existing `_publish_control` helper must preserve exact bytes, accept only
+200/201 exact JSON, bound the request to 4 KiB and the response to
+`MAX_CORE_EVENT_RESPONSE_BYTES`, map typed 503 to `DeliveryRetryableError`,
+and map 409 to `DeliveryFatalError`.
 
 - [ ] **Step 6: Detect candidate-capable triggers after durable acceptance**
 
