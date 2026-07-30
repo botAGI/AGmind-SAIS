@@ -16,6 +16,7 @@ from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.clock import CoreClockProvider
 from agmind_immune.contracts import (
     MAX_UINT64,
+    PCCCorrelationSnapshotRequestV1,
     RetentionBlockedV1,
     RetentionTombstoneV2,
 )
@@ -49,6 +50,7 @@ from agmind_immune.ingest.envelope import (
     EnvelopeVerifier,
     IngestVerificationError,
     PageDecodeError,
+    PCCCorrelationVerificationContext,
     SimulatedEvent,
     SimulatedRetentionBlocked,
     SimulatedRetentionTombstone,
@@ -118,7 +120,12 @@ class AcceptanceCoordinator:
     def segment_store(self) -> SegmentStore:
         return self._segment_store
 
-    def _accept_bound(self, item: CoreEventV1) -> EvidenceRef:
+    def _accept_bound(
+        self,
+        item: CoreEventV1,
+        *,
+        pcc_context: PCCCorrelationVerificationContext | None = None,
+    ) -> EvidenceRef:
         verifier = self._verifier
         segment_store = self._segment_store
         try:
@@ -127,6 +134,7 @@ class AcceptanceCoordinator:
                 sequence=item.sequence,
                 event_id=item.event_id,
                 content_sha256=item.content_sha256,
+                pcc_context=pcc_context,
             )
         except EnvelopeConflict:
             segment_store.enter_read_only("evidence_conflict")
@@ -147,6 +155,27 @@ class AcceptanceCoordinator:
                 "repair-resumed acceptance requires repair delivery authority"
             )
         return self._accept_bound(item)
+
+    def accept_pcc(
+        self,
+        item: CoreEventV1,
+        request: PCCCorrelationSnapshotRequestV1,
+    ) -> EvidenceRef:
+        """Append one PCC snapshot under its exact typed request authority."""
+        if type(request) is not PCCCorrelationSnapshotRequestV1:
+            raise TypeError("PCC acceptance requires the exact request contract")
+        status = self._segment_store.status()
+        if self._repair_mode or (
+            type(status) is EvidenceStatus
+            and status.repair_pending is True
+        ):
+            raise DeliveryFatalError(
+                "repair-resumed acceptance requires repair delivery authority"
+            )
+        return self._accept_bound(
+            item,
+            pcc_context=PCCCorrelationVerificationContext(request=request),
+        )
 
     def _accept_for_repair(
         self,

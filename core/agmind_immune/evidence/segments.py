@@ -43,6 +43,8 @@ from agmind_immune.contracts import (
     MAX_UINT64,
     ContractModel,
     EventEnvelopeV1,
+    PCCCorrelationSnapshotRequestV1,
+    PCCCorrelationSnapshotV1,
     RetentionBlockedV1,
     RetentionTombstoneV2,
     decode_strict,
@@ -73,6 +75,7 @@ from agmind_immune.evidence.repair import (
 from agmind_immune.ingest.envelope import (
     EnvelopeVerifier,
     IngestVerificationError,
+    PCCCorrelationVerificationContext,
     SimulatedRepairAuthorization,
     VerifiedEnvelope,
     VerifierCommitError,
@@ -9646,6 +9649,9 @@ class SegmentStore:
         verifier: EnvelopeVerifier,
         record: StoredEvidenceRecord,
     ) -> None:
+        if record.envelope.get("event_type") == "pcc_correlation_snapshot":
+            self._replay_recovered_pcc_record(verifier, record)
+            return
         ref = record.ref
         verified = verifier.verify(
             record.envelope,
@@ -9660,6 +9666,84 @@ class SegmentStore:
         )
         if authorization.canonical != record.canonical_envelope:
             raise EvidenceCorrupt("replay canonical bytes changed")
+        verifier._commit_durable(
+            authorization,
+            self._lifecycle_identity,
+            ref,
+        )
+
+    def _replay_recovered_pcc_record(
+        self,
+        verifier: EnvelopeVerifier,
+        record: StoredEvidenceRecord,
+    ) -> None:
+        if (
+            self._bound_verifier is not verifier
+            or self._authority_state != "recovering"
+        ):
+            raise EvidenceSealError(
+                "PCC recovery requires the bound recovering verifier lifecycle"
+            )
+        try:
+            envelope = EventEnvelopeV1.model_validate_json(
+                record.canonical_envelope,
+                strict=True,
+            )
+            snapshot = PCCCorrelationSnapshotV1.model_validate(
+                envelope.normalized_fields,
+                strict=True,
+            )
+            request = PCCCorrelationSnapshotRequestV1.model_validate(
+                {
+                    "schema_version": (
+                        "agmind.pcc-correlation-snapshot-request.v1"
+                    ),
+                    "trigger_event_id": snapshot.trigger.event_id,
+                    "trigger_content_sha256": (
+                        snapshot.trigger.content_sha256
+                    ),
+                    "trigger_source_sequence": (
+                        snapshot.trigger.source_sequence
+                    ),
+                    "requested_ttl_seconds": (
+                        snapshot.requested_ttl_seconds
+                    ),
+                },
+                strict=True,
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise EvidenceCorrupt(
+                "recovered PCC snapshot cannot reconstruct its exact request"
+            ) from error
+        ref = record.ref
+        if verifier.accepted_ref(snapshot.trigger.source_sequence) is None:
+            verifier._recover_deferred_pcc(
+                record.envelope,
+                sequence=ref.source_sequence,
+                event_id=ref.event_id,
+                content_sha256=ref.content_sha256,
+                request=request,
+                evidence_ref=ref,
+                evidence_priority=record.priority.value,
+                lifecycle=self._lifecycle_identity,
+            )
+            return
+        verified = verifier.verify(
+            record.envelope,
+            sequence=ref.source_sequence,
+            event_id=ref.event_id,
+            content_sha256=ref.content_sha256,
+            pcc_context=PCCCorrelationVerificationContext(
+                request=request,
+            ),
+        )
+        authorization = verifier._authorize_append(
+            verified,
+            self._lifecycle_identity,
+            record.priority.value,
+        )
+        if authorization.canonical != record.canonical_envelope:
+            raise EvidenceCorrupt("PCC replay canonical bytes changed")
         verifier._commit_durable(
             authorization,
             self._lifecycle_identity,
@@ -10042,24 +10126,30 @@ class SegmentStore:
                     "retention state and physical payloads are inconsistent"
                 )
 
-        self._authenticated_retired_ranges = tuple(
+        authenticated_omissions = tuple(
             (
+                item.manifest.manifest_sha256,
                 item.manifest.first_source_sequence,
                 item.manifest.last_source_sequence,
+                item.manifest.record_count,
             )
             for item in self._missing_manifest_payloads
         )
+        authenticated_retired_ranges = tuple(
+            (first_sequence, last_sequence)
+            for (
+                _manifest_sha256,
+                first_sequence,
+                last_sequence,
+                _record_count,
+            ) in authenticated_omissions
+        )
         verifier._commit_retention_recovery(
-            tuple(
-                (
-                    item.manifest.manifest_sha256,
-                    item.manifest.first_source_sequence,
-                    item.manifest.last_source_sequence,
-                    item.manifest.record_count,
-                )
-                for item in self._missing_manifest_payloads
-            ),
+            authenticated_omissions,
             self._lifecycle_identity,
+        )
+        self._authenticated_retired_ranges = (
+            authenticated_retired_ranges
         )
         boundary_raw: bytes | None
         if authenticated_tombstones:

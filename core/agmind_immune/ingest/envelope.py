@@ -17,6 +17,8 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 
 from agmind_immune.canonicaljson import (
     canonical_json,
+    pcc_boot_transition_chain_sha256,
+    pcc_correlation_request_sha256,
     verify_event_signature,
     verify_key_transition,
 )
@@ -34,6 +36,10 @@ from agmind_immune.contracts import (
     KeyTransitionV1,
     ObserverBootBoundaryV1,
     ObserverTrustRootV1,
+    PCCBootTransitionHopV1,
+    PCCCorrelationSnapshotRequestV1,
+    PCCCorrelationSnapshotV1,
+    PCCFalcoTriggerProjectionV1,
     RetentionBlockedV1,
     RetentionTombstoneV2,
     decode_strict,
@@ -95,6 +101,21 @@ class RepairSimulationError(IngestVerificationError):
 
 class RetentionSimulationError(IngestVerificationError):
     """A retention proof did not bind one exact authenticated control path."""
+
+
+class PCCSnapshotVerificationError(IngestVerificationError):
+    """A PCC snapshot did not bind its request and authenticated stream prefix."""
+
+
+@dataclass(frozen=True, slots=True)
+class PCCCorrelationVerificationContext:
+    """Explicit caller context for one narrow PCC snapshot request."""
+
+    request: PCCCorrelationSnapshotRequestV1
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not PCCCorrelationSnapshotRequestV1:
+            raise TypeError("PCC verification request must be the strict typed contract")
 
 
 class CoreSequenceGapV1(ContractModel):
@@ -517,10 +538,13 @@ class AnchoredPublicKeyChain:
 class _PendingRotation:
     transition_sequence: int
     transition_boot_id: str
+    transition_content_sha256: str
     new_epoch: int
     new_key_id: str
     transition_event_id: str
     expected_start_event_id: str
+    previous_boot_id: str | None
+    previous_source_sequence: int
     mode: Literal["b", "same_or_c"]
 
 
@@ -536,6 +560,7 @@ class ObserverStreamFSM:
     last_sequence: int = 0
     unresolved_holes: tuple[tuple[int, int], ...] = ()
     pending_rotation: _PendingRotation | None = None
+    pcc_boot_transition_hops: tuple[PCCBootTransitionHopV1, ...] = ()
     mutation_read_only: bool = False
 
     def __post_init__(self) -> None:
@@ -549,8 +574,18 @@ class ObserverStreamFSM:
             or not 1 <= self.active_epoch <= MAX_UINT64
             or not 0 <= self.last_sequence <= MAX_UINT64
             or len(set(self.seen_boot_ids)) != len(self.seen_boot_ids)
+            or type(self.pcc_boot_transition_hops) is not tuple
+            or len(self.pcc_boot_transition_hops) > 1_024
+            or any(
+                type(hop) is not PCCBootTransitionHopV1
+                for hop in self.pcc_boot_transition_hops
+            )
         ):
             raise ValueError("observer stream FSM identity/state is invalid")
+        if self.pcc_boot_transition_hops:
+            pcc_boot_transition_chain_sha256(
+                self.pcc_boot_transition_hops
+            )
         if self.current_boot_id is None:
             if self.seen_boot_ids:
                 raise ValueError("observer FSM has history without a current boot")
@@ -571,8 +606,26 @@ class ObserverStreamFSM:
             or pending.new_epoch != self.active_epoch + 1
             or pending.new_key_id == self.active_key_id
             or pending.transition_boot_id != self.current_boot_id
+            or pending.previous_source_sequence >= pending.transition_sequence
         ):
             raise ValueError("observer FSM pending rotation is inconsistent")
+
+    def _append_pcc_boot_transition_hop(
+        self,
+        hop: PCCBootTransitionHopV1,
+    ) -> tuple[PCCBootTransitionHopV1, ...]:
+        if type(hop) is not PCCBootTransitionHopV1:
+            raise BootBoundaryError("PCC boot-transition hop is not exact")
+        ledger = self.pcc_boot_transition_hops + (hop,)
+        if len(ledger) > 1_024:
+            ledger = ledger[-1_024:]
+        try:
+            pcc_boot_transition_chain_sha256(ledger)
+        except (TypeError, ValueError, ValidationError) as error:
+            raise BootBoundaryError(
+                "PCC boot-transition hop disconnected verifier history"
+            ) from error
+        return ledger
 
     def enter_read_only(self) -> ObserverStreamFSM:
         return replace(self, mutation_read_only=True)
@@ -600,6 +653,8 @@ class ObserverStreamFSM:
         current_boot = self.current_boot_id
         seen = list(self.seen_boot_ids)
         if envelope.event_type == "observer_key_transition":
+            previous_boot = current_boot
+            previous_sequence = self.last_sequence
             proof = chain.proof(envelope.key_epoch + 1)
             if canonical != proof.transition_canonical:
                 raise KeyMetadataError("stream transition differs from anchored proof")
@@ -619,10 +674,13 @@ class ObserverStreamFSM:
             pending = _PendingRotation(
                 transition_sequence=envelope.source_sequence,
                 transition_boot_id=envelope.boot_id,
+                transition_content_sha256=hashlib.sha256(canonical).hexdigest(),
                 new_epoch=proof.new_epoch,
                 new_key_id=proof.new_key_id,
                 transition_event_id=envelope.event_id,
                 expected_start_event_id=proof.start_event_id,
+                previous_boot_id=previous_boot,
+                previous_source_sequence=previous_sequence,
                 mode=mode,
             )
             return replace(
@@ -634,6 +692,7 @@ class ObserverStreamFSM:
                 pending_rotation=pending,
             )
 
+        boot_transition_hops = self.pcc_boot_transition_hops
         if current_boot is None or envelope.boot_id != current_boot:
             if envelope.boot_id in seen:
                 raise BootBoundaryError("historical boot ID was reused")
@@ -657,6 +716,29 @@ class ObserverStreamFSM:
                 )
             ):
                 raise BootBoundaryError("changed-boot boundary predecessor mismatch")
+            if current_boot is not None:
+                try:
+                    hop = PCCBootTransitionHopV1.model_validate(
+                        {
+                            "boundary_event_type": envelope.event_type,
+                            "event_id": envelope.event_id,
+                            "content_sha256": hashlib.sha256(canonical).hexdigest(),
+                            "source_sequence": envelope.source_sequence,
+                            "boot_id": envelope.boot_id,
+                            "previous_boot_id": boundary.previous_boot_id,
+                            "previous_source_sequence": (
+                                boundary.previous_source_sequence
+                            ),
+                        },
+                        strict=True,
+                    )
+                except ValidationError as error:
+                    raise BootBoundaryError(
+                        "dedicated boot boundary cannot enter PCC history"
+                    ) from error
+                boot_transition_hops = (
+                    self._append_pcc_boot_transition_hop(hop)
+                )
             seen.append(envelope.boot_id)
             current_boot = envelope.boot_id
         elif "boot_transition" in envelope.coverage_flags:
@@ -669,6 +751,7 @@ class ObserverStreamFSM:
             seen_boot_ids=tuple(seen),
             last_sequence=envelope.source_sequence,
             unresolved_holes=tuple(holes),
+            pcc_boot_transition_hops=boot_transition_hops,
         )
 
     def _finish_rotation(
@@ -694,11 +777,48 @@ class ObserverStreamFSM:
             raise KeyMetadataError("stream epoch start differs from anchored proof")
         current_boot = self.current_boot_id
         seen = list(self.seen_boot_ids)
+        boot_transition_hops = self.pcc_boot_transition_hops
         if pending.mode == "b":
             if envelope.boot_id != pending.transition_boot_id or envelope.coverage_flags != [
                 "key_rotation"
             ]:
                 raise BootBoundaryError("B epoch start must remain adjacent in its new boot")
+            if pending.previous_boot_id is not None:
+                try:
+                    hop = PCCBootTransitionHopV1.model_validate(
+                        {
+                            "boundary_event_type": "observer_key_transition",
+                            "event_id": pending.transition_event_id,
+                            "content_sha256": (
+                                pending.transition_content_sha256
+                            ),
+                            "source_sequence": pending.transition_sequence,
+                            "boot_id": pending.transition_boot_id,
+                            "previous_boot_id": pending.previous_boot_id,
+                            "previous_source_sequence": (
+                                pending.previous_source_sequence
+                            ),
+                            "rotation_companion_event_type": (
+                                envelope.event_type
+                            ),
+                            "rotation_companion_event_id": envelope.event_id,
+                            "rotation_companion_content_sha256": hashlib.sha256(
+                                canonical
+                            ).hexdigest(),
+                            "rotation_companion_source_sequence": (
+                                envelope.source_sequence
+                            ),
+                            "rotation_companion_boot_id": envelope.boot_id,
+                        },
+                        strict=True,
+                    )
+                except ValidationError as error:
+                    raise BootBoundaryError(
+                        "boundary-B pair cannot enter PCC history"
+                    ) from error
+                boot_transition_hops = (
+                    self._append_pcc_boot_transition_hop(hop)
+                )
         elif envelope.boot_id == pending.transition_boot_id:
             if envelope.coverage_flags != ["key_rotation"]:
                 raise BootBoundaryError("same-boot epoch start has incorrect flags")
@@ -708,6 +828,43 @@ class ObserverStreamFSM:
                 or envelope.boot_id in seen
             ):
                 raise BootBoundaryError("C epoch start did not introduce one unseen boot")
+            try:
+                hop = PCCBootTransitionHopV1.model_validate(
+                    {
+                        "boundary_event_type": envelope.event_type,
+                        "event_id": envelope.event_id,
+                        "content_sha256": hashlib.sha256(canonical).hexdigest(),
+                        "source_sequence": envelope.source_sequence,
+                        "boot_id": envelope.boot_id,
+                        "previous_boot_id": pending.transition_boot_id,
+                        "previous_source_sequence": (
+                            pending.transition_sequence
+                        ),
+                        "rotation_companion_event_type": (
+                            "observer_key_transition"
+                        ),
+                        "rotation_companion_event_id": (
+                            pending.transition_event_id
+                        ),
+                        "rotation_companion_content_sha256": (
+                            pending.transition_content_sha256
+                        ),
+                        "rotation_companion_source_sequence": (
+                            pending.transition_sequence
+                        ),
+                        "rotation_companion_boot_id": (
+                            pending.transition_boot_id
+                        ),
+                    },
+                    strict=True,
+                )
+            except ValidationError as error:
+                raise BootBoundaryError(
+                    "boundary-C pair cannot enter PCC history"
+                ) from error
+            boot_transition_hops = self._append_pcc_boot_transition_hop(
+                hop
+            )
             seen.append(envelope.boot_id)
             current_boot = envelope.boot_id
         return replace(
@@ -718,6 +875,7 @@ class ObserverStreamFSM:
             seen_boot_ids=tuple(seen),
             last_sequence=envelope.source_sequence,
             pending_rotation=None,
+            pcc_boot_transition_hops=boot_transition_hops,
         )
 
     @staticmethod
@@ -850,6 +1008,28 @@ class _AcceptedEnvelope:
     evidence_priority: Literal["routine", "protected"]
     key_epoch: int
     key_id: str
+
+
+@dataclass(frozen=True)
+class _AuthenticatedEnvelopeTransition:
+    canonical: bytes
+    content_sha256: str
+    envelope: EventEnvelopeV1
+    evidence_priority: Literal["routine", "protected"]
+    next_fsm: ObserverStreamFSM
+    pcc_snapshot: PCCCorrelationSnapshotV1 | None
+
+
+@dataclass(frozen=True)
+class _DeferredPCCRecovery:
+    canonical: bytes
+    content_sha256: str
+    event_id: str
+    evidence_ref: object
+    key_epoch: int
+    key_id: str
+    request: PCCCorrelationSnapshotRequestV1
+    source_sequence: int
 
 
 @dataclass(frozen=True)
@@ -1277,6 +1457,7 @@ _PROTECTED_EVENT_TYPES = frozenset(
         "observer_key_epoch_start",
         "observer_key_transition",
         "observer_start",
+        "pcc_correlation_snapshot",
         "evidence_repair_authorized",
         "evidence_repair_completed",
         "retention_blocked_priority_evidence",
@@ -1317,6 +1498,10 @@ class EnvelopeVerifier:
             tuple[str, int, int, int],
             ...,
         ] = ()
+        self._deferred_pcc_recovery: tuple[
+            _DeferredPCCRecovery,
+            ...,
+        ] = ()
 
     @property
     def fsm(self) -> ObserverStreamFSM:
@@ -1334,6 +1519,7 @@ class EnvelopeVerifier:
             or self._authority.accepted
             or self._staged
             or self._authorizations
+            or self._deferred_pcc_recovery
             or self._authority.fsm != genesis
         ):
             raise VerifierCommitError("store factories require a pristine epoch-1 verifier")
@@ -1347,6 +1533,7 @@ class EnvelopeVerifier:
             or self._retention_recovery_open
             or self._retention_recovery_consumed
             or self._provisional_retention_omissions
+            or self._deferred_pcc_recovery
             or self._staged
             or self._authorizations
         ):
@@ -1427,6 +1614,94 @@ class EnvelopeVerifier:
             raise VerifierCommitError(
                 "retention recovery did not consume exact provisional omissions"
             )
+        authority = self._authority
+        next_accepted = dict(authority.accepted)
+        for binding in self._deferred_pcc_recovery:
+            covering = tuple(
+                omission
+                for omission in omissions
+                if omission[1]
+                <= binding.request.trigger_source_sequence
+                <= omission[2]
+            )
+            if len(covering) != 1:
+                raise PCCSnapshotVerificationError(
+                    "deferred PCC trigger lacks one exact authenticated "
+                    "retired range"
+                )
+            if (
+                binding.request.trigger_source_sequence
+                in authority.accepted
+                or binding.source_sequence in next_accepted
+                or hashlib.sha256(binding.canonical).hexdigest()
+                != binding.content_sha256
+                or getattr(
+                    binding.evidence_ref,
+                    "source_sequence",
+                    None,
+                )
+                != binding.source_sequence
+                or getattr(binding.evidence_ref, "event_id", None)
+                != binding.event_id
+                or getattr(
+                    binding.evidence_ref,
+                    "content_sha256",
+                    None,
+                )
+                != binding.content_sha256
+            ):
+                raise VerifierCommitError(
+                    "deferred PCC recovery binding changed before promotion"
+                )
+            try:
+                envelope = EventEnvelopeV1.model_validate_json(
+                    binding.canonical,
+                    strict=True,
+                )
+            except ValidationError as error:
+                raise VerifierCommitError(
+                    "deferred PCC recovery envelope no longer decodes"
+                ) from error
+            if (
+                envelope.event_type != "pcc_correlation_snapshot"
+                or envelope.event_id != binding.event_id
+                or envelope.source_sequence != binding.source_sequence
+                or envelope.key_epoch != binding.key_epoch
+                or envelope.key_id != binding.key_id
+            ):
+                raise VerifierCommitError(
+                    "deferred PCC recovery identity changed before promotion"
+                )
+            snapshot = self._validate_pcc_snapshot_local_semantics(
+                envelope
+            )
+            self._validate_pcc_request_context(
+                envelope,
+                PCCCorrelationVerificationContext(
+                    request=binding.request,
+                ),
+            )
+            if (
+                snapshot.trigger.source_sequence
+                != binding.request.trigger_source_sequence
+            ):
+                raise VerifierCommitError(
+                    "deferred PCC trigger identity changed before promotion"
+                )
+            next_accepted[binding.source_sequence] = _AcceptedEnvelope(
+                canonical=binding.canonical,
+                evidence_ref=binding.evidence_ref,
+                evidence_priority="protected",
+                key_epoch=binding.key_epoch,
+                key_id=binding.key_id,
+            )
+        next_authority = _VerifierAuthorityState(
+            fsm=authority.fsm,
+            accepted=MappingProxyType(next_accepted),
+            generation=authority.generation,
+        )
+        self._authority = next_authority
+        self._deferred_pcc_recovery = ()
         self._provisional_retention_omissions = ()
         self._retention_recovery_open = False
         self._retention_recovery_consumed = True
@@ -1438,6 +1713,7 @@ class EnvelopeVerifier:
             or self._retention_recovery_open
             or self._retention_recovery_consumed
             or self._provisional_retention_omissions
+            or self._deferred_pcc_recovery
             or self._staged
             or self._authorizations
         ):
@@ -1446,14 +1722,14 @@ class EnvelopeVerifier:
             )
         self._retention_recovery_consumed = True
 
-    def verify(
-        self,
+    @staticmethod
+    def _validated_outer_binding(
         envelope_value: object,
         *,
         sequence: int,
         event_id: str,
         content_sha256: str,
-    ) -> VerifiedEnvelope:
+    ) -> tuple[dict[str, Any], bytes, str]:
         if not isinstance(envelope_value, dict):
             raise OuterBindingError("outer envelope is not an object")
         if any(value is None for value in envelope_value.values()):
@@ -1461,7 +1737,9 @@ class EnvelopeVerifier:
         try:
             canonical = canonical_json(envelope_value)
         except (TypeError, ValueError) as error:
-            raise OuterBindingError("envelope is not canonicalizable") from error
+            raise OuterBindingError(
+                "envelope is not canonicalizable"
+            ) from error
         if len(canonical) > MAX_CANONICAL_ENVELOPE_BYTES:
             raise OuterBindingError("canonical envelope exceeds 64 KiB")
         digest = hashlib.sha256(canonical).hexdigest()
@@ -1473,24 +1751,20 @@ class EnvelopeVerifier:
             or envelope_value.get("event_id") != event_id
             or digest != content_sha256
         ):
-            raise OuterBindingError("outer item does not exactly bind canonical envelope")
-
-        accepted = self._authority.accepted.get(sequence)
-        if accepted is not None and accepted.canonical == canonical:
-            try:
-                envelope = EventEnvelopeV1.model_validate(envelope_value, strict=True)
-            except ValidationError as error:
-                raise OuterBindingError("accepted retry no longer decodes identically") from error
-            return self._stage(
-                canonical=canonical,
-                content_sha256=digest,
-                envelope=envelope,
-                evidence_priority=accepted.evidence_priority,
-                is_retry=True,
-                next_fsm=self._authority.fsm,
-                existing_ref=accepted.evidence_ref,
+            raise OuterBindingError(
+                "outer item does not exactly bind canonical envelope"
             )
+        return envelope_value, canonical, digest
 
+    def _authenticate_envelope_transition(
+        self,
+        envelope_value: dict[str, Any],
+        *,
+        canonical: bytes,
+        content_sha256: str,
+        accepted: _AcceptedEnvelope | None,
+        validate_pcc_authority: bool,
+    ) -> _AuthenticatedEnvelopeTransition:
         self._precheck_signed_content(envelope_value)
         event_type = envelope_value["event_type"]
         source_sequence = envelope_value["source_sequence"]
@@ -1504,7 +1778,9 @@ class EnvelopeVerifier:
             or isinstance(key_epoch, bool)
             or not isinstance(key_id, str)
         ):
-            raise EnvelopeIdentityError("envelope key/sequence identity has invalid types")
+            raise EnvelopeIdentityError(
+                "envelope key/sequence identity has invalid types"
+            )
         public_key = self._select_verification_key(
             event_type=event_type,
             source_sequence=source_sequence,
@@ -1515,29 +1791,239 @@ class EnvelopeVerifier:
         try:
             verify_event_signature(envelope_value, public_key)
         except (InvalidSignature, TypeError, ValueError) as error:
-            raise EnvelopeSignatureError("observer envelope signature is invalid") from error
+            raise EnvelopeSignatureError(
+                "observer envelope signature is invalid"
+            ) from error
 
         try:
-            envelope = EventEnvelopeV1.model_validate(envelope_value, strict=True)
+            envelope = EventEnvelopeV1.model_validate(
+                envelope_value,
+                strict=True,
+            )
         except ValidationError as error:
-            raise OuterBindingError("signed envelope contract is invalid") from error
-        if envelope.host_id != self.root.host_id or envelope.source_id != "agmind-observerd":
-            raise EnvelopeIdentityError("envelope is not from the pinned observer host/source")
+            raise OuterBindingError(
+                "signed envelope contract is invalid"
+            ) from error
+        if (
+            envelope.host_id != self.root.host_id
+            or envelope.source_id != "agmind-observerd"
+        ):
+            raise EnvelopeIdentityError(
+                "envelope is not from the pinned observer host/source"
+            )
 
         self._validate_special_semantics(envelope)
+        pcc_snapshot: PCCCorrelationSnapshotV1 | None = None
+        if envelope.event_type == "pcc_correlation_snapshot":
+            pcc_snapshot = self._validate_pcc_snapshot_local_semantics(
+                envelope
+            )
 
         if accepted is not None:
-            raise EnvelopeConflict(f"valid signed conflict at ({self.root.host_id}, {sequence})")
-        next_fsm = self._authority.fsm.advance(envelope, canonical, self.key_chain)
-        evidence_priority: Literal["routine", "protected"] = (
-            "protected" if envelope.event_type in _PROTECTED_EVENT_TYPES else "routine"
+            raise EnvelopeConflict(
+                "valid signed conflict at "
+                f"({self.root.host_id}, {source_sequence})"
+            )
+        if pcc_snapshot is not None and validate_pcc_authority:
+            self._validate_pcc_snapshot_authority(
+                envelope=envelope,
+                snapshot=pcc_snapshot,
+            )
+        next_fsm = self._authority.fsm.advance(
+            envelope,
+            canonical,
+            self.key_chain,
         )
-        return self._stage(
+        evidence_priority: Literal["routine", "protected"] = (
+            "protected"
+            if envelope.event_type in _PROTECTED_EVENT_TYPES
+            else "routine"
+        )
+        return _AuthenticatedEnvelopeTransition(
             canonical=canonical,
-            content_sha256=digest,
+            content_sha256=content_sha256,
             envelope=envelope,
             evidence_priority=evidence_priority,
             next_fsm=next_fsm,
+            pcc_snapshot=pcc_snapshot,
+        )
+
+    def _recover_deferred_pcc(
+        self,
+        envelope_value: object,
+        *,
+        sequence: int,
+        event_id: str,
+        content_sha256: str,
+        request: PCCCorrelationSnapshotRequestV1,
+        evidence_ref: object,
+        evidence_priority: str,
+        lifecycle: object,
+    ) -> None:
+        authority = self._authority
+        if (
+            lifecycle is not self._bound_lifecycle
+            or self._bound_lifecycle is None
+            or not self._retention_recovery_open
+            or self._retention_recovery_consumed
+            or type(request) is not PCCCorrelationSnapshotRequestV1
+            or evidence_priority != "protected"
+            or self._staged
+            or self._authorizations
+            or authority.generation >= MAX_UINT64
+            or (
+                self._deferred_pcc_recovery
+                and sequence
+                <= self._deferred_pcc_recovery[-1].source_sequence
+            )
+        ):
+            raise VerifierCommitError(
+                "deferred PCC replay is outside recovering verifier authority"
+            )
+        envelope_dict, canonical, digest = self._validated_outer_binding(
+            envelope_value,
+            sequence=sequence,
+            event_id=event_id,
+            content_sha256=content_sha256,
+        )
+        accepted = authority.accepted.get(sequence)
+        transition = self._authenticate_envelope_transition(
+            envelope_dict,
+            canonical=canonical,
+            content_sha256=digest,
+            accepted=accepted,
+            validate_pcc_authority=False,
+        )
+        snapshot = transition.pcc_snapshot
+        if (
+            snapshot is None
+            or transition.envelope.event_type
+            != "pcc_correlation_snapshot"
+            or transition.evidence_priority != "protected"
+        ):
+            raise PCCSnapshotVerificationError(
+                "deferred PCC recovery requires one exact protected snapshot"
+            )
+        self._validate_pcc_request_context(
+            transition.envelope,
+            PCCCorrelationVerificationContext(request=request),
+        )
+        if snapshot.failure_reasons == ("observer_boot_changed",):
+            self._validate_pcc_boot_transition_chain(
+                snapshot=snapshot,
+                envelope=transition.envelope,
+            )
+        if snapshot.trigger.source_sequence in authority.accepted:
+            raise PCCSnapshotVerificationError(
+                "deferred PCC recovery cannot replace a live trigger check"
+            )
+        if (
+            getattr(evidence_ref, "source_sequence", None) != sequence
+            or getattr(evidence_ref, "event_id", None) != event_id
+            or getattr(evidence_ref, "content_sha256", None)
+            != content_sha256
+        ):
+            raise VerifierCommitError(
+                "deferred PCC recovery lacks its exact durable reference"
+            )
+        if self._authority is not authority:
+            raise VerifierCommitError(
+                "verifier authority changed during deferred PCC replay"
+            )
+        binding = _DeferredPCCRecovery(
+            canonical=canonical,
+            content_sha256=digest,
+            event_id=transition.envelope.event_id,
+            evidence_ref=evidence_ref,
+            key_epoch=transition.envelope.key_epoch,
+            key_id=transition.envelope.key_id,
+            request=request.model_copy(deep=True),
+            source_sequence=transition.envelope.source_sequence,
+        )
+        self._authority = _VerifierAuthorityState(
+            fsm=transition.next_fsm,
+            accepted=authority.accepted,
+            generation=authority.generation + 1,
+        )
+        self._deferred_pcc_recovery += (binding,)
+        self._repair_transient_generation += 1
+
+    def verify(
+        self,
+        envelope_value: object,
+        *,
+        sequence: int,
+        event_id: str,
+        content_sha256: str,
+        pcc_context: PCCCorrelationVerificationContext | None = None,
+    ) -> VerifiedEnvelope:
+        envelope_dict, canonical, digest = self._validated_outer_binding(
+            envelope_value,
+            sequence=sequence,
+            event_id=event_id,
+            content_sha256=content_sha256,
+        )
+
+        event_type_value = envelope_dict.get("event_type")
+        pcc_event = event_type_value == "pcc_correlation_snapshot"
+        accepted = self._authority.accepted.get(sequence)
+        if accepted is None or accepted.canonical == canonical:
+            if pcc_event and pcc_context is None:
+                raise PCCSnapshotVerificationError(
+                    "PCC snapshot requires explicit typed verification context"
+                )
+            if not pcc_event and pcc_context is not None:
+                raise PCCSnapshotVerificationError(
+                    "PCC verification context cannot authorize another event type"
+                )
+            if (
+                pcc_context is not None
+                and type(pcc_context) is not PCCCorrelationVerificationContext
+            ):
+                raise PCCSnapshotVerificationError(
+                    "PCC verification context is not exact"
+                )
+
+        if accepted is not None and accepted.canonical == canonical:
+            try:
+                envelope = EventEnvelopeV1.model_validate(
+                    envelope_dict,
+                    strict=True,
+                )
+            except ValidationError as error:
+                raise OuterBindingError(
+                    "accepted retry no longer decodes identically"
+                ) from error
+            if pcc_context is not None:
+                self._validate_pcc_request_context(envelope, pcc_context)
+            return self._stage(
+                canonical=canonical,
+                content_sha256=digest,
+                envelope=envelope,
+                evidence_priority=accepted.evidence_priority,
+                is_retry=True,
+                next_fsm=self._authority.fsm,
+                existing_ref=accepted.evidence_ref,
+            )
+
+        transition = self._authenticate_envelope_transition(
+            envelope_dict,
+            canonical=canonical,
+            content_sha256=digest,
+            accepted=accepted,
+            validate_pcc_authority=True,
+        )
+        if pcc_context is not None:
+            self._validate_pcc_request_context(
+                transition.envelope,
+                pcc_context,
+            )
+        return self._stage(
+            canonical=transition.canonical,
+            content_sha256=transition.content_sha256,
+            envelope=transition.envelope,
+            evidence_priority=transition.evidence_priority,
+            next_fsm=transition.next_fsm,
         )
 
     def _stage(
@@ -1673,7 +2159,18 @@ class EnvelopeVerifier:
     @classmethod
     def _validate_special_semantics(cls, envelope: EventEnvelopeV1) -> None:
         try:
-            if envelope.event_type == "evidence_repair_authorized":
+            if (
+                envelope.normalized_fields.get("schema_version")
+                == "agmind.pcc-correlation-snapshot.v1"
+                and envelope.event_type != "pcc_correlation_snapshot"
+            ):
+                raise ValueError("PCC snapshot schema is bound to its exact event type")
+            if envelope.event_type == "pcc_correlation_snapshot":
+                PCCCorrelationSnapshotV1.model_validate(
+                    envelope.normalized_fields,
+                    strict=True,
+                )
+            elif envelope.event_type == "evidence_repair_authorized":
                 EvidenceRepairAuthorizeV1.model_validate(
                     envelope.normalized_fields,
                     strict=True,
@@ -1804,6 +2301,281 @@ class EnvelopeVerifier:
                     raise ValueError("Falco envelope has an ungrounded release identity")
         except (TypeError, ValueError, ValidationError) as error:
             raise OuterBindingError("event-specific signed semantics are invalid") from error
+
+    @staticmethod
+    def _validate_pcc_request_context(
+        envelope: EventEnvelopeV1,
+        context: PCCCorrelationVerificationContext,
+    ) -> PCCCorrelationSnapshotV1:
+        try:
+            snapshot = PCCCorrelationSnapshotV1.model_validate(
+                envelope.normalized_fields,
+                strict=True,
+            )
+            request = context.request
+            if (
+                pcc_correlation_request_sha256(request) != snapshot.request_sha256
+                or request.trigger_event_id != snapshot.trigger.event_id
+                or request.trigger_content_sha256 != snapshot.trigger.content_sha256
+                or request.trigger_source_sequence != snapshot.trigger.source_sequence
+                or request.requested_ttl_seconds != snapshot.requested_ttl_seconds
+            ):
+                raise PCCSnapshotVerificationError(
+                    "PCC snapshot does not bind the exact typed request"
+                )
+            return snapshot
+        except PCCSnapshotVerificationError:
+            raise
+        except (TypeError, ValueError, ValidationError) as error:
+            raise PCCSnapshotVerificationError(
+                "PCC snapshot request context is invalid"
+            ) from error
+
+    @staticmethod
+    def _pcc_projection_from_accepted_trigger(
+        envelope: EventEnvelopeV1,
+        *,
+        content_sha256: str,
+    ) -> PCCFalcoTriggerProjectionV1:
+        try:
+            if envelope.event_type != "falco_connect":
+                raise ValueError("retained trigger is not falco_connect")
+            falco = FalcoConnectV1.model_validate(
+                envelope.normalized_fields,
+                strict=True,
+            )
+            if not falco.successful_connect or falco.investigation_only:
+                raise ValueError("retained trigger is not candidate-capable")
+            fields: dict[str, object] = {
+                "schema_version": "agmind.pcc-falco-trigger-projection.v1",
+                "event_id": envelope.event_id,
+                "content_sha256": content_sha256,
+                "normalized_fields_sha256": envelope.normalized_fields_sha256,
+                "source_sequence": envelope.source_sequence,
+                "source_id": envelope.source_id,
+                "source_version": envelope.source_version,
+                "host_id": envelope.host_id,
+                "boot_id": envelope.boot_id,
+                "event_time": envelope.event_time,
+                "ingest_time": envelope.ingest_time,
+                "clock_uncertainty_ms": envelope.clock_uncertainty_ms,
+                "inventory_generation": envelope.inventory_generation,
+                "inventory_revision": envelope.inventory_revision,
+                "container_id": envelope.container_id,
+                "container_start_time": envelope.container_start_time,
+                "release_id": envelope.release_id,
+                "detector_rule": falco.detector_rule,
+                "detector_rule_version": falco.detector_rule_version,
+                "falco_version": falco.falco_version,
+                "evt_res": falco.evt_res,
+                "successful_connect": falco.successful_connect,
+                "investigation_only": falco.investigation_only,
+                "image_id": falco.image_id,
+                "repo_digests": falco.repo_digests,
+                "immutable_spec_sha256": falco.immutable_spec_sha256,
+                "proc_name": falco.proc_name,
+                "proc_exe_path": falco.proc_exe_path,
+                "proc_parent_name": falco.proc_parent_name,
+                "destination_ipv4": falco.destination_ipv4,
+                "destination_port": falco.destination_port,
+                "l4_protocol": falco.l4_protocol,
+                "missing_required_fields": falco.missing_required_fields,
+                "coverage_flags": envelope.coverage_flags,
+                "raw_event_sha256": falco.raw_event_sha256,
+            }
+            if falco.evt_rawres is not None:
+                fields["evt_rawres"] = falco.evt_rawres
+            return PCCFalcoTriggerProjectionV1.model_validate(fields, strict=True)
+        except (TypeError, ValueError, ValidationError) as error:
+            raise PCCSnapshotVerificationError(
+                "accepted trigger cannot produce the exact retained projection"
+            ) from error
+
+    def _pcc_boot_transition_chain(
+        self,
+        *,
+        trigger: PCCFalcoTriggerProjectionV1,
+        snapshot_envelope: EventEnvelopeV1,
+    ) -> tuple[PCCBootTransitionHopV1, ...]:
+        chain = tuple(
+            hop
+            for hop in self._authority.fsm.pcc_boot_transition_hops
+            if (
+                trigger.source_sequence
+                < min(
+                    hop.source_sequence,
+                    hop.rotation_companion_source_sequence
+                    or hop.source_sequence,
+                )
+                and max(
+                    hop.source_sequence,
+                    hop.rotation_companion_source_sequence or 0,
+                )
+                < snapshot_envelope.source_sequence
+            )
+        )
+        if (
+            not chain
+            or chain[0].previous_boot_id != trigger.boot_id
+            or chain[-1].boot_id != snapshot_envelope.boot_id
+        ):
+            raise PCCSnapshotVerificationError(
+                "PCC boot-transition chain does not reach the snapshot boot"
+            )
+        return chain
+
+    def _validate_pcc_boot_transition_chain(
+        self,
+        *,
+        snapshot: PCCCorrelationSnapshotV1,
+        envelope: EventEnvelopeV1,
+    ) -> None:
+        if (
+            snapshot.boot_transition_hop_count is None
+            or snapshot.boot_transition_chain_sha256 is None
+        ):
+            raise PCCSnapshotVerificationError(
+                "cross-boot PCC snapshot lacks its exact transition-chain proof"
+            )
+        chain = self._pcc_boot_transition_chain(
+            trigger=snapshot.trigger,
+            snapshot_envelope=envelope,
+        )
+        try:
+            chain_sha256 = pcc_boot_transition_chain_sha256(chain)
+        except (TypeError, ValueError, ValidationError) as error:
+            raise PCCSnapshotVerificationError(
+                "accepted PCC boot-transition chain is invalid"
+            ) from error
+        if (
+            len(chain) != snapshot.boot_transition_hop_count
+            or chain_sha256 != snapshot.boot_transition_chain_sha256
+        ):
+            raise PCCSnapshotVerificationError(
+                "PCC boot-transition proof differs from authenticated evidence"
+            )
+
+    def _validate_pcc_snapshot_local_semantics(
+        self,
+        envelope: EventEnvelopeV1,
+    ) -> PCCCorrelationSnapshotV1:
+        try:
+            snapshot = PCCCorrelationSnapshotV1.model_validate(
+                envelope.normalized_fields,
+                strict=True,
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise PCCSnapshotVerificationError(
+                "PCC snapshot contract is invalid"
+            ) from error
+        trigger = snapshot.trigger
+        if (
+            envelope.source_id != "agmind-observerd"
+            or envelope.event_time != envelope.ingest_time
+            or envelope.event_time != snapshot.decision_time
+            or envelope.redaction_flags
+            or envelope.coverage_flags
+            or envelope.source_payload_hash != envelope.normalized_fields_sha256
+            or snapshot.coverage_through_sequence != envelope.source_sequence - 1
+            or trigger.source_sequence >= envelope.source_sequence
+            or envelope.host_id != trigger.host_id
+        ):
+            raise PCCSnapshotVerificationError(
+                "PCC snapshot envelope metadata is not exact"
+            )
+
+        top_level_identity = {
+            "container_id",
+            "container_start_time",
+            "release_id",
+            "inventory_revision",
+        }
+        if snapshot.outcome == "complete":
+            assert snapshot.docker_container_id is not None
+            assert snapshot.docker_started_at is not None
+            assert snapshot.image_id is not None
+            assert snapshot.immutable_spec_sha256 is not None
+            assert snapshot.inventory_generation is not None
+            assert snapshot.inventory_revision is not None
+            if (
+                not top_level_identity <= envelope.model_fields_set
+                or envelope.container_id != snapshot.docker_container_id
+                or envelope.container_start_time != snapshot.docker_started_at
+                or envelope.release_id
+                != derive_release_id(
+                    snapshot.image_id,
+                    snapshot.immutable_spec_sha256,
+                )
+                or envelope.inventory_generation != snapshot.inventory_generation
+                or envelope.inventory_revision != snapshot.inventory_revision
+            ):
+                raise PCCSnapshotVerificationError(
+                    "complete PCC snapshot is not bound to envelope identity"
+                )
+        elif (
+            top_level_identity & envelope.model_fields_set
+            or envelope.inventory_generation != 0
+        ):
+            raise PCCSnapshotVerificationError(
+                "failed PCC snapshot carries container or inventory authority"
+            )
+
+        cross_boot = snapshot.failure_reasons == ("observer_boot_changed",)
+        if cross_boot:
+            if envelope.boot_id == trigger.boot_id:
+                raise PCCSnapshotVerificationError(
+                    "cross-boot PCC terminal proof did not change boot"
+                )
+        elif envelope.boot_id != trigger.boot_id:
+            raise PCCSnapshotVerificationError(
+                "complete or ordinary failed PCC snapshot changed boot"
+            )
+        return snapshot
+
+    def _validate_pcc_snapshot_authority(
+        self,
+        *,
+        envelope: EventEnvelopeV1,
+        snapshot: PCCCorrelationSnapshotV1,
+    ) -> None:
+        trigger = snapshot.trigger
+        if snapshot.failure_reasons == ("observer_boot_changed",):
+            self._validate_pcc_boot_transition_chain(
+                snapshot=snapshot,
+                envelope=envelope,
+            )
+        accepted = self._authority.accepted.get(trigger.source_sequence)
+        if accepted is None:
+            raise PCCSnapshotVerificationError(
+                "PCC trigger lacks verifier-owned retired-range proof"
+            )
+        accepted_hash = hashlib.sha256(accepted.canonical).hexdigest()
+        try:
+            trigger_envelope = EventEnvelopeV1.model_validate_json(
+                accepted.canonical,
+                strict=True,
+            )
+        except ValidationError as error:
+            raise PCCSnapshotVerificationError(
+                "accepted PCC trigger no longer decodes exactly"
+            ) from error
+        if (
+            accepted.evidence_priority != "routine"
+            or accepted_hash != trigger.content_sha256
+            or trigger_envelope.event_id != trigger.event_id
+            or trigger_envelope.source_sequence != trigger.source_sequence
+        ):
+            raise PCCSnapshotVerificationError(
+                "PCC trigger identity differs from authenticated live evidence"
+            )
+        expected = self._pcc_projection_from_accepted_trigger(
+            trigger_envelope,
+            content_sha256=accepted_hash,
+        )
+        if expected != trigger:
+            raise PCCSnapshotVerificationError(
+                "retained PCC trigger projection differs from exact authenticated trigger"
+            )
 
     def _authorize_append(
         self,
@@ -2583,6 +3355,13 @@ class EnvelopeSimulation:
         ):
             raise EnvelopeIdentityError(
                 "simulated envelope is not from the pinned observer host/source"
+            )
+        if (
+            envelope.event_type == "pcc_correlation_snapshot"
+            and accepted is None
+        ):
+            raise PCCSnapshotVerificationError(
+                "simulated PCC admission requires explicit verification context"
             )
         EnvelopeVerifier._validate_special_semantics(envelope)
 
