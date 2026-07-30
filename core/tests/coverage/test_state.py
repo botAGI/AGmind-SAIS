@@ -352,6 +352,8 @@ def _readiness_context(
         "confirmed_through": head,
         "projection_cursor": head,
         "evidence_healthy": True,
+        "repair_pending": False,
+        "retention_pending": False,
         "key_healthy": True,
         "ack_journal_healthy": True,
         "projection_healthy": True,
@@ -429,6 +431,63 @@ def _generic_critical(
             ).hexdigest(),
         )
     )
+
+
+def test_readiness_pending_flags_require_exact_bool(tmp_path: Path) -> None:
+    coverage = _coverage_module()
+    state, store = _live_ready_state(coverage, tmp_path / "pending-bool")
+    valid = _readiness_context(coverage, 5)
+
+    for field in ("repair_pending", "retention_pending"):
+        for value in (0, 1):
+            with pytest.raises(coverage.CoverageValidationError):
+                _readiness_context(coverage, 5, **{field: value})
+
+            tampered = replace(valid)
+            object.__setattr__(tampered, field, value)
+            with pytest.raises(coverage.CoverageValidationError):
+                state.mutation_readiness(tampered)
+
+    state.close()
+    store.close()
+
+
+def test_readiness_pending_reasons_remain_distinct(
+    tmp_path: Path,
+) -> None:
+    coverage = _coverage_module()
+    state, store = _live_ready_state(coverage, tmp_path / "pending-reasons")
+    valid = _readiness_context(coverage, 5)
+
+    cases = (
+        (
+            {"repair_pending": True},
+            ("repair_pending",),
+        ),
+        (
+            {"retention_pending": True},
+            ("retention_pending",),
+        ),
+        (
+            {"repair_pending": True, "retention_pending": True},
+            ("repair_pending", "retention_pending"),
+        ),
+        (
+            {
+                "evidence_healthy": False,
+                "repair_pending": True,
+                "retention_pending": True,
+            },
+            ("evidence_unhealthy", "repair_pending", "retention_pending"),
+        ),
+    )
+    for changes, expected in cases:
+        result = state.mutation_readiness(replace(valid, **changes))
+        assert not result.ready
+        assert result.reason_codes == expected == tuple(sorted(set(expected)))
+
+    state.close()
+    store.close()
 
 
 def test_readiness_context_health_and_cursor_matrix(tmp_path: Path) -> None:

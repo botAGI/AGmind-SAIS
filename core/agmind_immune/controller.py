@@ -216,6 +216,7 @@ class CoreController:
             or type(status.healthy) is not bool
             or type(status.key_healthy) is not bool
             or type(status.repair_pending) is not bool
+            or type(status.retention_pending) is not bool
             or (
                 status.host_id is not None
                 and type(status.host_id) is not str
@@ -583,7 +584,9 @@ class CoreController:
             acceptance_cursor=evidence.acceptance_cursor,
             confirmed_through=acknowledgements.confirmed_through,
             projection_cursor=projection_cursor,
-            evidence_healthy=evidence.healthy and not evidence.repair_pending,
+            evidence_healthy=evidence.healthy,
+            repair_pending=evidence.repair_pending,
+            retention_pending=evidence.retention_pending,
             key_healthy=evidence.key_healthy,
             ack_journal_healthy=acknowledgements.healthy,
             projection_healthy=projection_healthy,

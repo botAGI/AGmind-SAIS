@@ -331,6 +331,7 @@ class EvidenceStatus:
     acceptance_cursor: int
     key_healthy: bool
     repair_pending: bool = False
+    retention_pending: bool = False
 
 
 def _exact_coverage_ref_key(
@@ -2339,6 +2340,7 @@ class SegmentStore:
         self._retention_commit_uncertain_latched = False
         self._retention_finalization_uncertain_latched = False
         self._retention_state_namespace_uncertain = False
+        self._retention_pending_latched = False
         self._repair_authorization: _RepairAuthorizationBinding | None = None
         self._repair_completion_authorization: (
             _RepairCompletionAuthorizationBinding | None
@@ -2543,12 +2545,55 @@ class SegmentStore:
             and verifier._bound_lifecycle is self._lifecycle_identity
         )
 
+    def _retention_pending_snapshot(self) -> bool:
+        """Return a conservative lock-free snapshot of the retention deny gate."""
+        latched_before = self._retention_pending_latched
+        pending_source = (
+            self._retention_state_binding is not None
+            or self._retention_state_temporary is not None
+            or self._retention_state_namespace_uncertain
+            or self._retention_commit_uncertain_latched
+            or self._retention_finalization_uncertain_latched
+        )
+        latched_after = self._retention_pending_latched
+        return latched_before or pending_source or latched_after
+
+    def _clear_retention_pending_latch(self) -> None:
+        if (
+            self._retention_state_binding is not None
+            or self._retention_state_temporary is not None
+            or self._retention_state_namespace_uncertain
+            or self._retention_commit_uncertain_latched
+            or self._retention_finalization_uncertain_latched
+        ):
+            raise EvidenceSealError(
+                "retention pending latch cannot clear before exact settlement"
+            )
+        self._retention_pending_latched = False
+
     def status(self) -> EvidenceStatus:
+        retention_pending = self._retention_pending_snapshot()
         if self._closed:
-            return EvidenceStatus(False, None, 0, 0, False)
+            return EvidenceStatus(
+                False,
+                None,
+                0,
+                0,
+                False,
+                self._repair_pending,
+                retention_pending,
+            )
         verifier = self._bound_verifier
         if verifier is None:
-            return EvidenceStatus(False, None, 0, 0, False)
+            return EvidenceStatus(
+                False,
+                None,
+                0,
+                0,
+                False,
+                self._repair_pending,
+                retention_pending,
+            )
         fsm = verifier.fsm
         evidence_head = fsm.last_sequence
         holes = fsm.unresolved_holes
@@ -2559,7 +2604,15 @@ class SegmentStore:
             or type(acceptance_cursor) is not int
             or not 0 <= acceptance_cursor <= evidence_head <= MAX_UINT64
         ):
-            return EvidenceStatus(False, None, 0, 0, False)
+            return EvidenceStatus(
+                False,
+                None,
+                0,
+                0,
+                False,
+                self._repair_pending,
+                retention_pending,
+            )
         active = self._active
         active_descriptor = None if active is None else active.descriptor
         base_healthy = (
@@ -2597,6 +2650,7 @@ class SegmentStore:
             acceptance_cursor,
             key_healthy,
             self._repair_pending,
+            retention_pending,
         )
 
     def _require_retention_directory_bindings(self) -> None:
@@ -4655,6 +4709,7 @@ class SegmentStore:
                 self._authenticated_retention_unlink_completion = None
                 self._retention_finalization_uncertain_latched = False
                 self._retention_state_namespace_uncertain = False
+                self._clear_retention_pending_latch()
                 return
         except BaseException as error:
             if mutation_started:
@@ -4926,6 +4981,7 @@ class SegmentStore:
             except BaseException:
                 os.close(old_descriptor)
                 raise
+        self._retention_pending_latched = True
         self._retention_state_namespace_uncertain = True
         try:
             descriptor, identity = _write_temporary_at(
@@ -8028,6 +8084,10 @@ class SegmentStore:
             if retention_state_temporaries
             else None
         )
+        self._retention_pending_latched = (
+            self._retention_state_binding is not None
+            or self._retention_state_temporary is not None
+        )
         self._ack_journal_identity = ack_journal_identity
         self._ack_commitment = ack_commitment
         self._ack_commitment_raw = ack_commitment_raw
@@ -8828,6 +8888,8 @@ class SegmentStore:
             )
         self._retention_state_temporary = None
         self._retention_state_namespace_uncertain = False
+        if self._retention_state_binding is None:
+            self._clear_retention_pending_latch()
 
     def _discard_retention_boundary_temporary(
         self,
@@ -9816,6 +9878,7 @@ class SegmentStore:
         journal._raw = None
         self._retention_state_binding = None
         self._retention_state_authority = None
+        self._clear_retention_pending_latch()
 
     def _retention_state_selected_manifests(
         self,

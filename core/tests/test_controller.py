@@ -217,6 +217,68 @@ def _ready_events() -> tuple[dict[str, object], ...]:
     )
 
 
+@pytest.mark.parametrize(
+    ("pending_changes", "expected_reason"),
+    (
+        pytest.param(
+            {"repair_pending": True},
+            "repair_pending",
+            id="repair-pending",
+        ),
+        pytest.param(
+            {"retention_pending": True},
+            "retention_pending",
+            id="retention-pending",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_controller_maps_evidence_pending_without_collapsing_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_changes: dict[str, bool],
+    expected_reason: str,
+) -> None:
+    acceptance, store, journal, coverage, projection, _ = _authorities(
+        tmp_path / "runtime"
+    )
+    controller = CoreController.create(
+        acceptance,
+        journal,
+        coverage,
+        projection,
+        _Transport([_page(*_ready_events(), reserved=5)], ack_count=5),
+        _Clock(receipts=[None, None, None, None, 100.0]),
+    )
+    try:
+        baseline = (await controller.poll_once()).readiness
+        assert baseline.ready
+        baseline_status = store.status()
+        assert baseline_status.healthy is True
+
+        pending_status = replace(baseline_status, **pending_changes)
+        assert pending_status.healthy is True
+        monkeypatch.setattr(store, "status", lambda: pending_status)
+
+        readiness = controller.mutation_readiness()
+        assert readiness.ready is False
+        assert readiness.reason_codes == (expected_reason,)
+        assert "evidence_unhealthy" not in readiness.reason_codes
+        assert (
+            readiness.evidence_head,
+            readiness.acceptance_cursor,
+            readiness.confirmed_through,
+            readiness.projection_cursor,
+        ) == (
+            baseline.evidence_head,
+            baseline.acceptance_cursor,
+            baseline.confirmed_through,
+            baseline.projection_cursor,
+        )
+    finally:
+        await controller.close()
+
+
 @pytest.mark.asyncio
 async def test_controller_projection_catchup_and_readiness_matrix(
     tmp_path: Path,
@@ -282,7 +344,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
     baseline_evidence = original_evidence_status()
     for changes, reason in (
         ({"healthy": False}, "evidence_unhealthy"),
-        ({"repair_pending": True}, "evidence_unhealthy"),
+        ({"repair_pending": True}, "repair_pending"),
         ({"key_healthy": False}, "key_unhealthy"),
         ({"acceptance_cursor": 4}, "cursor_evidence_acceptance_mismatch"),
     ):

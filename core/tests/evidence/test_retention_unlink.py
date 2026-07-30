@@ -12,7 +12,10 @@ from agmind_immune.evidence import retention as retention_module
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.segments import EvidenceCorrupt, EvidenceSealError
 from agmind_immune.ingest.ack_journal import AckJournal
-from tests.evidence.test_retention import _retention_proof_case
+from tests.evidence.test_retention import (
+    _live_store_with_active_routine,
+    _retention_proof_case,
+)
 
 
 def _issued_case(
@@ -40,6 +43,51 @@ def _completed_case(path: Path) -> tuple[object, object]:
         _factory=segments_module._RETENTION_PROOF_FACTORY,
     )
     return case, completion
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("_retention_state_binding", object()),
+        ("_retention_state_temporary", object()),
+        ("_retention_state_namespace_uncertain", True),
+        ("_retention_commit_uncertain_latched", True),
+        ("_retention_finalization_uncertain_latched", True),
+        ("_retention_pending_latched", True),
+    ),
+)
+def test_retention_status_fails_closed_for_every_pending_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    _key, _acceptance, store, coverage = (
+        _live_store_with_active_routine(tmp_path)
+    )
+    try:
+        baseline = store.status()
+        assert baseline.healthy is True
+        assert baseline.retention_pending is False
+
+        monkeypatch.setattr(store, field, value)
+        pending = store.status()
+        assert pending.healthy is True
+        assert pending.retention_pending is True
+
+        with monkeypatch.context() as unhealthy:
+            unhealthy.setattr(store, "_bound_verifier", None)
+            unbound = store.status()
+            assert unbound.healthy is False
+            assert unbound.retention_pending is True
+        with monkeypatch.context() as closed_status:
+            closed_status.setattr(store, "_closed", True)
+            closed = store.status()
+            assert closed.healthy is False
+            assert closed.retention_pending is True
+    finally:
+        coverage.close()
+        store.close(flush=False)
 
 
 def test_authenticated_retention_unlink_is_ordered_and_payload_only(
@@ -443,6 +491,7 @@ def test_retention_completion_publishes_exact_cache_then_clears_state(
         trace_payload_unlink,
     )
     try:
+        assert case.store.status().retention_pending is True
         lookalike = object.__new__(type(completion))
         with pytest.raises(EvidenceSealError, match="completion|retention|exact"):
             case.store._finalize_authenticated_retention_completion(
@@ -461,6 +510,7 @@ def test_retention_completion_publishes_exact_cache_then_clears_state(
 
         assert not state_path.exists()
         assert cache_path.exists()
+        assert case.store.status().retention_pending is False
         assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
         boundary = retention_module.decode_retention_boundary(
             cache_path.read_bytes()

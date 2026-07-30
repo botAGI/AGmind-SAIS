@@ -71,6 +71,8 @@ class MutationReadinessContext:
     confirmed_through: int
     projection_cursor: int
     evidence_healthy: bool
+    repair_pending: bool
+    retention_pending: bool
     key_healthy: bool
     ack_journal_healthy: bool
     projection_healthy: bool
@@ -104,6 +106,8 @@ def _validate_mutation_readiness_context(
     for value in (
         context.clock_healthy,
         context.evidence_healthy,
+        context.repair_pending,
+        context.retention_pending,
         context.key_healthy,
         context.ack_journal_healthy,
         context.projection_healthy,
@@ -964,6 +968,10 @@ class CoverageState:
             reasons.add("docker_reconcile_missing")
         if not context.evidence_healthy:
             reasons.add("evidence_unhealthy")
+        if context.repair_pending:
+            reasons.add("repair_pending")
+        if context.retention_pending:
+            reasons.add("retention_pending")
         if not context.key_healthy:
             reasons.add("key_unhealthy")
         if snapshot.boot_transition_sequence is None or not snapshot.observer_started:
