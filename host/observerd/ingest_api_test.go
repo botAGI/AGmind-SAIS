@@ -101,6 +101,13 @@ func TestIngestFalcoReplacesUntrustedDockerFieldsWithAuthoritativeIdentity(
 	if err != nil {
 		t.Fatal(err)
 	}
+	expectedReleaseID, err := contracts.ReleaseID(
+		identity.ImageID,
+		identity.ImmutableSpecSHA256,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	got := decodeFalcoEnvelope(t, event)
 	if got.InvestigationOnly ||
 		got.DockerContainerID == nil ||
@@ -123,6 +130,8 @@ func TestIngestFalcoReplacesUntrustedDockerFieldsWithAuthoritativeIdentity(
 		event.InventoryGeneration != identity.InventoryGeneration ||
 		event.InventoryRevision == nil ||
 		*event.InventoryRevision != identity.InventoryRevision ||
+		event.ReleaseID == nil ||
+		*event.ReleaseID != expectedReleaseID ||
 		event.SourcePayloadHash != got.RawEventSHA256 ||
 		len(event.CoverageFlags) != 0 {
 		t.Fatalf("envelope identity=%+v", event)

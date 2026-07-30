@@ -297,6 +297,10 @@ func (service *Service) IngestFalco(
 		imageID := identity.ImageID
 		immutableSpec := identity.ImmutableSpecSHA256
 		revision := identity.InventoryRevision
+		releaseID, err := contracts.ReleaseID(imageID, immutableSpec)
+		if err != nil {
+			return contracts.EventEnvelopeV1{}, err
+		}
 		normalized.DockerContainerID = &fullID
 		normalized.DockerStartedAt = &startedAt
 		normalized.ImageID = &imageID
@@ -308,6 +312,7 @@ func (service *Service) IngestFalco(
 		normalized.InventoryRevision = &revision
 		metadata.ContainerID = &fullID
 		metadata.ContainerStartTime = &startedAt
+		metadata.ReleaseID = &releaseID
 		metadata.InventoryGeneration = identity.InventoryGeneration
 		metadata.InventoryRevision = &revision
 	} else {
