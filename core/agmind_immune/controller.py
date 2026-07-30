@@ -4,26 +4,42 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Literal
 
 from agmind_immune.clock import (
     CoreClockProvider,
     CoreClockSample,
     _validate_core_clock_sample,
 )
-from agmind_immune.contracts import MAX_UINT64
+from agmind_immune.contracts import (
+    MAX_UINT64,
+    RetentionBlockedV1,
+    RetentionTombstoneV2,
+)
 from agmind_immune.coverage import (
     CoverageState,
     MutationReadiness,
     MutationReadinessContext,
 )
 from agmind_immune.evidence.projection import (
+    _RETENTION_REBUILD_FACTORY,
     ProjectionApplyResult,
     ProjectionCursor,
     ProjectionError,
     ProjectionStatus,
     ProjectionStore,
+    RebuildReport,
+)
+from agmind_immune.evidence.retention import (
+    AcceptedRetentionBlocked,
+    RetentionProtocolError,
+    RetentionStateV1,
+    RetentionTargetV1,
+    _open_retention_state_journal,
+    _select_retention_lazily,
 )
 from agmind_immune.evidence.segments import (
+    _RETENTION_PROOF_FACTORY,
     EvidenceRef,
     EvidenceStatus,
     EvidenceStoreError,
@@ -38,14 +54,30 @@ from agmind_immune.ingest.ack_journal import (
 )
 from agmind_immune.ingest.envelope import MAX_PAGE_EVENTS, EnvelopeVerifier
 from agmind_immune.ingest.service import (
+    _RETENTION_DELIVERY_FACTORY,
     AcceptanceCoordinator,
     DeliveryCoordinator,
+    DeliveryRetryableError,
     ObserverCoreTransport,
     PollResult,
 )
 
 _CONTROLLER_FACTORY = object()
 _PROJECTION_BATCH = 100
+
+_RetentionOutcome = Literal[
+    "not_due",
+    "blocked_unchanged",
+    "retry_required",
+    "blocked_reported",
+    "tombstone_completed",
+]
+_RetentionRetryReason = Literal[
+    "pending_ack",
+    "ack_prefix_lag",
+    "observer_retryable",
+]
+_RetentionRequestKind = Literal["tombstone", "blocked"]
 
 
 class CoreControllerError(RuntimeError):
@@ -67,6 +99,27 @@ class CoreControllerClosed(CoreControllerError):
 @dataclass(frozen=True)
 class CorePollResult:
     delivery: PollResult
+    projected: int
+    readiness: MutationReadiness
+
+
+@dataclass(frozen=True, slots=True)
+class _RetentionObservation:
+    outcome: _RetentionOutcome
+    retry_reason: _RetentionRetryReason | None
+    request_kind: _RetentionRequestKind | None
+    request_id: str | None
+    target_sequence: int | None
+    target_event_id: str | None
+    target_content_sha256: str | None
+    unlinked_manifest_count: int
+    unlinked_bytes: int
+    projection_rebuilt: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RetentionExecution:
+    observation: _RetentionObservation
     projected: int
     readiness: MutationReadiness
 
@@ -601,6 +654,392 @@ class CoreController:
     def mutation_readiness(self) -> MutationReadiness:
         self._require_open()
         return self._mutation_readiness()
+
+    async def _execute_retention_locked(
+        self,
+        *,
+        _lock_authority: object,
+    ) -> _RetentionObservation:
+        self._delivery._require_retention_delivery(
+            _factory=_RETENTION_DELIVERY_FACTORY,
+            _lock_authority=_lock_authority,
+        )
+
+        def settled_ack() -> AckJournalSnapshot:
+            snapshot = self._acknowledgements.snapshot()
+            self._validate_ack_snapshot(snapshot)
+            if not snapshot.healthy:
+                raise CoreControllerAuthorityError(
+                    "retention requires one healthy ACK snapshot"
+                )
+            confirmed = snapshot.confirmed
+            if confirmed is not None:
+                ref = self._ref_at(confirmed.sequence)
+                if not self._ack_matches_ref(confirmed, ref):
+                    raise CoreControllerAuthorityError(
+                        "retention ACK differs from authenticated evidence"
+                    )
+            pending = snapshot.pending
+            if pending is not None:
+                ref = self._ref_at(pending.sequence)
+                if (
+                    pending.sequence <= snapshot.confirmed_through
+                    or not self._ack_matches_ref(pending, ref)
+                ):
+                    raise CoreControllerAuthorityError(
+                        "retention pending ACK differs from authenticated evidence"
+                    )
+            return snapshot
+
+        def request_identity(
+            state: RetentionStateV1,
+        ) -> tuple[_RetentionRequestKind, str]:
+            request = state.request
+            if type(request) is RetentionTombstoneV2:
+                return "tombstone", request.tombstone_id
+            if type(request) is RetentionBlockedV1:
+                return "blocked", request.blocked_id
+            raise CoreControllerAuthorityError(
+                "retention state has an inexact request"
+            )
+
+        def target_identity(
+            target: RetentionTargetV1 | EvidenceRef | None,
+        ) -> tuple[int | None, str | None, str | None]:
+            if target is None:
+                return None, None, None
+            if type(target) is RetentionTargetV1:
+                return (
+                    target.sequence,
+                    target.event_id,
+                    target.content_sha256,
+                )
+            if type(target) is EvidenceRef:
+                return (
+                    target.source_sequence,
+                    target.event_id,
+                    target.content_sha256,
+                )
+            raise CoreControllerAuthorityError(
+                "retention target identity is inexact"
+            )
+
+        def state_observation(
+            state: RetentionStateV1,
+            *,
+            outcome: _RetentionOutcome,
+            retry_reason: _RetentionRetryReason | None = None,
+            target_ref: EvidenceRef | None = None,
+            unlinked_manifest_count: int = 0,
+            unlinked_bytes: int = 0,
+            projection_rebuilt: bool = False,
+        ) -> _RetentionObservation:
+            request_kind, request_id = request_identity(state)
+            target: RetentionTargetV1 | EvidenceRef | None = (
+                target_ref if target_ref is not None else state.target
+            )
+            target_sequence, target_event_id, target_content_sha256 = (
+                target_identity(target)
+            )
+            return _RetentionObservation(
+                outcome=outcome,
+                retry_reason=retry_reason,
+                request_kind=request_kind,
+                request_id=request_id,
+                target_sequence=target_sequence,
+                target_event_id=target_event_id,
+                target_content_sha256=target_content_sha256,
+                unlinked_manifest_count=unlinked_manifest_count,
+                unlinked_bytes=unlinked_bytes,
+                projection_rebuilt=projection_rebuilt,
+            )
+
+        initial_ack = settled_ack()
+        if initial_ack.pending is not None:
+            return _RetentionObservation(
+                outcome="retry_required",
+                retry_reason="pending_ack",
+                request_kind=None,
+                request_id=None,
+                target_sequence=None,
+                target_event_id=None,
+                target_content_sha256=None,
+                unlinked_manifest_count=0,
+                unlinked_bytes=0,
+                projection_rebuilt=False,
+            )
+
+        journal = _open_retention_state_journal(self._store)
+        state = journal.state
+        if state is None:
+            snapshot = self._store._freeze_retention_snapshot(
+                self._decision_sample(),
+                _factory=_RETENTION_PROOF_FACTORY,
+            )
+            decision = _select_retention_lazily(snapshot)
+            request = decision.request
+            if request is None:
+                reused = decision.reused_blocked
+                if reused is None:
+                    return _RetentionObservation(
+                        outcome="not_due",
+                        retry_reason=None,
+                        request_kind=None,
+                        request_id=None,
+                        target_sequence=None,
+                        target_event_id=None,
+                        target_content_sha256=None,
+                        unlinked_manifest_count=0,
+                        unlinked_bytes=0,
+                        projection_rebuilt=False,
+                    )
+                if type(reused) is not AcceptedRetentionBlocked:
+                    raise CoreControllerAuthorityError(
+                        "retention reused blocked authority is inexact"
+                    )
+                blocked = reused.request
+                return _RetentionObservation(
+                    outcome="blocked_unchanged",
+                    retry_reason=None,
+                    request_kind="blocked",
+                    request_id=blocked.blocked_id,
+                    target_sequence=reused.sequence,
+                    target_event_id=reused.event_id,
+                    target_content_sha256=reused.content_sha256,
+                    unlinked_manifest_count=0,
+                    unlinked_bytes=0,
+                    projection_rebuilt=False,
+                )
+            journal.prepare_publication(decision)
+            state = journal.state
+            if type(state) is not RetentionStateV1:
+                raise CoreControllerAuthorityError(
+                    "retention selection did not publish exact durable state"
+                )
+        elif type(state) is not RetentionStateV1:
+            raise CoreControllerAuthorityError(
+                "retention journal returned an inexact state"
+            )
+
+        if state.phase not in {
+            "selected",
+            "target_bound",
+            "evidence_appended",
+        }:
+            raise RetentionProtocolError(
+                "durable retention execution phase requires restart recovery"
+            )
+
+        selected_max: int | None = None
+        if state.operation == "tombstone":
+            selected_max = self._store._retention_selected_max_sequence(
+                state
+            )
+            if selected_max >= MAX_UINT64:
+                raise RetentionProtocolError(
+                    "retention selection has no surviving ACK position"
+                )
+            before_delivery = settled_ack()
+            if before_delivery.pending is not None:
+                return state_observation(
+                    state,
+                    outcome="retry_required",
+                    retry_reason="pending_ack",
+                )
+            if before_delivery.confirmed_through < selected_max:
+                return state_observation(
+                    state,
+                    outcome="retry_required",
+                    retry_reason="ack_prefix_lag",
+                )
+
+        delivery_phase = state.phase
+        delivery_status = self._store.status()
+        self._validate_evidence_status(delivery_status)
+        future_observer_path = delivery_phase == "selected" or (
+            delivery_phase == "target_bound"
+            and type(state.target) is RetentionTargetV1
+            and state.target.sequence > delivery_status.evidence_head
+        )
+        try:
+            target_ref = (
+                await self._delivery._deliver_retention_target_locked(
+                    journal,
+                    _factory=_RETENTION_DELIVERY_FACTORY,
+                    _lock_authority=_lock_authority,
+                )
+            )
+        except DeliveryRetryableError:
+            if not future_observer_path:
+                raise
+            retry_ack = settled_ack()
+            journal._assert_consistent()
+            durable_state = journal.state
+            durable_raw = journal._raw
+            if (
+                type(durable_state) is not RetentionStateV1
+                or type(durable_raw) is not bytes
+                or durable_state.phase not in {
+                    "selected",
+                    "target_bound",
+                }
+            ):
+                raise
+            journal._prove_publication(durable_raw)
+            if retry_ack.pending is not None:
+                return state_observation(
+                    durable_state,
+                    outcome="retry_required",
+                    retry_reason="pending_ack",
+                )
+            return state_observation(
+                durable_state,
+                outcome="retry_required",
+                retry_reason="observer_retryable",
+            )
+
+        state = journal.state
+        if (
+            type(state) is not RetentionStateV1
+            or state.phase != "evidence_appended"
+        ):
+            raise CoreControllerAuthorityError(
+                "retention delivery did not publish exact evidence authority"
+            )
+        request_kind, _request_id = request_identity(state)
+        if request_kind == "blocked":
+            self._delivery._clear_retention_blocked_locked(
+                journal,
+                target_ref,
+                _factory=_RETENTION_DELIVERY_FACTORY,
+                _lock_authority=_lock_authority,
+            )
+            return state_observation(
+                state,
+                outcome="blocked_reported",
+                target_ref=target_ref,
+            )
+
+        if selected_max is None:
+            raise CoreControllerAuthorityError(
+                "tombstone retention lost its selected range"
+            )
+        surviving_ack = settled_ack()
+        if surviving_ack.pending is not None:
+            return state_observation(
+                state,
+                outcome="retry_required",
+                retry_reason="pending_ack",
+                target_ref=target_ref,
+            )
+        if surviving_ack.confirmed_through < selected_max + 1:
+            return state_observation(
+                state,
+                outcome="retry_required",
+                retry_reason="ack_prefix_lag",
+                target_ref=target_ref,
+            )
+
+        final_snapshot = self._store._freeze_retention_snapshot(
+            self._decision_sample(),
+            _factory=_RETENTION_PROOF_FACTORY,
+        )
+        proof = self._store._authenticate_retention_tombstone(
+            journal,
+            final_snapshot,
+            target_ref,
+            _factory=_RETENTION_PROOF_FACTORY,
+        )
+        completion = self._store._execute_authenticated_retention_unlink(
+            proof,
+            _factory=_RETENTION_PROOF_FACTORY,
+        )
+        try:
+            rebuild = (
+                self._projection
+                ._rebuild_after_authenticated_retention(
+                    completion,
+                    _factory=_RETENTION_REBUILD_FACTORY,
+                )
+            )
+            if type(rebuild) is not RebuildReport:
+                raise CoreControllerAuthorityError(
+                    "retention projection rebuild result is inexact"
+                )
+            rebuilt_ack = settled_ack()
+            rebuilt_status = self._projection.status()
+            rebuilt_cursor, rebuilt_terminal = self._projection_boundary(
+                rebuilt_ack,
+                rebuilt_status,
+            )
+            rebuilt_confirmed = rebuilt_ack.confirmed
+            if (
+                rebuilt_ack != surviving_ack
+                or rebuilt_confirmed is None
+                or rebuilt_terminal is None
+                or rebuilt_cursor != rebuilt_confirmed.sequence
+                or rebuilt_status.cursor != rebuild.cursor
+                or rebuild.cursor is None
+                or not self._cursor_matches_ref(
+                    rebuild.cursor,
+                    rebuilt_terminal,
+                )
+                or not self._projection._is_bound_to(
+                    self._store,
+                    self._acknowledgements,
+                )
+            ):
+                raise CoreControllerAuthorityError(
+                    "retention projection rebuild lost exact ACK authority"
+                )
+        except BaseException:
+            self._latch_projection_failure()
+            raise
+        self._store._finalize_authenticated_retention_completion(
+            completion,
+            _factory=_RETENTION_PROOF_FACTORY,
+        )
+        request = state.request
+        if type(request) is not RetentionTombstoneV2:
+            raise CoreControllerAuthorityError(
+                "completed retention request is not an exact tombstone"
+            )
+        return state_observation(
+            state,
+            outcome="tombstone_completed",
+            target_ref=target_ref,
+            unlinked_manifest_count=len(
+                request.removed_manifest_hashes
+            ),
+            unlinked_bytes=request.removed_bytes,
+            projection_rebuilt=True,
+        )
+
+    async def _run_retention_once(self) -> _RetentionExecution:
+        async with self._lock:
+            self._require_open()
+            projected = self._catch_up_projection()
+            if not self._projection_healthy:
+                raise CoreControllerAuthorityError(
+                    "retention requires complete projection catch-up"
+                )
+            async with self._delivery._retention_preflight_scope(
+                _factory=_RETENTION_DELIVERY_FACTORY,
+            ) as lock_authority:
+                observation = await self._execute_retention_locked(
+                    _lock_authority=lock_authority,
+                )
+            projected += self._catch_up_projection()
+            if not self._projection_healthy:
+                raise CoreControllerAuthorityError(
+                    "retention projection catch-up failed"
+                )
+            readiness = self._mutation_readiness()
+            return _RetentionExecution(
+                observation=observation,
+                projected=projected,
+                readiness=readiness,
+            )
 
     async def poll_once(self, *, limit: int = MAX_PAGE_EVENTS) -> CorePollResult:
         if (
