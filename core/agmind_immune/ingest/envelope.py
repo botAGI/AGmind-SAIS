@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import re
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, Never, SupportsIndex, final
+from typing import Any, Literal, Never, Self, SupportsIndex, final
 
 from cryptography.exceptions import InvalidSignature
 from pydantic import Field, ValidationError, field_validator, model_validator
@@ -999,6 +999,341 @@ class VerifiedEnvelope:
     @property
     def source_sequence(self) -> int:
         return self._source_sequence
+
+
+class AuthenticatedFalcoInput:
+    """Immutable post-commit authority for one exact Falco observation."""
+
+    _boot_id: str
+    _canonical: bytes
+    _content_sha256: str
+    _coverage_flags: tuple[str, ...]
+    _event_id: str
+    _event_time: str
+    _evidence_ref: object
+    _falco_canonical: bytes
+    _host_id: str
+    _ingest_time: str
+    _source_sequence: int
+
+    __slots__ = (
+        "__weakref__",
+        "_boot_id",
+        "_canonical",
+        "_content_sha256",
+        "_coverage_flags",
+        "_event_id",
+        "_event_time",
+        "_evidence_ref",
+        "_falco_canonical",
+        "_host_id",
+        "_ingest_time",
+        "_source_sequence",
+    )
+
+    def __new__(cls, *args: object, **kwargs: object) -> Self:
+        del cls, args, kwargs
+        raise TypeError(
+            "AuthenticatedFalcoInput has no public constructor; "
+            "use committed verifier/store authority"
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("AuthenticatedFalcoInput is immutable")
+
+    @property
+    def boot_id(self) -> str:
+        return self._boot_id
+
+    @property
+    def canonical(self) -> bytes:
+        return self._canonical
+
+    @property
+    def content_sha256(self) -> str:
+        return self._content_sha256
+
+    @property
+    def coverage_flags(self) -> tuple[str, ...]:
+        return self._coverage_flags
+
+    @property
+    def event_id(self) -> str:
+        return self._event_id
+
+    @property
+    def event_time(self) -> str:
+        return self._event_time
+
+    @property
+    def event_type(self) -> Literal["falco_connect"]:
+        return "falco_connect"
+
+    @property
+    def evidence_ref(self) -> object:
+        return self._evidence_ref
+
+    @property
+    def falco(self) -> FalcoConnectV1:
+        return FalcoConnectV1.model_validate_json(
+            self._falco_canonical,
+            strict=True,
+        )
+
+    @property
+    def host_id(self) -> str:
+        return self._host_id
+
+    @property
+    def ingest_time(self) -> str:
+        return self._ingest_time
+
+    @property
+    def source_sequence(self) -> int:
+        return self._source_sequence
+
+
+class AuthenticatedPCCInput:
+    """Immutable post-commit correlation authority for one exact PCC record."""
+
+    _boot_id: str
+    _canonical: bytes
+    _content_sha256: str
+    _event_id: str
+    _event_type: Literal["pcc_correlation_snapshot"]
+    _evidence_ref: object
+    _host_id: str
+    _request: PCCCorrelationSnapshotRequestV1
+    _snapshot: PCCCorrelationSnapshotV1
+    _source_sequence: int
+
+    __slots__ = (
+        "__weakref__",
+        "_boot_id",
+        "_canonical",
+        "_content_sha256",
+        "_event_id",
+        "_event_type",
+        "_evidence_ref",
+        "_host_id",
+        "_request",
+        "_snapshot",
+        "_source_sequence",
+    )
+
+    def __new__(cls, *args: object, **kwargs: object) -> Self:
+        del cls, args, kwargs
+        raise TypeError(
+            "AuthenticatedPCCInput has no public constructor; "
+            "use committed verifier/store authority"
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("AuthenticatedPCCInput is immutable")
+
+    @property
+    def boot_id(self) -> str:
+        return self._boot_id
+
+    @property
+    def canonical(self) -> bytes:
+        return self._canonical
+
+    @property
+    def content_sha256(self) -> str:
+        return self._content_sha256
+
+    @property
+    def event_id(self) -> str:
+        return self._event_id
+
+    @property
+    def event_type(self) -> Literal["pcc_correlation_snapshot"]:
+        return "pcc_correlation_snapshot"
+
+    @property
+    def evidence_ref(self) -> object:
+        return self._evidence_ref
+
+    @property
+    def host_id(self) -> str:
+        return self._host_id
+
+    @property
+    def request(self) -> PCCCorrelationSnapshotRequestV1:
+        return self._request
+
+    @property
+    def snapshot(self) -> PCCCorrelationSnapshotV1:
+        return self._snapshot
+
+    @property
+    def source_sequence(self) -> int:
+        return self._source_sequence
+
+
+@dataclass(frozen=True)
+class _AuthenticatedFalcoFacts:
+    canonical: bytes
+    content_sha256: str
+    envelope: EventEnvelopeV1
+    evidence_ref: object
+    falco: FalcoConnectV1
+
+
+@dataclass(frozen=True)
+class _AuthenticatedPCCFacts:
+    canonical: bytes
+    content_sha256: str
+    envelope: EventEnvelopeV1
+    evidence_ref: object
+    request: PCCCorrelationSnapshotRequestV1
+    snapshot: PCCCorrelationSnapshotV1
+
+
+def _authenticated_input_issuers() -> tuple[
+    Callable[[object, object, object], AuthenticatedFalcoInput],
+    Callable[
+        [object, object, PCCCorrelationSnapshotRequestV1, object],
+        AuthenticatedPCCInput,
+    ],
+    Callable[[object], bool],
+    Callable[[object], bool],
+]:
+    issued_falco: weakref.WeakSet[AuthenticatedFalcoInput] = weakref.WeakSet()
+    issued_pcc: weakref.WeakSet[AuthenticatedPCCInput] = weakref.WeakSet()
+
+    def issue_falco(
+        verifier: object,
+        evidence_ref: object,
+        lifecycle: object,
+    ) -> AuthenticatedFalcoInput:
+        if type(verifier) is not EnvelopeVerifier:
+            raise VerifierCommitError(
+                "Falco authority requires the exact live envelope verifier"
+            )
+        facts = EnvelopeVerifier._derive_authenticated_falco_facts(
+            verifier,
+            evidence_ref,
+            lifecycle,
+        )
+        capability: AuthenticatedFalcoInput = object.__new__(
+            AuthenticatedFalcoInput
+        )
+        object.__setattr__(capability, "_boot_id", facts.envelope.boot_id)
+        object.__setattr__(capability, "_canonical", facts.canonical)
+        object.__setattr__(
+            capability,
+            "_content_sha256",
+            facts.content_sha256,
+        )
+        object.__setattr__(
+            capability,
+            "_coverage_flags",
+            tuple(facts.envelope.coverage_flags),
+        )
+        object.__setattr__(capability, "_event_id", facts.envelope.event_id)
+        object.__setattr__(
+            capability,
+            "_event_time",
+            facts.envelope.event_time,
+        )
+        object.__setattr__(capability, "_evidence_ref", facts.evidence_ref)
+        object.__setattr__(
+            capability,
+            "_falco_canonical",
+            canonical_json(facts.falco),
+        )
+        object.__setattr__(capability, "_host_id", facts.envelope.host_id)
+        object.__setattr__(
+            capability,
+            "_ingest_time",
+            facts.envelope.ingest_time,
+        )
+        object.__setattr__(
+            capability,
+            "_source_sequence",
+            facts.envelope.source_sequence,
+        )
+        issued_falco.add(capability)
+        return capability
+
+    def issue_pcc(
+        verifier: object,
+        evidence_ref: object,
+        request: PCCCorrelationSnapshotRequestV1,
+        lifecycle: object,
+    ) -> AuthenticatedPCCInput:
+        if type(verifier) is not EnvelopeVerifier:
+            raise VerifierCommitError(
+                "PCC authority requires the exact live envelope verifier"
+            )
+        facts = EnvelopeVerifier._derive_authenticated_pcc_facts(
+            verifier,
+            evidence_ref,
+            request,
+            lifecycle,
+        )
+        capability: AuthenticatedPCCInput = object.__new__(
+            AuthenticatedPCCInput
+        )
+        object.__setattr__(capability, "_boot_id", facts.envelope.boot_id)
+        object.__setattr__(capability, "_canonical", facts.canonical)
+        object.__setattr__(
+            capability,
+            "_content_sha256",
+            facts.content_sha256,
+        )
+        object.__setattr__(capability, "_event_id", facts.envelope.event_id)
+        object.__setattr__(
+            capability,
+            "_event_type",
+            facts.envelope.event_type,
+        )
+        object.__setattr__(capability, "_evidence_ref", facts.evidence_ref)
+        object.__setattr__(capability, "_host_id", facts.envelope.host_id)
+        object.__setattr__(
+            capability,
+            "_request",
+            facts.request.model_copy(deep=True),
+        )
+        object.__setattr__(
+            capability,
+            "_snapshot",
+            facts.snapshot.model_copy(deep=True),
+        )
+        object.__setattr__(
+            capability,
+            "_source_sequence",
+            facts.envelope.source_sequence,
+        )
+        issued_pcc.add(capability)
+        return capability
+
+    def falco_is_issued(value: object) -> bool:
+        return (
+            type(value) is AuthenticatedFalcoInput
+            and value in issued_falco
+        )
+
+    def pcc_is_issued(value: object) -> bool:
+        return (
+            type(value) is AuthenticatedPCCInput
+            and value in issued_pcc
+        )
+
+    return issue_falco, issue_pcc, falco_is_issued, pcc_is_issued
+
+
+(
+    _issue_authenticated_falco_input_from_verifier,
+    _issue_authenticated_pcc_input_from_verifier,
+    authenticated_falco_input_is_issued,
+    authenticated_pcc_input_is_issued,
+) = _authenticated_input_issuers()
+del _authenticated_input_issuers
 
 
 @dataclass(frozen=True)
@@ -3187,6 +3522,178 @@ class EnvelopeVerifier:
                 "live verifier changed during historical retention replay"
             )
         return result
+
+    def _derive_authenticated_falco_facts(
+        self,
+        evidence_ref: object,
+        lifecycle: object,
+    ) -> _AuthenticatedFalcoFacts:
+        """Re-derive one exact Falco input from committed verifier authority."""
+        sequence = getattr(evidence_ref, "source_sequence", None)
+        accepted = (
+            None
+            if type(sequence) is not int
+            else self._authority.accepted.get(sequence)
+        )
+        if (
+            lifecycle is not self._bound_lifecycle
+            or self._bound_lifecycle is None
+            or self._retention_recovery_open
+            or not self._retention_recovery_consumed
+            or self._deferred_pcc_recovery
+            or self._provisional_retention_omissions
+            or self._staged
+            or self._authorizations
+            or accepted is None
+            or accepted.evidence_priority != "routine"
+            or accepted.evidence_ref != evidence_ref
+        ):
+            raise VerifierCommitError(
+                "Falco input lacks exact committed verifier authority"
+            )
+        try:
+            envelope = EventEnvelopeV1.model_validate_json(
+                accepted.canonical,
+                strict=True,
+            )
+            falco = FalcoConnectV1.model_validate(
+                envelope.normalized_fields,
+                strict=True,
+            )
+            self._validate_special_semantics(envelope)
+        except (OuterBindingError, ValidationError) as error:
+            raise VerifierCommitError(
+                "committed Falco input no longer validates exactly"
+            ) from error
+        content_sha256 = hashlib.sha256(accepted.canonical).hexdigest()
+        if (
+            accepted.canonical != canonical_json(envelope)
+            or envelope.event_type != "falco_connect"
+            or envelope.key_epoch != accepted.key_epoch
+            or envelope.key_id != accepted.key_id
+            or falco.event_time != envelope.event_time
+            or envelope.normalized_fields_sha256
+            != hashlib.sha256(canonical_json(falco)).hexdigest()
+            or canonical_json(envelope.normalized_fields)
+            != canonical_json(falco)
+            or getattr(evidence_ref, "source_sequence", None)
+            != envelope.source_sequence
+            or getattr(evidence_ref, "event_id", None)
+            != envelope.event_id
+            or getattr(evidence_ref, "content_sha256", None)
+            != content_sha256
+        ):
+            raise VerifierCommitError(
+                "committed Falco input changed accepted identity"
+            )
+        return _AuthenticatedFalcoFacts(
+            canonical=accepted.canonical,
+            content_sha256=content_sha256,
+            envelope=envelope,
+            evidence_ref=accepted.evidence_ref,
+            falco=falco,
+        )
+
+    def _issue_authenticated_falco_input(
+        self,
+        evidence_ref: object,
+        lifecycle: object,
+    ) -> AuthenticatedFalcoInput:
+        """Issue one exact Falco capability from live durable authority."""
+        return _issue_authenticated_falco_input_from_verifier(
+            self,
+            evidence_ref,
+            lifecycle,
+        )
+
+    def _derive_authenticated_pcc_facts(
+        self,
+        evidence_ref: object,
+        request: PCCCorrelationSnapshotRequestV1,
+        lifecycle: object,
+    ) -> _AuthenticatedPCCFacts:
+        """Re-derive one exact PCC input from committed verifier authority."""
+        sequence = getattr(evidence_ref, "source_sequence", None)
+        accepted = (
+            None
+            if type(sequence) is not int
+            else self._authority.accepted.get(sequence)
+        )
+        if (
+            lifecycle is not self._bound_lifecycle
+            or self._bound_lifecycle is None
+            or self._retention_recovery_open
+            or not self._retention_recovery_consumed
+            or self._deferred_pcc_recovery
+            or self._provisional_retention_omissions
+            or self._staged
+            or self._authorizations
+            or type(request) is not PCCCorrelationSnapshotRequestV1
+            or accepted is None
+            or accepted.evidence_priority != "protected"
+            or accepted.evidence_ref != evidence_ref
+        ):
+            raise VerifierCommitError(
+                "PCC correlation input lacks exact committed verifier authority"
+            )
+        try:
+            envelope = EventEnvelopeV1.model_validate_json(
+                accepted.canonical,
+                strict=True,
+            )
+            snapshot = self._validate_pcc_snapshot_local_semantics(
+                envelope
+            )
+            self._validate_pcc_request_context(
+                envelope,
+                PCCCorrelationVerificationContext(request=request),
+            )
+        except (
+            OuterBindingError,
+            PCCSnapshotVerificationError,
+            ValidationError,
+        ) as error:
+            raise VerifierCommitError(
+                "committed PCC correlation input no longer validates exactly"
+            ) from error
+        content_sha256 = hashlib.sha256(accepted.canonical).hexdigest()
+        if (
+            accepted.canonical != canonical_json(envelope)
+            or envelope.event_type != "pcc_correlation_snapshot"
+            or envelope.key_epoch != accepted.key_epoch
+            or envelope.key_id != accepted.key_id
+            or getattr(evidence_ref, "source_sequence", None)
+            != envelope.source_sequence
+            or getattr(evidence_ref, "event_id", None)
+            != envelope.event_id
+            or getattr(evidence_ref, "content_sha256", None)
+            != content_sha256
+        ):
+            raise VerifierCommitError(
+                "committed PCC correlation input changed accepted identity"
+            )
+        return _AuthenticatedPCCFacts(
+            canonical=accepted.canonical,
+            content_sha256=content_sha256,
+            envelope=envelope,
+            evidence_ref=accepted.evidence_ref,
+            request=request,
+            snapshot=snapshot,
+        )
+
+    def _issue_authenticated_pcc_input(
+        self,
+        evidence_ref: object,
+        request: PCCCorrelationSnapshotRequestV1,
+        lifecycle: object,
+    ) -> AuthenticatedPCCInput:
+        """Issue one exact PCC capability from live durable authority."""
+        return _issue_authenticated_pcc_input_from_verifier(
+            self,
+            evidence_ref,
+            request,
+            lifecycle,
+        )
 
     def accepted_ref(self, source_sequence: int) -> object | None:
         accepted = self._authority.accepted.get(source_sequence)

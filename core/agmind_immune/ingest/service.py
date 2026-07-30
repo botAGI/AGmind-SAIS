@@ -44,6 +44,8 @@ from agmind_immune.ingest.envelope import (
     MAX_CORE_EVENT_RESPONSE_BYTES,
     MAX_EVENTS_PAGE_BYTES,
     MAX_PAGE_EVENTS,
+    AuthenticatedFalcoInput,
+    AuthenticatedPCCInput,
     CoreEventsPageV1,
     CoreEventV1,
     EnvelopeConflict,
@@ -176,6 +178,62 @@ class AcceptanceCoordinator:
             item,
             pcc_context=PCCCorrelationVerificationContext(request=request),
         )
+
+    def authenticated_pcc_input(
+        self,
+        ref: EvidenceRef,
+        request: PCCCorrelationSnapshotRequestV1,
+    ) -> AuthenticatedPCCInput:
+        """Export one already-committed PCC as immutable correlation authority."""
+        if (
+            type(ref) is not EvidenceRef
+            or type(request) is not PCCCorrelationSnapshotRequestV1
+        ):
+            raise TypeError(
+                "PCC correlation authority requires exact ref and request contracts"
+            )
+        status = self._segment_store.status()
+        if self._repair_mode or (
+            type(status) is EvidenceStatus
+            and status.repair_pending is True
+        ):
+            raise DeliveryFatalError(
+                "repair-resumed evidence cannot issue correlation authority"
+            )
+        return self._segment_store._authenticated_pcc_input(
+            self._verifier,
+            ref,
+            request,
+        )
+
+    def authenticated_falco_input(
+        self,
+        ref: EvidenceRef,
+    ) -> AuthenticatedFalcoInput:
+        """Export one already-committed Falco event as immutable authority."""
+        if type(ref) is not EvidenceRef:
+            raise TypeError("Falco authority requires an exact evidence ref")
+        status = self._segment_store.status()
+        if self._repair_mode or (
+            type(status) is EvidenceStatus
+            and status.repair_pending is True
+        ):
+            raise DeliveryFatalError(
+                "repair-resumed evidence cannot issue Falco authority"
+            )
+        return self._segment_store._authenticated_falco_input(
+            self._verifier,
+            ref,
+        )
+
+    def accept_pcc_for_correlation(
+        self,
+        item: CoreEventV1,
+        request: PCCCorrelationSnapshotRequestV1,
+    ) -> AuthenticatedPCCInput:
+        """Durably accept one PCC and return its post-commit capability."""
+        ref = self.accept_pcc(item, request)
+        return self.authenticated_pcc_input(ref, request)
 
     def _accept_for_repair(
         self,

@@ -73,6 +73,8 @@ from agmind_immune.evidence.repair import (
     decode_repair_state,
 )
 from agmind_immune.ingest.envelope import (
+    AuthenticatedFalcoInput,
+    AuthenticatedPCCInput,
     EnvelopeVerifier,
     IngestVerificationError,
     PCCCorrelationVerificationContext,
@@ -6371,6 +6373,74 @@ class SegmentStore:
             accepted_at=record.accepted_at,
             ref=record.ref,
         )
+
+    def _authenticated_pcc_input(
+        self,
+        verifier: EnvelopeVerifier,
+        ref: EvidenceRef,
+        request: PCCCorrelationSnapshotRequestV1,
+    ) -> AuthenticatedPCCInput:
+        if (
+            self._closed
+            or self._authority_state != "ready"
+            or self._bound_verifier is not verifier
+            or type(ref) is not EvidenceRef
+            or type(request) is not PCCCorrelationSnapshotRequestV1
+        ):
+            raise EvidenceSealError(
+                "PCC correlation input requires exact recovered store authority"
+            )
+        record = self.resolve_authenticated_ref(ref)
+        if (
+            record.priority is not EvidencePriority.PROTECTED
+            or record.envelope.get("event_type")
+            != "pcc_correlation_snapshot"
+        ):
+            raise EvidenceSealError(
+                "PCC correlation input does not name protected PCC evidence"
+            )
+        try:
+            return verifier._issue_authenticated_pcc_input(
+                record.ref,
+                request,
+                self._lifecycle_identity,
+            )
+        except VerifierCommitError as error:
+            raise EvidenceSealError(
+                "PCC correlation input lacks committed verifier authority"
+            ) from error
+
+    def _authenticated_falco_input(
+        self,
+        verifier: EnvelopeVerifier,
+        ref: EvidenceRef,
+    ) -> AuthenticatedFalcoInput:
+        if (
+            self._closed
+            or self._authority_state != "ready"
+            or self._bound_verifier is not verifier
+            or type(ref) is not EvidenceRef
+        ):
+            raise EvidenceSealError(
+                "Falco input requires exact recovered store authority"
+            )
+        record = self.resolve_authenticated_ref(ref)
+        if (
+            record.priority is not EvidencePriority.ROUTINE
+            or record.envelope.get("event_type") != "falco_connect"
+        ):
+            raise EvidenceSealError(
+                "Falco input does not name routine Falco evidence"
+            )
+        try:
+            return verifier._issue_authenticated_falco_input(
+                record.ref,
+                self._lifecycle_identity,
+            )
+        except VerifierCommitError as error:
+            raise EvidenceSealError(
+                "Falco input lacks committed verifier authority"
+            ) from error
 
     def iter_authenticated_records(
         self,

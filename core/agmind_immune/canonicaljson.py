@@ -354,6 +354,12 @@ def release_id(image_id: str, immutable_spec_sha256: str) -> str:
     return "rel_" + hashlib.sha256(preimage).hexdigest()[:32]
 
 
+def incident_id(primary_event_id: str) -> str:
+    preimage = b"AGMIND_INCIDENT_ID_V1\0"
+    preimage += _ascii(primary_event_id, "primary_event_id")
+    return "inc_" + hashlib.sha256(preimage).hexdigest()
+
+
 def candidate_id(
     event_id_value: str,
     docker_container_id: str,

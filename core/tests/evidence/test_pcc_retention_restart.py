@@ -227,6 +227,14 @@ def test_retired_pcc_trigger_restarts_without_fabricated_trigger(
             case.item,
             case.request,
         ) == case.ref
+        capability = recovered.authenticated_pcc_input(
+            case.ref,
+            case.request,
+        )
+        assert capability.evidence_ref == case.ref
+        assert capability.snapshot.trigger.source_sequence == (
+            case.trigger_ref.source_sequence
+        )
         assert all(
             record.ref.source_sequence
             != case.trigger_ref.source_sequence
