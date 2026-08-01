@@ -71,6 +71,12 @@ func TestC2AObserverStateV3MigratesToEmptyReceiptAnchor(t *testing.T) {
 	delete(fields, "control_receipt_count")
 	delete(fields, "control_receipt_bytes")
 	delete(fields, "control_receipt_head_sha256")
+	delete(fields, "pcc_boundary_count")
+	delete(fields, "pcc_boundary_bytes")
+	delete(fields, "pcc_boundary_head_sha256")
+	delete(fields, "pcc_receipt_count")
+	delete(fields, "pcc_receipt_bytes")
+	delete(fields, "pcc_receipt_head_sha256")
 	legacyRaw, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)

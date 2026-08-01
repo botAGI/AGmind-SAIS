@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"os"
@@ -413,6 +414,390 @@ func TestRotationBoundaryRoutesAndSameBootFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRotationPCCArchiveRecordsOnlyCompleteBoundaryPairs(t *testing.T) {
+	oldKey := testKey(t, 222)
+	newKey := testKey(t, 223)
+	transitionFixture, _ := pccArchiveRotationPair(
+		t,
+		oldKey,
+		newKey,
+		testBootID2,
+		testBootID2,
+		10,
+		[]string{"boot_transition", "key_rotation"},
+		[]string{"key_rotation"},
+	)
+	transition, err := pccDecodeTransition(transitionFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPrivateHash := sha256.Sum256(newKey)
+	marker := rotationMarker{
+		SchemaVersion:      "agmind.observer-key-rotation.v1",
+		HostID:             testHostID,
+		Stage:              "prepared",
+		NewPrivateSHA256:   hex.EncodeToString(newPrivateHash[:]),
+		TransitionSequence: 2,
+		StartSequence:      3,
+		Transition:         transition,
+	}
+	keyring := pccArchiveKeyring(t, oldKey, newKey)
+	keyring.metadataEpoch = marker.Transition.OldEpoch
+
+	t.Run("B", func(t *testing.T) {
+		root := t.TempDir()
+		_, initialSpool, initialSigner := openSignerFixture(
+			t,
+			root,
+			testBootID,
+			oldKey,
+		)
+		if _, err := initialSigner.Wrap(
+			context.Background(),
+			"observer_start",
+			map[string]any{"kind": "observer_start"},
+			metadata(),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := initialSpool.Close(); err != nil {
+			t.Fatal(err)
+		}
+		state, err := OpenStateStore(
+			filepath.Join(root, "observer-state.json"),
+			StateIdentity{
+				HostID:   testHostID,
+				BootID:   testBootID2,
+				KeyID:    marker.Transition.OldKeyID,
+				KeyEpoch: marker.Transition.OldEpoch,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spool, err := NewSpool(
+			SpoolConfig{
+				StateDir:             root,
+				MaxBytes:             4 * 1024 * 1024,
+				PriorityReserveBytes: 1024 * 1024,
+				rotation:             &marker,
+			},
+			state,
+			keyring,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer spool.Close()
+		items, err := spool.Fetch(0, 100, 4*1024*1024)
+		if err != nil || len(items) != 1 {
+			t.Fatalf("pre-rotation items=%d err=%v", len(items), err)
+		}
+		if err := spool.Ack(
+			items[0].Sequence,
+			items[0].EventID,
+			items[0].ContentSHA256,
+		); err != nil {
+			t.Fatal(err)
+		}
+		state.publicationMutex.Lock()
+		publicationLocked := true
+		defer func() {
+			if publicationLocked {
+				state.publicationMutex.Unlock()
+			}
+		}()
+		oldSigner, err := NewEnvelopeSigner(
+			SignerConfig{
+				HostID:        testHostID,
+				BootID:        testBootID2,
+				KeyEpoch:      1,
+				SourceID:      "agmind-observerd",
+				SourceVersion: "0.1.0",
+				Now:           time.Now,
+			},
+			state,
+			spool,
+			oldKey,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitionFields, err := transitionMap(marker.Transition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitionMetadata, err := rotationMetadata(
+			time.Now(),
+			transitionFields,
+			"boot_transition",
+			"key_rotation",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitionEvent, err := oldSigner.wrapAuthorizedRotationLocked(
+			context.Background(),
+			marker,
+			rotationTransitionPublication,
+			"observer_key_transition",
+			transitionFields,
+			transitionMetadata,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Snapshot().PCCBoundaryCount != 0 {
+			t.Fatal("B transition alone entered PCC archive")
+		}
+		transitionContentHash := pccEnvelopeContentHash(t, transitionEvent)
+		ackAttempted := make(chan struct{})
+		ackDone := make(chan error, 1)
+		go func() {
+			close(ackAttempted)
+			ackDone <- spool.Ack(
+				transitionEvent.SourceSequence,
+				transitionEvent.EventID,
+				transitionContentHash,
+			)
+		}()
+		<-ackAttempted
+		select {
+		case err := <-ackDone:
+			t.Fatalf("ACK crossed incomplete B pair: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		ordinaryAttempted := make(chan struct{})
+		ordinaryDone := make(chan error, 1)
+		go func() {
+			close(ordinaryAttempted)
+			_, err := oldSigner.Wrap(
+				context.Background(),
+				"observer_start",
+				map[string]any{"kind": "intervening"},
+				metadata(),
+			)
+			ordinaryDone <- err
+		}()
+		<-ordinaryAttempted
+		select {
+		case err := <-ordinaryDone:
+			t.Fatalf("ordinary event crossed incomplete B pair: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		newSigner := &EnvelopeSigner{
+			config: SignerConfig{
+				HostID:        testHostID,
+				BootID:        testBootID2,
+				KeyEpoch:      2,
+				SourceID:      "agmind-observerd",
+				SourceVersion: "0.1.0",
+				Now:           time.Now,
+			},
+			state:      state,
+			spool:      spool,
+			privateKey: append(ed25519.PrivateKey(nil), newKey...),
+			keyID:      marker.Transition.NewKeyID,
+		}
+		startFields := map[string]any{
+			"kind":      "observer_key_epoch_start",
+			"key_id":    marker.Transition.NewKeyID,
+			"key_epoch": marker.Transition.NewEpoch,
+		}
+		startMetadata, err := rotationMetadata(
+			time.Now(),
+			startFields,
+			"key_rotation",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		startEvent, err := newSigner.wrapAuthorizedRotationLocked(
+			context.Background(),
+			marker,
+			rotationEpochStartPublication,
+			"observer_key_epoch_start",
+			startFields,
+			startMetadata,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.publicationMutex.Unlock()
+		publicationLocked = false
+		if err := <-ackDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-ordinaryDone; err == nil {
+			t.Fatal("ordinary old-epoch publication succeeded after B pair")
+		}
+		chain, err := spool.boundaryArchive.Chain(testBootID, testBootID2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chain) != 1 ||
+			chain[0].EventID != transitionEvent.EventID ||
+			chain[0].RotationCompanionEventID == nil ||
+			*chain[0].RotationCompanionEventID != startEvent.EventID {
+			t.Fatalf("B archive chain=%+v", chain)
+		}
+		if state.Snapshot().LastSequence != marker.StartSequence {
+			t.Fatalf("intervening event consumed B adjacency: %+v", state.Snapshot())
+		}
+	})
+
+	t.Run("C", func(t *testing.T) {
+		root := t.TempDir()
+		state, spool, oldSigner := openSignerFixture(
+			t,
+			root,
+			testBootID,
+			oldKey,
+		)
+		if _, err := oldSigner.Wrap(
+			context.Background(),
+			"observer_start",
+			map[string]any{"kind": "observer_start"},
+			metadata(),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+		spool, err := NewSpool(
+			SpoolConfig{
+				StateDir:             root,
+				MaxBytes:             4 * 1024 * 1024,
+				PriorityReserveBytes: 1024 * 1024,
+				rotation:             &marker,
+			},
+			state,
+			keyring,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldSigner, err = NewEnvelopeSigner(
+			SignerConfig{
+				HostID:        testHostID,
+				BootID:        testBootID,
+				KeyEpoch:      1,
+				SourceID:      "agmind-observerd",
+				SourceVersion: "0.1.0",
+				Now:           time.Now,
+			},
+			state,
+			spool,
+			oldKey,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitionFields, err := transitionMap(marker.Transition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitionMetadata, err := rotationMetadata(
+			time.Now(),
+			transitionFields,
+			"key_rotation",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitionEvent, err := oldSigner.wrapAuthorizedRotation(
+			context.Background(),
+			marker,
+			rotationTransitionPublication,
+			"observer_key_transition",
+			transitionFields,
+			transitionMetadata,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+		state, err = OpenStateStore(
+			filepath.Join(root, "observer-state.json"),
+			StateIdentity{
+				HostID:   testHostID,
+				BootID:   testBootID2,
+				KeyID:    marker.Transition.OldKeyID,
+				KeyEpoch: marker.Transition.OldEpoch,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spool, err = NewSpool(
+			SpoolConfig{
+				StateDir:             root,
+				MaxBytes:             4 * 1024 * 1024,
+				PriorityReserveBytes: 1024 * 1024,
+				rotation:             &marker,
+			},
+			state,
+			keyring,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer spool.Close()
+		newSigner := &EnvelopeSigner{
+			config: SignerConfig{
+				HostID:        testHostID,
+				BootID:        testBootID2,
+				KeyEpoch:      2,
+				SourceID:      "agmind-observerd",
+				SourceVersion: "0.1.0",
+				Now:           time.Now,
+			},
+			state:      state,
+			spool:      spool,
+			privateKey: append(ed25519.PrivateKey(nil), newKey...),
+			keyID:      marker.Transition.NewKeyID,
+		}
+		startFields := map[string]any{
+			"kind":      "observer_key_epoch_start",
+			"key_id":    marker.Transition.NewKeyID,
+			"key_epoch": marker.Transition.NewEpoch,
+		}
+		startMetadata, err := rotationMetadata(
+			time.Now(),
+			startFields,
+			"boot_transition",
+			"key_rotation",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		startEvent, err := newSigner.wrapAuthorizedRotation(
+			context.Background(),
+			marker,
+			rotationEpochStartPublication,
+			"observer_key_epoch_start",
+			startFields,
+			startMetadata,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chain, err := spool.boundaryArchive.Chain(testBootID, testBootID2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chain) != 1 ||
+			chain[0].EventID != startEvent.EventID ||
+			chain[0].RotationCompanionEventID == nil ||
+			*chain[0].RotationCompanionEventID != transitionEvent.EventID {
+			t.Fatalf("C archive chain=%+v", chain)
+		}
+	})
 }
 
 func TestRotationCandidateRemainsInactiveUntilExactStartIsDurable(

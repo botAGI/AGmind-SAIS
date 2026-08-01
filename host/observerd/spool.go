@@ -81,6 +81,7 @@ type Spool struct {
 	ackBytes            uint64
 	ackJournal          *durablefile.Journal
 	controlReceipts     *ControlReceiptJournal
+	boundaryArchive     *PCCBoundaryArchive
 	controlReceiptBytes uint64
 	closed              bool
 	remove              func(string, durablefile.FileIdentity) error
@@ -399,6 +400,7 @@ func eventAllowedByState(
 func recoverPendingDedicatedBootBoundary(
 	items map[uint64]SpoolItem,
 	state *StateStore,
+	archive *PCCBoundaryArchive,
 ) error {
 	snapshot := state.Snapshot()
 	if snapshot.BootBoundaryState != bootBoundaryPending {
@@ -439,6 +441,12 @@ func recoverPendingDedicatedBootBoundary(
 		!dedicatedBootBoundaryMatchesState(event, snapshot) {
 		return ErrSpoolCorrupt
 	}
+	if archive == nil {
+		return ErrPCCJournalCorrupt
+	}
+	if err := archive.RecordCommittedBoundary(event, nil); err != nil {
+		return err
+	}
 	return state.commitPendingBootBoundary(event)
 }
 
@@ -472,6 +480,7 @@ func recoverRotationPublication(
 	state *StateStore,
 	keys *Keyring,
 	rotation *rotationMarker,
+	archive *PCCBoundaryArchive,
 ) error {
 	if rotation == nil {
 		return nil
@@ -554,6 +563,26 @@ func recoverRotationPublication(
 				mode,
 			) {
 			return ErrSpoolCorrupt
+		}
+		archiveMode := rotationArchiveModeForState(snapshot, authorization)
+		if archive == nil {
+			return ErrPCCJournalCorrupt
+		}
+		switch archiveMode {
+		case rotationBoundaryB:
+			if err := archive.RecordCommittedBoundary(
+				transition,
+				&start,
+			); err != nil {
+				return err
+			}
+		case rotationBoundaryC:
+			if err := archive.RecordCommittedBoundary(
+				start,
+				&transition,
+			); err != nil {
+				return err
+			}
 		}
 		return state.commitRotationPublication(start, authorization)
 	}
@@ -1241,7 +1270,9 @@ func NewSpool(
 		case string(RoutineTier),
 			string(PriorityTier),
 			"publications",
-			"control-receipts.agf":
+			"control-receipts.agf",
+			"pcc-boundaries.agf",
+			"pcc-receipts.agf":
 		case "acked.agf":
 			ackExists = true
 		default:
@@ -1501,18 +1532,38 @@ func NewSpool(
 		_ = state.PersistReadOnly("observer_publication_recovery_failed")
 		return nil, err
 	}
+	boundaryArchive, err := OpenPCCBoundaryArchive(
+		config.StateDir,
+		state,
+		keys,
+	)
+	if err != nil {
+		_ = state.PersistReadOnly("observer_pcc_boundary_archive_corrupt")
+		return nil, err
+	}
+	archiveOwned := false
+	defer func() {
+		if !archiveOwned {
+			_ = boundaryArchive.Close()
+		}
+	}()
 	if err := recoverRotationPublication(
 		items,
 		state,
 		keys,
 		config.rotation,
+		boundaryArchive,
 	); err != nil {
 		_ = state.PersistReadOnly(
 			"observer_rotation_publication_recovery_failed",
 		)
 		return nil, err
 	}
-	if err := recoverPendingDedicatedBootBoundary(items, state); err != nil {
+	if err := recoverPendingDedicatedBootBoundary(
+		items,
+		state,
+		boundaryArchive,
+	); err != nil {
 		_ = state.PersistReadOnly(
 			"observer_boot_boundary_recovery_failed",
 		)
@@ -1592,6 +1643,7 @@ func NewSpool(
 		ackBytes:            ackBytes,
 		ackJournal:          ackJournal,
 		controlReceipts:     controlReceipts,
+		boundaryArchive:     boundaryArchive,
 		controlReceiptBytes: controlReceiptBytes,
 		remove:              durablefile.RemoveIfIdentity,
 		removePublication:   durablefile.RemoveIfIdentity,
@@ -1606,6 +1658,7 @@ func NewSpool(
 		_ = state.PersistReadOnly("observer_spool_acked_cleanup_failed")
 		return nil, err
 	}
+	archiveOwned = true
 	return spool, nil
 }
 
@@ -2774,13 +2827,17 @@ func removeIdentityDurably(
 	return retryErr
 }
 
-// Ack durably binds sequence, event ID, and canonical-content SHA-256 before
-// deleting any standalone spool file.
+// Ack serializes with publication so a protected boundary cannot be deleted
+// after its event append but before its authenticated archive anchor commits.
+// It then durably binds sequence, event ID, and canonical-content SHA-256
+// before deleting any standalone spool file.
 func (spool *Spool) Ack(
 	sequence uint64,
 	eventID string,
 	contentSHA256 string,
 ) error {
+	spool.state.publicationMutex.Lock()
+	defer spool.state.publicationMutex.Unlock()
 	spool.mutex.Lock()
 	defer spool.mutex.Unlock()
 	if spool.closed {
@@ -2935,5 +2992,9 @@ func (spool *Spool) Close() error {
 	if spool.ackJournal != nil {
 		ackErr = spool.ackJournal.Close()
 	}
-	return errors.Join(receiptErr, ackErr)
+	var archiveErr error
+	if spool.boundaryArchive != nil {
+		archiveErr = spool.boundaryArchive.Close()
+	}
+	return errors.Join(receiptErr, ackErr, archiveErr)
 }

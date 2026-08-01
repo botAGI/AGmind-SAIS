@@ -27,15 +27,19 @@ import (
 const observerStateSchemaV1 = "agmind.observer-state.v1"
 const observerStateSchemaV2 = "agmind.observer-state.v2"
 const observerStateSchemaV3 = "agmind.observer-state.v3"
-const observerStateSchema = "agmind.observer-state.v4"
+const observerStateSchemaV4 = "agmind.observer-state.v4"
+const observerStateSchema = "agmind.observer-state.v5"
 const sequenceGapProtocolC8 = "proof_carrying_containment_c8"
 const sequenceGapProtocolLegacyUnproven = "legacy_unproven"
 const zeroPublicationHash = "0000000000000000000000000000000000000000000000000000000000000000"
 const zeroControlReceiptHash = "0000000000000000000000000000000000000000000000000000000000000000"
+const zeroPCCJournalHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
 const (
 	controlReceiptMaxCount uint64 = 4_096
 	controlReceiptMaxBytes uint64 = 64 * 1024 * 1024
+	pccReceiptMaxCount     uint64 = 4_096
+	pccReceiptMaxBytes     uint64 = 16 * 1024 * 1024
 )
 
 const (
@@ -86,8 +90,93 @@ type ObserverState struct {
 	ControlReceiptCount     uint64               `json:"control_receipt_count"`
 	ControlReceiptBytes     uint64               `json:"control_receipt_bytes"`
 	ControlReceiptHeadHash  string               `json:"control_receipt_head_sha256"`
+	PCCBoundaryCount        uint64               `json:"pcc_boundary_count"`
+	PCCBoundaryBytes        uint64               `json:"pcc_boundary_bytes"`
+	PCCBoundaryHeadHash     string               `json:"pcc_boundary_head_sha256"`
+	PCCReceiptCount         uint64               `json:"pcc_receipt_count"`
+	PCCReceiptBytes         uint64               `json:"pcc_receipt_bytes"`
+	PCCReceiptHeadHash      string               `json:"pcc_receipt_head_sha256"`
 	BootBoundaryState       string               `json:"boot_boundary_state"`
 	PendingBootBoundary     *PendingBootBoundary `json:"pending_boot_boundary,omitempty"`
+}
+
+// observerStateV4 is the exact pre-PCC-journal state contract. Migration is
+// legal only when neither fixed PCC journal path exists.
+type observerStateV4 struct {
+	SchemaVersion           string               `json:"schema_version"`
+	HostID                  string               `json:"host_id"`
+	BootID                  string               `json:"boot_id"`
+	KeyID                   string               `json:"key_id"`
+	KeyEpoch                uint64               `json:"key_epoch"`
+	LastSequence            uint64               `json:"last_sequence"`
+	MutationReadOnly        bool                 `json:"mutation_read_only"`
+	ReadOnlyReason          string               `json:"read_only_reason"`
+	ReconcileRequired       bool                 `json:"reconcile_required"`
+	RoutineDropped          uint64               `json:"routine_dropped"`
+	DropEventPending        bool                 `json:"drop_event_pending"`
+	AckSequence             uint64               `json:"ack_sequence"`
+	AckEventID              string               `json:"ack_event_id"`
+	AckContentSHA256        string               `json:"ack_content_sha256"`
+	AckRecordHash           string               `json:"ack_record_hash"`
+	AckPayloadSHA256        string               `json:"ack_payload_sha256"`
+	LastCoveredGapEnd       uint64               `json:"last_covered_gap_end"`
+	SequenceGapProtocol     string               `json:"sequence_gap_protocol"`
+	BootHistory             []BootBoundary       `json:"boot_history,omitempty"`
+	AckRepairPending        bool                 `json:"ack_repair_pending"`
+	AckRepairReason         string               `json:"ack_repair_reason"`
+	PublicationBaseSequence uint64               `json:"publication_base_sequence"`
+	PublicationBaseHash     string               `json:"publication_base_hash"`
+	PublicationHeadSequence uint64               `json:"publication_head_sequence"`
+	PublicationHeadHash     string               `json:"publication_head_hash"`
+	ControlReceiptCount     uint64               `json:"control_receipt_count"`
+	ControlReceiptBytes     uint64               `json:"control_receipt_bytes"`
+	ControlReceiptHeadHash  string               `json:"control_receipt_head_sha256"`
+	BootBoundaryState       string               `json:"boot_boundary_state"`
+	PendingBootBoundary     *PendingBootBoundary `json:"pending_boot_boundary,omitempty"`
+}
+
+func observerStateFromV4(legacy observerStateV4) ObserverState {
+	return ObserverState{
+		SchemaVersion:           observerStateSchema,
+		HostID:                  legacy.HostID,
+		BootID:                  legacy.BootID,
+		KeyID:                   legacy.KeyID,
+		KeyEpoch:                legacy.KeyEpoch,
+		LastSequence:            legacy.LastSequence,
+		MutationReadOnly:        legacy.MutationReadOnly,
+		ReadOnlyReason:          legacy.ReadOnlyReason,
+		ReconcileRequired:       legacy.ReconcileRequired,
+		RoutineDropped:          legacy.RoutineDropped,
+		DropEventPending:        legacy.DropEventPending,
+		AckSequence:             legacy.AckSequence,
+		AckEventID:              legacy.AckEventID,
+		AckContentSHA256:        legacy.AckContentSHA256,
+		AckRecordHash:           legacy.AckRecordHash,
+		AckPayloadSHA256:        legacy.AckPayloadSHA256,
+		LastCoveredGapEnd:       legacy.LastCoveredGapEnd,
+		SequenceGapProtocol:     legacy.SequenceGapProtocol,
+		BootHistory:             append([]BootBoundary(nil), legacy.BootHistory...),
+		AckRepairPending:        legacy.AckRepairPending,
+		AckRepairReason:         legacy.AckRepairReason,
+		PublicationBaseSequence: legacy.PublicationBaseSequence,
+		PublicationBaseHash:     legacy.PublicationBaseHash,
+		PublicationHeadSequence: legacy.PublicationHeadSequence,
+		PublicationHeadHash:     legacy.PublicationHeadHash,
+		ControlReceiptCount:     legacy.ControlReceiptCount,
+		ControlReceiptBytes:     legacy.ControlReceiptBytes,
+		ControlReceiptHeadHash:  legacy.ControlReceiptHeadHash,
+		PCCBoundaryHeadHash:     zeroPCCJournalHash,
+		PCCReceiptHeadHash:      zeroPCCJournalHash,
+		BootBoundaryState:       legacy.BootBoundaryState,
+		PendingBootBoundary:     legacy.PendingBootBoundary,
+	}
+}
+
+func (legacy observerStateV4) Validate() error {
+	if legacy.SchemaVersion != observerStateSchemaV4 {
+		return fmt.Errorf("invalid V4 observer state")
+	}
+	return observerStateFromV4(legacy).Validate()
 }
 
 // observerStateV3 is the pre-control-receipt state contract. C2A is a
@@ -152,6 +241,8 @@ func observerStateFromV3(legacy observerStateV3) ObserverState {
 		PublicationHeadSequence: legacy.PublicationHeadSequence,
 		PublicationHeadHash:     legacy.PublicationHeadHash,
 		ControlReceiptHeadHash:  zeroControlReceiptHash,
+		PCCBoundaryHeadHash:     zeroPCCJournalHash,
+		PCCReceiptHeadHash:      zeroPCCJournalHash,
 		BootBoundaryState:       legacy.BootBoundaryState,
 		PendingBootBoundary:     legacy.PendingBootBoundary,
 	}
@@ -223,6 +314,8 @@ func observerStateFromV2(legacy observerStateV2) ObserverState {
 		PublicationHeadSequence: legacy.PublicationHeadSequence,
 		PublicationHeadHash:     legacy.PublicationHeadHash,
 		ControlReceiptHeadHash:  zeroControlReceiptHash,
+		PCCBoundaryHeadHash:     zeroPCCJournalHash,
+		PCCReceiptHeadHash:      zeroPCCJournalHash,
 		BootBoundaryState:       legacy.BootBoundaryState,
 		PendingBootBoundary:     legacy.PendingBootBoundary,
 	}
@@ -305,6 +398,8 @@ func observerStateFromV1(legacy observerStateV1) ObserverState {
 		PublicationHeadSequence: legacy.PublicationHeadSequence,
 		PublicationHeadHash:     legacy.PublicationHeadHash,
 		ControlReceiptHeadHash:  zeroControlReceiptHash,
+		PCCBoundaryHeadHash:     zeroPCCJournalHash,
+		PCCReceiptHeadHash:      zeroPCCJournalHash,
 	}
 }
 
@@ -392,6 +487,18 @@ func decodeObserverState(raw []byte) (ObserverState, bool, error) {
 			65_536,
 		)
 		return state, false, err
+	case observerStateSchemaV4:
+		legacy, err := contracts.DecodeStrict[observerStateV4](
+			bytes.NewReader(raw),
+			65_536,
+		)
+		if err != nil {
+			return ObserverState{}, false, err
+		}
+		if err := legacy.Validate(); err != nil {
+			return ObserverState{}, false, err
+		}
+		return observerStateFromV4(legacy), true, nil
 	case observerStateSchemaV3:
 		legacy, err := contracts.DecodeStrict[observerStateV3](
 			bytes.NewReader(raw),
@@ -489,6 +596,55 @@ func requireControlReceiptMigrationBoundary(
 	}
 }
 
+func requireLegacyPCCJournalsAbsent(statePath string) error {
+	spoolRoot := filepath.Join(filepath.Dir(statePath), "spool")
+	info, err := os.Lstat(spoolRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.Join(ErrPCCJournalCorrupt, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.Join(
+			ErrPCCJournalCorrupt,
+			durablefile.ErrUnsafePath,
+		)
+	}
+	if err := durablefile.EnsurePrivateDirectory(spoolRoot); err != nil {
+		return errors.Join(ErrPCCJournalCorrupt, err)
+	}
+	for _, name := range []string{
+		"pcc-boundaries.agf",
+		"pcc-receipts.agf",
+	} {
+		_, err := os.Lstat(filepath.Join(spoolRoot, name))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return errors.Join(ErrPCCJournalCorrupt, err)
+		}
+		return ErrPCCJournalCorrupt
+	}
+	return nil
+}
+
+func requirePCCMigrationBoundary(
+	statePath string,
+	sourceSchema string,
+) error {
+	switch sourceSchema {
+	case observerStateSchemaV1,
+		observerStateSchemaV2,
+		observerStateSchemaV3,
+		observerStateSchemaV4:
+		return requireLegacyPCCJournalsAbsent(statePath)
+	default:
+		return nil
+	}
+}
+
 var (
 	uuid4Pattern = regexp.MustCompile(
 		`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
@@ -568,6 +724,24 @@ func (state ObserverState) Validate() error {
 		(state.ControlReceiptCount == 0) !=
 			(state.ControlReceiptHeadHash == zeroControlReceiptHash) {
 		return fmt.Errorf("invalid control receipt anchor")
+	}
+	if !validPCCJournalAnchor(
+		state.PCCBoundaryCount,
+		state.PCCBoundaryBytes,
+		state.PCCBoundaryHeadHash,
+		pccBoundaryArchiveMaxCount,
+		pccBoundaryArchiveMaxBytes,
+	) {
+		return fmt.Errorf("invalid PCC boundary archive anchor")
+	}
+	if !validPCCJournalAnchor(
+		state.PCCReceiptCount,
+		state.PCCReceiptBytes,
+		state.PCCReceiptHeadHash,
+		pccReceiptMaxCount,
+		pccReceiptMaxBytes,
+	) {
+		return fmt.Errorf("invalid PCC receipt anchor")
 	}
 	if len(state.BootHistory) == 0 ||
 		len(state.BootHistory) > 1_024 ||
@@ -659,6 +833,20 @@ func (state ObserverState) Validate() error {
 	return nil
 }
 
+func validPCCJournalAnchor(
+	count uint64,
+	bytes uint64,
+	headHash string,
+	maxCount uint64,
+	maxBytes uint64,
+) bool {
+	return hex64Pattern.MatchString(headHash) &&
+		count <= maxCount &&
+		bytes <= maxBytes &&
+		(count == 0) == (bytes == 0) &&
+		(count == 0) == (headHash == zeroPCCJournalHash)
+}
+
 func isBootBoundaryEventType(eventType string) bool {
 	switch eventType {
 	case "observer_boot_boundary",
@@ -731,6 +919,8 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 		PublicationBaseHash:    zeroPublicationHash,
 		PublicationHeadHash:    zeroPublicationHash,
 		ControlReceiptHeadHash: zeroControlReceiptHash,
+		PCCBoundaryHeadHash:    zeroPCCJournalHash,
+		PCCReceiptHeadHash:     zeroPCCJournalHash,
 		BootHistory: []BootBoundary{{
 			BootID:        identity.BootID,
 			FirstSequence: 1,
@@ -771,6 +961,9 @@ func OpenStateStore(path string, identity StateIdentity) (*StateStore, error) {
 		path,
 		sourceSchema,
 	); err != nil {
+		return nil, err
+	}
+	if err := requirePCCMigrationBoundary(path, sourceSchema); err != nil {
 		return nil, err
 	}
 	needsPersist := migrated
@@ -1282,6 +1475,32 @@ func (store *StateStore) recoverControlReceipt(
 	return store.replaceLocked(next)
 }
 
+func (store *StateStore) anchorPCCBoundary(
+	expected PCCBoundaryArchiveAnchor,
+	nextAnchor PCCBoundaryArchiveAnchor,
+) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.state.MutationReadOnly ||
+		store.state.PCCBoundaryCount != expected.Count ||
+		store.state.PCCBoundaryBytes != expected.Bytes ||
+		store.state.PCCBoundaryHeadHash != expected.HeadHash ||
+		expected.Count >= pccBoundaryArchiveMaxCount ||
+		nextAnchor.Count != expected.Count+1 ||
+		nextAnchor.Bytes <= expected.Bytes ||
+		nextAnchor.Count > pccBoundaryArchiveMaxCount ||
+		nextAnchor.Bytes > pccBoundaryArchiveMaxBytes ||
+		!hex64Pattern.MatchString(nextAnchor.HeadHash) ||
+		nextAnchor.HeadHash == zeroPCCJournalHash {
+		return fmt.Errorf("invalid PCC boundary archive head transition")
+	}
+	next := cloneObserverState(store.state)
+	next.PCCBoundaryCount = nextAnchor.Count
+	next.PCCBoundaryBytes = nextAnchor.Bytes
+	next.PCCBoundaryHeadHash = nextAnchor.HeadHash
+	return store.replaceLocked(next)
+}
+
 func (store *StateStore) switchKey(newKeyID string, newEpoch uint64) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -1698,6 +1917,7 @@ func (signer *EnvelopeSigner) Wrap(
 		eventType,
 		normalizedFields,
 		metadata,
+		false,
 	)
 }
 
@@ -1715,6 +1935,7 @@ func (signer *EnvelopeSigner) wrapAuthorizedBootBoundary(
 		eventType,
 		normalizedFields,
 		metadata,
+		false,
 	)
 }
 
@@ -1737,6 +1958,32 @@ func (signer *EnvelopeSigner) wrapAuthorizedRotation(
 		eventType,
 		normalizedFields,
 		metadata,
+		false,
+	)
+}
+
+// wrapAuthorizedRotationLocked publishes while its caller retains the
+// publication mutex across the complete transition/epoch-start pair.
+func (signer *EnvelopeSigner) wrapAuthorizedRotationLocked(
+	ctx context.Context,
+	marker rotationMarker,
+	role rotationPublicationRole,
+	eventType string,
+	normalizedFields map[string]any,
+	metadata EventMetadata,
+) (contracts.EventEnvelopeV1, error) {
+	authorization := rotationPublicationAuthorization{
+		marker: marker,
+		role:   role,
+	}
+	return signer.wrap(
+		ctx,
+		noBootBoundaryPublication,
+		&authorization,
+		eventType,
+		normalizedFields,
+		metadata,
+		true,
 	)
 }
 
@@ -1747,14 +1994,17 @@ func (signer *EnvelopeSigner) wrap(
 	eventType string,
 	normalizedFields map[string]any,
 	metadata EventMetadata,
+	publicationAlreadyLocked bool,
 ) (contracts.EventEnvelopeV1, error) {
 	select {
 	case <-ctx.Done():
 		return contracts.EventEnvelopeV1{}, ctx.Err()
 	default:
 	}
-	signer.state.publicationMutex.Lock()
-	locked := true
+	locked := !publicationAlreadyLocked
+	if locked {
+		signer.state.publicationMutex.Lock()
+	}
 	defer func() {
 		if locked {
 			signer.state.publicationMutex.Unlock()
@@ -1917,6 +2167,12 @@ func (signer *EnvelopeSigner) wrap(
 	if appendErr != nil {
 		err := appendErr
 		if errors.Is(err, ErrRoutineQuota) {
+			if publicationAlreadyLocked {
+				// The only lock-aware caller publishes priority rotation
+				// records, so routine quota is unreachable without a caller
+				// contract violation.
+				return contracts.EventEnvelopeV1{}, err
+			}
 			locked = false
 			signer.state.publicationMutex.Unlock()
 			return contracts.EventEnvelopeV1{}, routineQuotaError(
@@ -1925,6 +2181,36 @@ func (signer *EnvelopeSigner) wrap(
 			)
 		}
 		return contracts.EventEnvelopeV1{}, err
+	}
+	if signer.spool.boundaryArchive == nil {
+		return contracts.EventEnvelopeV1{}, ErrPCCJournalCorrupt
+	}
+	if authorization == observerBootBoundaryPublication {
+		if err := signer.spool.boundaryArchive.RecordCommittedBoundary(
+			event,
+			nil,
+		); err != nil {
+			return contracts.EventEnvelopeV1{}, err
+		}
+	}
+	if rotationAuthorization != nil &&
+		rotationAuthorization.role == rotationEpochStartPublication {
+		switch rotationArchiveModeForState(snapshot, *rotationAuthorization) {
+		case rotationBoundaryB:
+			if err := signer.spool.boundaryArchive.RecordCommittedBoundary(
+				rotationAuthorization.transitionBinding.event,
+				&event,
+			); err != nil {
+				return contracts.EventEnvelopeV1{}, err
+			}
+		case rotationBoundaryC:
+			if err := signer.spool.boundaryArchive.RecordCommittedBoundary(
+				event,
+				&rotationAuthorization.transitionBinding.event,
+			); err != nil {
+				return contracts.EventEnvelopeV1{}, err
+			}
+		}
 	}
 	if boundaryPending {
 		var commitErr error
@@ -1955,6 +2241,7 @@ var (
 	ErrRootRequired           = errors.New("root privileges required")
 	ErrStateLocked            = errors.New("observer state is locked")
 	ErrInjectedRotationStop   = errors.New("injected rotation stop")
+	ErrPCCJournalCorrupt      = errors.New("PCC journal corrupt")
 	ErrBootBoundaryPending    = errors.New("observer boot boundary publication pending")
 	ErrBootBoundaryNotPending = errors.New(
 		"observer boot boundary publication is not pending",
@@ -2437,6 +2724,9 @@ func loadObserverState(path string) (ObserverState, error) {
 		); err != nil {
 			return ObserverState{}, err
 		}
+		if err := requirePCCMigrationBoundary(path, sourceSchema); err != nil {
+			return ObserverState{}, err
+		}
 		if err := persistState(path, state); err != nil {
 			return ObserverState{}, err
 		}
@@ -2535,6 +2825,33 @@ func rotationEpochStartMode(
 			event: transition,
 		},
 	})
+}
+
+func rotationArchiveModeForState(
+	state ObserverState,
+	authorization rotationPublicationAuthorization,
+) rotationBoundaryMode {
+	mode := rotationModeForState(state, authorization)
+	if mode != rotationBoundarySameBoot ||
+		authorization.role != rotationEpochStartPublication ||
+		authorization.transitionBinding == nil ||
+		len(state.BootHistory) == 0 {
+		return mode
+	}
+	transition := authorization.transitionBinding.event
+	last := state.BootHistory[len(state.BootHistory)-1]
+	if last.BoundaryEventType == "observer_key_transition" &&
+		last.BoundaryEventID == transition.EventID &&
+		last.BootID == transition.BootID &&
+		last.FirstSequence == transition.SourceSequence &&
+		exactFlags(
+			transition.CoverageFlags,
+			"boot_transition",
+			"key_rotation",
+		) {
+		return rotationBoundaryB
+	}
+	return mode
 }
 
 func rotationCoverageFlags(
@@ -3327,6 +3644,13 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		return err
 	}
 	defer spool.Close()
+	state.publicationMutex.Lock()
+	rotationPublicationLocked := true
+	defer func() {
+		if rotationPublicationLocked {
+			state.publicationMutex.Unlock()
+		}
+	}()
 	transitionFields, err := transitionMap(marker.Transition)
 	if err != nil {
 		return err
@@ -3392,7 +3716,7 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		if err != nil {
 			return err
 		}
-		transitionEvent, err = signer.wrapAuthorizedRotation(
+		transitionEvent, err = signer.wrapAuthorizedRotationLocked(
 			context.Background(),
 			marker,
 			rotationTransitionPublication,
@@ -3490,7 +3814,7 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		if err != nil {
 			return err
 		}
-		startEvent, err = startSigner.wrapAuthorizedRotation(
+		startEvent, err = startSigner.wrapAuthorizedRotationLocked(
 			context.Background(),
 			marker,
 			rotationEpochStartPublication,
@@ -3527,6 +3851,8 @@ func RotateKeys(configPath string, supplied ...RotationOption) error {
 		)
 		return ErrRotationPublicationMismatch
 	}
+	state.publicationMutex.Unlock()
+	rotationPublicationLocked = false
 	if state.Snapshot().BootBoundaryState == bootBoundaryPending {
 		currentSigner, signerErr := NewEnvelopeSigner(
 			SignerConfig{

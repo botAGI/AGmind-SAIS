@@ -1981,6 +1981,93 @@ func TestRotationProofsSurviveAckDeletionAndBootstrapRestart(t *testing.T) {
 	}
 }
 
+func TestRepairRecoversBoundaryArchiveBeforeStateCommit(t *testing.T) {
+	root := t.TempDir()
+	privateKey := testKey(t, 224)
+	_, initialSpool, initialSigner := openSignerFixture(
+		t,
+		root,
+		testBootID,
+		privateKey,
+	)
+	if _, err := initialSigner.Wrap(
+		context.Background(),
+		"observer_start",
+		map[string]any{"kind": "observer_start"},
+		metadata(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := initialSpool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, spool, signer := openPendingSignerFixture(
+		t,
+		root,
+		testBootID2,
+		privateKey,
+	)
+	injected := errors.New("injected boundary-state commit failure")
+	state.persist = func(path string, next ObserverState) error {
+		if next.BootBoundaryState == bootBoundaryCommitted &&
+			next.PCCBoundaryCount == 1 {
+			return injected
+		}
+		return persistState(path, next)
+	}
+	if err := ensureDedicatedBootBoundary(
+		context.Background(),
+		state,
+		signer,
+		time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
+	); !errors.Is(err, injected) {
+		t.Fatalf("boundary commit err=%v", err)
+	}
+	pending := state.Snapshot()
+	if pending.BootBoundaryState != bootBoundaryPending ||
+		pending.PCCBoundaryCount != 1 {
+		t.Fatalf("failure did not retain anchored pending boundary: %+v", pending)
+	}
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedState, err := OpenStateStore(
+		filepath.Join(root, "observer-state.json"),
+		StateIdentity{
+			HostID:   testHostID,
+			BootID:   testBootID2,
+			KeyID:    pending.KeyID,
+			KeyEpoch: pending.KeyEpoch,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewSpool(
+		SpoolConfig{
+			StateDir:             root,
+			MaxBytes:             4 * 1024 * 1024,
+			PriorityReserveBytes: 1024 * 1024,
+		},
+		reopenedState,
+		pccArchiveKeyring(t, privateKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := reopenedState.Snapshot()
+	if recovered.BootBoundaryState != bootBoundaryCommitted ||
+		recovered.PendingBootBoundary != nil ||
+		recovered.PCCBoundaryCount != 1 {
+		t.Fatalf("boundary archive recovery failed: %+v", recovered)
+	}
+	chain, err := reopened.boundaryArchive.Chain(testBootID, testBootID2)
+	if err != nil || len(chain) != 1 {
+		t.Fatalf("recovered chain=%+v err=%v", chain, err)
+	}
+}
+
 func TestOpenStateStoreRejectsHistoricalBootIDAndPersistsFence(t *testing.T) {
 	root := t.TempDir()
 	privateKey := testKey(t, 100)
