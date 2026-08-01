@@ -392,12 +392,15 @@ func (receipts *PCCReceiptStore) lookupLocked(
 		return PCCPublicationReceipt{}, false, ErrPCCReceiptCorrupt
 	}
 	receipt, found := receipts.receipts[operationKey]
-	if !found {
-		return PCCPublicationReceipt{}, false, nil
-	}
-	if receipt.RequestSHA256 != requestSHA256 {
+	if found && receipt.RequestSHA256 != requestSHA256 {
 		pccReceiptFailState(receipts.state, "observer_pcc_request_conflict")
 		return PCCPublicationReceipt{}, false, ErrPCCReceiptConflict
+	}
+	if receipts.state.Snapshot().MutationReadOnly {
+		return PCCPublicationReceipt{}, false, ErrPCCReceiptCorrupt
+	}
+	if !found {
+		return PCCPublicationReceipt{}, false, nil
 	}
 	item, err := receipts.spool.lookupUnacknowledgedEventLocked(
 		receipt.SnapshotEventID,
@@ -647,6 +650,10 @@ func (spool *Spool) appendPCCReceiptLocked(
 		receipt.SnapshotContentSHA256,
 	)
 	if err != nil {
+		pccReceiptFailState(
+			spool.pccReceipts.state,
+			"observer_pcc_receipt_append_invalid",
+		)
 		return pccReceiptCorrupt(err)
 	}
 	spool.pccReceipts.mutex.Lock()
@@ -655,6 +662,10 @@ func (spool *Spool) appendPCCReceiptLocked(
 			validatePCCReceiptBinding(existing, item) == nil
 		spool.pccReceipts.mutex.Unlock()
 		if !valid {
+			pccReceiptFailState(
+				spool.pccReceipts.state,
+				"observer_pcc_receipt_binding_invalid",
+			)
 			return ErrPCCReceiptCorrupt
 		}
 		return nil
@@ -664,14 +675,32 @@ func (spool *Spool) appendPCCReceiptLocked(
 	_, expectedMeta, _, previewErr := spool.pccReceipts.previewAppendLocked(receipt)
 	spool.pccReceipts.mutex.Unlock()
 	if previewErr != nil {
+		reason := "observer_pcc_receipt_append_invalid"
+		if errors.Is(previewErr, ErrPCCReceiptQuota) {
+			reason = "observer_pcc_receipt_quota_exhausted"
+		}
+		pccReceiptFailState(spool.pccReceipts.state, reason)
 		return previewErr
 	}
 	if spool.totalBytes > spool.config.MaxBytes ||
-		expectedMeta.Size > spool.config.MaxBytes-spool.totalBytes {
+		ackJournalMaxFrameBytes > spool.config.MaxBytes-spool.totalBytes ||
+		expectedMeta.Size >
+			spool.config.MaxBytes-spool.totalBytes-ackJournalMaxFrameBytes {
+		pccReceiptFailState(
+			spool.pccReceipts.state,
+			"observer_pcc_receipt_quota_exhausted",
+		)
 		return ErrPCCReceiptQuota
 	}
 	added, err := spool.pccReceipts.appendBoundLocked(receipt, item)
 	if err != nil {
+		if !spool.state.Snapshot().MutationReadOnly {
+			reason := "observer_pcc_receipt_append_invalid"
+			if errors.Is(err, ErrPCCReceiptQuota) {
+				reason = "observer_pcc_receipt_quota_exhausted"
+			}
+			pccReceiptFailState(spool.pccReceipts.state, reason)
+		}
 		return err
 	}
 	if added > 0 {
@@ -698,6 +727,9 @@ func (spool *Spool) lookupUnacknowledgedLocked(
 	contentSHA256 string,
 ) (SpoolItem, error) {
 	snapshot := spool.state.Snapshot()
+	if snapshot.MutationReadOnly {
+		return SpoolItem{}, errors.Join(ErrSpoolCorrupt, errSpoolReadOnly)
+	}
 	if spool.closed || sourceSequence == 0 ||
 		sourceSequence <= snapshot.AckSequence ||
 		!eventPattern.MatchString(eventID) ||
@@ -733,7 +765,8 @@ func (spool *Spool) LookupUnacknowledged(
 		eventID,
 		contentSHA256,
 	)
-	if errors.Is(err, ErrSpoolCorrupt) {
+	if errors.Is(err, ErrSpoolCorrupt) &&
+		!errors.Is(err, errSpoolReadOnly) {
 		_ = spool.state.PersistReadOnly("observer_spool_lookup_corrupt")
 	}
 	return item, err
@@ -743,6 +776,9 @@ func (spool *Spool) lookupUnacknowledgedEventLocked(
 	eventID string,
 	contentSHA256 string,
 ) (SpoolItem, error) {
+	if spool.state.Snapshot().MutationReadOnly {
+		return SpoolItem{}, errors.Join(ErrSpoolCorrupt, errSpoolReadOnly)
+	}
 	if !eventPattern.MatchString(eventID) ||
 		!hex64Pattern.MatchString(contentSHA256) {
 		return SpoolItem{}, os.ErrNotExist
@@ -776,7 +812,8 @@ func (spool *Spool) LookupUnacknowledgedEvent(
 	spool.mutex.Lock()
 	defer spool.mutex.Unlock()
 	item, err := spool.lookupUnacknowledgedEventLocked(eventID, contentSHA256)
-	if errors.Is(err, ErrSpoolCorrupt) {
+	if errors.Is(err, ErrSpoolCorrupt) &&
+		!errors.Is(err, errSpoolReadOnly) {
 		_ = spool.state.PersistReadOnly("observer_spool_lookup_corrupt")
 	}
 	return item, err

@@ -332,6 +332,106 @@ func TestPCCReceiptExactRetryConflictQuotaAndRestart(t *testing.T) {
 	})
 }
 
+func TestPCCReceiptPreservesAckJournalReserve(t *testing.T) {
+	for name, short := range map[string]uint64{
+		"exact reserve":  0,
+		"one byte short": 1,
+	} {
+		t.Run("append/"+name, func(t *testing.T) {
+			root := t.TempDir()
+			privateKey := testKey(t, 248)
+			state, spool, signer := openSignerFixture(
+				t,
+				root,
+				testBootID,
+				privateKey,
+			)
+			_, receipt := pccReceiptSnapshotFixture(
+				t,
+				spool,
+				signer,
+				"append-reserve-"+name,
+			)
+			spool.pccReceipts.mutex.Lock()
+			_, meta, _, err := spool.pccReceipts.previewAppendLocked(receipt)
+			spool.pccReceipts.mutex.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			spool.config.MaxBytes = spool.totalBytes + meta.Size +
+				ackJournalMaxFrameBytes - short
+			err = spool.pccReceipts.Append(receipt)
+			if short == 0 {
+				if err != nil {
+					t.Fatalf("exact ACK reserve append error=%v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrPCCReceiptQuota) {
+				t.Fatalf("short ACK reserve append error=%v", err)
+			}
+			if snapshot := state.Snapshot(); !snapshot.MutationReadOnly ||
+				snapshot.ReadOnlyReason !=
+					"observer_pcc_receipt_quota_exhausted" {
+				t.Fatalf("short ACK reserve append did not fence: %+v", snapshot)
+			}
+		})
+
+		t.Run("startup/"+name, func(t *testing.T) {
+			root := t.TempDir()
+			privateKey := testKey(t, 247)
+			state, spool, signer := openSignerFixture(
+				t,
+				root,
+				testBootID,
+				privateKey,
+			)
+			_, receipt := pccReceiptSnapshotFixture(
+				t,
+				spool,
+				signer,
+				"startup-reserve-"+name,
+			)
+			if err := spool.pccReceipts.Append(receipt); err != nil {
+				t.Fatal(err)
+			}
+			used := spool.totalBytes
+			if err := spool.Close(); err != nil {
+				t.Fatal(err)
+			}
+			opened, err := NewSpool(
+				SpoolConfig{
+					StateDir: root,
+					MaxBytes: used + ackJournalMaxFrameBytes -
+						short,
+					PriorityReserveBytes: 1024,
+				},
+				state,
+				pccReceiptKeys(t, privateKey),
+			)
+			if short == 0 {
+				if err != nil {
+					t.Fatalf("exact ACK reserve startup error=%v", err)
+				}
+				if closeErr := opened.Close(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+				return
+			}
+			if opened != nil {
+				_ = opened.Close()
+			}
+			if !errors.Is(err, ErrSpoolCorrupt) {
+				t.Fatalf("short ACK reserve startup error=%v", err)
+			}
+			if snapshot := state.Snapshot(); !snapshot.MutationReadOnly ||
+				snapshot.ReadOnlyReason != "observer_spool_quota_invalid" {
+				t.Fatalf("short ACK reserve startup did not fence: %+v", snapshot)
+			}
+		})
+	}
+}
+
 func TestPCCReceiptRebindsIndependentRequestAndNormalizedHashes(t *testing.T) {
 	for name, mutate := range map[string]func(*PCCPublicationReceipt){
 		"request": func(receipt *PCCPublicationReceipt) {
@@ -383,6 +483,85 @@ func TestPCCReceiptRebindsIndependentRequestAndNormalizedHashes(t *testing.T) {
 		if snapshot := state.Snapshot(); !snapshot.MutationReadOnly ||
 			snapshot.ReadOnlyReason != "observer_pcc_receipt_binding_invalid" {
 			t.Fatalf("changed publication lookup did not fence: %+v", snapshot)
+		}
+	})
+}
+
+func TestPCCReceiptLookupRejectsReadOnlyBeforeLiveBinding(t *testing.T) {
+	for _, hidden := range []string{"frame", "publication"} {
+		t.Run(hidden, func(t *testing.T) {
+			root := t.TempDir()
+			privateKey := testKey(t, 255)
+			state, spool, signer := openSignerFixture(
+				t,
+				root,
+				testBootID,
+				privateKey,
+			)
+			item, receipt := pccReceiptSnapshotFixture(
+				t,
+				spool,
+				signer,
+				"fenced-receipt-"+hidden,
+			)
+			if err := spool.pccReceipts.Append(receipt); err != nil {
+				t.Fatal(err)
+			}
+			const reason = "test_pcc_receipt_lookup_read_only"
+			if err := state.PersistReadOnly(reason); err != nil {
+				t.Fatal(err)
+			}
+			path := item.path
+			if hidden == "publication" {
+				path = item.publicationPath
+			}
+			hiddenPath := path + ".hidden"
+			if err := os.Rename(path, hiddenPath); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Rename(hiddenPath, path) })
+
+			if _, found, err := spool.pccReceipts.Lookup(
+				receipt.OperationKey,
+				receipt.RequestSHA256,
+			); !errors.Is(err, ErrPCCReceiptCorrupt) || found {
+				t.Fatalf("fenced receipt lookup found=%t err=%v", found, err)
+			}
+			if snapshot := state.Snapshot(); snapshot.ReadOnlyReason != reason {
+				t.Fatalf("fenced receipt lookup touched live binding: %+v", snapshot)
+			}
+		})
+	}
+
+	t.Run("conflict metadata precedes fence", func(t *testing.T) {
+		root := t.TempDir()
+		privateKey := testKey(t, 251)
+		state, spool, signer := openSignerFixture(
+			t,
+			root,
+			testBootID,
+			privateKey,
+		)
+		_, receipt := pccReceiptSnapshotFixture(
+			t,
+			spool,
+			signer,
+			"fenced-conflict",
+		)
+		if err := spool.pccReceipts.Append(receipt); err != nil {
+			t.Fatal(err)
+		}
+		if err := state.PersistReadOnly("test_pcc_lookup_conflict_order"); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := spool.pccReceipts.Lookup(
+			receipt.OperationKey,
+			strings.Repeat("9", 64),
+		); !errors.Is(err, ErrPCCReceiptConflict) || found {
+			t.Fatalf("fenced conflict lookup found=%t err=%v", found, err)
+		}
+		if snapshot := state.Snapshot(); snapshot.ReadOnlyReason != "observer_pcc_request_conflict" {
+			t.Fatalf("request conflict did not precede fence: %+v", snapshot)
 		}
 	})
 }
@@ -677,6 +856,103 @@ func TestPCCReceiptRecoveryRejectsCorruptionAndUnanchoredTail(t *testing.T) {
 	})
 }
 
+func TestPCCReceiptRecoveryPrecedesAckAnchorRecovery(t *testing.T) {
+	for name, damage := range map[string]func(*testing.T, string){
+		"missing": func(t *testing.T, path string) {
+			t.Helper()
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"invalid": func(t *testing.T, path string) {
+			t.Helper()
+			if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			privateKey := testKey(t, 254)
+			state, spool, signer := openSignerFixture(
+				t,
+				root,
+				testBootID,
+				privateKey,
+			)
+			item, receipt := pccReceiptSnapshotFixture(
+				t,
+				spool,
+				signer,
+				"ack-recovery-"+name,
+			)
+			if err := spool.pccReceipts.Append(receipt); err != nil {
+				t.Fatal(err)
+			}
+			trigger := spool.items[item.Sequence-1]
+			if err := spool.Ack(
+				trigger.Sequence,
+				trigger.EventID,
+				trigger.ContentSHA256,
+			); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("injected snapshot ACK anchor failure")
+			state.persist = func(path string, next ObserverState) error {
+				if next.AckSequence == item.Sequence {
+					return injected
+				}
+				return persistState(path, next)
+			}
+			if err := spool.Ack(
+				item.Sequence,
+				item.EventID,
+				item.ContentSHA256,
+			); !errors.Is(err, injected) {
+				t.Fatalf("snapshot ACK error=%v", err)
+			}
+			state.persist = nil
+			if err := spool.Close(); err != nil {
+				t.Fatal(err)
+			}
+			damage(t, pccReceiptJournalPath(root))
+
+			reopenedState, err := OpenStateStore(
+				filepath.Join(root, "observer-state.json"),
+				stateIdentityForKey(t, privateKey),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := reopenedState.Snapshot().AckSequence; got != trigger.Sequence {
+				t.Fatalf("durable fixture ACK=%d want=%d", got, trigger.Sequence)
+			}
+			opened, err := NewSpool(
+				SpoolConfig{
+					StateDir:             root,
+					MaxBytes:             4 * 1024 * 1024,
+					PriorityReserveBytes: 1024 * 1024,
+				},
+				reopenedState,
+				pccReceiptKeys(t, privateKey),
+			)
+			if opened != nil {
+				_ = opened.Close()
+			}
+			if err == nil {
+				t.Fatal("startup accepted missing or invalid PCC receipt")
+			}
+			if got := reopenedState.Snapshot().AckSequence; got != trigger.Sequence {
+				t.Fatalf(
+					"startup applied snapshot ACK before receipt recovery: got=%d want=%d",
+					got,
+					trigger.Sequence,
+				)
+			}
+		})
+	}
+}
+
 func pccReceiptInstallRecords(
 	t *testing.T,
 	root string,
@@ -812,6 +1088,121 @@ func TestPCCReceiptRequiresExactLiveSpoolBinding(t *testing.T) {
 		}
 		pccReceiptExpectStartupCorrupt(t, root, state, privateKey)
 	})
+}
+
+func TestPCCReceiptNewAppendFailureHardFencesAndRetainsEvidence(t *testing.T) {
+	type failureCase struct {
+		wantErr    error
+		wantReason string
+		prepare    func(*StateStore, *Spool, *PCCPublicationReceipt)
+	}
+	for name, testCase := range map[string]failureCase{
+		"validation": {
+			wantErr:    ErrPCCReceiptCorrupt,
+			wantReason: "observer_pcc_receipt_append_invalid",
+			prepare: func(_ *StateStore, _ *Spool, receipt *PCCPublicationReceipt) {
+				receipt.SnapshotNormalizedSHA256 = strings.Repeat("7", 64)
+			},
+		},
+		"receipt quota": {
+			wantErr:    ErrPCCReceiptQuota,
+			wantReason: "observer_pcc_receipt_quota_exhausted",
+			prepare: func(state *StateStore, spool *Spool, _ *PCCPublicationReceipt) {
+				exhausted := PCCReceiptAnchor{
+					Count:    pccReceiptMaxCount,
+					Bytes:    1,
+					HeadHash: strings.Repeat("a", 64),
+				}
+				spool.pccReceipts.mutex.Lock()
+				spool.pccReceipts.anchor = exhausted
+				spool.pccReceipts.mutex.Unlock()
+				state.mutex.Lock()
+				state.state.PCCReceiptCount = exhausted.Count
+				state.state.PCCReceiptBytes = exhausted.Bytes
+				state.state.PCCReceiptHeadHash = exhausted.HeadHash
+				state.mutex.Unlock()
+			},
+		},
+		"global capacity": {
+			wantErr:    ErrPCCReceiptQuota,
+			wantReason: "observer_pcc_receipt_quota_exhausted",
+			prepare: func(_ *StateStore, spool *Spool, _ *PCCPublicationReceipt) {
+				spool.config.MaxBytes = spool.totalBytes
+			},
+		},
+		"preanchor": {
+			wantErr:    ErrPCCReceiptCorrupt,
+			wantReason: "observer_pcc_receipt_preanchor_invalid",
+			prepare: func(_ *StateStore, spool *Spool, _ *PCCPublicationReceipt) {
+				spool.pccReceipts.mutex.Lock()
+				spool.pccReceipts.anchor = PCCReceiptAnchor{
+					Count:    1,
+					Bytes:    1,
+					HeadHash: strings.Repeat("b", 64),
+				}
+				spool.pccReceipts.mutex.Unlock()
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			privateKey := testKey(t, 249)
+			state, spool, signer := openSignerFixture(
+				t,
+				root,
+				testBootID,
+				privateKey,
+			)
+			item, receipt := pccReceiptSnapshotFixture(
+				t,
+				spool,
+				signer,
+				"append-failure-"+name,
+			)
+			frameBefore, err := os.ReadFile(item.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publicationBefore, err := os.ReadFile(item.publicationPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testCase.prepare(state, spool, &receipt)
+			if err := spool.pccReceipts.Append(receipt); !errors.Is(
+				err,
+				testCase.wantErr,
+			) {
+				t.Fatalf("append failure error=%v", err)
+			}
+			if snapshot := state.Snapshot(); !snapshot.MutationReadOnly ||
+				snapshot.ReadOnlyReason != testCase.wantReason {
+				t.Fatalf("append failure did not hard-fence: %+v", snapshot)
+			}
+			persisted, err := OpenStateStore(
+				state.path,
+				stateIdentityForKey(t, privateKey),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snapshot := persisted.Snapshot(); !snapshot.MutationReadOnly ||
+				snapshot.ReadOnlyReason != testCase.wantReason {
+				t.Fatalf("append fence was not durable: %+v", snapshot)
+			}
+			frameAfter, err := os.ReadFile(item.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publicationAfter, err := os.ReadFile(item.publicationPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(frameBefore, frameAfter) ||
+				!bytes.Equal(publicationBefore, publicationAfter) {
+				t.Fatal("append failure changed live PCC evidence")
+			}
+		})
+	}
 }
 
 func TestPCCSnapshotAckRequiresValidSpecializedReceipt(t *testing.T) {
@@ -1123,4 +1514,99 @@ func TestSpoolLookupUnacknowledgedRequiresExactTriple(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSpoolLookupUnacknowledgedRejectsReadOnlyBeforeDisk(t *testing.T) {
+	for _, lookup := range []string{"sequence", "event"} {
+		for _, hidden := range []string{"frame", "publication"} {
+			t.Run(lookup+"/"+hidden, func(t *testing.T) {
+				root := t.TempDir()
+				privateKey := testKey(t, 252)
+				state, spool, signer := openSignerFixture(
+					t,
+					root,
+					testBootID,
+					privateKey,
+				)
+				event, err := signer.Wrap(
+					context.Background(),
+					"falco_connect",
+					map[string]any{"kind": "fenced-spool-" + lookup + "-" + hidden},
+					metadata(),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				item := spool.items[event.SourceSequence]
+				const reason = "test_spool_lookup_read_only"
+				if err := state.PersistReadOnly(reason); err != nil {
+					t.Fatal(err)
+				}
+				path := item.path
+				if hidden == "publication" {
+					path = item.publicationPath
+				}
+				hiddenPath := path + ".hidden"
+				if err := os.Rename(path, hiddenPath); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Rename(hiddenPath, path) })
+
+				var lookupErr error
+				if lookup == "sequence" {
+					_, lookupErr = spool.LookupUnacknowledged(
+						item.Sequence,
+						item.EventID,
+						item.ContentSHA256,
+					)
+				} else {
+					_, lookupErr = spool.LookupUnacknowledgedEvent(
+						item.EventID,
+						item.ContentSHA256,
+					)
+				}
+				if !errors.Is(lookupErr, ErrSpoolCorrupt) {
+					t.Fatalf("fenced spool lookup error=%v", lookupErr)
+				}
+				if snapshot := state.Snapshot(); snapshot.ReadOnlyReason != reason {
+					t.Fatalf("fenced spool lookup touched disk: %+v", snapshot)
+				}
+			})
+		}
+	}
+
+	t.Run("event/map scan", func(t *testing.T) {
+		root := t.TempDir()
+		privateKey := testKey(t, 250)
+		state, spool, signer := openSignerFixture(
+			t,
+			root,
+			testBootID,
+			privateKey,
+		)
+		event, err := signer.Wrap(
+			context.Background(),
+			"falco_connect",
+			map[string]any{"kind": "fenced-event-map"},
+			metadata(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		item := spool.items[event.SourceSequence]
+		spool.items[item.Sequence+100] = item
+		const reason = "test_spool_event_lookup_read_only"
+		if err := state.PersistReadOnly(reason); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := spool.LookupUnacknowledgedEvent(
+			item.EventID,
+			item.ContentSHA256,
+		); !errors.Is(err, ErrSpoolCorrupt) {
+			t.Fatalf("fenced event lookup error=%v", err)
+		}
+		if snapshot := state.Snapshot(); snapshot.ReadOnlyReason != reason {
+			t.Fatalf("fenced event lookup scanned item map: %+v", snapshot)
+		}
+	})
 }

@@ -24,6 +24,7 @@ var (
 	ErrRoutineQuota  = errors.New("routine spool quota exhausted")
 	ErrPriorityQuota = errors.New("priority spool quota exhausted")
 	ErrAckInvalid    = errors.New("invalid spool acknowledgement")
+	errSpoolReadOnly = errors.New("observer spool mutation read-only")
 )
 
 type Tier string
@@ -1427,6 +1428,29 @@ func NewSpool(
 		previousSequence = record.Sequence
 		ackRecords = append(ackRecords, record)
 	}
+	pccReceipts, err := OpenPCCReceiptStore(config.StateDir, state)
+	if err != nil {
+		snapshot := state.Snapshot()
+		if pccReceiptEntrySeen && snapshot.PCCReceiptCount == 0 &&
+			snapshot.PCCReceiptBytes == 0 &&
+			snapshot.PCCReceiptHeadHash == zeroPCCJournalHash {
+			_ = state.PersistReadOnly("observer_spool_root_unknown")
+		}
+		return nil, errors.Join(
+			ErrSpoolCorrupt,
+			fmt.Errorf("open PCC receipt store: %w", err),
+		)
+	}
+	pccReceiptsOwned := false
+	defer func() {
+		if !pccReceiptsOwned {
+			_ = pccReceipts.Close()
+		}
+	}()
+	if err := pccReceipts.validateLiveItems(items); err != nil {
+		_ = state.PersistReadOnly("observer_pcc_receipt_corrupt")
+		return nil, err
+	}
 	if err := reconcileAckAnchor(
 		state,
 		ackRecovery.Records,
@@ -1615,26 +1639,13 @@ func NewSpool(
 		_ = state.PersistReadOnly("observer_ack_journal_corrupt")
 		return nil, err
 	}
-	pccReceipts, err := OpenPCCReceiptStore(config.StateDir, state)
-	if err != nil {
-		_ = ackJournal.Close()
-		snapshot := state.Snapshot()
-		if pccReceiptEntrySeen && snapshot.PCCReceiptCount == 0 &&
-			snapshot.PCCReceiptBytes == 0 &&
-			snapshot.PCCReceiptHeadHash == zeroPCCJournalHash {
-			_ = state.PersistReadOnly("observer_spool_root_unknown")
-		}
-		return nil, errors.Join(
-			ErrSpoolCorrupt,
-			fmt.Errorf("open PCC receipt store: %w", err),
-		)
-	}
 	pccReceiptBytes := pccReceipts.anchor.Bytes
+	durableSpoolBytes := config.MaxBytes - ackJournalMaxFrameBytes
 	if !receiptBytesFitGlobal(
 		totalBytes,
 		0,
 		pccReceiptBytes,
-		config.MaxBytes,
+		durableSpoolBytes,
 	) {
 		_ = pccReceipts.Close()
 		_ = ackJournal.Close()
@@ -1647,7 +1658,7 @@ func NewSpool(
 		state,
 		items,
 		keys,
-		config.MaxBytes-totalBytes,
+		durableSpoolBytes-totalBytes,
 	)
 	if err != nil {
 		_ = pccReceipts.Close()
@@ -1660,7 +1671,7 @@ func NewSpool(
 		totalBytes,
 		0,
 		controlReceiptBytes,
-		config.MaxBytes,
+		durableSpoolBytes,
 	) {
 		_ = controlReceipts.Close()
 		_ = pccReceipts.Close()
@@ -1691,13 +1702,6 @@ func NewSpool(
 		},
 	}
 	pccReceipts.spool = spool
-	if err := pccReceipts.validateLiveItems(items); err != nil {
-		_ = controlReceipts.Close()
-		_ = pccReceipts.Close()
-		_ = ackJournal.Close()
-		_ = state.PersistReadOnly("observer_pcc_receipt_corrupt")
-		return nil, err
-	}
 	if err := spool.cleanupAckedLocked(state.Snapshot().AckSequence); err != nil {
 		_ = controlReceipts.Close()
 		_ = pccReceipts.Close()
@@ -1706,6 +1710,7 @@ func NewSpool(
 		return nil, err
 	}
 	archiveOwned = true
+	pccReceiptsOwned = true
 	return spool, nil
 }
 
