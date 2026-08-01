@@ -40,6 +40,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournal,
     AckJournalSnapshot,
 )
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
     MAX_CORE_EVENT_RESPONSE_BYTES,
     MAX_EVENTS_PAGE_BYTES,
@@ -808,6 +809,7 @@ class DeliveryCoordinator:
         store: SegmentStore,
         verifier: EnvelopeVerifier,
         ack_journal: AckJournal,
+        correlation_requests: CorrelationRequestJournal | None,
         delivery_lease: AckDeliveryLease,
         transport: ObserverCoreTransport,
         *,
@@ -831,6 +833,16 @@ class DeliveryCoordinator:
             raise TypeError("use DeliveryCoordinator.create()")
         if type(delivery_lease) is not AckDeliveryLease:
             raise TypeError("delivery requires an exact ACK-journal lease")
+        if (
+            (
+                _repair_mode is False
+                and type(correlation_requests) is not CorrelationRequestJournal
+            )
+            or (_repair_mode is True and correlation_requests is not None)
+        ):
+            raise TypeError(
+                "ordinary delivery requires an exact correlation-request journal"
+            )
         if type(coverage_adapter) is not _CoverageDeliveryAdapter:
             raise TypeError("delivery requires its exact coverage adapter")
         if (
@@ -843,6 +855,7 @@ class DeliveryCoordinator:
         self._store = store
         self._verifier = verifier
         self._ack_journal = ack_journal
+        self._correlation_requests = correlation_requests
         self._delivery_lease = delivery_lease
         self._transport = transport
         self._coverage_adapter = coverage_adapter
@@ -862,6 +875,7 @@ class DeliveryCoordinator:
         cls,
         acceptance: AcceptanceCoordinator,
         acknowledgements: AckJournal,
+        correlation_requests: CorrelationRequestJournal,
         transport: ObserverCoreTransport,
         *,
         coverage: CoverageState,
@@ -871,6 +885,7 @@ class DeliveryCoordinator:
         return cls._compose(
             acceptance,
             acknowledgements,
+            correlation_requests,
             transport,
             coverage=coverage,
             clock=clock,
@@ -896,6 +911,7 @@ class DeliveryCoordinator:
         return cls._compose(
             acceptance,
             acknowledgements,
+            None,
             transport,
             coverage=coverage,
             clock=clock,
@@ -909,6 +925,7 @@ class DeliveryCoordinator:
         cls,
         acceptance: AcceptanceCoordinator,
         acknowledgements: AckJournal,
+        correlation_requests: CorrelationRequestJournal | None,
         transport: ObserverCoreTransport,
         *,
         coverage: CoverageState,
@@ -925,6 +942,15 @@ class DeliveryCoordinator:
             raise TypeError("delivery requires exact evidence authority")
         if type(acknowledgements) is not AckJournal:
             raise TypeError("delivery requires exact ACK authority")
+        if repair_mode:
+            if correlation_requests is not None:
+                raise TypeError(
+                    "repair delivery must remain correlation-journal-free"
+                )
+        elif type(correlation_requests) is not CorrelationRequestJournal:
+            raise TypeError(
+                "ordinary delivery requires exact correlation-request authority"
+            )
         if type(coverage) is not CoverageState:
             raise TypeError("delivery requires exact coverage authority")
         mode_status = store.status()
@@ -943,6 +969,13 @@ class DeliveryCoordinator:
             or not store._is_bound_verifier(verifier)
         ):
             raise DeliveryFatalError("acceptance authority binding is invalid")
+        if (
+            correlation_requests is not None
+            and not correlation_requests._is_bound_to(store)
+        ):
+            raise DeliveryFatalError(
+                "correlation-request authority binding is invalid"
+            )
         if (
             not callable(getattr(clock, "live_receipt_monotonic", None))
             or not callable(getattr(clock, "decision_sample", None))
@@ -965,6 +998,7 @@ class DeliveryCoordinator:
                 store,
                 verifier,
                 acknowledgements,
+                correlation_requests,
                 lease,
                 transport,
                 coverage_adapter=adapter,
@@ -977,6 +1011,10 @@ class DeliveryCoordinator:
                 acceptance.segment_store is not store
                 or acceptance.verifier is not verifier
                 or not store._is_bound_verifier(verifier)
+                or (
+                    correlation_requests is not None
+                    and not correlation_requests._is_bound_to(store)
+                )
                 or delivery._store is not store
                 or delivery._verifier is not verifier
                 or not delivery._status_matches_repair_mode(
@@ -1006,6 +1044,10 @@ class DeliveryCoordinator:
         return self._ack_journal
 
     @property
+    def correlation_requests(self) -> CorrelationRequestJournal | None:
+        return self._correlation_requests
+
+    @property
     def transport(self) -> ObserverCoreTransport:
         return self._transport
 
@@ -1017,12 +1059,14 @@ class DeliveryCoordinator:
         self,
         acceptance: AcceptanceCoordinator,
         acknowledgements: AckJournal,
+        correlation_requests: CorrelationRequestJournal | None,
         coverage: CoverageState,
         clock: CoreClockProvider,
     ) -> bool:
         return (
             self._acceptance is acceptance
             and self._ack_journal is acknowledgements
+            and self._correlation_requests is correlation_requests
             and self._coverage_adapter._coverage is coverage
             and self._clock is clock
         )

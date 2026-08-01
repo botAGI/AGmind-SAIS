@@ -133,6 +133,7 @@ _ROOT_TEMP_NAME = re.compile(rf"^\.chain-head\.json\.{_UUID4_TEXT}\.tmp$")
 _HEALTH_FINAL_TEMP_NAME = re.compile(
     rf"^\.health\.json\.{_UUID4_TEXT}\.tmp$"
 )
+_CORRELATION_JOURNAL_NAME = "correlation-requests.agf"
 _ACK_COMMITMENT_NAME = "ack-commitment.json"
 _ACK_COMMITMENT_TEMP_NAME = re.compile(
     rf"^\.ack-commitment\.json\.{_UUID4_TEXT}\.tmp$"
@@ -211,6 +212,18 @@ class _AckLifecycleCorrupt(EvidenceStoreError):
 
 class _AckLifecycleIoUncertain(EvidenceStoreError):
     """ACK authority I/O may have completed but could not be authenticated."""
+
+
+class _CorrelationJournalLifecycleStateError(EvidenceStoreError):
+    """The requested correlation-journal operation is illegal in this lifecycle."""
+
+
+class _CorrelationJournalLifecycleCorrupt(EvidenceStoreError):
+    """An expected correlation-journal artifact disappeared or was substituted."""
+
+
+class _CorrelationJournalLifecycleIoUncertain(EvidenceStoreError):
+    """Correlation-journal I/O could not be authenticated conclusively."""
 
 
 class TornTailRepairRequired(EvidenceStoreError):
@@ -2399,6 +2412,23 @@ class SegmentStore:
             "retention_uncertain",
         ] = "unbound"
         self._coverage_state_owner: object | None = None
+        self._correlation_journal_owner: object | None = None
+        self._correlation_journal_state: Literal[
+            "unknown",
+            "fresh",
+            "present",
+            "creating",
+            "recovering",
+            "initialization_uncertain",
+            "initialized",
+            "append_uncertain",
+            "io_uncertain",
+        ] = "unknown"
+        self._correlation_journal_operation: (
+            Literal["create", "recover"] | None
+        ) = None
+        self._correlation_journal_identity: _FileIdentity | None = None
+        self._correlation_journal_digest: bytes | None = None
         self._ack_journal_owner: object | None = None
         self._retention_ack_recovery_permitted = False
         self._ack_journal_is_retention_recovery = False
@@ -6630,6 +6660,473 @@ class SegmentStore:
                 break
         return tuple(refs)
 
+    def _correlation_journal_artifact_identity(self) -> _FileIdentity | None:
+        try:
+            if (
+                _entry_stat_at(
+                    self._root_descriptor,
+                    _CORRELATION_JOURNAL_NAME,
+                )
+                is None
+            ):
+                return None
+            return _file_identity(
+                _regular_stat_at(
+                    self._root_descriptor,
+                    _CORRELATION_JOURNAL_NAME,
+                    self.root / _CORRELATION_JOURNAL_NAME,
+                )
+            )
+        except EvidenceCorrupt as error:
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal root artifact is unsafe or unstable"
+            ) from error
+        except OSError as error:
+            raise _CorrelationJournalLifecycleIoUncertain(
+                "correlation-journal root artifact I/O is uncertain"
+            ) from error
+
+    def _correlation_journal_prefix_digest(
+        self,
+        prefix_size: int,
+    ) -> tuple[_FileIdentity, bytes]:
+        if (
+            isinstance(prefix_size, bool)
+            or not isinstance(prefix_size, int)
+            or prefix_size < 0
+        ):
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal prefix size is invalid"
+            )
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                _CORRELATION_JOURNAL_NAME,
+                flags,
+                dir_fd=self._root_descriptor,
+            )
+        except FileNotFoundError as error:
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal authority disappeared during content binding"
+            ) from error
+        except OSError as error:
+            raise _CorrelationJournalLifecycleIoUncertain(
+                "correlation-journal content binding I/O is uncertain"
+            ) from error
+        primary_error: BaseException | None = None
+        try:
+            try:
+                opened_identity = _file_identity(os.fstat(descriptor))
+                published_identity = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        _CORRELATION_JOURNAL_NAME,
+                        self.root / _CORRELATION_JOURNAL_NAME,
+                    )
+                )
+                if (
+                    opened_identity != published_identity
+                    or opened_identity.size < prefix_size
+                ):
+                    raise _CorrelationJournalLifecycleCorrupt(
+                        "correlation-journal prefix identity changed"
+                    )
+                digest = hashlib.sha256()
+                offset = 0
+                while offset < prefix_size:
+                    chunk = os.pread(
+                        descriptor,
+                        min(1024 * 1024, prefix_size - offset),
+                        offset,
+                    )
+                    if not chunk:
+                        raise _CorrelationJournalLifecycleCorrupt(
+                            "correlation-journal prefix shortened during hashing"
+                        )
+                    digest.update(chunk)
+                    offset += len(chunk)
+                after_identity = _file_identity(os.fstat(descriptor))
+                published_after = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        _CORRELATION_JOURNAL_NAME,
+                        self.root / _CORRELATION_JOURNAL_NAME,
+                    )
+                )
+                if (
+                    after_identity != opened_identity
+                    or published_after != opened_identity
+                ):
+                    raise _CorrelationJournalLifecycleCorrupt(
+                        "correlation-journal identity changed during prefix hashing"
+                    )
+                return opened_identity, digest.digest()
+            except FileNotFoundError as error:
+                raise _CorrelationJournalLifecycleCorrupt(
+                    "correlation-journal prefix disappeared during binding"
+                ) from error
+            except EvidenceCorrupt as error:
+                raise _CorrelationJournalLifecycleCorrupt(
+                    "correlation-journal prefix is unsafe or unstable"
+                ) from error
+            except OSError as error:
+                raise _CorrelationJournalLifecycleIoUncertain(
+                    "correlation-journal prefix I/O is uncertain"
+                ) from error
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                if primary_error is None:
+                    raise _CorrelationJournalLifecycleIoUncertain(
+                        "correlation-journal prefix descriptor close became uncertain"
+                    ) from close_error
+                primary_error.add_note(
+                    "secondary correlation-journal prefix descriptor close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+
+    @staticmethod
+    def _same_correlation_journal_inode(
+        actual: _FileIdentity,
+        expected: _FileIdentity,
+    ) -> bool:
+        return (
+            actual.device == expected.device
+            and actual.inode == expected.inode
+        )
+
+    def _acquire_correlation_journal(
+        self,
+        owner: object,
+        *,
+        operation: Literal["create", "recover"],
+    ) -> tuple[int, object]:
+        self._require_ack_mutation_ready()
+        if self._correlation_journal_owner is not None:
+            raise EvidenceStoreBusy(
+                "evidence root already has one correlation-journal owner"
+            )
+        state = self._correlation_journal_state
+        if state == "unknown":
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal startup presence was not authenticated"
+            )
+        if state == "initialization_uncertain":
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal initialization is uncertain until store restart"
+            )
+        if state in {"append_uncertain", "io_uncertain"}:
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal publication is uncertain until store restart"
+            )
+        if state in {"creating", "recovering"}:
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal initialization did not settle"
+            )
+
+        actual_identity = self._correlation_journal_artifact_identity()
+        if state in {"present", "initialized"}:
+            expected_identity = self._correlation_journal_identity
+            if actual_identity is None:
+                raise _CorrelationJournalLifecycleCorrupt(
+                    "expected correlation-journal authority disappeared"
+                )
+            if expected_identity is None or actual_identity != expected_identity:
+                raise _CorrelationJournalLifecycleCorrupt(
+                    "expected correlation-journal authority changed identity"
+                )
+        elif state == "fresh" and actual_identity is not None:
+            raise _CorrelationJournalLifecycleCorrupt(
+                "unexpected correlation journal appeared in a fresh store lifecycle"
+            )
+
+        if operation == "create":
+            if state != "fresh":
+                raise _CorrelationJournalLifecycleStateError(
+                    "correlation journal may be created only in a fresh store lifecycle"
+                )
+            next_state: Literal["creating", "recovering"] = "creating"
+        elif operation == "recover":
+            if state != "present":
+                raise _CorrelationJournalLifecycleStateError(
+                    "correlation journal may be recovered only from startup presence"
+                )
+            next_state = "recovering"
+        else:
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation journal operation is invalid"
+            )
+
+        duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
+        if duplicate_command is None:
+            root_descriptor = os.dup(self._root_descriptor)
+            try:
+                os.set_inheritable(root_descriptor, False)
+            except BaseException as error:
+                try:
+                    os.close(root_descriptor)
+                except OSError as cleanup_error:
+                    error.add_note(
+                        "secondary correlation root descriptor cleanup failure: "
+                        f"{cleanup_error}"
+                    )
+                raise
+        else:
+            root_descriptor = fcntl.fcntl(
+                self._root_descriptor,
+                duplicate_command,
+                0,
+            )
+        self._correlation_journal_owner = owner
+        self._correlation_journal_operation = operation
+        self._correlation_journal_state = next_state
+        return root_descriptor, self._lifecycle_identity
+
+    def _correlation_journal_final_name_created(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._correlation_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._correlation_journal_operation != "create"
+            or self._correlation_journal_state
+            not in {"creating", "initialization_uncertain"}
+        ):
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal create publication has the wrong lifecycle"
+            )
+        self._correlation_journal_state = "initialization_uncertain"
+
+    def _complete_correlation_journal_initialization(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result,
+        authenticated_digest: bytes,
+    ) -> None:
+        if (
+            owner is not self._correlation_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal completion has the wrong lifecycle"
+            )
+        operation = self._correlation_journal_operation
+        state = self._correlation_journal_state
+        if not (
+            (operation == "create" and state == "initialization_uncertain")
+            or (operation == "recover" and state == "recovering")
+        ):
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal completion did not follow create or recovery"
+            )
+        actual_identity = self._correlation_journal_artifact_identity()
+        authenticated_identity = _file_identity(authenticated)
+        if actual_identity is None:
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal authority disappeared before initialization completed"
+            )
+        if actual_identity != authenticated_identity:
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal authority changed before initialization completed"
+            )
+        if len(authenticated_digest) != hashlib.sha256().digest_size:
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal authenticated digest is invalid"
+            )
+        expected_identity = self._correlation_journal_identity
+        if (
+            operation == "recover"
+            and (
+                expected_identity is None
+                or authenticated_identity != expected_identity
+            )
+        ):
+            raise _CorrelationJournalLifecycleCorrupt(
+                "recovered correlation journal differs from startup identity"
+            )
+        self._correlation_journal_identity = authenticated_identity
+        self._correlation_journal_digest = authenticated_digest
+        self._correlation_journal_state = "initialized"
+
+    def _validate_correlation_journal_owner(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        self._require_ack_mutation_ready()
+        if (
+            owner is not self._correlation_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._correlation_journal_state
+            not in {"recovering", "initialization_uncertain", "initialized"}
+        ):
+            raise EvidenceSealError(
+                "correlation journal is outside this evidence lifecycle"
+            )
+
+    def _seal_correlation_journal_identity(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result,
+        authenticated_digest: bytes,
+    ) -> None:
+        if (
+            owner is not self._correlation_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._correlation_journal_state != "initialized"
+        ):
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal seal has the wrong lifecycle"
+            )
+        authenticated_identity = _file_identity(authenticated)
+        if len(authenticated_digest) != hashlib.sha256().digest_size:
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal seal digest is invalid"
+            )
+        actual_identity = self._correlation_journal_artifact_identity()
+        expected_identity = self._correlation_journal_identity
+        if (
+            actual_identity is None
+            or actual_identity != authenticated_identity
+            or expected_identity is None
+            or not self._same_correlation_journal_inode(
+                authenticated_identity,
+                expected_identity,
+            )
+        ):
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal authority changed before seal"
+            )
+        self._correlation_journal_identity = authenticated_identity
+        self._correlation_journal_digest = authenticated_digest
+
+    def _mark_correlation_journal_append_uncertain(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated_before: os.stat_result,
+        authenticated_digest_before: bytes,
+    ) -> None:
+        if (
+            owner is not self._correlation_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._correlation_journal_state
+            not in {"initialized", "append_uncertain"}
+        ):
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal uncertainty has the wrong lifecycle"
+            )
+        retained_identity = _file_identity(authenticated_before)
+        if len(authenticated_digest_before) != hashlib.sha256().digest_size:
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal pre-append digest is invalid"
+            )
+        expected_identity = self._correlation_journal_identity
+        if (
+            expected_identity is None
+            or not self._same_correlation_journal_inode(
+                retained_identity,
+                expected_identity,
+            )
+        ):
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal pre-append identity changed"
+            )
+        self._correlation_journal_identity = retained_identity
+        self._correlation_journal_digest = authenticated_digest_before
+        self._correlation_journal_state = "append_uncertain"
+
+    def _mark_correlation_journal_io_uncertain(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result | None,
+        authenticated_digest: bytes | None,
+    ) -> None:
+        if (
+            owner is not self._correlation_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._correlation_journal_state
+            not in {
+                "recovering",
+                "initialization_uncertain",
+                "initialized",
+                "io_uncertain",
+            }
+        ):
+            raise _CorrelationJournalLifecycleStateError(
+                "correlation-journal I/O uncertainty has the wrong lifecycle"
+            )
+        if (authenticated is None) != (authenticated_digest is None):
+            raise _CorrelationJournalLifecycleCorrupt(
+                "correlation-journal I/O uncertainty has an incomplete content anchor"
+            )
+        if authenticated is not None and authenticated_digest is not None:
+            retained_identity = _file_identity(authenticated)
+            if len(authenticated_digest) != hashlib.sha256().digest_size:
+                raise _CorrelationJournalLifecycleCorrupt(
+                    "correlation-journal I/O uncertainty digest is invalid"
+                )
+            expected_identity = self._correlation_journal_identity
+            if expected_identity is not None:
+                if not self._same_correlation_journal_inode(
+                    retained_identity,
+                    expected_identity,
+                ):
+                    raise _CorrelationJournalLifecycleCorrupt(
+                        "correlation-journal I/O uncertainty identity changed"
+                    )
+            elif self._correlation_journal_state != "initialization_uncertain":
+                raise _CorrelationJournalLifecycleCorrupt(
+                    "correlation-journal I/O uncertainty has no identity anchor"
+                )
+            actual_identity = self._correlation_journal_artifact_identity()
+            if (
+                actual_identity is None
+                or not self._same_correlation_journal_inode(
+                    actual_identity,
+                    retained_identity,
+                )
+                or actual_identity.size < retained_identity.size
+            ):
+                raise _CorrelationJournalLifecycleCorrupt(
+                    "correlation-journal I/O uncertainty lost its content anchor"
+                )
+            self._correlation_journal_identity = retained_identity
+            self._correlation_journal_digest = authenticated_digest
+        if self._correlation_journal_state != "initialization_uncertain":
+            self._correlation_journal_state = "io_uncertain"
+
+    def _release_correlation_journal(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._correlation_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise EvidenceSealError(
+                "correlation journal release has the wrong lifecycle"
+            )
+        state = self._correlation_journal_state
+        if state == "creating":
+            self._correlation_journal_state = "fresh"
+        elif state in {"recovering", "initialized"}:
+            self._correlation_journal_state = "present"
+        self._correlation_journal_owner = None
+        self._correlation_journal_operation = None
+
     def _ack_journal_artifact_identity(self) -> _FileIdentity | None:
         name = "ack-journal.agf"
         try:
@@ -8090,6 +8587,77 @@ class SegmentStore:
         """Persist a root-wide fence without rewriting corrupt ACK bytes."""
         self._trip_read_only("segment_corrupt")
 
+    def _trip_correlation_journal_corrupt(self) -> None:
+        """Persist a root-wide fence without rewriting corrupt correlation bytes."""
+        self._trip_read_only("segment_corrupt")
+
+    def _fence_missing_expected_correlation_journal(self) -> None:
+        state = self._correlation_journal_state
+        if state not in {
+            "present",
+            "initialized",
+            "append_uncertain",
+            "io_uncertain",
+        }:
+            return
+        try:
+            actual_identity = self._correlation_journal_artifact_identity()
+        except (
+            _CorrelationJournalLifecycleCorrupt,
+            _CorrelationJournalLifecycleIoUncertain,
+        ):
+            actual_identity = None
+        expected_identity = self._correlation_journal_identity
+        identity_changed = actual_identity is None or expected_identity is None
+        if (
+            not identity_changed
+            and actual_identity is not None
+            and expected_identity is not None
+        ):
+            if state in {"append_uncertain", "io_uncertain"}:
+                identity_changed = (
+                    not self._same_correlation_journal_inode(
+                        actual_identity,
+                        expected_identity,
+                    )
+                    or actual_identity.size < expected_identity.size
+                )
+            else:
+                identity_changed = actual_identity != expected_identity
+
+        content_changed = False
+        expected_digest = self._correlation_journal_digest
+        if (
+            not identity_changed
+            and expected_identity is not None
+            and expected_digest is not None
+        ):
+            try:
+                hashed_identity, actual_digest = (
+                    self._correlation_journal_prefix_digest(
+                        expected_identity.size
+                    )
+                )
+            except (
+                _CorrelationJournalLifecycleCorrupt,
+                _CorrelationJournalLifecycleIoUncertain,
+            ):
+                content_changed = True
+            else:
+                content_changed = (
+                    actual_identity is None
+                    or not self._same_correlation_journal_inode(
+                        hashed_identity,
+                        actual_identity,
+                    )
+                    or actual_digest != expected_digest
+                )
+        elif state in {"initialized", "append_uncertain"}:
+            content_changed = True
+
+        if identity_changed or content_changed:
+            self._trip_read_only("segment_corrupt")
+
     def _fence_missing_expected_ack_journal(self) -> None:
         state = self._ack_journal_state
         if state not in {
@@ -8338,6 +8906,7 @@ class SegmentStore:
         root_temporaries: list[str] = []
         allowed_root = {
             "ack-journal.agf",
+            _CORRELATION_JOURNAL_NAME,
             _ACK_COMMITMENT_NAME,
             "chain-head.json",
             "health.intent.json",
@@ -8346,6 +8915,7 @@ class SegmentStore:
             "segments",
         }
         root_entries = tuple(os.listdir(self._root_descriptor))
+        correlation_journal_identity: _FileIdentity | None = None
         ack_journal_identity: _FileIdentity | None = None
         ack_commitment: _AckCommitmentV1 | None = None
         ack_commitment_raw: bytes | None = None
@@ -8362,6 +8932,15 @@ class SegmentStore:
         retention_boundary_names: list[str] = []
         retention_boundary_temporary_names: list[str] = []
         for name in root_entries:
+            if name == _CORRELATION_JOURNAL_NAME:
+                correlation_journal_identity = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        name,
+                        self.root / name,
+                    )
+                )
+                continue
             if name == _RETENTION_BOUNDARY_NAME:
                 _regular_stat_at(
                     self._root_descriptor,
@@ -8541,6 +9120,13 @@ class SegmentStore:
         self._retention_pending_latched = (
             self._retention_state_binding is not None
             or self._retention_state_temporary is not None
+        )
+        self._correlation_journal_identity = correlation_journal_identity
+        self._correlation_journal_digest = None
+        self._correlation_journal_state = (
+            "fresh"
+            if correlation_journal_identity is None
+            else "present"
         )
         self._ack_journal_identity = ack_journal_identity
         self._ack_commitment = ack_commitment
@@ -11752,25 +12338,47 @@ class SegmentStore:
                     if coverage_close_error is not None:
                         raise coverage_close_error
                 finally:
-                    owner = self._ack_journal_owner
-                    if owner is not None:
-                        close_from_store = getattr(
-                            owner,
-                            "_close_from_segment_store",
-                            None,
-                        )
-                        if not callable(close_from_store):
-                            raise EvidenceStoreError(
-                                "ACK-journal owner cannot close before evidence unlock"
+                    try:
+                        correlation_owner = self._correlation_journal_owner
+                        if correlation_owner is not None:
+                            close_from_store = getattr(
+                                correlation_owner,
+                                "_close_from_segment_store",
+                                None,
                             )
-                        cast(Callable[[object], None], close_from_store)(
-                            self._lifecycle_identity
-                        )
-                    if self._ack_journal_owner is not None:
-                        raise EvidenceStoreError(
-                            "ACK-journal owner survived evidence shutdown"
-                        )
-                    self._fence_missing_expected_ack_journal()
+                            if not callable(close_from_store):
+                                raise EvidenceStoreError(
+                                    "correlation-journal owner cannot close "
+                                    "before evidence unlock"
+                                )
+                            cast(Callable[[object], None], close_from_store)(
+                                self._lifecycle_identity
+                            )
+                        if self._correlation_journal_owner is not None:
+                            raise EvidenceStoreError(
+                                "correlation-journal owner survived evidence shutdown"
+                            )
+                        self._fence_missing_expected_correlation_journal()
+                    finally:
+                        owner = self._ack_journal_owner
+                        if owner is not None:
+                            close_from_store = getattr(
+                                owner,
+                                "_close_from_segment_store",
+                                None,
+                            )
+                            if not callable(close_from_store):
+                                raise EvidenceStoreError(
+                                    "ACK-journal owner cannot close before evidence unlock"
+                                )
+                            cast(Callable[[object], None], close_from_store)(
+                                self._lifecycle_identity
+                            )
+                        if self._ack_journal_owner is not None:
+                            raise EvidenceStoreError(
+                                "ACK-journal owner survived evidence shutdown"
+                            )
+                        self._fence_missing_expected_ack_journal()
             finally:
                 for repair_target in (
                     self._repair_target,

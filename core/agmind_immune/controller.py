@@ -54,6 +54,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournalError,
     AckJournalSnapshot,
 )
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import MAX_PAGE_EVENTS, EnvelopeVerifier
 from agmind_immune.ingest.service import (
     _RETENTION_DELIVERY_FACTORY,
@@ -309,6 +310,7 @@ class CoreController:
         self,
         acceptance: AcceptanceCoordinator,
         acknowledgements: AckJournal,
+        correlation_requests: CorrelationRequestJournal,
         coverage: CoverageState,
         projection: ProjectionStore,
         clock: CoreClockProvider,
@@ -324,6 +326,7 @@ class CoreController:
         self._store = store
         self._verifier = verifier
         self._acknowledgements = acknowledgements
+        self._correlation_requests = correlation_requests
         self._coverage = coverage
         self._projection = projection
         self._clock = clock
@@ -337,6 +340,7 @@ class CoreController:
         cls,
         acceptance: AcceptanceCoordinator,
         acknowledgements: AckJournal,
+        correlation_requests: CorrelationRequestJournal,
         coverage: CoverageState,
         projection: ProjectionStore,
         transport: ObserverCoreTransport,
@@ -348,6 +352,10 @@ class CoreController:
             raise TypeError("controller requires exact acceptance authority")
         if type(acknowledgements) is not AckJournal:
             raise TypeError("controller requires exact ACK authority")
+        if type(correlation_requests) is not CorrelationRequestJournal:
+            raise TypeError(
+                "controller requires exact correlation-request authority"
+            )
         if type(coverage) is not CoverageState:
             raise TypeError("controller requires exact coverage authority")
         if type(projection) is not ProjectionStore:
@@ -364,6 +372,10 @@ class CoreController:
             raise CoreControllerAuthorityError(
                 "acceptance authority binding is invalid"
             )
+        if not correlation_requests._is_bound_to(store):
+            raise CoreControllerAuthorityError(
+                "correlation-request authority binding is invalid"
+            )
         if not projection._is_bound_to(store, acknowledgements):
             raise CoreControllerAuthorityError(
                 "projection authority binding is invalid"
@@ -376,6 +388,7 @@ class CoreController:
         delivery = DeliveryCoordinator.create(
             acceptance,
             acknowledgements,
+            correlation_requests,
             transport,
             coverage=coverage,
             clock=clock,
@@ -386,12 +399,14 @@ class CoreController:
                 acceptance.segment_store is not store
                 or acceptance.verifier is not verifier
                 or not store._is_bound_verifier(verifier)
+                or not correlation_requests._is_bound_to(store)
                 or not projection._is_bound_to(store, acknowledgements)
                 or delivery._store is not store
                 or delivery._verifier is not verifier
                 or not delivery._is_bound_to(
                     acceptance,
                     acknowledgements,
+                    correlation_requests,
                     coverage,
                     clock,
                 )
@@ -402,6 +417,7 @@ class CoreController:
             return cls(
                 acceptance,
                 acknowledgements,
+                correlation_requests,
                 coverage,
                 projection,
                 clock,
@@ -1256,6 +1272,7 @@ class CoreController:
                 close_delivery,
                 self._projection.close,
                 self._coverage.close,
+                self._correlation_requests.close,
                 self._acknowledgements.close,
                 self._store.close,
             )

@@ -30,6 +30,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournalError,
     AckJournalSnapshot,
 )
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
     EnvelopeVerifier,
@@ -120,6 +121,7 @@ def _authorities(
     AcceptanceCoordinator,
     SegmentStore,
     AckJournal,
+    CorrelationRequestJournal,
     CoverageState,
     ProjectionStore,
     tuple[EvidenceRef, ...],
@@ -137,6 +139,7 @@ def _authorities(
         store,
     )
     journal = AckJournal.create_new(store)
+    correlation = CorrelationRequestJournal.create_new(store)
     refs = tuple(
         acceptance.accept(
             decode_events_page(canonical_json(page_value(value))).events[0]
@@ -152,7 +155,7 @@ def _authorities(
         evidence=store,
         acknowledgements=journal,
     )
-    return acceptance, store, journal, coverage, projection, refs
+    return acceptance, store, journal, correlation, coverage, projection, refs
 
 
 def _ready_events() -> tuple[dict[str, object], ...]:
@@ -217,6 +220,51 @@ def _ready_events() -> tuple[dict[str, object], ...]:
     )
 
 
+def test_controller_requires_correlation_journal_from_the_same_evidence_root(
+    tmp_path: Path,
+) -> None:
+    (
+        acceptance,
+        store,
+        journal,
+        primary_correlation,
+        coverage,
+        projection,
+        _,
+    ) = _authorities(tmp_path / "primary")
+    (
+        _foreign_acceptance,
+        foreign_store,
+        foreign_ack,
+        foreign_correlation,
+        foreign_coverage,
+        foreign_projection,
+        _,
+    ) = _authorities(tmp_path / "foreign")
+
+    with pytest.raises(CoreControllerAuthorityError):
+        CoreController.create(
+            acceptance,
+            journal,
+            foreign_correlation,
+            coverage,
+            projection,
+            _Transport(),
+            _Clock(),
+        )
+
+    projection.close()
+    coverage.close()
+    primary_correlation.close()
+    journal.close()
+    store.close()
+    foreign_projection.close()
+    foreign_coverage.close()
+    foreign_correlation.close()
+    foreign_ack.close()
+    foreign_store.close()
+
+
 @pytest.mark.parametrize(
     ("pending_changes", "expected_reason"),
     (
@@ -239,12 +287,13 @@ async def test_controller_maps_evidence_pending_without_collapsing_health(
     pending_changes: dict[str, bool],
     expected_reason: str,
 ) -> None:
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "runtime"
     )
     controller = CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         _Transport([_page(*_ready_events(), reserved=5)], ack_count=5),
@@ -289,6 +338,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         lag_acceptance,
         _lag_store,
         lag_journal,
+        lag_correlation,
         lag_coverage,
         lag_projection,
         lag_refs,
@@ -296,6 +346,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
     lag_controller = CoreController.create(
         lag_acceptance,
         lag_journal,
+        lag_correlation,
         lag_coverage,
         lag_projection,
         _Transport([_page(acked=1, reserved=1)]),
@@ -307,7 +358,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
     assert lag_projection.status().cursor.source_sequence == lag_refs[-1].source_sequence
     await lag_controller.close()
 
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "ready"
     )
     applied: list[int] = []
@@ -323,6 +374,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
     controller = CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         transport,
@@ -493,6 +545,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         capped_acceptance,
         _capped_store,
         capped_journal,
+        capped_correlation,
         capped_coverage,
         capped_projection,
         capped_refs,
@@ -516,6 +569,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
     capped = CoreController.create(
         capped_acceptance,
         capped_journal,
+        capped_correlation,
         capped_coverage,
         capped_projection,
         _Transport(),
@@ -534,7 +588,7 @@ async def test_controller_projection_failure_and_shutdown_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "failure"
     )
     transport = _Transport(
@@ -555,6 +609,7 @@ async def test_controller_projection_failure_and_shutdown_order(
     controller = CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         transport,
@@ -579,6 +634,7 @@ async def test_controller_projection_failure_and_shutdown_order(
     original_delivery_close = controller._delivery.close
     original_projection_close = projection.close
     original_coverage_close = coverage.close
+    original_correlation_close = correlation.close
     original_journal_close = journal.close
     original_store_close = store.close
     first_failure = KeyboardInterrupt("private first cleanup failure")
@@ -606,6 +662,11 @@ async def test_controller_projection_failure_and_shutdown_order(
         fail_close("coverage", SystemExit("private coverage cleanup")),
     )
     monkeypatch.setattr(
+        correlation,
+        "close",
+        fail_close("correlation", RuntimeError("private correlation cleanup")),
+    )
+    monkeypatch.setattr(
         journal,
         "close",
         fail_close("journal", RuntimeError("private journal cleanup")),
@@ -618,7 +679,14 @@ async def test_controller_projection_failure_and_shutdown_order(
     with pytest.raises(KeyboardInterrupt) as raised:
         await controller.close()
     assert raised.value is first_failure
-    assert order == ["delivery", "projection", "coverage", "journal", "evidence"]
+    assert order == [
+        "delivery",
+        "projection",
+        "coverage",
+        "correlation",
+        "journal",
+        "evidence",
+    ]
     assert all("private" not in note for note in getattr(first_failure, "__notes__", ()))
     await controller.close()
     with pytest.raises(CoreControllerClosed):
@@ -629,10 +697,12 @@ async def test_controller_projection_failure_and_shutdown_order(
     monkeypatch.setattr(controller._delivery, "close", original_delivery_close)
     monkeypatch.setattr(projection, "close", original_projection_close)
     monkeypatch.setattr(coverage, "close", original_coverage_close)
+    monkeypatch.setattr(correlation, "close", original_correlation_close)
     monkeypatch.setattr(journal, "close", original_journal_close)
     monkeypatch.setattr(store, "close", original_store_close)
     await original_delivery_close()
     original_projection_close()
     original_coverage_close()
+    original_correlation_close()
     original_journal_close()
     original_store_close()

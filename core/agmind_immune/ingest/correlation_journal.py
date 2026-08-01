@@ -1,0 +1,1229 @@
+"""Durable Core correlation-request phases bound to one evidence lifecycle."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import stat
+from _thread import LockType
+from threading import Lock
+from typing import BinaryIO, Literal, Never, Protocol, cast
+
+from pydantic import ConfigDict, ValidationError, field_validator, model_validator
+
+from agmind_immune.canonicaljson import (
+    canonical_json,
+    pcc_correlation_request_sha256,
+)
+from agmind_immune.contracts import (
+    ContractModel,
+    PCCCorrelationSnapshotRequestV1,
+    decode_strict,
+)
+from agmind_immune.evidence.frames import (
+    FrameRecord,
+    JournalCorrupt,
+    TornTail,
+    encode_frame,
+    iter_frames,
+)
+from agmind_immune.evidence.segments import (
+    EvidenceCorrupt,
+    EvidenceRef,
+    EvidenceSealError,
+    SegmentStore,
+    _AckAuthorityError,
+    _CorrelationJournalLifecycleCorrupt,
+    _CorrelationJournalLifecycleIoUncertain,
+    _CorrelationJournalLifecycleStateError,
+    _full_write,
+)
+
+_JOURNAL_NAME = "correlation-requests.agf"
+_MAX_RECORDS = 4_096
+_MAX_VERIFIED_BYTES = 16 * 1024 * 1024
+_MAX_FRAME_PAYLOAD = 64 * 1024
+_EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_OPERATION_PREFIX = "pcc_correlation_snapshot:"
+
+
+class _DigestState(Protocol):
+    def update(self, value: bytes, /) -> None: ...
+
+    def digest(self) -> bytes: ...
+
+    def copy(self) -> _DigestState: ...
+
+
+class CorrelationRequestJournalError(RuntimeError):
+    """Base class for durable correlation-request failures."""
+
+
+class CorrelationRequestJournalCorrupt(CorrelationRequestJournalError):
+    """The journal, its chain, or its evidence-root binding is corrupt."""
+
+
+class CorrelationRequestJournalStateError(CorrelationRequestJournalError):
+    """A caller requested an illegal or conflicting phase transition."""
+
+
+class CorrelationRequestJournalAuthorityError(CorrelationRequestJournalError):
+    """A caller supplied evidence outside this journal's store authority."""
+
+
+class CorrelationRequestJournalUnhealthy(CorrelationRequestJournalError):
+    """A prior write has ambiguous durability and requires restart recovery."""
+
+
+class _CorrelationRequestStateV1(ContractModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    schema_version: Literal["agmind.correlation-request-state.v1"]
+    operation_key: str
+    request_sha256: str
+    request: PCCCorrelationSnapshotRequestV1
+    phase: Literal["selected", "proof_observed", "completed"]
+    snapshot_event_id: str | None = None
+    snapshot_content_sha256: str | None = None
+
+    @field_validator("request_sha256", "snapshot_content_sha256")
+    @classmethod
+    def digest_is_exact(cls, value: str | None) -> str | None:
+        if value is not None and not _HEX64.fullmatch(value):
+            raise ValueError("correlation-request digest is invalid")
+        return value
+
+    @field_validator("snapshot_event_id")
+    @classmethod
+    def snapshot_event_is_exact(cls, value: str | None) -> str | None:
+        if value is not None and not _EVENT_ID.fullmatch(value):
+            raise ValueError("correlation snapshot event ID is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def bindings_and_phase_shape_are_exact(self) -> _CorrelationRequestStateV1:
+        request = self.request
+        expected_operation = _operation_key(request.trigger_event_id)
+        if self.operation_key != expected_operation:
+            raise ValueError("operation_key does not bind the exact trigger")
+        if request.requested_ttl_seconds != 120:
+            raise ValueError("correlation request TTL must be exactly 120 seconds")
+        if self.request_sha256 != pcc_correlation_request_sha256(request):
+            raise ValueError("request_sha256 does not bind the exact request")
+
+        snapshot_fields = {
+            "snapshot_event_id",
+            "snapshot_content_sha256",
+        }
+        if self.phase == "selected":
+            if (
+                self.snapshot_event_id is not None
+                or self.snapshot_content_sha256 is not None
+                or bool(snapshot_fields & self.model_fields_set)
+            ):
+                raise ValueError("selected phase must omit snapshot identity")
+        elif (
+            self.snapshot_event_id is None
+            or self.snapshot_content_sha256 is None
+            or not snapshot_fields.issubset(self.model_fields_set)
+        ):
+            raise ValueError("observed phases require the complete snapshot identity")
+        return self
+
+
+def _operation_key(trigger_event_id: str) -> str:
+    return f"{_OPERATION_PREFIX}{trigger_event_id}"
+
+
+def _validate_journal_stat(info: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise CorrelationRequestJournalCorrupt(
+            "unsafe correlation-request journal artifact"
+        )
+
+
+def _same_file(actual: os.stat_result, expected: os.stat_result) -> bool:
+    return (
+        actual.st_dev == expected.st_dev
+        and actual.st_ino == expected.st_ino
+        and actual.st_size == expected.st_size
+        and actual.st_mode == expected.st_mode
+        and actual.st_uid == expected.st_uid
+        and actual.st_nlink == expected.st_nlink
+        and actual.st_mtime_ns == expected.st_mtime_ns
+        and actual.st_ctime_ns == expected.st_ctime_ns
+    )
+
+
+class _BoundedReader:
+    def __init__(self, stream: BinaryIO, limit: int) -> None:
+        self._stream = stream
+        self._remaining = limit
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        if size < 0 or size > self._remaining:
+            size = self._remaining
+        raw = self._stream.read(size)
+        self._remaining -= len(raw)
+        return raw
+
+
+class CorrelationRequestJournal:
+    """One sequential correlation-request authority leased from a SegmentStore."""
+
+    _store: SegmentStore
+    _root_descriptor: int
+    _descriptor: int
+    _lifecycle_identity: object
+    _previous_hash: bytes
+    _states_by_operation: dict[str, _CorrelationRequestStateV1]
+    _operation_by_request: dict[str, str]
+    _healthy: bool
+    _closed: bool
+    _closing: bool
+    _size: int
+    _record_count: int
+    _authenticated_stat: os.stat_result | None
+    _authenticated_hasher: _DigestState | None
+    _lock: LockType
+
+    def __init__(self) -> None:
+        raise TypeError(
+            "use CorrelationRequestJournal.create_new() or open_and_recover()"
+        )
+
+    @classmethod
+    def create_new(cls, store: SegmentStore) -> CorrelationRequestJournal:
+        """Create one absent journal under the store's authenticated root."""
+        return cls._open_bound(store, create=True)
+
+    @classmethod
+    def open_and_recover(cls, store: SegmentStore) -> CorrelationRequestJournal:
+        """Strictly recover one existing complete journal without tail repair."""
+        return cls._open_bound(store, create=False)
+
+    @classmethod
+    def _open_bound(
+        cls,
+        store: SegmentStore,
+        *,
+        create: bool,
+    ) -> CorrelationRequestJournal:
+        journal = object.__new__(cls)
+        journal._store = store
+        journal._root_descriptor = -1
+        journal._descriptor = -1
+        journal._lifecycle_identity = object()
+        journal._previous_hash = bytes(32)
+        journal._states_by_operation = {}
+        journal._operation_by_request = {}
+        journal._healthy = True
+        journal._closed = False
+        journal._closing = False
+        journal._size = 0
+        journal._record_count = 0
+        journal._authenticated_stat = None
+        journal._authenticated_hasher = None
+        journal._lock = Lock()
+        try:
+            root_descriptor, lifecycle_identity = (
+                store._acquire_correlation_journal(
+                    journal,
+                    operation="create" if create else "recover",
+                )
+            )
+            journal._root_descriptor = root_descriptor
+            journal._lifecycle_identity = lifecycle_identity
+            journal._descriptor = (
+                journal._create_new() if create else journal._open_existing()
+            )
+            journal._recover()
+            authenticated = journal._bind_published_or_latch()
+            store._complete_correlation_journal_initialization(
+                journal,
+                lifecycle_identity,
+                authenticated,
+                journal._authenticated_digest(),
+            )
+            return journal
+        except _CorrelationJournalLifecycleCorrupt as error:
+            corrupt = CorrelationRequestJournalCorrupt(str(error))
+            journal._healthy = False
+            journal._attempt_corruption_fence(corrupt)
+            journal._close_after_failed_open(corrupt)
+            raise corrupt from error
+        except _CorrelationJournalLifecycleStateError as error:
+            state_error = CorrelationRequestJournalStateError(str(error))
+            journal._close_after_failed_open(state_error)
+            raise state_error from error
+        except _CorrelationJournalLifecycleIoUncertain as error:
+            journal._healthy = False
+            journal._attempt_io_uncertain(
+                error,
+                journal._authenticated_stat,
+                journal._authenticated_digest_or_none(),
+            )
+            journal._close_after_failed_open(error)
+            raise
+        except CorrelationRequestJournalCorrupt as error:
+            journal._healthy = False
+            journal._attempt_corruption_fence(error)
+            journal._close_after_failed_open(error)
+            raise
+        except BaseException as error:
+            journal._healthy = False
+            if (
+                getattr(store, "_correlation_journal_owner", None)
+                is journal
+            ):
+                journal._attempt_io_uncertain(
+                    error,
+                    journal._authenticated_stat,
+                    journal._authenticated_digest_or_none(),
+                )
+            journal._close_after_failed_open(error)
+            raise
+
+    def _create_new(self) -> int:
+        flags = os.O_RDWR | os.O_APPEND | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                _JOURNAL_NAME,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=self._root_descriptor,
+            )
+        except FileExistsError as error:
+            raise CorrelationRequestJournalCorrupt(
+                "correlation-request journal appeared during fresh initialization"
+            ) from error
+        try:
+            self._store._correlation_journal_final_name_created(
+                self,
+                self._lifecycle_identity,
+            )
+            os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+            published = os.stat(
+                _JOURNAL_NAME,
+                dir_fd=self._root_descriptor,
+                follow_symlinks=False,
+            )
+            _validate_journal_stat(opened)
+            if not _same_file(opened, published):
+                raise CorrelationRequestJournalCorrupt(
+                    "created correlation-request journal changed before root sync"
+                )
+            os.fsync(descriptor)
+            os.fsync(self._root_descriptor)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _open_existing(self) -> int:
+        flags = os.O_RDWR | os.O_APPEND | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            expected = os.stat(
+                _JOURNAL_NAME,
+                dir_fd=self._root_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise CorrelationRequestJournalCorrupt(
+                "expected correlation-request journal disappeared before recovery"
+            ) from error
+        _validate_journal_stat(expected)
+        try:
+            descriptor = os.open(
+                _JOURNAL_NAME,
+                flags,
+                dir_fd=self._root_descriptor,
+            )
+        except OSError as error:
+            raise CorrelationRequestJournalCorrupt(
+                "correlation-request journal became unavailable during open"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            _validate_journal_stat(opened)
+            if not _same_file(opened, expected):
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation-request journal changed during authenticated open"
+                )
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _recover(self) -> None:
+        expected = os.fstat(self._descriptor)
+        _validate_journal_stat(expected)
+        if expected.st_size > _MAX_VERIFIED_BYTES:
+            raise CorrelationRequestJournalCorrupt(
+                "correlation-request journal exceeds its verified-byte bound"
+            )
+
+        read_descriptor = os.dup(self._descriptor)
+        try:
+            os.set_inheritable(read_descriptor, False)
+            os.lseek(read_descriptor, 0, os.SEEK_SET)
+            stream = os.fdopen(read_descriptor, "rb", buffering=0, closefd=True)
+        except BaseException:
+            os.close(read_descriptor)
+            raise
+
+        states: dict[str, _CorrelationRequestStateV1] = {}
+        request_index: dict[str, str] = {}
+        previous_hash = bytes(32)
+        verified_size = 0
+        record_count = 0
+        hasher = hashlib.sha256()
+        try:
+            with stream:
+                bounded = _BoundedReader(cast(BinaryIO, stream), expected.st_size)
+                try:
+                    for frame in iter_frames(
+                        cast(BinaryIO, bounded),
+                        max_frame=_MAX_FRAME_PAYLOAD,
+                    ):
+                        record_count += 1
+                        if record_count > _MAX_RECORDS:
+                            raise CorrelationRequestJournalCorrupt(
+                                "correlation-request journal exceeds its record bound"
+                            )
+                        state = self._decode_frame_state(frame)
+                        self._replay_state(state, states, request_index)
+                        authenticated_frame = encode_frame(
+                            frame.payload,
+                            previous_hash=frame.previous_hash,
+                            max_frame=_MAX_FRAME_PAYLOAD,
+                        )
+                        if (
+                            len(authenticated_frame) != frame.size
+                            or authenticated_frame[-32:] != frame.record_hash
+                        ):
+                            raise CorrelationRequestJournalCorrupt(
+                                "verified correlation frame cannot be reconstructed"
+                            )
+                        hasher.update(authenticated_frame)
+                        verified_size += len(authenticated_frame)
+                        if verified_size > _MAX_VERIFIED_BYTES:
+                            raise CorrelationRequestJournalCorrupt(
+                                "verified correlation bytes exceed their bound"
+                            )
+                        previous_hash = frame.record_hash
+                except TornTail as error:
+                    raise CorrelationRequestJournalCorrupt(
+                        "correlation-request journal has an unproven torn tail"
+                    ) from error
+        except JournalCorrupt as error:
+            raise CorrelationRequestJournalCorrupt(
+                "correlation-request frame chain is corrupt"
+            ) from error
+
+        published = self._bind_published()
+        after = os.fstat(self._descriptor)
+        if (
+            verified_size != expected.st_size
+            or not _same_file(after, expected)
+            or not _same_file(published, expected)
+        ):
+            raise CorrelationRequestJournalCorrupt(
+                "correlation-request journal changed during held-descriptor recovery"
+            )
+        self._states_by_operation = states
+        self._operation_by_request = request_index
+        self._previous_hash = previous_hash
+        self._size = verified_size
+        self._record_count = record_count
+        self._authenticated_stat = published
+        self._authenticated_hasher = hasher
+
+    @staticmethod
+    def _decode_frame_state(frame: FrameRecord) -> _CorrelationRequestStateV1:
+        try:
+            state = decode_strict(
+                frame.payload,
+                _CorrelationRequestStateV1,
+                _MAX_FRAME_PAYLOAD,
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise CorrelationRequestJournalCorrupt(
+                "correlation-request record schema is invalid"
+            ) from error
+        if frame.payload != canonical_json(state):
+            raise CorrelationRequestJournalCorrupt(
+                "correlation-request record is not canonical JSON"
+            )
+        return state
+
+    @staticmethod
+    def _replay_state(
+        state: _CorrelationRequestStateV1,
+        states: dict[str, _CorrelationRequestStateV1],
+        request_index: dict[str, str],
+    ) -> None:
+        existing = states.get(state.operation_key)
+        indexed_operation = request_index.get(state.request_sha256)
+        if state.phase == "selected":
+            if existing is not None or indexed_operation is not None:
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation-request journal repeats a selection"
+                )
+            states[state.operation_key] = state
+            request_index[state.request_sha256] = state.operation_key
+            return
+        if (
+            existing is None
+            or indexed_operation != state.operation_key
+            or existing.request_sha256 != state.request_sha256
+            or existing.request != state.request
+        ):
+            raise CorrelationRequestJournalCorrupt(
+                "correlation phase does not bind one selected request"
+            )
+        if state.phase == "proof_observed":
+            if existing.phase != "selected":
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation proof phase skips or repeats a transition"
+                )
+        elif (
+            existing.phase != "proof_observed"
+            or state.snapshot_event_id != existing.snapshot_event_id
+            or state.snapshot_content_sha256
+            != existing.snapshot_content_sha256
+        ):
+            raise CorrelationRequestJournalCorrupt(
+                "correlation completion does not match its observed proof"
+            )
+        states[state.operation_key] = state
+
+    def _bind_published(self) -> os.stat_result:
+        opened = os.fstat(self._descriptor)
+        _validate_journal_stat(opened)
+        try:
+            published = os.stat(
+                _JOURNAL_NAME,
+                dir_fd=self._root_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise CorrelationRequestJournalCorrupt(
+                "correlation-request journal disappeared from its root"
+            ) from error
+        _validate_journal_stat(published)
+        if not _same_file(opened, published):
+            raise CorrelationRequestJournalCorrupt(
+                "journal root name no longer binds the retained inode"
+            )
+        return published
+
+    def _bind_published_or_latch(self) -> os.stat_result:
+        try:
+            published = self._bind_published()
+            retained = self._authenticated_stat
+            if retained is None or not _same_file(published, retained):
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation journal identity changed outside its writer"
+                )
+            return published
+        except CorrelationRequestJournalCorrupt as error:
+            self._healthy = False
+            self._attempt_corruption_fence(error)
+            raise
+
+    def _authenticated_digest_or_none(self) -> bytes | None:
+        hasher = self._authenticated_hasher
+        if hasher is None:
+            return None
+        return hasher.digest()
+
+    def _authenticated_digest(self) -> bytes:
+        digest = self._authenticated_digest_or_none()
+        if digest is None:
+            raise CorrelationRequestJournalCorrupt(
+                "correlation journal has no authenticated content anchor"
+            )
+        return digest
+
+    def _hash_held_prefix(self) -> bytes:
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < self._size:
+            raw = os.pread(
+                self._descriptor,
+                min(1024 * 1024, self._size - offset),
+                offset,
+            )
+            if not raw:
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation journal shortened during verification"
+                )
+            digest.update(raw)
+            offset += len(raw)
+        return digest.digest()
+
+    def _verify_authenticated_content(self) -> os.stat_result:
+        before = self._bind_published_or_latch()
+        digest = self._hash_held_prefix()
+        after = self._bind_published_or_latch()
+        if not _same_file(before, after) or digest != self._authenticated_digest():
+            raise CorrelationRequestJournalCorrupt(
+                "correlation journal content differs from its authenticated anchor"
+            )
+        return after
+
+    def _require_open(self) -> None:
+        if self._closed or self._closing:
+            raise CorrelationRequestJournalStateError(
+                "correlation-request journal is closed"
+            )
+
+    def _require_usable(self) -> None:
+        self._require_open()
+        if not self._healthy:
+            raise CorrelationRequestJournalUnhealthy(
+                "correlation journal durability is ambiguous until recovery"
+            )
+        try:
+            self._store._validate_correlation_journal_owner(
+                self,
+                self._lifecycle_identity,
+            )
+        except _CorrelationJournalLifecycleCorrupt as error:
+            corrupt = CorrelationRequestJournalCorrupt(str(error))
+            self._healthy = False
+            self._attempt_corruption_fence(corrupt)
+            raise corrupt from error
+        except _CorrelationJournalLifecycleStateError as error:
+            raise CorrelationRequestJournalStateError(str(error)) from error
+        except EvidenceSealError as error:
+            raise CorrelationRequestJournalStateError(str(error)) from error
+        self._bind_published_or_latch()
+
+    def _append(self, state: _CorrelationRequestStateV1) -> None:
+        payload = canonical_json(state)
+        if len(payload) > _MAX_FRAME_PAYLOAD:
+            raise CorrelationRequestJournalStateError(
+                "correlation-request record exceeds its payload bound"
+            )
+        if self._record_count >= _MAX_RECORDS:
+            raise CorrelationRequestJournalStateError(
+                "correlation-request journal record quota is exhausted"
+            )
+        frame = encode_frame(
+            payload,
+            previous_hash=self._previous_hash,
+            max_frame=_MAX_FRAME_PAYLOAD,
+        )
+        if self._size + len(frame) > _MAX_VERIFIED_BYTES:
+            raise CorrelationRequestJournalStateError(
+                "correlation-request journal byte quota is exhausted"
+            )
+
+        authenticated_before: os.stat_result | None = None
+        digest_before: bytes | None = None
+        authenticated_after: os.stat_result | None = None
+        hasher_after: _DigestState | None = None
+        try:
+            authenticated_before = self._bind_published_or_latch()
+            digest_before = self._authenticated_digest()
+            before = os.fstat(self._descriptor)
+            if not _same_file(before, authenticated_before):
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation append did not start at its authenticated identity"
+                )
+            _full_write(self._descriptor, frame)
+            os.fsync(self._descriptor)
+            after = self._bind_published()
+            expected_size = before.st_size + len(frame)
+            if after.st_size != expected_size:
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation append includes an unexpected concurrent write"
+                )
+            if os.pread(self._descriptor, len(frame), before.st_size) != frame:
+                raise CorrelationRequestJournalCorrupt(
+                    "durable correlation frame differs from appended bytes"
+                )
+            authenticated_after = self._bind_published()
+            if not _same_file(authenticated_after, after):
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation journal identity changed during append"
+                )
+            hasher = self._authenticated_hasher
+            if hasher is None:
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation journal lost its content anchor"
+                )
+            hasher_after = hasher.copy()
+            hasher_after.update(frame)
+        except CorrelationRequestJournalCorrupt as error:
+            self._healthy = False
+            self._attempt_corruption_fence(error)
+            raise
+        except BaseException as error:
+            self._healthy = False
+            if authenticated_before is not None and digest_before is not None:
+                self._attempt_append_uncertain(
+                    error,
+                    authenticated_before,
+                    digest_before,
+                )
+            raise
+        if authenticated_after is None or hasher_after is None:
+            raise AssertionError("successful correlation append lost its anchor")
+        self._size = expected_size
+        self._record_count += 1
+        self._previous_hash = frame[-32:]
+        self._authenticated_stat = authenticated_after
+        self._authenticated_hasher = hasher_after
+
+    def select(
+        self,
+        trigger_ref: EvidenceRef,
+        canonical_request: bytes,
+    ) -> _CorrelationRequestStateV1:
+        """Durably select one exact narrow request for an authenticated trigger."""
+        with self._lock:
+            self._require_usable()
+            if type(canonical_request) is not bytes:
+                raise CorrelationRequestJournalStateError(
+                    "canonical request must be exact bytes"
+                )
+            try:
+                request = decode_strict(
+                    canonical_request,
+                    PCCCorrelationSnapshotRequestV1,
+                    _MAX_FRAME_PAYLOAD,
+                )
+            except (TypeError, ValueError, ValidationError) as error:
+                raise CorrelationRequestJournalStateError(
+                    "correlation request schema is invalid"
+                ) from error
+            if canonical_request != canonical_json(request):
+                raise CorrelationRequestJournalStateError(
+                    "correlation request is not canonical JSON"
+                )
+            if request.requested_ttl_seconds != 120:
+                raise CorrelationRequestJournalStateError(
+                    "correlation request TTL must be exactly 120 seconds"
+                )
+            request_sha256 = pcc_correlation_request_sha256(request)
+            self._resolve_authenticated_ref(trigger_ref)
+            operation_key = _operation_key(trigger_ref.event_id)
+            existing = self._states_by_operation.get(operation_key)
+            if existing is not None:
+                if (
+                    existing.request_sha256 != request_sha256
+                    or canonical_json(existing.request) != canonical_request
+                ):
+                    self._raise_conflict(
+                        "a correlation operation was reselected differently"
+                    )
+                if not self._trigger_matches(trigger_ref, request):
+                    raise CorrelationRequestJournalAuthorityError(
+                        "correlation request does not match its trigger ref"
+                    )
+                return existing.model_copy(deep=True)
+
+            if not self._trigger_matches(trigger_ref, request):
+                raise CorrelationRequestJournalAuthorityError(
+                    "correlation request does not match its trigger ref"
+                )
+            if request_sha256 in self._operation_by_request:
+                self._raise_conflict(
+                    "one correlation request hash names another operation"
+                )
+            selected = _CorrelationRequestStateV1(
+                schema_version="agmind.correlation-request-state.v1",
+                operation_key=operation_key,
+                request_sha256=request_sha256,
+                request=request,
+                phase="selected",
+            )
+            self._append(selected)
+            self._states_by_operation[operation_key] = selected
+            self._operation_by_request[request_sha256] = operation_key
+            return selected.model_copy(deep=True)
+
+    @staticmethod
+    def _trigger_matches(
+        trigger_ref: EvidenceRef,
+        request: PCCCorrelationSnapshotRequestV1,
+    ) -> bool:
+        return (
+            type(trigger_ref) is EvidenceRef
+            and trigger_ref.event_id == request.trigger_event_id
+            and trigger_ref.content_sha256 == request.trigger_content_sha256
+            and trigger_ref.source_sequence == request.trigger_source_sequence
+        )
+
+    def _resolve_authenticated_ref(self, ref: EvidenceRef) -> None:
+        if type(ref) is not EvidenceRef:
+            raise CorrelationRequestJournalAuthorityError(
+                "correlation evidence must be an exact EvidenceRef"
+            )
+        try:
+            self._store.resolve_authenticated_ref(ref)
+        except _AckAuthorityError as error:
+            raise CorrelationRequestJournalAuthorityError(
+                "correlation evidence is outside the authenticated store"
+            ) from error
+        except EvidenceCorrupt as error:
+            self._raise_internal_evidence_corruption(
+                "authenticated trigger evidence is internally corrupt",
+                error,
+            )
+
+    def mark_proof_observed(
+        self,
+        request_sha256: str,
+        snapshot_ref: EvidenceRef,
+    ) -> _CorrelationRequestStateV1:
+        """Durably bind one protected PCC proof to its selected request."""
+        with self._lock:
+            self._require_usable()
+            state = self._state_for_request(request_sha256)
+            if type(snapshot_ref) is not EvidenceRef:
+                raise CorrelationRequestJournalAuthorityError(
+                    "correlation proof must be an exact EvidenceRef"
+                )
+            if state.phase != "selected":
+                self._authenticate_snapshot(state, snapshot_ref)
+                if (
+                    state.snapshot_event_id != snapshot_ref.event_id
+                    or state.snapshot_content_sha256
+                    != snapshot_ref.content_sha256
+                ):
+                    self._raise_conflict(
+                        "correlation request was rebound to a different proof"
+                    )
+                return state.model_copy(deep=True)
+
+            self._authenticate_snapshot(state, snapshot_ref)
+            observed = _CorrelationRequestStateV1(
+                schema_version="agmind.correlation-request-state.v1",
+                operation_key=state.operation_key,
+                request_sha256=state.request_sha256,
+                request=state.request,
+                phase="proof_observed",
+                snapshot_event_id=snapshot_ref.event_id,
+                snapshot_content_sha256=snapshot_ref.content_sha256,
+            )
+            self._append(observed)
+            self._states_by_operation[state.operation_key] = observed
+            return observed.model_copy(deep=True)
+
+    def _authenticate_snapshot(
+        self,
+        state: _CorrelationRequestStateV1,
+        snapshot_ref: EvidenceRef,
+    ) -> None:
+        if snapshot_ref.source_sequence <= state.request.trigger_source_sequence:
+            raise CorrelationRequestJournalAuthorityError(
+                "correlation proof must follow its trigger"
+            )
+        verifier = getattr(self._store, "_bound_verifier", None)
+        if verifier is None:
+            raise CorrelationRequestJournalAuthorityError(
+                "correlation store has no authenticated verifier"
+            )
+        try:
+            authenticated = self._store._authenticated_pcc_input(
+                verifier,
+                snapshot_ref,
+                state.request,
+            )
+        except (_AckAuthorityError, EvidenceSealError) as error:
+            raise CorrelationRequestJournalAuthorityError(
+                "correlation proof lacks exact protected PCC authority"
+            ) from error
+        except EvidenceCorrupt as error:
+            self._raise_internal_evidence_corruption(
+                "authenticated PCC evidence is internally corrupt",
+                error,
+            )
+        snapshot = authenticated.snapshot
+        if (
+            authenticated.evidence_ref != snapshot_ref
+            or authenticated.source_sequence != snapshot_ref.source_sequence
+            or authenticated.event_id != snapshot_ref.event_id
+            or authenticated.content_sha256 != snapshot_ref.content_sha256
+            or snapshot.request_sha256 != state.request_sha256
+            or snapshot.trigger.event_id != state.request.trigger_event_id
+            or snapshot.trigger.content_sha256
+            != state.request.trigger_content_sha256
+            or snapshot.trigger.source_sequence
+            != state.request.trigger_source_sequence
+            or snapshot.requested_ttl_seconds
+            != state.request.requested_ttl_seconds
+        ):
+            raise CorrelationRequestJournalAuthorityError(
+                "correlation proof does not bind the exact selected request"
+            )
+
+    def mark_completed(
+        self,
+        request_sha256: str,
+    ) -> _CorrelationRequestStateV1:
+        """Durably complete only one request whose exact proof was observed."""
+        with self._lock:
+            self._require_usable()
+            state = self._state_for_request(request_sha256)
+            if state.phase == "completed":
+                return state.model_copy(deep=True)
+            if state.phase != "proof_observed":
+                raise CorrelationRequestJournalStateError(
+                    "correlation request has no observed proof"
+                )
+            completed = _CorrelationRequestStateV1(
+                schema_version="agmind.correlation-request-state.v1",
+                operation_key=state.operation_key,
+                request_sha256=state.request_sha256,
+                request=state.request,
+                phase="completed",
+                snapshot_event_id=state.snapshot_event_id,
+                snapshot_content_sha256=state.snapshot_content_sha256,
+            )
+            self._append(completed)
+            self._states_by_operation[state.operation_key] = completed
+            return completed.model_copy(deep=True)
+
+    def _state_for_request(
+        self,
+        request_sha256: str,
+    ) -> _CorrelationRequestStateV1:
+        if type(request_sha256) is not str or not _HEX64.fullmatch(request_sha256):
+            raise CorrelationRequestJournalStateError(
+                "request_sha256 must be 64 lowercase hex"
+            )
+        operation = self._operation_by_request.get(request_sha256)
+        if operation is None:
+            raise CorrelationRequestJournalStateError(
+                "correlation request is not selected"
+            )
+        state = self._states_by_operation.get(operation)
+        if state is None or state.request_sha256 != request_sha256:
+            raise CorrelationRequestJournalCorrupt(
+                "correlation request index no longer binds its state"
+            )
+        return state
+
+    def _raise_conflict(self, message: str) -> None:
+        failures: list[Exception] = []
+        for _attempt in range(2):
+            try:
+                self._store.enter_read_only("evidence_conflict")
+                if self._store.read_only_reason != "evidence_conflict":
+                    raise RuntimeError(
+                        "evidence-conflict fence did not bind the exact reason"
+                    )
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    self._latch_operational_failure(error)
+                    raise
+                failures.append(error)
+                continue
+            self._latch_verifier_after_conflict_fence()
+            raise CorrelationRequestJournalStateError(message)
+
+        self._healthy = False
+        unhealthy = CorrelationRequestJournalUnhealthy(
+            "evidence-conflict fence durability is uncertain"
+        )
+        for failure in failures[:-1]:
+            unhealthy.add_note(
+                "prior evidence-conflict persistence failure: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        self._latch_operational_failure(unhealthy)
+        raise unhealthy from failures[-1]
+
+    def _latch_verifier_after_conflict_fence(self) -> None:
+        verifier = getattr(self._store, "_bound_verifier", None)
+        latch = getattr(verifier, "_enter_read_only_after_durable_fence", None)
+        if verifier is None or not callable(latch):
+            unhealthy = CorrelationRequestJournalUnhealthy(
+                "durable evidence-conflict fence has no exact verifier latch"
+            )
+            self._latch_operational_failure(unhealthy)
+            raise unhealthy
+        try:
+            latch()
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                self._latch_operational_failure(error)
+                raise
+            unhealthy = CorrelationRequestJournalUnhealthy(
+                "durable evidence-conflict verifier latch failed"
+            )
+            self._latch_operational_failure(unhealthy)
+            raise unhealthy from error
+        if getattr(verifier.fsm, "mutation_read_only", None) is not True:
+            unhealthy = CorrelationRequestJournalUnhealthy(
+                "durable evidence-conflict verifier latch did not settle"
+            )
+            self._latch_operational_failure(unhealthy)
+            raise unhealthy
+
+    def _latch_operational_failure(self, primary: BaseException) -> None:
+        retained = self._authenticated_stat
+        digest = self._authenticated_digest_or_none()
+        try:
+            if retained is None or digest is None:
+                raise CorrelationRequestJournalCorrupt(
+                    "operational failure has no authenticated journal anchor"
+                )
+            before = self._bind_published()
+            if not _same_file(before, retained):
+                raise CorrelationRequestJournalCorrupt(
+                    "operational failure journal identity changed"
+                )
+            if self._hash_held_prefix() != digest:
+                raise CorrelationRequestJournalCorrupt(
+                    "operational failure journal content changed"
+                )
+            after = self._bind_published()
+            if not _same_file(after, before):
+                raise CorrelationRequestJournalCorrupt(
+                    "operational failure journal changed during verification"
+                )
+            self._store._seal_correlation_journal_identity(
+                self,
+                self._lifecycle_identity,
+                after,
+                digest,
+            )
+        except BaseException as error:  # noqa: BLE001
+            primary.add_note(
+                "secondary operational-failure anchor seal failure: "
+                f"{type(error).__name__}: {error}"
+            )
+            self._attempt_io_uncertain(primary, retained, digest)
+        self._healthy = False
+
+    def _raise_internal_evidence_corruption(
+        self,
+        message: str,
+        cause: EvidenceCorrupt,
+    ) -> Never:
+        self._healthy = False
+        corrupt = CorrelationRequestJournalCorrupt(message)
+        self._attempt_corruption_fence(corrupt)
+        raise corrupt from cause
+
+    def pending(self) -> tuple[_CorrelationRequestStateV1, ...]:
+        """Return selected/observed requests in stable selection order."""
+        with self._lock:
+            self._require_usable()
+            return tuple(
+                state.model_copy(deep=True)
+                for state in self._states_by_operation.values()
+                if state.phase != "completed"
+            )
+
+    def _is_bound_to(self, store: SegmentStore) -> bool:
+        """Report whether this live journal owns the exact supplied store."""
+        with self._lock:
+            if (
+                store is not self._store
+                or self._closed
+                or self._closing
+                or not self._healthy
+            ):
+                return False
+            try:
+                self._store._validate_correlation_journal_owner(
+                    self,
+                    self._lifecycle_identity,
+                )
+                self._bind_published_or_latch()
+            except CorrelationRequestJournalError:
+                return False
+            except (
+                _CorrelationJournalLifecycleCorrupt,
+                _CorrelationJournalLifecycleStateError,
+                EvidenceSealError,
+            ):
+                return False
+            return True
+
+    def _attempt_corruption_fence(
+        self,
+        primary: CorrelationRequestJournalCorrupt,
+    ) -> None:
+        try:
+            self._store._trip_correlation_journal_corrupt()
+        except Exception as error:  # noqa: BLE001
+            primary.add_note(
+                "secondary correlation corruption-fence failure: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _attempt_append_uncertain(
+        self,
+        primary: BaseException,
+        authenticated_before: os.stat_result,
+        digest_before: bytes,
+    ) -> None:
+        try:
+            self._store._mark_correlation_journal_append_uncertain(
+                self,
+                self._lifecycle_identity,
+                authenticated_before,
+                digest_before,
+            )
+        except Exception as error:  # noqa: BLE001
+            primary.add_note(
+                "secondary correlation append-uncertainty failure: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _attempt_io_uncertain(
+        self,
+        primary: BaseException,
+        authenticated: os.stat_result | None,
+        digest: bytes | None,
+    ) -> None:
+        try:
+            self._store._mark_correlation_journal_io_uncertain(
+                self,
+                self._lifecycle_identity,
+                authenticated,
+                digest,
+            )
+        except Exception as error:  # noqa: BLE001
+            primary.add_note(
+                "secondary correlation I/O-uncertainty failure: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _close_resources(self) -> list[Exception]:
+        errors: list[Exception] = []
+        if self._descriptor >= 0:
+            try:
+                os.close(self._descriptor)
+            except OSError as error:
+                errors.append(error)
+            finally:
+                self._descriptor = -1
+        if self._root_descriptor >= 0:
+            try:
+                os.close(self._root_descriptor)
+            except OSError as error:
+                errors.append(error)
+            finally:
+                self._root_descriptor = -1
+        if getattr(self._store, "_correlation_journal_owner", None) is self:
+            try:
+                self._store._release_correlation_journal(
+                    self,
+                    self._lifecycle_identity,
+                )
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+        retained = getattr(self._store, "_correlation_journal_owner", None) is self
+        self._closed = not retained
+        if retained:
+            self._closing = True
+        return errors
+
+    def _close_after_failed_open(self, primary: BaseException) -> None:
+        for error in self._close_resources():
+            primary.add_note(
+                "secondary correlation cleanup failure: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _close_from_segment_store(self, lifecycle_identity: object) -> None:
+        if lifecycle_identity is not self._lifecycle_identity:
+            raise CorrelationRequestJournalStateError(
+                "store supplied the wrong correlation lifecycle"
+            )
+        self.close()
+
+    def close(self) -> None:
+        """Seal the authenticated journal identity and release its root lease."""
+        with self._lock:
+            if self._closed:
+                return
+            if self._closing:
+                errors = self._close_resources()
+                if errors:
+                    raise CorrelationRequestJournalUnhealthy(
+                        "correlation journal close remains uncertain"
+                    ) from errors[0]
+                return
+            self._closing = True
+            primary: BaseException | None = None
+            if self._healthy:
+                authenticated: os.stat_result | None = None
+                try:
+                    authenticated = self._verify_authenticated_content()
+                    self._store._seal_correlation_journal_identity(
+                        self,
+                        self._lifecycle_identity,
+                        authenticated,
+                        self._authenticated_digest(),
+                    )
+                except _CorrelationJournalLifecycleCorrupt as error:
+                    corrupt = CorrelationRequestJournalCorrupt(str(error))
+                    self._healthy = False
+                    self._attempt_corruption_fence(corrupt)
+                    primary = corrupt
+                except _CorrelationJournalLifecycleIoUncertain as error:
+                    self._healthy = False
+                    self._attempt_io_uncertain(
+                        error,
+                        authenticated,
+                        self._authenticated_digest_or_none(),
+                    )
+                    primary = error
+                except CorrelationRequestJournalCorrupt as error:
+                    self._healthy = False
+                    self._attempt_corruption_fence(error)
+                    primary = error
+                except BaseException as error:  # noqa: BLE001
+                    self._healthy = False
+                    self._attempt_io_uncertain(
+                        error,
+                        authenticated,
+                        self._authenticated_digest_or_none(),
+                    )
+                    primary = error
+            cleanup_errors = self._close_resources()
+            if primary is not None:
+                for cleanup_error in cleanup_errors:
+                    primary.add_note(
+                        "secondary correlation close failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                raise primary
+            if cleanup_errors:
+                raise CorrelationRequestJournalUnhealthy(
+                    "correlation journal close cleanup failed"
+                ) from cleanup_errors[0]
+
+
+__all__ = [
+    "CorrelationRequestJournal",
+    "CorrelationRequestJournalAuthorityError",
+    "CorrelationRequestJournalCorrupt",
+    "CorrelationRequestJournalError",
+    "CorrelationRequestJournalStateError",
+    "CorrelationRequestJournalUnhealthy",
+]
