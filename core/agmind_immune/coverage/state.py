@@ -17,9 +17,11 @@ from agmind_immune.contracts import (
     MAX_UINT64,
     CoverageEventV1,
     EventEnvelopeV1,
-    KeyTransitionV1,
-    ObserverBootBoundaryV1,
     decode_strict,
+)
+from agmind_immune.coverage.grammar import (
+    _classify_coverage_record,
+    _CoverageClassification,
 )
 from agmind_immune.evidence.segments import (
     EvidencePriority,
@@ -161,10 +163,14 @@ class _DockerRecovery:
 
 @dataclass(frozen=True)
 class _CriticalInterval:
+    scope_boot_id: str | None
     component: str
     kind: str
     opened_at: str
     source_sequence: int
+    latest_source_sequence: int
+    reason_code: str
+    dropped_count: int | None
     normalized_fields_sha256: str
     source_payload_hash: str
 
@@ -192,6 +198,7 @@ class _FalcoLease:
 @dataclass(frozen=True)
 class _CoverageSnapshot:
     host_id: str | None = None
+    boot_id: str | None = None
     head_sequence: int = 0
     head_ref: EvidenceRef | None = None
     boot_transition_sequence: int | None = None
@@ -275,235 +282,6 @@ def _prepare(record: StoredEvidenceRecord) -> _PreparedRecord:
         except (TypeError, ValueError, ValidationError) as error:
             raise CoverageValidationError("coverage fields are invalid") from error
     return _PreparedRecord(record=record, envelope=envelope, coverage=coverage)
-
-
-def _empty_security_context(envelope: EventEnvelopeV1) -> bool:
-    return (
-        envelope.container_id is None
-        and envelope.container_start_time is None
-        and envelope.release_id is None
-        and envelope.inventory_generation == 0
-        and envelope.inventory_revision is None
-        and envelope.redaction_flags == []
-        and envelope.source_payload_hash == envelope.normalized_fields_sha256
-    )
-
-
-def _is_boot_transition(envelope: EventEnvelopeV1) -> bool:
-    if "boot_transition" not in envelope.coverage_flags:
-        return False
-    try:
-        if envelope.event_type == "observer_boot_boundary":
-            ObserverBootBoundaryV1.model_validate(
-                envelope.normalized_fields,
-                strict=True,
-            )
-            exact = envelope.coverage_flags == [
-                "boot_transition",
-                "reconcile_required",
-            ]
-        elif envelope.event_type == "observer_key_transition":
-            KeyTransitionV1.model_validate(envelope.normalized_fields, strict=True)
-            exact = envelope.coverage_flags == ["boot_transition", "key_rotation"]
-        elif envelope.event_type == "observer_key_epoch_start":
-            exact = (
-                set(envelope.normalized_fields) == {"kind", "key_id", "key_epoch"}
-                and envelope.normalized_fields.get("kind") == "observer_key_epoch_start"
-                and envelope.normalized_fields.get("key_id") == envelope.key_id
-                and envelope.normalized_fields.get("key_epoch") == envelope.key_epoch
-                and envelope.coverage_flags == ["boot_transition", "key_rotation"]
-            )
-        else:
-            exact = False
-    except (TypeError, ValueError, ValidationError) as error:
-        raise CoverageValidationError("boot transition form is invalid") from error
-    if not exact or not _empty_security_context(envelope):
-        raise CoverageValidationError("boot transition context is invalid")
-    return True
-
-
-def _is_observer_start(envelope: EventEnvelopeV1) -> bool:
-    if envelope.event_type != "observer_start":
-        return False
-    if (
-        envelope.normalized_fields != {"kind": "observer_start", "reconcile_required": True}
-        or envelope.coverage_flags != ["reconcile_required"]
-        or not _empty_security_context(envelope)
-    ):
-        raise CoverageValidationError("observer-start form is invalid")
-    return True
-
-
-def _coverage_context_is_empty(envelope: EventEnvelopeV1) -> bool:
-    return (
-        envelope.container_id is None
-        and envelope.container_start_time is None
-        and envelope.release_id is None
-        and envelope.inventory_revision is None
-        and envelope.redaction_flags == []
-    )
-
-
-def _exact_docker_open(
-    prepared: _PreparedRecord,
-    coverage: CoverageEventV1,
-) -> _DockerOpen:
-    envelope = prepared.envelope
-    fields = envelope.normalized_fields
-    required = {
-        "component",
-        "kind",
-        "severity",
-        "opened_at",
-        "reason_code",
-        "reconcile_generation",
-    }
-    generation = coverage.reconcile_generation
-    if (
-        set(fields) != required
-        or coverage.component != "observer"
-        or coverage.severity != "CRITICAL"
-        or coverage.closed_at is not None
-        or generation is None
-        or generation == 0
-        or envelope.event_time != coverage.opened_at
-        or envelope.inventory_generation != generation
-        or not _coverage_context_is_empty(envelope)
-        or envelope.coverage_flags != ["docker_event_gap", "reconcile_required"]
-        or envelope.source_payload_hash != envelope.normalized_fields_sha256
-    ):
-        raise CoverageValidationError("Docker reconcile open form is invalid")
-    return _DockerOpen(
-        source_sequence=envelope.source_sequence,
-        opened_at=coverage.opened_at,
-        generation=generation,
-    )
-
-
-def _exact_docker_recovery(
-    prepared: _PreparedRecord,
-    coverage: CoverageEventV1,
-) -> _DockerRecovery:
-    envelope = prepared.envelope
-    fields = envelope.normalized_fields
-    required = {
-        "component",
-        "kind",
-        "severity",
-        "opened_at",
-        "closed_at",
-        "reason_code",
-        "reconcile_generation",
-    }
-    generation = coverage.reconcile_generation
-    closed_at = coverage.closed_at
-    if (
-        set(fields) != required
-        or coverage.component != "observer"
-        or coverage.severity != "INFO"
-        or coverage.reason_code != "docker_full_reconcile_succeeded"
-        or closed_at is None
-        or generation is None
-        or generation == 0
-        or _timestamp(closed_at) < _timestamp(coverage.opened_at)
-        or envelope.event_time != closed_at
-        or envelope.inventory_generation != generation
-        or not _coverage_context_is_empty(envelope)
-        or envelope.coverage_flags != ["docker_event_gap", "reconcile_required"]
-        or envelope.source_payload_hash != envelope.normalized_fields_sha256
-    ):
-        raise CoverageValidationError("Docker reconcile recovery form is invalid")
-    return _DockerRecovery(
-        source_sequence=envelope.source_sequence,
-        opened_at=coverage.opened_at,
-        closed_at=closed_at,
-        generation=generation,
-    )
-
-
-def _exact_falco_point(
-    prepared: _PreparedRecord,
-    coverage: CoverageEventV1,
-) -> str | None:
-    expected = {
-        "falco_adapter_start": ("INFO", "adapter_started"),
-        "falco_adapter_stop": ("CRITICAL", "adapter_stopping"),
-        "falco_heartbeat_lease": ("INFO", "valid_heartbeat"),
-    }
-    selected = expected.get(coverage.kind)
-    if selected is None:
-        return None
-    envelope = prepared.envelope
-    if (
-        set(envelope.normalized_fields)
-        != {
-            "component",
-            "kind",
-            "severity",
-            "opened_at",
-            "closed_at",
-            "reason_code",
-        }
-        or coverage.component != "falco-adapter"
-        or (coverage.severity, coverage.reason_code) != selected
-        or coverage.closed_at != coverage.opened_at
-        or envelope.event_time != coverage.opened_at
-        or not _coverage_context_is_empty(envelope)
-        or envelope.coverage_flags != []
-    ):
-        raise CoverageValidationError("Falco lifecycle coverage form is invalid")
-    return coverage.kind
-
-
-def _exact_sequence_gap(
-    prepared: _PreparedRecord,
-    coverage: CoverageEventV1,
-) -> str:
-    envelope = prepared.envelope
-    start = coverage.affected_source_sequence_start
-    end = coverage.affected_source_sequence_end
-    common = (
-        coverage.component == "observer"
-        and start is not None
-        and end is not None
-        and start > 0
-        and end >= start
-        and _coverage_context_is_empty(envelope)
-        and envelope.coverage_flags == ["reconcile_required", "sequence_gap"]
-        and envelope.source_payload_hash == envelope.normalized_fields_sha256
-    )
-    open_fields = {
-        "component",
-        "kind",
-        "severity",
-        "opened_at",
-        "affected_source_sequence_start",
-        "affected_source_sequence_end",
-        "reason_code",
-    }
-    close_fields = open_fields | {"closed_at", "reconcile_generation"}
-    exact_open = (
-        set(envelope.normalized_fields) == open_fields
-        and coverage.severity == "CRITICAL"
-        and coverage.reason_code == "reserved_sequence_not_published"
-        and coverage.closed_at is None
-        and coverage.reconcile_generation is None
-        and envelope.event_time == coverage.opened_at
-        and envelope.inventory_generation == 0
-    )
-    exact_close = (
-        set(envelope.normalized_fields) == close_fields
-        and coverage.severity == "INFO"
-        and coverage.reason_code == "reserved_sequence_reconciled"
-        and coverage.closed_at is not None
-        and coverage.reconcile_generation is not None
-        and coverage.reconcile_generation > 0
-        and envelope.event_time == coverage.closed_at
-        and envelope.inventory_generation == coverage.reconcile_generation
-    )
-    if not common or not (exact_open or exact_close):
-        raise CoverageValidationError("sequence-gap coverage form is invalid")
-    return "open" if exact_open else "close"
 
 
 def _validate_receipt(value: float) -> float:
@@ -639,14 +417,31 @@ def _apply_generic_critical(
     snapshot: _CoverageSnapshot,
     prepared: _PreparedRecord,
     coverage: CoverageEventV1,
+    classification: _CoverageClassification,
 ) -> _CoverageSnapshot:
-    if coverage.severity != "CRITICAL":
-        return snapshot
-    key = (coverage.component, coverage.kind, coverage.opened_at)
+    scope_boot_id = (
+        prepared.envelope.boot_id
+        if classification.scope == "process"
+        else None
+    )
+    key = (
+        scope_boot_id,
+        coverage.component,
+        coverage.kind,
+        coverage.opened_at,
+    )
     intervals = snapshot.open_critical_intervals
     if coverage.closed_at is None:
         matching = tuple(
-            item for item in intervals if (item.component, item.kind, item.opened_at) == key
+            item
+            for item in intervals
+            if (
+                item.scope_boot_id,
+                item.component,
+                item.kind,
+                item.opened_at,
+            )
+            == key
         )
         if len(matching) > 1:
             raise CoverageConflict("generic critical interval is duplicated")
@@ -661,31 +456,83 @@ def _apply_generic_critical(
                 opened.source_payload_hash,
             ) == logical_identity:
                 return snapshot
-            raise CoverageConflict("generic critical interval identity changed")
+            prior_count = opened.dropped_count
+            next_count = coverage.dropped_count
+            if classification.counter_required:
+                if prior_count is None or next_count is None:
+                    raise CoverageConflict("generic critical counter disappeared")
+                if next_count <= prior_count and not (
+                    prior_count == MAX_UINT64 and next_count == MAX_UINT64
+                ):
+                    raise CoverageConflict("generic critical counter did not advance")
+            elif prior_count is not None or next_count is not None:
+                raise CoverageConflict("uncounted generic critical gained a counter")
+            if (
+                classification.scope != "process"
+                and coverage.reason_code != opened.reason_code
+            ):
+                raise CoverageConflict("generic critical opening reason changed")
+            updated = replace(
+                opened,
+                latest_source_sequence=prepared.envelope.source_sequence,
+                reason_code=coverage.reason_code,
+                dropped_count=next_count,
+                normalized_fields_sha256=(
+                    prepared.envelope.normalized_fields_sha256
+                ),
+                source_payload_hash=prepared.envelope.source_payload_hash,
+            )
+            return replace(
+                snapshot,
+                open_critical_intervals=tuple(
+                    updated if item is opened else item for item in intervals
+                ),
+            )
         return replace(
             snapshot,
             open_critical_intervals=(
                 *intervals,
                 _CriticalInterval(
+                    scope_boot_id=scope_boot_id,
                     component=coverage.component,
                     kind=coverage.kind,
                     opened_at=coverage.opened_at,
                     source_sequence=prepared.envelope.source_sequence,
+                    latest_source_sequence=prepared.envelope.source_sequence,
+                    reason_code=coverage.reason_code,
+                    dropped_count=coverage.dropped_count,
                     normalized_fields_sha256=(prepared.envelope.normalized_fields_sha256),
                     source_payload_hash=prepared.envelope.source_payload_hash,
                 ),
             ),
         )
     matching = tuple(
-        item for item in intervals if (item.component, item.kind, item.opened_at) == key
+        item
+        for item in intervals
+        if (
+            item.scope_boot_id,
+            item.component,
+            item.kind,
+            item.opened_at,
+        )
+        == key
     )
     if not matching:
         return snapshot
     if len(matching) != 1:
         raise CoverageConflict("generic critical close is ambiguous")
+    opened = matching[0]
+    if classification.counter_required:
+        if (
+            opened.dropped_count is None
+            or coverage.dropped_count != opened.dropped_count
+        ):
+            raise CoverageConflict("generic critical close changed its counter")
+    elif opened.dropped_count is not None or coverage.dropped_count is not None:
+        raise CoverageConflict("uncounted generic critical gained a counter")
     return replace(
         snapshot,
-        open_critical_intervals=tuple(item for item in intervals if item != matching[0]),
+        open_critical_intervals=tuple(item for item in intervals if item is not opened),
     )
 
 
@@ -704,8 +551,36 @@ def _transition(
     if live_receipt_monotonic is not None and not live_receipt_allowed:
         raise CoverageValidationError("live monotonic receipt requires a bound live evidence apply")
 
+    classification = _classify_coverage_record(envelope, prepared.coverage)
+    if (
+        live_receipt_monotonic is not None
+        and classification.action != "falco_lease"
+    ):
+        raise CoverageValidationError("receipt is legal only on a Falco lease")
+
     candidate = snapshot
-    if _is_boot_transition(envelope):
+    boot_changed = (
+        snapshot.boot_id is not None and snapshot.boot_id != envelope.boot_id
+    )
+    if boot_changed:
+        candidate = replace(
+            candidate,
+            boot_transition_sequence=envelope.source_sequence,
+            observer_started=False,
+            docker_generation=None,
+            open_critical_intervals=tuple(
+                item
+                for item in candidate.open_critical_intervals
+                if item.scope_boot_id is None
+            ),
+            falco_lease=None,
+            live_lease_deadline=None,
+            latest_falco_stop_sequence=None,
+        )
+
+    action = classification.action
+    coverage = prepared.coverage
+    if action == "boot_boundary":
         candidate = replace(
             candidate,
             boot_transition_sequence=envelope.source_sequence,
@@ -714,7 +589,7 @@ def _transition(
             falco_lease=None,
             live_lease_deadline=None,
         )
-    elif _is_observer_start(envelope):
+    elif action == "observer_start":
         candidate = replace(
             candidate,
             observer_started=True,
@@ -722,80 +597,86 @@ def _transition(
             falco_lease=None,
             live_lease_deadline=None,
         )
-    elif envelope.event_type == "coverage":
-        coverage = prepared.coverage
+    elif action == "docker_open":
+        if coverage is None or coverage.reconcile_generation is None:
+            raise CoverageValidationError("classified Docker open lost exact fields")
+        candidate = _apply_docker_open(
+            candidate,
+            _DockerOpen(
+                source_sequence=envelope.source_sequence,
+                opened_at=coverage.opened_at,
+                generation=coverage.reconcile_generation,
+            ),
+        )
+    elif action == "docker_close":
+        if (
+            coverage is None
+            or coverage.reconcile_generation is None
+            or coverage.closed_at is None
+        ):
+            raise CoverageValidationError("classified Docker close lost exact fields")
+        candidate = _apply_docker_recovery(
+            candidate,
+            _DockerRecovery(
+                source_sequence=envelope.source_sequence,
+                opened_at=coverage.opened_at,
+                closed_at=coverage.closed_at,
+                generation=coverage.reconcile_generation,
+            )
+        )
+    elif action == "sequence_open":
         if coverage is None:
-            raise CoverageValidationError("coverage event has no typed fields")
-        if coverage.kind == "docker_reconcile_gap":
-            if live_receipt_monotonic is not None:
-                raise CoverageValidationError("receipt is legal only on a Falco lease")
-            candidate = _apply_docker_open(
-                candidate,
-                _exact_docker_open(prepared, coverage),
+            raise CoverageValidationError("classified sequence open lost exact fields")
+        candidate = _apply_sequence_gap_open(candidate, prepared, coverage)
+    elif action == "sequence_close":
+        if coverage is None:
+            raise CoverageValidationError("classified sequence close lost exact fields")
+        candidate = _apply_sequence_gap_close(candidate, prepared, coverage)
+    elif action == "falco_stop":
+        candidate = replace(
+            candidate,
+            falco_lease=None,
+            live_lease_deadline=None,
+            latest_falco_stop_sequence=envelope.source_sequence,
+        )
+    elif action == "falco_lease":
+        if coverage is None:
+            raise CoverageValidationError("classified Falco lease lost exact fields")
+        opened = _timestamp(coverage.opened_at)
+        ingest = _timestamp(envelope.ingest_time)
+        lease_age = ingest - opened
+        if lease_age < timedelta(0) or lease_age > _LEASE_WINDOW:
+            raise CoverageValidationError(
+                "Falco lease ingest is outside its signed window"
             )
-        elif coverage.kind == "docker_reconcile_recovered":
-            if live_receipt_monotonic is not None:
-                raise CoverageValidationError("receipt is legal only on a Falco lease")
-            candidate = _apply_docker_recovery(
-                candidate,
-                _exact_docker_recovery(prepared, coverage),
-            )
-        elif coverage.kind == "observer_sequence_gap":
-            if live_receipt_monotonic is not None:
-                raise CoverageValidationError("receipt is legal only on a Falco lease")
-            form = _exact_sequence_gap(prepared, coverage)
-            if form == "open":
-                candidate = _apply_sequence_gap_open(candidate, prepared, coverage)
-            else:
-                candidate = _apply_sequence_gap_close(candidate, prepared, coverage)
-        else:
-            falco_form = _exact_falco_point(prepared, coverage)
-            if falco_form == "falco_adapter_start":
-                if live_receipt_monotonic is not None:
-                    raise CoverageValidationError("receipt is legal only on a Falco lease")
-            elif falco_form == "falco_adapter_stop":
-                if live_receipt_monotonic is not None:
-                    raise CoverageValidationError("receipt is legal only on a Falco lease")
-                candidate = replace(
-                    candidate,
-                    falco_lease=None,
-                    live_lease_deadline=None,
-                    latest_falco_stop_sequence=envelope.source_sequence,
-                )
-            elif falco_form == "falco_heartbeat_lease":
-                opened = _timestamp(coverage.opened_at)
-                ingest = _timestamp(envelope.ingest_time)
-                lease_age = ingest - opened
-                if lease_age < timedelta(0) or lease_age > _LEASE_WINDOW:
-                    raise CoverageValidationError("Falco lease ingest is outside its signed window")
-                deadline = None
-                if live_receipt_monotonic is not None:
-                    receipt = _validate_receipt(live_receipt_monotonic)
-                    deadline = receipt + (_LEASE_WINDOW - lease_age).total_seconds()
-                candidate = replace(
-                    candidate,
-                    falco_lease=_FalcoLease(
-                        source_sequence=envelope.source_sequence,
-                        event_id=envelope.event_id,
-                        opened_at=coverage.opened_at,
-                        ingest_time=envelope.ingest_time,
-                    ),
-                    live_lease_deadline=deadline,
-                )
-            else:
-                if live_receipt_monotonic is not None:
-                    raise CoverageValidationError("receipt is legal only on a Falco lease")
-                candidate = _apply_generic_critical(
-                    candidate,
-                    prepared,
-                    coverage,
-                )
-    elif live_receipt_monotonic is not None:
-        raise CoverageValidationError("receipt is legal only on a Falco lease")
+        deadline = None
+        if live_receipt_monotonic is not None:
+            receipt = _validate_receipt(live_receipt_monotonic)
+            deadline = receipt + (_LEASE_WINDOW - lease_age).total_seconds()
+        candidate = replace(
+            candidate,
+            falco_lease=_FalcoLease(
+                source_sequence=envelope.source_sequence,
+                event_id=envelope.event_id,
+                opened_at=coverage.opened_at,
+                ingest_time=envelope.ingest_time,
+            ),
+            live_lease_deadline=deadline,
+        )
+    elif action in {"generic_open", "generic_close"}:
+        if coverage is None:
+            raise CoverageValidationError("classified critical interval lost exact fields")
+        candidate = _apply_generic_critical(
+            candidate,
+            prepared,
+            coverage,
+            classification,
+        )
 
     return replace(
         candidate,
         host_id=envelope.host_id,
+        boot_id=envelope.boot_id,
         head_sequence=envelope.source_sequence,
         head_ref=prepared.record.ref,
     )

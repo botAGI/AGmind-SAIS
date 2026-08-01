@@ -146,7 +146,7 @@ class HistoricalCoverageAssessment:
     trigger_event_id: str
     trigger_source_sequence: int
     coverage_through_sequence: int
-    window_start: str
+    window_start: str | None
     window_end: str
     complete: bool
     critical_gap: bool
@@ -164,21 +164,32 @@ class HistoricalCoverageAssessment:
             self.coverage_through_sequence,
             "coverage_through_sequence",
         )
-        parse_rfc3339nano_utc_ns(self.window_start)
-        parse_rfc3339nano_utc_ns(self.window_end)
+        window_start_ns = (
+            None
+            if self.window_start is None
+            else parse_rfc3339nano_utc_ns(self.window_start)
+        )
+        window_end_ns = parse_rfc3339nano_utc_ns(self.window_end)
         if type(self.complete) is not bool:
             raise TypeError("complete must be an exact Boolean")
         if type(self.critical_gap) is not bool:
             raise TypeError("critical_gap must be an exact Boolean")
+        if self.window_start is None and self.complete:
+            raise ValueError("complete coverage requires a representable window start")
+        if self.complete and window_start_ns is not None and window_end_ns < window_start_ns:
+            raise ValueError("coverage window is reversed")
         if self.complete:
             _exact_hex64(
                 self.coverage_snapshot_sha256,
                 "coverage_snapshot_sha256",
             )
-        elif self.coverage_snapshot_sha256 is not None:
-            raise ValueError(
-                "incomplete coverage cannot carry an authority hash"
-            )
+        else:
+            if self.critical_gap:
+                raise ValueError("incomplete coverage cannot report a critical gap")
+            if self.coverage_snapshot_sha256 is not None:
+                raise ValueError(
+                    "incomplete coverage cannot carry an authority hash"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,6 +597,17 @@ def _coverage_binding_matches(
     expected_window_start = (
         trigger_ns - trigger.clock_uncertainty_ms * 1_000_000
     )
+    minimum_timestamp_ns = parse_rfc3339nano_utc_ns(
+        "0001-01-01T00:00:00Z"
+    )
+    window_start_matches = (
+        coverage.window_start is None
+        and expected_window_start < minimum_timestamp_ns
+    ) or (
+        coverage.window_start is not None
+        and parse_rfc3339nano_utc_ns(coverage.window_start)
+        == expected_window_start
+    )
     return (
         coverage.host_id == authenticated.host_id
         and coverage.boot_id == authenticated.boot_id
@@ -593,8 +615,7 @@ def _coverage_binding_matches(
         and coverage.trigger_source_sequence == trigger.source_sequence
         and coverage.coverage_through_sequence
         == snapshot.coverage_through_sequence
-        and parse_rfc3339nano_utc_ns(coverage.window_start)
-        == expected_window_start
+        and window_start_matches
         and parse_rfc3339nano_utc_ns(coverage.window_end)
         == parse_rfc3339nano_utc_ns(snapshot.decision_time)
     )

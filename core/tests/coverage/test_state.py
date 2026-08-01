@@ -14,7 +14,7 @@ from agmind_immune.canonicaljson import (
     canonical_json,
     event_signing_message,
 )
-from agmind_immune.contracts import ObserverTrustRootV1
+from agmind_immune.contracts import MAX_UINT64, ObserverTrustRootV1
 from agmind_immune.evidence.segments import (
     EvidencePriority,
     EvidenceRef,
@@ -40,6 +40,7 @@ from tests.phase5b_helpers import (
     page_value,
     private_key,
     root_value,
+    rotation_pair,
 )
 
 T0 = "2026-07-28T10:00:00Z"
@@ -412,12 +413,21 @@ def _generic_critical(
     opened_at: str,
     closed_at: str | None = None,
 ) -> StoredEvidenceRecord:
+    assert component == "falco-adapter"
+    reasons = {
+        "falco_heartbeat_gap": ("awaiting_initial_heartbeat", "recovered"),
+        "falco_delivery_failure": (
+            "observer_delivery_failed",
+            "observer_delivery_recovered",
+        ),
+    }
+    open_reason, close_reason = reasons[kind]
     fields: dict[str, object] = {
         "component": component,
         "kind": kind,
         "severity": "CRITICAL",
         "opened_at": opened_at,
-        "reason_code": "test_critical",
+        "reason_code": close_reason if closed_at is not None else open_reason,
     }
     if closed_at is not None:
         fields["closed_at"] = closed_at
@@ -426,6 +436,7 @@ def _generic_critical(
             key,
             sequence,
             fields,
+            coverage_flags=[] if closed_at is not None else [kind],
             source_payload_hash=hashlib.sha256(
                 f"{component}\0{kind}\0{opened_at}\0{closed_at}".encode()
             ).hexdigest(),
@@ -989,15 +1000,15 @@ def test_readiness_lease_clock_edges_and_logical_hash(tmp_path: Path) -> None:
         _generic_critical(
             key,
             5,
-            component="z-component",
-            kind="z-kind",
+            component="falco-adapter",
+            kind="falco_heartbeat_gap",
             opened_at=T2,
         ),
         _generic_critical(
             key,
             6,
-            component="a-component",
-            kind="a-kind",
+            component="falco-adapter",
+            kind="falco_delivery_failure",
             opened_at=T1,
         ),
         _gap_open(key, 7, start=30, end=31, opened_at=T2),
@@ -1199,8 +1210,9 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
                 "kind": "falco_heartbeat_gap",
                 "severity": "CRITICAL",
                 "opened_at": T1,
-                "reason_code": "heartbeat_missing",
+                "reason_code": "awaiting_initial_heartbeat",
             },
+            coverage_flags=["falco_heartbeat_gap"],
             source_payload_hash="b" * 64,
         )
     )
@@ -1214,8 +1226,7 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
                 "severity": "CRITICAL",
                 "opened_at": T1,
                 "closed_at": T2,
-                "dropped_count": 1,
-                "reason_code": "valid_heartbeat_recovered",
+                "reason_code": "recovered",
             },
             source_payload_hash="c" * 64,
         )
@@ -1254,8 +1265,10 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
                 "kind": "falco_queue_drop",
                 "severity": "CRITICAL",
                 "opened_at": T4,
-                "reason_code": "routine_queue_full",
+                "dropped_count": 1,
+                "reason_code": "routine_capacity_exceeded",
             },
+            coverage_flags=["falco_queue_drop"],
             source_payload_hash="d" * 64,
         )
     )
@@ -1299,7 +1312,7 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
     assert state._snapshot.docker_generation is None
     assert state._snapshot.live_lease_deadline is None
     assert len(state._snapshot.docker_recoveries) == 1
-    assert len(state._snapshot.open_critical_intervals) == 1
+    assert state._snapshot.open_critical_intervals == ()
     assert accepted_boot.ref.source_sequence == 1
     store.close()
 
@@ -1313,13 +1326,14 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
         "kind": "falco_heartbeat_gap",
         "severity": "CRITICAL",
         "opened_at": T1,
-        "reason_code": "heartbeat_missing",
+        "reason_code": "awaiting_initial_heartbeat",
     }
     repeat_open = _stored(
         _coverage(
             key,
             2,
             repeat_fields,
+            coverage_flags=["falco_heartbeat_gap"],
             source_payload_hash="e" * 64,
         )
     )
@@ -1328,6 +1342,7 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
             key,
             3,
             repeat_fields,
+            coverage_flags=["falco_heartbeat_gap"],
             source_payload_hash="e" * 64,
         )
     )
@@ -1338,8 +1353,7 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
             {
                 **repeat_fields,
                 "closed_at": T2,
-                "dropped_count": 1,
-                "reason_code": "valid_heartbeat_recovered",
+                "reason_code": "recovered",
             },
             source_payload_hash="f" * 64,
         )
@@ -1367,6 +1381,7 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
             key,
             3,
             repeat_fields,
+            coverage_flags=["falco_heartbeat_gap"],
             source_payload_hash="0" * 64,
         )
     )
@@ -1378,12 +1393,16 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
                 **repeat_fields,
                 "reason_code": "different_reason",
             },
+            coverage_flags=["falco_heartbeat_gap"],
             source_payload_hash="e" * 64,
         )
     )
-    for changed_repeat in (changed_payload, changed_facts):
-        with pytest.raises(coverage.CoverageConflict):
-            coverage.CoverageState.rebuild([boot, repeat_open, changed_repeat])
+    changed_state = coverage.CoverageState.rebuild(
+        [boot, repeat_open, changed_payload]
+    )
+    assert len(changed_state._snapshot.open_critical_intervals) == 1
+    with pytest.raises((coverage.CoverageValidationError, coverage.CoverageConflict)):
+        coverage.CoverageState.rebuild([boot, repeat_open, changed_facts])
 
     for index, receipt in enumerate((True, -1.0, math.inf, math.nan)):
         bad_coordinator, bad_store = _system(tmp_path / f"receipt-{index}")
@@ -1485,6 +1504,266 @@ def test_boot_docker_generic_and_falco_transitions(tmp_path: Path) -> None:
     maximum_replay = coverage.CoverageState.open_and_recover(maximum_store)
     assert maximum_replay._snapshot.live_lease_deadline is None
     maximum_store.close()
+
+
+def test_exact_falco_cumulative_updates_and_saturation_rules() -> None:
+    coverage = _coverage_module()
+    key = private_key(11)
+
+    def interval(
+        sequence: int,
+        *,
+        kind: str = "falco_parse_rejection",
+        reason: str = "invalid_falco_body",
+        dropped_count: int | None = 1,
+        closed_at: str | None = None,
+        payload: str,
+    ) -> StoredEvidenceRecord:
+        fields: dict[str, object] = {
+            "component": "falco-adapter",
+            "kind": kind,
+            "severity": "CRITICAL",
+            "opened_at": T0,
+            "reason_code": reason,
+        }
+        if dropped_count is not None:
+            fields["dropped_count"] = dropped_count
+        if closed_at is not None:
+            fields["closed_at"] = closed_at
+        return _stored(
+            _coverage(
+                key,
+                sequence,
+                fields,
+                coverage_flags=[] if closed_at is not None else [kind],
+                source_payload_hash=payload * 64,
+            )
+        )
+
+    boot = _stored(boot_boundary(key))
+    legal = coverage.CoverageState.rebuild(
+        [
+            boot,
+            interval(2, dropped_count=1, payload="1"),
+            interval(3, dropped_count=2, payload="2"),
+            interval(4, dropped_count=MAX_UINT64, payload="3"),
+            interval(5, dropped_count=MAX_UINT64, payload="4"),
+        ]
+    )
+    assert len(legal._snapshot.open_critical_intervals) == 1
+    assert legal._snapshot.open_critical_intervals[0].dropped_count == MAX_UINT64
+    closed = coverage.CoverageState.rebuild(
+        [
+            boot,
+            interval(2, dropped_count=1, payload="1"),
+            interval(3, dropped_count=2, payload="2"),
+            interval(
+                4,
+                reason="valid_heartbeat_recovered",
+                dropped_count=2,
+                closed_at=T1,
+                payload="3",
+            ),
+        ]
+    )
+    assert closed._snapshot.open_critical_intervals == ()
+
+    heartbeat = coverage.CoverageState.rebuild(
+        [
+            boot,
+            interval(
+                2,
+                kind="falco_heartbeat_gap",
+                reason="awaiting_initial_heartbeat",
+                dropped_count=None,
+                payload="5",
+            ),
+            interval(
+                3,
+                kind="falco_heartbeat_gap",
+                reason="falco_heartbeat_timeout",
+                dropped_count=None,
+                payload="6",
+            ),
+        ]
+    )
+    assert len(heartbeat._snapshot.open_critical_intervals) == 1
+    configuration = coverage.CoverageState.rebuild(
+        [
+            boot,
+            interval(
+                2,
+                kind="falco_configuration_mismatch",
+                reason="falco_counter_rollback",
+                dropped_count=None,
+                payload="7",
+            ),
+            interval(
+                3,
+                kind="falco_configuration_mismatch",
+                reason="falco_rules_hash_mismatch",
+                dropped_count=None,
+                payload="8",
+            ),
+        ]
+    )
+    assert len(configuration._snapshot.open_critical_intervals) == 1
+
+    invalid_histories = (
+        [
+            boot,
+            interval(2, dropped_count=1, payload="1"),
+            interval(3, dropped_count=1, payload="2"),
+        ],
+        [
+            boot,
+            interval(2, dropped_count=2, payload="1"),
+            interval(3, dropped_count=1, payload="2"),
+        ],
+        [
+            boot,
+            interval(2, dropped_count=2, payload="1"),
+            interval(
+                3,
+                reason="valid_heartbeat_recovered",
+                dropped_count=1,
+                closed_at=T1,
+                payload="2",
+            ),
+        ],
+        [boot, interval(2, dropped_count=None, payload="1")],
+        [
+            boot,
+            interval(
+                2,
+                kind="falco_delivery_failure",
+                reason="observer_delivery_failed",
+                dropped_count=1,
+                payload="1",
+            ),
+        ],
+    )
+    for history in invalid_histories:
+        with pytest.raises((coverage.CoverageValidationError, coverage.CoverageConflict)):
+            coverage.CoverageState.rebuild(history)
+
+
+def test_boot_scope_clears_only_process_local_falco_episodes() -> None:
+    coverage = _coverage_module()
+    key = private_key(11)
+    next_key = private_key(12)
+    _transition, transition_envelope, epoch_start = rotation_pair(
+        key,
+        next_key,
+        transition_sequence=10,
+        transition_boot=BOOT_A,
+        start_boot=BOOT_A,
+        mode="b",
+    )
+    spool_open = _stored(
+        _coverage(
+            key,
+            6,
+            {
+                "component": "observer",
+                "kind": "observer_spool_drop",
+                "severity": "CRITICAL",
+                "opened_at": T1,
+                "dropped_count": 1,
+                "reason_code": "routine_spool_quota",
+            },
+            coverage_flags=["storage_pressure"],
+        )
+    )
+    falco_open = _stored(
+        _coverage(
+            key,
+            8,
+            {
+                "component": "falco-adapter",
+                "kind": "falco_heartbeat_gap",
+                "severity": "CRITICAL",
+                "opened_at": T1,
+                "reason_code": "falco_heartbeat_timeout",
+            },
+            coverage_flags=["falco_heartbeat_gap"],
+            source_payload_hash="8" * 64,
+        )
+    )
+    records = [
+        _stored(boot_boundary(key)),
+        _stored(_observer_start(key, 2)),
+        _docker_open(key, 3, opened_at=T0, generation=1),
+        _docker_recovery(key, 4, opened_at=T0, closed_at=T1, generation=1),
+        _gap_open(key, 5, start=50, end=51, opened_at=T1),
+        spool_open,
+        _falco_point(
+            key,
+            7,
+            kind="falco_heartbeat_lease",
+            severity="INFO",
+            at=T1,
+            reason="valid_heartbeat",
+        ),
+        falco_open,
+        _docker_open(key, 9, opened_at=T1, generation=2),
+    ]
+    before_rotation = coverage.CoverageState.rebuild(records)
+    same_boot = coverage.CoverageState.rebuild(
+        [*records, _stored(transition_envelope), _stored(epoch_start)]
+    )
+    assert same_boot._snapshot.observer_started is True
+    assert same_boot._snapshot.boot_transition_sequence == 1
+    assert same_boot._snapshot.docker_opens == before_rotation._snapshot.docker_opens
+    assert same_boot._snapshot.sequence_gaps == before_rotation._snapshot.sequence_gaps
+    assert same_boot._snapshot.open_critical_intervals == (
+        before_rotation._snapshot.open_critical_intervals
+    )
+    assert same_boot._snapshot.falco_lease == before_rotation._snapshot.falco_lease
+
+    next_boot = _stored(
+        boot_boundary(
+            next_key,
+            sequence=12,
+            boot_id=BOOT_B,
+            previous_boot_id=BOOT_A,
+            previous_source_sequence=11,
+        )
+    )
+    changed_boot = coverage.CoverageState.rebuild(
+        [*records, _stored(transition_envelope), _stored(epoch_start), next_boot]
+    )
+    assert changed_boot._snapshot.observer_started is False
+    assert changed_boot._snapshot.boot_transition_sequence == 12
+    assert changed_boot._snapshot.docker_opens == before_rotation._snapshot.docker_opens
+    assert changed_boot._snapshot.sequence_gaps == before_rotation._snapshot.sequence_gaps
+    assert tuple(
+        item.component for item in changed_boot._snapshot.open_critical_intervals
+    ) == ("observer",)
+    assert changed_boot._snapshot.falco_lease is None
+
+    pressure_recovery = _stored(
+        _coverage(
+            key,
+            7,
+            {
+                "component": "observer",
+                "kind": "observer_spool_drop_recovered",
+                "severity": "INFO",
+                "opened_at": T2,
+                "closed_at": T2,
+                "dropped_count": 1,
+                "reason_code": "routine_spool_recovered",
+            },
+            coverage_flags=["storage_pressure"],
+        )
+    )
+    persistent = coverage.CoverageState.rebuild(
+        [records[0], spool_open, pressure_recovery]
+    )
+    assert tuple(
+        item.kind for item in persistent._snapshot.open_critical_intervals
+    ) == ("observer_spool_drop",)
 
 
 def test_structural_pairing_and_lowest_open_sequence_barrier(tmp_path: Path) -> None:

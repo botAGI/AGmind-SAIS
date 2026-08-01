@@ -253,6 +253,63 @@ def _reason(result: object) -> tuple[str, ...]:
     return cast(tuple[str, ...], result.reason_codes)
 
 
+def test_historical_coverage_assessment_locks_nullable_underflow_invariants() -> None:
+    common = {
+        "host_id": "123e4567-e89b-42d3-a456-426614174000",
+        "boot_id": "223e4567-e89b-42d3-a456-426614174000",
+        "trigger_event_id": "evt_" + "a" * 64,
+        "trigger_source_sequence": 1,
+        "coverage_through_sequence": 2,
+        "window_end": "0001-01-01T00:00:00Z",
+    }
+    underflow = HistoricalCoverageAssessment(
+        **common,
+        window_start=None,
+        complete=False,
+        critical_gap=False,
+        coverage_snapshot_sha256=None,
+    )
+    assert underflow.window_start is None
+
+    reversed_window = HistoricalCoverageAssessment(
+        **{**common, "window_end": "2026-08-01T00:00:00Z"},
+        window_start="2026-08-01T00:00:00.000000001Z",
+        complete=False,
+        critical_gap=False,
+        coverage_snapshot_sha256=None,
+    )
+    assert reversed_window.window_start is not None
+
+    invalid = (
+        {"complete": True, "critical_gap": False, "coverage_snapshot_sha256": "b" * 64},
+        {"complete": False, "critical_gap": True, "coverage_snapshot_sha256": None},
+        {"complete": False, "critical_gap": False, "coverage_snapshot_sha256": "b" * 64},
+    )
+    for changes in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            HistoricalCoverageAssessment(
+                **common,
+                window_start=None,
+                **changes,
+            )
+
+
+def test_complete_historical_coverage_rejects_reversed_window() -> None:
+    with pytest.raises(ValueError, match="coverage window is reversed"):
+        HistoricalCoverageAssessment(
+            host_id="123e4567-e89b-42d3-a456-426614174000",
+            boot_id="223e4567-e89b-42d3-a456-426614174000",
+            trigger_event_id="evt_" + "a" * 64,
+            trigger_source_sequence=1,
+            coverage_through_sequence=2,
+            window_start="2026-08-01T00:00:00.000000001Z",
+            window_end="2026-08-01T00:00:00Z",
+            complete=True,
+            critical_gap=False,
+            coverage_snapshot_sha256="b" * 64,
+        )
+
+
 def _correlate_facts(
     authenticated: AuthenticatedPCCInput,
     context: CorrelationContext,
