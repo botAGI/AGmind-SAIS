@@ -64,6 +64,13 @@ class _HistoricalCoverageWindow:
 
 _IGNORE = _CoverageClassification("ignore")
 
+_DOCKER_OPEN_REASONS = frozenset(
+    {
+        "observer_startup",
+        "docker_event_stream_error",
+        "docker_event_reconcile_retry",
+    }
+)
 _FALCO_OPEN_REASONS: dict[str, frozenset[str]] = {
     "falco_parse_rejection": frozenset({"invalid_falco_body"}),
     "falco_queue_drop": frozenset({"routine_capacity_exceeded"}),
@@ -283,6 +290,7 @@ def _classify_docker(
             or set(envelope.normalized_fields) != expected_fields
             or coverage.severity != "CRITICAL"
             or coverage.closed_at is not None
+            or coverage.reason_code not in _DOCKER_OPEN_REASONS
             or envelope.event_time != coverage.opened_at
         ):
             raise ValueError("Docker reconcile open form is invalid")

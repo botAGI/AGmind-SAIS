@@ -177,6 +177,39 @@ def test_classifier_locks_docker_sequence_and_falco_lifecycle_forms() -> None:
 
 
 @pytest.mark.parametrize(
+    "reason",
+    [
+        "observer_startup",
+        "docker_event_stream_error",
+        "docker_event_reconcile_retry",
+    ],
+)
+def test_classifier_accepts_only_production_docker_open_reasons(reason: str) -> None:
+    assert _classified(
+        _docker_open(
+            private_key(11),
+            1,
+            opened_at=T0,
+            generation=1,
+            reason=reason,
+        )
+    ).action == "docker_open"
+
+
+def test_classifier_rejects_unknown_docker_open_reason() -> None:
+    with pytest.raises(ValueError, match="Docker reconcile open form"):
+        _classified(
+            _docker_open(
+                private_key(11),
+                1,
+                opened_at=T0,
+                generation=1,
+                reason="unknown_reason",
+            )
+        )
+
+
+@pytest.mark.parametrize(
     ("kind", "reason", "count"),
     [
         ("falco_parse_rejection", "invalid_falco_body", 1),

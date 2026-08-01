@@ -1648,6 +1648,48 @@ def test_exact_falco_cumulative_updates_and_saturation_rules() -> None:
             coverage.CoverageState.rebuild(history)
 
 
+def test_counted_falco_exact_transport_replay_below_maximum_is_idempotent() -> None:
+    coverage = _coverage_module()
+    key = private_key(11)
+    fields = {
+        "component": "falco-adapter",
+        "kind": "falco_parse_rejection",
+        "severity": "CRITICAL",
+        "opened_at": T0,
+        "dropped_count": 1,
+        "reason_code": "invalid_falco_body",
+    }
+    original = _stored(
+        _coverage(
+            key,
+            2,
+            fields,
+            coverage_flags=["falco_parse_rejection"],
+            source_payload_hash="1" * 64,
+        )
+    )
+    replay = _stored(
+        _coverage(
+            key,
+            3,
+            fields,
+            coverage_flags=["falco_parse_rejection"],
+            source_payload_hash="1" * 64,
+        )
+    )
+
+    state = coverage.CoverageState.rebuild(
+        [_stored(boot_boundary(key)), original, replay]
+    )
+
+    assert state._snapshot.head_sequence == 3
+    assert len(state._snapshot.open_critical_intervals) == 1
+    retained = state._snapshot.open_critical_intervals[0]
+    assert retained.source_sequence == 2
+    assert retained.latest_source_sequence == 2
+    assert retained.dropped_count == 1
+
+
 def test_boot_scope_clears_only_process_local_falco_episodes() -> None:
     coverage = _coverage_module()
     key = private_key(11)
