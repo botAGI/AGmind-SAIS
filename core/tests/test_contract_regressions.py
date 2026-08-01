@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from agmind_immune import canonicaljson, contracts
+from agmind_immune.incidents.models import ContainmentCandidateV1
 from cryptography.exceptions import InvalidSignature
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict
@@ -36,6 +37,50 @@ def _schema(name: str) -> dict[str, Any]:
     assert isinstance(value, dict)
     Draft202012Validator.check_schema(value)
     return value
+
+
+def _containment_candidate(**changes: object) -> ContainmentCandidateV1:
+    document: dict[str, object] = {
+        "schema_version": "agmind.containment-candidate.v1",
+        "candidate_id": (
+            "cand_e2a860ac90463466aa8052b923eb0a8887a566173603a56837050eb9e3030cbd"
+        ),
+        "incident_id": (
+            "inc_b6a20642d932fed5b59e1d7221f7dacc8824a244fce8fcd85f5139b837ba5f52"
+        ),
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "boot_id": "22222222-2222-4222-8222-222222222222",
+        "primary_event_id": "evt_" + "a" * 64,
+        "primary_source_sequence": 7,
+        "correlation_snapshot_event_id": "evt_" + "b" * 64,
+        "docker_container_id": "f" * 64,
+        "docker_started_at": "2026-07-27T12:00:00Z",
+        "image_id": "sha256:" + "e" * 64,
+        "repo_digests": (
+            "registry.example/agmind@sha256:" + "d" * 64,
+        ),
+        "immutable_spec_sha256": "c" * 64,
+        "inventory_generation": 11,
+        "inventory_revision": 12,
+        "destination_ipv4": "1.1.1.1",
+        "destination_port": 443,
+        "l4_protocol": "tcp",
+        "ttl_seconds": 120,
+        "detector_rule": "AGmind PCC Suspicious Process Outbound Connect",
+        "detector_rule_version": "agmind-pcc-rules-v1",
+        "detector_bundle_sha256": (
+            "f6189db90ea61fefe991672b20316f1693f723de28ab37800029a40545af7b15"
+        ),
+        "coverage_snapshot_sha256": "1" * 64,
+        "docker_network_snapshot_sha256": "2" * 64,
+        "special_use_registry_sha256": "3" * 64,
+        "operator_denylist_sha256": "4" * 64,
+        "management_denylist_sha256": "5" * 64,
+        "evidence_ids": ("evt_" + "a" * 64, "evt_" + "b" * 64),
+        "created_at": "2026-07-27T12:00:05.123456789Z",
+    }
+    document.update(changes)
+    return ContainmentCandidateV1.model_validate(document, strict=True)
 
 
 def test_prepared_plan_is_a_standalone_valid_closed_contract() -> None:
@@ -256,6 +301,80 @@ def test_locked_derivations_match_independent_shared_vectors() -> None:
             canonicaljson.key_id(bytes.fromhex(vectors["keys"][public_name]))
             == vectors["keys"][key_id_name]
         )
+
+
+def test_candidate_facts_hash_matches_the_locked_full_candidate_vector() -> None:
+    candidate = _containment_candidate()
+
+    assert canonicaljson.candidate_facts_sha256(candidate) == (
+        "bcc3922cc5e8e08119670e9a2d78b018a5523f57f35aa5f04263cc391bc17498"
+    )
+
+
+def test_candidate_facts_hash_binds_every_candidate_field() -> None:
+    mutations: dict[str, object] = {
+        "schema_version": "agmind.containment-candidate.v2",
+        "candidate_id": "cand_" + "0" * 64,
+        "incident_id": "inc_" + "0" * 64,
+        "host_id": "33333333-3333-4333-8333-333333333333",
+        "boot_id": "44444444-4444-4444-8444-444444444444",
+        "primary_event_id": "evt_" + "c" * 64,
+        "primary_source_sequence": 8,
+        "correlation_snapshot_event_id": "evt_" + "d" * 64,
+        "docker_container_id": "a" * 64,
+        "docker_started_at": "2026-07-27T12:00:01Z",
+        "image_id": "sha256:" + "a" * 64,
+        "repo_digests": (
+            "registry.example/agmind@sha256:" + "c" * 64,
+        ),
+        "immutable_spec_sha256": "6" * 64,
+        "inventory_generation": 13,
+        "inventory_revision": 14,
+        "destination_ipv4": "8.8.8.8",
+        "destination_port": 8443,
+        "l4_protocol": "udp",
+        "ttl_seconds": 60,
+        "detector_rule": "different detector rule",
+        "detector_rule_version": "agmind-pcc-rules-v2",
+        "detector_bundle_sha256": "7" * 64,
+        "coverage_snapshot_sha256": "8" * 64,
+        "docker_network_snapshot_sha256": "9" * 64,
+        "special_use_registry_sha256": "a" * 64,
+        "operator_denylist_sha256": "b" * 64,
+        "management_denylist_sha256": "c" * 64,
+        "evidence_ids": ("evt_" + "c" * 64, "evt_" + "d" * 64),
+        "created_at": "2026-07-27T12:00:05.123456790Z",
+    }
+    assert set(mutations) == set(ContainmentCandidateV1.model_fields)
+    expected = canonicaljson.candidate_facts_sha256(_containment_candidate())
+
+    for field, changed_value in mutations.items():
+        changed = _containment_candidate()
+        object.__setattr__(changed, field, changed_value)
+
+        assert canonicaljson.candidate_facts_sha256(changed) != expected, field
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ttl_seconds", 60),
+        ("destination_port", 8443),
+        ("image_id", "sha256:" + "a" * 64),
+        ("coverage_snapshot_sha256", "8" * 64),
+    ],
+)
+def test_same_id_candidates_with_changed_action_facts_hash_differently(
+    field: str,
+    value: object,
+) -> None:
+    original = _containment_candidate()
+    changed = _containment_candidate(**{field: value})
+
+    assert changed.candidate_id == original.candidate_id
+    assert canonicaljson.candidate_facts_sha256(changed) != (
+        canonicaljson.candidate_facts_sha256(original)
+    )
 
 
 def test_signatures_bind_the_declared_key_and_exact_record_content() -> None:

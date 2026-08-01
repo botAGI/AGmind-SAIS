@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from threading import Lock
 from typing import Self
 
 from agmind_immune.contracts import PCC_SPECIAL_USE_REGISTRY_SHA256
@@ -142,6 +143,38 @@ class SpecialUseRegistry(ParsedSpecialUseRegistry):
         return PCC_SPECIAL_USE_REGISTRY_SHA256
 
 
+type _RegistryBinding = tuple[
+    tuple[tuple[str, str], ...],
+    tuple[tuple[int, int, str], ...],
+]
+
+
+def _canonical_registry_binding(
+    registry: SpecialUseRegistry,
+) -> _RegistryBinding:
+    if type(registry.entries) is not tuple or type(registry._index) is not tuple:
+        raise TypeError("special-use registry facts must be exact tuples")
+
+    entries: list[tuple[str, str]] = []
+    for entry in registry.entries:
+        if type(entry) is not SpecialUseEntry:
+            raise TypeError("special-use registry entries are not exact")
+        if type(entry.prefix) is not str or type(entry.globally_reachable) is not GlobalReachability:
+            raise TypeError("special-use registry entry facts are not exact")
+        entries.append((entry.prefix, entry.globally_reachable.value))
+
+    index: list[tuple[int, int, str]] = []
+    for network_int, prefix_length, reachability in registry._index:
+        if (
+            type(network_int) is not int
+            or type(prefix_length) is not int
+            or type(reachability) is not GlobalReachability
+        ):
+            raise TypeError("special-use registry index facts are not exact")
+        index.append((network_int, prefix_length, reachability.value))
+    return tuple(entries), tuple(index)
+
+
 def _canonical_ipv4_address(value: str) -> ipaddress.IPv4Address:
     if type(value) is not str:
         raise TypeError("IPv4 address must be an exact string")
@@ -251,7 +284,14 @@ def _pinned_registry_loader() -> tuple[
     Callable[[Path], SpecialUseRegistry],
     Callable[[object], bool],
 ]:
-    issued: weakref.WeakSet[SpecialUseRegistry] = weakref.WeakSet()
+    issued: dict[
+        int,
+        tuple[
+            weakref.ReferenceType[SpecialUseRegistry],
+            _RegistryBinding,
+        ],
+    ] = {}
+    issued_lock = Lock()
 
     def load(path: Path) -> SpecialUseRegistry:
         """Load the fixed digest-pinned IANA snapshot before parsing."""
@@ -270,11 +310,33 @@ def _pinned_registry_loader() -> tuple[
         parsed = _parse_special_use_registry_bytes(raw)
         registry = object.__new__(SpecialUseRegistry)
         ParsedSpecialUseRegistry.__init__(registry, parsed.entries)
-        issued.add(registry)
+        identity = id(registry)
+
+        def cleanup(reference: weakref.ReferenceType[SpecialUseRegistry]) -> None:
+            with issued_lock:
+                current = issued.get(identity)
+                if current is not None and current[0] is reference:
+                    issued.pop(identity, None)
+
+        reference = weakref.ref(registry, cleanup)
+        with issued_lock:
+            issued[identity] = (
+                reference,
+                _canonical_registry_binding(registry),
+            )
         return registry
 
     def is_issued(value: object) -> bool:
-        return type(value) is SpecialUseRegistry and value in issued
+        if type(value) is not SpecialUseRegistry:
+            return False
+        with issued_lock:
+            registered = issued.get(id(value))
+        if registered is None or registered[0]() is not value:
+            return False
+        try:
+            return _canonical_registry_binding(value) == registered[1]
+        except (AttributeError, RecursionError, TypeError, ValueError):
+            return False
 
     return load, is_issued
 

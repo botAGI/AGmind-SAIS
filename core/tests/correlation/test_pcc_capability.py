@@ -14,6 +14,11 @@ from agmind_immune.correlation.pcc import (
     incident_from_retained_trigger,
     incident_from_verified_falco,
 )
+from agmind_immune.correlation.primitives import (
+    ParsedSpecialUseRegistry,
+    SpecialUseRegistry,
+    load_pinned_special_use_registry,
+)
 from agmind_immune.evidence.segments import EvidenceRef
 from agmind_immune.ingest.envelope import (
     AuthenticatedFalcoInput,
@@ -60,6 +65,20 @@ def _accepted_falco(
     ref = _accept(coordinator, _candidate_trigger(key))
     assert type(ref) is EvidenceRef
     return coordinator, ref
+
+
+def test_equal_unissued_registry_cannot_cross_context_authority_boundary() -> None:
+    issued = load_pinned_special_use_registry(
+        Path("contracts/v1/ipv4-special-use.csv")
+    )
+    forged = object.__new__(SpecialUseRegistry)
+    ParsedSpecialUseRegistry.__init__(forged, issued.entries)
+
+    with pytest.raises(TypeError, match="special-use authority"):
+        CorrelationContext(
+            pinned_detector_bundle_sha256="0" * 64,
+            special_use_registry=forged,
+        )
 
 
 def test_authenticated_pcc_input_has_no_public_constructor(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import importlib
+import pickle
 from pathlib import Path
 from types import ModuleType
 
@@ -45,6 +47,45 @@ def test_pinned_registry_loads_and_uses_the_most_specific_ipv4_prefix() -> None:
     assert not registry.is_globally_reachable("192.0.0.8")
     assert registry.is_globally_reachable("192.0.0.9")
     assert not registry.is_globally_reachable("192.0.2.1")
+
+
+@pytest.mark.parametrize("field", ["entries", "_index"])
+def test_mutating_issued_registry_facts_revokes_its_authority(field: str) -> None:
+    primitives = _subject()
+    registry = primitives.load_pinned_special_use_registry(
+        Path("contracts/v1/ipv4-special-use.csv")
+    )
+    current = getattr(registry, field)
+    object.__setattr__(registry, field, current[1:])
+
+    assert not primitives.special_use_registry_is_issued(registry)
+
+
+def test_equal_unissued_registry_cannot_borrow_loader_authority() -> None:
+    primitives = _subject()
+    issued = primitives.load_pinned_special_use_registry(
+        Path("contracts/v1/ipv4-special-use.csv")
+    )
+    forged = object.__new__(primitives.SpecialUseRegistry)
+    primitives.ParsedSpecialUseRegistry.__init__(forged, issued.entries)
+
+    assert forged == issued
+    assert not primitives.special_use_registry_is_issued(forged)
+
+
+def test_copied_pickled_and_parsed_registries_have_no_loader_authority() -> None:
+    primitives = _subject()
+    issued = primitives.load_pinned_special_use_registry(
+        Path("contracts/v1/ipv4-special-use.csv")
+    )
+    parsed = _parse((_HEADER + _row("10.0.0.0/8", "False")).encode())
+
+    assert not primitives.special_use_registry_is_issued(parsed)
+    for copier in (copy.copy, copy.deepcopy):
+        with pytest.raises(TypeError, match="pinned loader"):
+            copier(issued)
+    with pytest.raises(TypeError, match="pinned loader"):
+        pickle.loads(pickle.dumps(issued))
 
 
 def test_registry_parses_every_comma_separated_block_and_footnote_suffix() -> None:

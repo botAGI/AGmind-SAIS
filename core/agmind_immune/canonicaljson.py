@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         PCCCorrelationSnapshotRequestV1,
         PCCDockerNetworkV1,
     )
+    from .incidents.models import ContainmentCandidateV1
 
 MIN_CANONICAL_INTEGER = -(2**63)
 MAX_CANONICAL_INTEGER = 2**64 - 1
@@ -27,6 +28,7 @@ _PCC_DOCKER_NETWORK_DOMAIN = b"AGMIND_DOCKER_NETWORK_SNAPSHOT_V1\0"
 _PCC_OPERATOR_DENYLIST_DOMAIN = b"AGMIND_OPERATOR_DENYLIST_V1\0"
 _PCC_MANAGEMENT_DENYLIST_DOMAIN = b"AGMIND_MANAGEMENT_DENYLIST_V1\0"
 _PCC_BOOT_TRANSITION_CHAIN_DOMAIN = b"AGMIND_BOOT_TRANSITION_CHAIN_V1\0"
+_CANDIDATE_FACTS_DOMAIN = b"AGMIND_CANDIDATE_FACTS_V1\0"
 _PCC_MAX_DENYLIST_ITEMS = 128
 _PCC_MAX_DOCKER_NETWORKS = 64
 _PCC_MAX_DOCKER_SUBNETS = 128
@@ -378,6 +380,17 @@ def candidate_id(
         _ascii(value, "candidate field") for value in fields
     )
     return "cand_" + hashlib.sha256(preimage).hexdigest()
+
+
+def candidate_facts_sha256(candidate: ContainmentCandidateV1) -> str:
+    """Hash every canonical containment-candidate fact under its fixed domain."""
+    from .incidents.models import ContainmentCandidateV1
+
+    if type(candidate) is not ContainmentCandidateV1:
+        raise TypeError("candidate must be an exact ContainmentCandidateV1")
+    return hashlib.sha256(
+        _CANDIDATE_FACTS_DOMAIN + canonical_json(candidate)
+    ).hexdigest()
 
 
 def intent_id(candidate_id_value: str, policy_bundle_sha256: str, ttl_seconds: int) -> str:
