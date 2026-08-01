@@ -142,6 +142,12 @@ canonical `window_start` is rendered without floating point, with `Z`, and
 with the shortest exact fractional representation (no fraction for an exact
 second; otherwise trailing fractional zeroes are removed).
 
+`HistoricalCoverageAssessment.window_start` is an exact string when that value
+is representable and is absent only for the deterministic year-underflow
+outcome. An absent start therefore requires `complete=false`,
+`critical_gap=false`, and no hash. A reversed but representable window keeps
+its exact rendered start and has the same incomplete/no-hash outcome.
+
 The interval is closed: a critical point exactly at either boundary
 intersects and fails closed.
 
@@ -156,6 +162,7 @@ private shared reducer primitive. It does not reinterpret free-form
 A normalized critical episode contains exactly:
 
 ```text
+scope_boot_id?                # required only for process-local episodes
 component
 kind                         # the opening assertion's kind
 opened_at
@@ -170,20 +177,60 @@ The opening assertion is an exact authenticated CRITICAL coverage form. Episode
 keys are closed by grammar:
 
 ```text
-Docker gap:    (component, opened_at, reconcile_generation)
-sequence gap:  (component, opened_at, affected_start, affected_end)
-generic:       (component, kind, opened_at)
+Docker gap:       (component, opened_at, reconcile_generation)
+sequence gap:     (component, opened_at, affected_start, affected_end)
+Falco generic:    (boot_id, component, kind, opened_at)
+persistent other: (component, kind, opened_at)
 ```
 
-Its
-close, where that coverage grammar permits one, must be the one exact later
-matching recovery/close record. Cumulative updates with the same logical
-generic key must keep component, kind, opened_at, severity, and the opening
-reason immutable; an optional `dropped_count` may only increase. Source payload
-and normalized hashes may change and the latest primary update supersedes the
-earlier counter value. Bounded state retains the earliest open and latest
-primary update, not every lifetime update ID. A lawful close may change its
-reason to the authenticated recovery reason and must not lower the counter.
+Its close, where that coverage grammar permits one, must be the one exact later
+matching recovery/close record. Cumulative updates with the same logical key
+keep component, kind, opened_at, severity, counter presence, and scope
+immutable. Source payload and normalized hashes may change and the latest
+primary update supersedes the earlier counter value. Bounded state retains the
+earliest open and latest primary update, not every lifetime update ID.
+
+The Falco adapter's reason is diagnostic, not interval identity. Its exact
+closed grammar permits these open/update and close reasons:
+
+```text
+kind                          open/update reasons                     close
+falco_parse_rejection         invalid_falco_body                      valid_heartbeat_recovered
+falco_queue_drop              routine_capacity_exceeded               routine_queue_recovered
+falco_delivery_failure        observer_delivery_failed                observer_delivery_recovered
+falco_heartbeat_gap           awaiting_initial_heartbeat |            recovered
+                              falco_heartbeat_timeout
+falco_configuration_mismatch  falco_version_mismatch |                recovered
+                              falco_engine_mismatch |
+                              falco_config_hash_mismatch |
+                              falco_rules_hash_mismatch |
+                              falco_counter_rollback
+falco_kernel_event_drop       falco_kernel_drop_counter_increase      recovered
+falco_outputs_queue_drop      falco_outputs_queue_counter_increase    recovered
+```
+
+The parse, queue, kernel-drop, and outputs-drop kinds require
+`dropped_count` on every open/update/close. It strictly increases, except that
+`MAX_UINT64 -> MAX_UINT64` is a lawful saturated update. The other three kinds
+must omit it. A close preserves the latest counter and uses only its listed
+recovery reason. Below-maximum equality, disappearance, introduction on an
+uncounted kind, or rollback is conflict. Non-Falco generic grammars keep their
+opening reason immutable unless an exact source-specific rule says otherwise.
+
+`observer_spool_drop` is the exact persistent observer-loss grammar. Its INFO
+`observer_spool_drop_recovered` point says that pressure ended but cannot
+restore discarded evidence and never closes the critical loss episode.
+That recovery form requires `opened_at == closed_at`, reason
+`routine_spool_recovered`, a positive `dropped_count`, exact
+`["storage_pressure"]` flags, and normalized/source-hash binding.
+
+`docker_logging_visibility_degraded` is the exact accepted non-critical
+observer point: `WARNING`, reason `docker_logging_unavailable`, positive
+`reconcile_generation`, `inventory_generation` equal to it, event time equal
+to `opened_at`, exact `["docker_logging_unavailable"]` flags, and
+normalized/source-hash binding. It opens and closes no critical episode.
+Unknown component/kind/reason combinations are validation failures, not
+free-form generic intervals.
 
 A self-contained CRITICAL record with `closed_at` is historical authority even
 if an earlier pending open was lawfully coalesced out of the observer outbox;
@@ -210,6 +257,93 @@ no hash. An open generic critical interval is structurally complete but has
 WARNING and INFO points are not critical episodes. They can only close or
 structurally support an episode where the shared closed grammar explicitly
 allows that role.
+
+### Boot scope
+
+Every historical record carries its exact `boot_id`. A change of envelope
+`boot_id`, not a key-rotation event type by itself, ends the old process-local
+Falco epoch. Active `falco-adapter` episodes from the prior boot are discarded
+at that authenticated boundary and cannot be closed by the new boot. A
+same-boot key rotation does not reset them.
+
+Structural sequence gaps, Docker reconciliation gaps, and persistent observer
+loss are host-scoped and survive boot changes until their own exact grammar
+resolves them. This prevents reboot laundering of missing evidence while not
+making a dead Falco process appear open forever. The live and historical
+reducers apply this identical split. A complete PCC still requires the trigger
+and snapshot to name the same target boot and no intervening boot change in
+`[trigger,S]`.
+
+### Logical-primary identity
+
+Projection V1's boot-blind dedup remains unchanged until the atomic V2
+activation. Projection V2 and historical coverage use the new frozen identity:
+
+```text
+hex(SHA256("AGMIND_PROJECTION_DEDUP_V2\0" || kind || "\0" || canonical_json(key)))
+
+Falco key:    (host_id, boot_id, event_type, source_payload_hash)
+coverage key: (host_id, boot_id, event_type,
+               normalized_fields_sha256, source_payload_hash)
+other key:    (event_id,)
+```
+
+Including `boot_id` prevents replayed prior-boot sensor bytes from suppressing
+a new critical assertion. One neutral helper owns both frozen V1 and V2
+derivations. Active V1 continues to call V1; the dormant V2 reducer,
+historical reducer, and later promoted Projection V2 call V2.
+
+Historical code never keeps a lifetime `seen` set. A transaction-bound
+logical-primary oracle is issued only while V2 is being built from
+authenticated source order or after its complete logical prefix has been
+revalidated. It returns the first source-order event for an exact V2 key. A
+pure constant-memory prefix probe is used by tests and as the fail-closed
+fallback; a V2 index is only an accelerator, never caller authority.
+
+For a close or reopen whose episode is no longer active, the same oracle probes
+earlier logical-primary records with that episode key. No earlier record allows
+an exact grammar-approved self-contained generic close. An earlier closed
+episode makes another close or reopen conflict. This detects lifetime second
+closes without an unbounded tombstone set.
+
+### Bounded target-specific reduction
+
+Reduction is target-specific and streaming. It retains only:
+
+- active episode summaries;
+- closed pre-trigger episodes that intersect the exact target window;
+- logical-primary coverage IDs in `(trigger,S-1]`;
+- structural endpoint/dependency IDs used by the target path;
+- the final intersecting intervals and sorted-unique ID set.
+
+Completed irrelevant lifetime episodes are discarded after their exact close;
+their episode-prefix status remains queryable through the bound primary
+oracle. The active, pre-trigger, recent-path, recent-primary, final-interval,
+and final-ID collections each have an independent 4,096 cap checked with
+cap-plus-one before storage. No lifetime count is truncated and no one cap is
+shared with another.
+
+`HistoricalPathAuthority` has no public constructor and is not exported from
+`coverage.__init__`. Only the same recovered `SegmentStore` issues it for one
+exact authenticated PCC. Its private binding rechecks the store lifecycle,
+verifier generation, full PCC ref, host/boot, trigger identity,
+`S/coverage_through=S-1`, surviving-ref fingerprints, clipped authenticated
+retired routine ranges, acceptance cursor, and healthy repair/retention state.
+Copy, serialization, mutation, restart, cross-store use, or namespace drift
+revokes it.
+
+The live protected PCC at `S` is the terminal anchor; `S-1` need not have a
+live ref. A retired trigger is covered structurally by exactly one
+authenticated routine-only retired range while its event/content identity
+comes from the retained PCC request and snapshot. Protected coverage can never
+be justified by a retired range. The path binding is revalidated inside the
+Projection V2 source-order transaction before use.
+
+A closed sequence-gap proof adds its own open/close IDs and the exact matched
+Docker gap open/recovery IDs that establish its baseline-advancing reconcile.
+If an earlier Docker recovery supplies the comparison baseline, its matching
+open/recovery IDs are dependencies too. All dependency IDs enter the same
+sorted-unique final coverage-ID set and its independent cap.
 
 ### Locked coverage hash
 
@@ -368,6 +502,7 @@ candidate bytes and this hash.
 ```text
 schema_version  = agmind.projection-schema.v2
 reducer_version = agmind.projection-reducer.v2
+dedup_version   = AGMIND_PROJECTION_DEDUP_V2
 snapshot_layout = AGMIND_PROJECTION_SNAPSHOT_V2
 snapshot domain = "AGMIND_PROJECTION_SNAPSHOT_V2\0"
 ```

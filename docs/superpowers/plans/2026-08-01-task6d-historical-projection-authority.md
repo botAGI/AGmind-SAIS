@@ -102,11 +102,25 @@ git commit -m "fix(core): bind immutable correlation pins"
 
 **Files**
 
+- Create: `core/agmind_immune/coverage/grammar.py`
 - Create: `core/agmind_immune/coverage/historical.py`
+- Create: `core/agmind_immune/evidence/dedup.py`
+- Create: `core/tests/coverage/test_grammar.py`
 - Create: `core/tests/coverage/test_historical.py`
+- Create: `core/tests/evidence/test_dedup.py`
+- Create: `core/tests/evidence/test_historical_path.py`
 - Modify: `core/agmind_immune/coverage/__init__.py`
 - Modify: `core/agmind_immune/coverage/state.py`
+- Modify: `core/agmind_immune/correlation/pcc.py`
+- Modify: `core/agmind_immune/evidence/projection.py`
+- Modify: `core/agmind_immune/evidence/segments.py`
 - Modify: `core/tests/coverage/test_state.py`
+- Modify: `core/tests/correlation/test_pcc.py`
+- Modify: `core/tests/evidence/test_pcc_retention_restart.py`
+
+Implement this task as two reviewed commits: 2A locks the shared grammar,
+nanosecond/window model, and boot scope; 2B adds V2 logical-primary identity,
+the store-bound path capability, target-specific reducer, and hash.
 
 ### RED
 
@@ -115,6 +129,8 @@ Write locked tests for:
 - RFC3339Nano parse/format round trips at 0/1/6/9 fractional digits and years
   0001/9999, plus `window_start` year underflow and
   `window_end < window_start` as deterministic incomplete assessments;
+- nullable `HistoricalCoverageAssessment.window_start` only for underflow,
+  with incomplete/critical/hash invariants locked in `test_pcc.py`;
 - inclusive window intersections at both exact boundaries;
 - exact frozen hash vectors for empty clean history, an open interval with
   absent optional keys, a closed self-contained interval, and a pre-trigger
@@ -122,22 +138,42 @@ Write locked tests for:
   IDs while excluding intermediate updates;
 - a multi-interval vector locking canonical optional-key omission, interval
   sort order, coverage-event ID sort/dedup, and structural-gap endpoint IDs;
-- Docker open/recovery, sequence-gap open/close, generic open/update/close,
-  closed critical point, and self-contained close;
+- Docker open/recovery, sequence-gap open/close, exact Falco
+  open/update/close, closed critical point, and self-contained close;
+- every Falco per-kind reason/counter form, legal heartbeat/config reason
+  transitions, strict counter growth, lawful `MAX_UINT64 -> MAX_UINT64`, and
+  rejection of equality below maximum, count disappearance, or count on an
+  uncounted kind;
+- exact persistent `observer_spool_drop` and proof that its INFO pressure
+  recovery point has the full fixed wire form and cannot close lost evidence;
+- exact `docker_logging_visibility_degraded` WARNING wire form is accepted as
+  non-critical/no-op; malformed variants fail validation;
+- an actual boot-ID change clears only process-local Falco episodes; same-boot
+  key rotation clears nothing, while sequence, Docker, and permanent observer
+  gaps survive;
 - a closed sequence gap whose timestamp misses the window but affected range
   overlaps `[trigger,S-1]` and therefore still reports a critical gap;
-- monotonic counter updates and rejection of rollback/second logical close;
+- V1 dedup vectors remain byte-identical, V2 vectors bind `boot_id`, and exact
+  prior-boot sensor bytes are distinct V2 primaries;
+- logical-primary transport replay versus cumulative primary update, plus
+  second-close/reopen detection through the bounded prefix-status oracle;
 - a pre-trigger open interval that overlaps the trigger window;
 - structural path coverage by surviving refs plus authenticated retired ranges;
+- terminal anchoring at the live protected PCC `S`, including a retired
+  routine `S-1` and retired routine trigger whose identity remains bound by the
+  retained PCC request/snapshot;
+- path capability mutation/copy/pickle/cross-store/restart/retention-drift and
+  raw retired-range tuple rejection;
 - an open structural sequence gap producing `complete=false`, no hash, and
   `critical_gap=false`;
-- exact primary dedup and transport replay versus second logical close;
 - independent 4,096/4,097 no-truncation cases for interval IDs,
-  coverage-event IDs, active episodes, recent path events, and pre-trigger
-  summaries;
-- backwards, ambiguous, and unmatched closes; immutable key/opening-reason
-  changes; counter rollback; and INFO/WARNING records that cannot open critical
-  episodes;
+  coverage-event IDs, active episodes, recent path events, recent primary IDs,
+  and pre-trigger summaries, without a lifetime episode/tombstone collection;
+- backwards, ambiguous, and unmatched closes; immutable key/non-Falco opening
+  reason changes; counter rollback; and INFO/WARNING records that cannot open
+  critical episodes;
+- a sequence-gap close whose coverage IDs include its exact gap endpoints,
+  matched Docker open/recovery, and prior baseline pair when present;
 - a parity assertion that live and historical paths invoke the same strict
   coverage record classifier;
 - proof-path and assessment stability when the routine trigger is retired.
@@ -147,8 +183,14 @@ Run and confirm RED:
 ```bash
 TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
   .venv/bin/python -m pytest \
+  core/tests/coverage/test_grammar.py \
   core/tests/coverage/test_historical.py \
-  core/tests/coverage/test_state.py -q
+  core/tests/coverage/test_state.py \
+  core/tests/correlation/test_pcc.py \
+  core/tests/evidence/test_dedup.py \
+  core/tests/evidence/test_historical_path.py \
+  core/tests/evidence/test_pcc_retention_restart.py::test_historical_path_survives_routine_trigger_retirement \
+  -q
 ```
 
 ### GREEN
@@ -166,35 +208,82 @@ HistoricalCoverageConflict
 
 Extract only the strict coverage record classifier shared with live
 `CoverageState`; keep historical episode retention separate from live
-`MutationReadiness`. Retain bounded active summaries plus recent primary path
-IDs, not an unbounded lifetime list.
+`MutationReadiness`. The classifier uses the exact per-kind Falco grammar from
+the design and scopes process-local episodes by real `boot_id` changes. It uses
+integer nanosecond comparisons throughout; do not reuse the current
+microsecond `datetime` ordering for historical facts.
 
-Expose no public facts-to-assessment authority constructor. The pure hash
-function may accept exact internal values for tests; production issuance is
-Task 4.
+Extract neutral frozen V1/V2 logical-primary helpers into `evidence/dedup.py`.
+Calling the V1 helper from active Projection V1 must be byte-for-byte behavior
+preserving. Historical coverage calls only V2, whose key includes `boot_id`;
+the dormant V2 projection will use the same helper.
 
-Focused quality gate:
+Retain bounded active summaries, target-intersecting pre-trigger summaries,
+recent primaries, path facts, and final hash inputs. Completed irrelevant
+lifetime episodes are discarded. A private logical-primary/episode-prefix
+oracle detects replay, second close, and reopen without a lifetime in-memory
+set; production binds that oracle to source-order V2 construction or a fully
+revalidated V2 prefix.
+
+`HistoricalPathAuthority` is factory-only, non-copyable/non-serializable, and
+issued only by the exact recovered `SegmentStore` for an issued
+`AuthenticatedPCCInput`. It is not exported from `coverage.__init__`. Recheck
+its complete weak-key binding at every use. The pure hash function may accept
+exact internal values for locked tests; only Task 4 can combine its result with
+the completed-journal and correlation authorities.
+
+#### 2A focused quality gate and commit
+
+```bash
+.venv/bin/ruff check \
+  core/agmind_immune/coverage/grammar.py \
+  core/agmind_immune/coverage/state.py \
+  core/agmind_immune/correlation/pcc.py \
+  core/tests/coverage/test_grammar.py \
+  core/tests/coverage/test_state.py \
+  core/tests/correlation/test_pcc.py
+.venv/bin/mypy \
+  core/agmind_immune/coverage/grammar.py \
+  core/agmind_immune/coverage/state.py \
+  core/agmind_immune/correlation/pcc.py
+git diff --check
+git add core/agmind_immune/coverage/grammar.py \
+  core/agmind_immune/coverage/state.py \
+  core/agmind_immune/correlation/pcc.py \
+  core/tests/coverage/test_grammar.py \
+  core/tests/coverage/test_state.py \
+  core/tests/correlation/test_pcc.py
+git commit -m "fix(core): normalize historical coverage grammar"
+```
+
+#### 2B focused quality gate and commit
 
 ```bash
 .venv/bin/ruff check \
   core/agmind_immune/coverage/historical.py \
-  core/agmind_immune/coverage/state.py \
+  core/agmind_immune/coverage/__init__.py \
+  core/agmind_immune/evidence/dedup.py \
+  core/agmind_immune/evidence/projection.py \
+  core/agmind_immune/evidence/segments.py \
   core/tests/coverage/test_historical.py \
-  core/tests/coverage/test_state.py
+  core/tests/evidence/test_dedup.py \
+  core/tests/evidence/test_historical_path.py \
+  core/tests/evidence/test_pcc_retention_restart.py
 .venv/bin/mypy \
   core/agmind_immune/coverage/historical.py \
-  core/agmind_immune/coverage/state.py
+  core/agmind_immune/evidence/dedup.py \
+  core/agmind_immune/evidence/projection.py \
+  core/agmind_immune/evidence/segments.py
 git diff --check
-```
-
-Commit:
-
-```bash
 git add core/agmind_immune/coverage/historical.py \
   core/agmind_immune/coverage/__init__.py \
-  core/agmind_immune/coverage/state.py \
+  core/agmind_immune/evidence/dedup.py \
+  core/agmind_immune/evidence/projection.py \
+  core/agmind_immune/evidence/segments.py \
   core/tests/coverage/test_historical.py \
-  core/tests/coverage/test_state.py
+  core/tests/evidence/test_dedup.py \
+  core/tests/evidence/test_historical_path.py \
+  core/tests/evidence/test_pcc_retention_restart.py
 git commit -m "feat(core): derive historical coverage proofs"
 ```
 
@@ -349,7 +438,8 @@ Strengthen `HistoricalCoverageAssessment` invariants:
 
 ```text
 complete=false => critical_gap=false and hash absent
-complete=true  => exact hash present
+complete=true  => exact window_start and hash present
+window_start absent => deterministic underflow and complete=false
 ```
 
 Focused quality gate and commit:
@@ -387,7 +477,10 @@ Copy the committed V1 DDL byte-for-byte into `schema_v1.sql`, stage the future
 DDL in `schema_v2.sql`, then add tests
 that demand:
 
-- exact V2 metadata, table set/order, DDL, indexes, and snapshot domain;
+- exact V2 metadata including `AGMIND_PROJECTION_DEDUP_V2`, table set/order,
+  DDL, indexes, and snapshot domain;
+- V2 uses the Task 2 boot-aware helper for every dedup row and never the
+  boot-blind V1 identity;
 - full frozen Incident/Candidate column order and round-trip codecs;
 - 20-digit uint64, 0/1 Boolean, canonical tuple JSON, closed result/role/reason
   checks, FKs, and no trigger-event FK where retention forbids it;
