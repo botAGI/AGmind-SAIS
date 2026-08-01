@@ -467,6 +467,15 @@ framed bytes, and at most 128 KiB per frame payload. The nested receipt has
 exactly the five fields frozen above, carries no source sequence, and rebinds
 the spool event by event ID and content hash.
 
+V5-anchored receipt records are permanent append-only audit history; ACK never
+deletes, compacts, or checkpoints them. Startup therefore accepts an exact
+anchored historical receipt after its spool event has been acknowledged and
+removed, while strictly revalidating every receipt whose snapshot remains in
+the spool and rejecting every live snapshot without its exact receipt. A new
+append, exact retry lookup, and ACK authorization always require the exact live
+unacknowledged spool frame and publication binding. Historical receipt presence
+alone can never republish or return an acknowledged snapshot.
+
 Core durably appends the trigger without ACK, requests the snapshot, fetches and
 durably appends every intervening event plus the snapshot, then advances ACKs in
 source order. A crash retries the exact persisted request bytes.

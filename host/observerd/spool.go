@@ -81,8 +81,10 @@ type Spool struct {
 	ackBytes            uint64
 	ackJournal          *durablefile.Journal
 	controlReceipts     *ControlReceiptJournal
+	pccReceipts         *PCCReceiptStore
 	boundaryArchive     *PCCBoundaryArchive
 	controlReceiptBytes uint64
+	pccReceiptBytes     uint64
 	closed              bool
 	remove              func(string, durablefile.FileIdentity) error
 	removePublication   func(string, durablefile.FileIdentity) error
@@ -1264,6 +1266,7 @@ func NewSpool(
 	}
 	ackPath := filepath.Join(spoolRoot, "acked.agf")
 	ackExists := false
+	pccReceiptEntrySeen := false
 	tempPaths := make([]string, 0)
 	for _, entry := range rootEntries {
 		switch entry {
@@ -1272,6 +1275,11 @@ func NewSpool(
 			"publications",
 			"control-receipts.agf",
 			"pcc-boundaries.agf":
+		case "pcc-receipts.agf":
+			// This name is only provisionally recognized here. The fixed
+			// artifact is accepted below only after PCCReceiptStore owns,
+			// locks, strictly recovers, and exactly reconciles it to V5.
+			pccReceiptEntrySeen = true
 		case "acked.agf":
 			ackExists = true
 		default:
@@ -1607,6 +1615,33 @@ func NewSpool(
 		_ = state.PersistReadOnly("observer_ack_journal_corrupt")
 		return nil, err
 	}
+	pccReceipts, err := OpenPCCReceiptStore(config.StateDir, state)
+	if err != nil {
+		_ = ackJournal.Close()
+		snapshot := state.Snapshot()
+		if pccReceiptEntrySeen && snapshot.PCCReceiptCount == 0 &&
+			snapshot.PCCReceiptBytes == 0 &&
+			snapshot.PCCReceiptHeadHash == zeroPCCJournalHash {
+			_ = state.PersistReadOnly("observer_spool_root_unknown")
+		}
+		return nil, errors.Join(
+			ErrSpoolCorrupt,
+			fmt.Errorf("open PCC receipt store: %w", err),
+		)
+	}
+	pccReceiptBytes := pccReceipts.anchor.Bytes
+	if !receiptBytesFitGlobal(
+		totalBytes,
+		0,
+		pccReceiptBytes,
+		config.MaxBytes,
+	) {
+		_ = pccReceipts.Close()
+		_ = ackJournal.Close()
+		_ = state.PersistReadOnly("observer_spool_quota_invalid")
+		return nil, ErrSpoolCorrupt
+	}
+	totalBytes += pccReceiptBytes
 	controlReceipts, err := recoverControlReceiptJournal(
 		config.StateDir,
 		state,
@@ -1615,6 +1650,7 @@ func NewSpool(
 		config.MaxBytes-totalBytes,
 	)
 	if err != nil {
+		_ = pccReceipts.Close()
 		_ = ackJournal.Close()
 		_ = state.PersistReadOnly("observer_control_receipt_corrupt")
 		return nil, err
@@ -1627,6 +1663,7 @@ func NewSpool(
 		config.MaxBytes,
 	) {
 		_ = controlReceipts.Close()
+		_ = pccReceipts.Close()
 		_ = ackJournal.Close()
 		_ = state.PersistReadOnly("observer_spool_quota_invalid")
 		return nil, ErrSpoolCorrupt
@@ -1642,8 +1679,10 @@ func NewSpool(
 		ackBytes:            ackBytes,
 		ackJournal:          ackJournal,
 		controlReceipts:     controlReceipts,
+		pccReceipts:         pccReceipts,
 		boundaryArchive:     boundaryArchive,
 		controlReceiptBytes: controlReceiptBytes,
+		pccReceiptBytes:     pccReceiptBytes,
 		remove:              durablefile.RemoveIfIdentity,
 		removePublication:   durablefile.RemoveIfIdentity,
 		syncDirectory:       durablefile.SyncDirectory,
@@ -1651,8 +1690,17 @@ func NewSpool(
 			return durablefile.CreateOnly(path, payload)
 		},
 	}
+	pccReceipts.spool = spool
+	if err := pccReceipts.validateLiveItems(items); err != nil {
+		_ = controlReceipts.Close()
+		_ = pccReceipts.Close()
+		_ = ackJournal.Close()
+		_ = state.PersistReadOnly("observer_pcc_receipt_corrupt")
+		return nil, err
+	}
 	if err := spool.cleanupAckedLocked(state.Snapshot().AckSequence); err != nil {
 		_ = controlReceipts.Close()
+		_ = pccReceipts.Close()
 		_ = ackJournal.Close()
 		_ = state.PersistReadOnly("observer_spool_acked_cleanup_failed")
 		return nil, err
@@ -2678,6 +2726,9 @@ func (spool *Spool) cleanupAckedLocked(sequence uint64) error {
 		if err := spool.requireControlReceiptLocked(item); err != nil {
 			return err
 		}
+		if err := spool.requirePCCReceiptLocked(item); err != nil {
+			return err
+		}
 		publicationErr := validatePublicationItem(item)
 		if errors.Is(publicationErr, os.ErrNotExist) {
 			_, _, frameErr := durablefile.ReadRegularIdentity(
@@ -2843,6 +2894,9 @@ func (spool *Spool) Ack(
 		return fmt.Errorf("spool closed")
 	}
 	snapshot := spool.state.Snapshot()
+	if snapshot.MutationReadOnly {
+		return ErrAckInvalid
+	}
 	if sequence < snapshot.AckSequence {
 		return ErrAckInvalid
 	}
@@ -2913,6 +2967,9 @@ func (spool *Spool) Ack(
 	if err := validatePublicationItem(item); err != nil {
 		_ = spool.state.PersistReadOnly("observer_ack_publication_changed")
 		return ErrSpoolCorrupt
+	}
+	if err := spool.requirePCCReceiptLocked(item); err != nil {
+		return err
 	}
 	var following *contracts.EventEnvelopeV1
 	if item.Sequence < math.MaxUint64 {
@@ -3019,6 +3076,10 @@ func (spool *Spool) Close() error {
 	if spool.controlReceipts != nil {
 		receiptErr = spool.controlReceipts.Close()
 	}
+	var pccReceiptErr error
+	if spool.pccReceipts != nil {
+		pccReceiptErr = spool.pccReceipts.Close()
+	}
 	var ackErr error
 	if spool.ackJournal != nil {
 		ackErr = spool.ackJournal.Close()
@@ -3027,5 +3088,5 @@ func (spool *Spool) Close() error {
 	if spool.boundaryArchive != nil {
 		archiveErr = spool.boundaryArchive.Close()
 	}
-	return errors.Join(receiptErr, ackErr, archiveErr)
+	return errors.Join(receiptErr, pccReceiptErr, ackErr, archiveErr)
 }

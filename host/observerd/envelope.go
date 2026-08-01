@@ -38,8 +38,6 @@ const zeroPCCJournalHash = "0000000000000000000000000000000000000000000000000000
 const (
 	controlReceiptMaxCount uint64 = 4_096
 	controlReceiptMaxBytes uint64 = 64 * 1024 * 1024
-	pccReceiptMaxCount     uint64 = 4_096
-	pccReceiptMaxBytes     uint64 = 16 * 1024 * 1024
 )
 
 const (
@@ -1501,6 +1499,32 @@ func (store *StateStore) anchorPCCBoundary(
 	return store.replaceLocked(next)
 }
 
+func (store *StateStore) anchorPCCReceipt(
+	expected PCCReceiptAnchor,
+	nextAnchor PCCReceiptAnchor,
+) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.state.MutationReadOnly ||
+		store.state.PCCReceiptCount != expected.Count ||
+		store.state.PCCReceiptBytes != expected.Bytes ||
+		store.state.PCCReceiptHeadHash != expected.HeadHash ||
+		expected.Count >= pccReceiptMaxCount ||
+		nextAnchor.Count != expected.Count+1 ||
+		nextAnchor.Bytes <= expected.Bytes ||
+		nextAnchor.Count > pccReceiptMaxCount ||
+		nextAnchor.Bytes > pccReceiptMaxBytes ||
+		!hex64Pattern.MatchString(nextAnchor.HeadHash) ||
+		nextAnchor.HeadHash == zeroPCCJournalHash {
+		return fmt.Errorf("invalid PCC receipt head transition")
+	}
+	next := cloneObserverState(store.state)
+	next.PCCReceiptCount = nextAnchor.Count
+	next.PCCReceiptBytes = nextAnchor.Bytes
+	next.PCCReceiptHeadHash = nextAnchor.HeadHash
+	return store.replaceLocked(next)
+}
+
 func (store *StateStore) switchKey(newKeyID string, newEpoch uint64) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -1889,6 +1913,7 @@ func priorityEventType(eventType string) bool {
 		"observer_start",
 		"observer_key_transition",
 		"observer_key_epoch_start",
+		"pcc_correlation_snapshot",
 		"evidence_repair_authorized",
 		"evidence_repair_completed",
 		"retention_tombstone",

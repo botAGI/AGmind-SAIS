@@ -524,6 +524,14 @@ Under `spool.mutex`, require the requested sequence is above `AckSequence`, load
 
 Before deleting any `pcc_correlation_snapshot`, require a unique specialized receipt whose event/content hashes match the exact spool item and whose normalized hash equals the envelope. On same operation key with different request hash, call `StateStore.PersistReadOnly("observer_pcc_request_conflict")` before returning the conflict.
 
+Clarification: V5-anchored PCC receipts are permanent append-only audit
+history. ACK does not remove or compact them. Startup accepts an exact anchored
+historical receipt after its spool item is gone, but revalidates every receipt
+for a still-live snapshot and rejects every live snapshot without its exact
+receipt. New append, exact retry lookup, and ACK authorization still require an
+exact live unacknowledged spool binding; historical receipt presence is never a
+publication retry authority.
+
 - [ ] **Step 7: Wire startup and close ownership**
 
 Open/recover the receipt store after V5 state and before spool publication; attach it to `Spool`; close it with the spool; and reject missing or substituted expected artifacts at startup.

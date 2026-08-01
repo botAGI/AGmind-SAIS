@@ -2068,6 +2068,63 @@ func TestRepairRecoversBoundaryArchiveBeforeStateCommit(t *testing.T) {
 	}
 }
 
+func TestRepairPCCReceiptPreAnchorFailureFencesAndRejectsTail(t *testing.T) {
+	root := t.TempDir()
+	privateKey := testKey(t, 252)
+	state, spool, signer := openSignerFixture(
+		t,
+		root,
+		testBootID,
+		privateKey,
+	)
+	_, receipt := pccReceiptSnapshotFixture(t, spool, signer, "preanchor")
+	injected := errors.New("injected PCC receipt anchor failure")
+	state.persist = func(path string, next ObserverState) error {
+		if next.PCCReceiptCount == 1 {
+			return injected
+		}
+		return persistState(path, next)
+	}
+	if err := spool.pccReceipts.Append(receipt); !errors.Is(err, injected) {
+		t.Fatalf("receipt append error=%v", err)
+	}
+	if snapshot := state.Snapshot(); !snapshot.MutationReadOnly ||
+		snapshot.ReadOnlyReason != "observer_pcc_receipt_anchor_failed" ||
+		snapshot.PCCReceiptCount != 0 {
+		t.Fatalf("pre-anchor failure did not retain exact fence: %+v", snapshot)
+	}
+	path := pccReceiptJournalPath(root)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := NewSpool(
+		SpoolConfig{
+			StateDir:             root,
+			MaxBytes:             4 * 1024 * 1024,
+			PriorityReserveBytes: 1024 * 1024,
+		},
+		state,
+		pccReceiptKeys(t, privateKey),
+	)
+	if opened != nil {
+		_ = opened.Close()
+	}
+	if !errors.Is(err, ErrPCCReceiptCorrupt) {
+		t.Fatalf("restart adopted unanchored receipt tail: %v", err)
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("restart truncated or rewrote unanchored receipt tail")
+	}
+}
+
 func TestOpenStateStoreRejectsHistoricalBootIDAndPersistsFence(t *testing.T) {
 	root := t.TempDir()
 	privateKey := testKey(t, 100)

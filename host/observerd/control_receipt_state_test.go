@@ -97,6 +97,7 @@ func TestC2AObserverStateV3MigratesToEmptyReceiptAnchor(t *testing.T) {
 
 func TestC2AControlEventTypesArePriority(t *testing.T) {
 	for _, eventType := range []string{
+		"pcc_correlation_snapshot",
 		"evidence_repair_authorized",
 		"evidence_repair_completed",
 		"retention_tombstone",
