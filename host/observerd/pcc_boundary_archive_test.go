@@ -1187,6 +1187,95 @@ func TestPCCBoundaryArchivePersistsReadOnlyAfterUncertainMutation(
 	})
 }
 
+func TestPCCBoundaryArchivePreAnchorFailurePersistsReadOnly(t *testing.T) {
+	root := t.TempDir()
+	privateKey := testKey(t, 230)
+	state := pccArchiveState(t, root, privateKey, testBootID2, 1)
+	boundary := pccArchiveDedicated(
+		t, privateKey, testBootID2, 10, testBootID, 9,
+	)
+	pccArchivePendingCrossBoot(t, state, testBootID2, 10, testBootID, 9)
+	pccArchiveCommitForTest(t, state, boundary)
+	archive, err := OpenPCCBoundaryArchive(
+		root, state, pccArchiveKeyring(t, privateKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	archive.anchor.Count = pccBoundaryArchiveMaxCount
+	if err := archive.RecordCommittedBoundary(boundary, nil); err == nil {
+		t.Fatal("quota-invalid pre-anchor boundary was accepted")
+	}
+	if snapshot := state.Snapshot(); !snapshot.MutationReadOnly ||
+		snapshot.ReadOnlyReason != "observer_pcc_boundary_archive_preanchor_invalid" {
+		t.Fatalf("pre-anchor failure did not persist stable fence: %+v", snapshot)
+	}
+}
+
+func TestPCCBoundaryArchiveRetentionGuardProtectsCCompanion(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	oldKey := testKey(t, 231)
+	newKey := testKey(t, 232)
+	state := pccArchiveState(t, root, oldKey, testBootID, 1)
+	archive, err := OpenPCCBoundaryArchive(
+		root, state, pccArchiveKeyring(t, oldKey, newKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	cTransition, cStart := pccArchiveRotationPair(
+		t,
+		oldKey,
+		newKey,
+		testBootID,
+		testBootID2,
+		10,
+		[]string{"key_rotation"},
+		[]string{"boot_transition", "key_rotation"},
+	)
+	if err := archive.RetainsCommittedEvent(cTransition, &cStart); err == nil {
+		t.Fatal("unanchored C transition companion was ACK-cleanable")
+	}
+	sameBootTransition, sameBootStart := pccArchiveRotationPair(
+		t,
+		oldKey,
+		newKey,
+		testBootID,
+		testBootID,
+		20,
+		[]string{"key_rotation"},
+		[]string{"key_rotation"},
+	)
+	if err := archive.RetainsCommittedEvent(
+		sameBootTransition,
+		&sameBootStart,
+	); err != nil {
+		t.Fatalf("same-boot rotation was incorrectly archive-gated: %v", err)
+	}
+	genesis := pccArchiveEnvelope(
+		t,
+		oldKey,
+		1,
+		testBootID,
+		1,
+		"observer_boot_boundary",
+		map[string]any{
+			"schema_version":           "agmind.observer-boot-boundary.v1",
+			"kind":                     "observer_boot_boundary",
+			"reason_code":              "observer_genesis",
+			"previous_source_sequence": uint64(0),
+		},
+		[]string{"boot_transition", "reconcile_required"},
+	)
+	if err := archive.RetainsCommittedEvent(genesis, nil); err != nil {
+		t.Fatalf("genesis was incorrectly archive-gated: %v", err)
+	}
+}
+
 func TestPCCBoundaryArchiveDoesNotExpandPublicKeyMetadata(t *testing.T) {
 	metadata := PublicKeyMetadata{Keys: make([]PublicKeyEpoch, 17)}
 	if err := metadata.Validate(); err == nil {

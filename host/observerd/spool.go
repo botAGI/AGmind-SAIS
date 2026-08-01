@@ -1271,8 +1271,7 @@ func NewSpool(
 			string(PriorityTier),
 			"publications",
 			"control-receipts.agf",
-			"pcc-boundaries.agf",
-			"pcc-receipts.agf":
+			"pcc-boundaries.agf":
 		case "acked.agf":
 			ackExists = true
 		default:
@@ -2913,6 +2912,38 @@ func (spool *Spool) Ack(
 	}
 	if err := validatePublicationItem(item); err != nil {
 		_ = spool.state.PersistReadOnly("observer_ack_publication_changed")
+		return ErrSpoolCorrupt
+	}
+	var following *contracts.EventEnvelopeV1
+	if item.Sequence < math.MaxUint64 {
+		if next, exists := spool.items[item.Sequence+1]; exists {
+			nextEvent, decodeErr := contracts.DecodeStrict[contracts.EventEnvelopeV1](bytes.NewReader(next.Canonical), 65_536)
+			_, nextHash, hashErr := pccEnvelopeCanonicalAndHash(nextEvent)
+			if decodeErr != nil ||
+				hashErr != nil ||
+				nextEvent.SourceSequence != next.Sequence ||
+				nextEvent.EventID != next.EventID ||
+				nextHash != next.ContentSHA256 {
+				if !snapshot.MutationReadOnly {
+					_ = spool.state.PersistReadOnly(
+						"observer_ack_pcc_boundary_unretained",
+					)
+				}
+				return ErrSpoolCorrupt
+			}
+			following = &nextEvent
+		}
+	}
+	if spool.boundaryArchive == nil ||
+		spool.boundaryArchive.RetainsCommittedEvent(
+			diskEvent,
+			following,
+		) != nil {
+		if !snapshot.MutationReadOnly {
+			_ = spool.state.PersistReadOnly(
+				"observer_ack_pcc_boundary_unretained",
+			)
+		}
 		return ErrSpoolCorrupt
 	}
 	record := ackRecord{

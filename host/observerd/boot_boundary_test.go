@@ -310,3 +310,79 @@ func TestBootBoundaryPCCArchiveBlocksAckUntilAnchor(t *testing.T) {
 		t.Fatalf("anchored boundary state=%+v", snapshot)
 	}
 }
+
+func TestBootBoundaryPCCArchiveAppendFailureRetainsSpoolEvidenceOnAck(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	privateKey := testKey(t, 229)
+	_, firstSpool, firstSigner := openSignerFixture(
+		t, root, testBootID, privateKey,
+	)
+	if _, err := firstSigner.Wrap(
+		context.Background(),
+		"observer_start",
+		map[string]any{"kind": "observer_start"},
+		metadata(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstSpool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, spool, signer := openPendingSignerFixture(
+		t, root, testBootID2, privateKey,
+	)
+	defer spool.Close()
+	items, err := spool.Fetch(0, 100, 4*1024*1024)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("pre-boundary items=%d err=%v", len(items), err)
+	}
+	if err := spool.Ack(
+		items[0].Sequence,
+		items[0].EventID,
+		items[0].ContentSHA256,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// The protected boundary reaches the ordinary spool before its archive
+	// append. A failed append must not make the frame ACK-cleanable merely
+	// because the state is mutation-read-only.
+	if err := spool.boundaryArchive.journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = ensureDedicatedBootBoundary(
+		context.Background(),
+		state,
+		signer,
+		time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
+	)
+	if err == nil {
+		t.Fatal("boundary publication unexpectedly survived closed archive")
+	}
+	spool.mutex.Lock()
+	boundary := cloneSpoolItem(spool.items[2])
+	spool.mutex.Unlock()
+	if boundary.EventID == "" {
+		t.Fatal("failed archive append did not leave boundary spool evidence")
+	}
+	if err := spool.Ack(
+		boundary.Sequence,
+		boundary.EventID,
+		boundary.ContentSHA256,
+	); err == nil {
+		t.Fatal("ACK deleted unanchored boundary evidence")
+	}
+	spool.mutex.Lock()
+	_, retained := spool.items[boundary.Sequence]
+	spool.mutex.Unlock()
+	if !retained {
+		t.Fatal("ACK removed sole unanchored boundary evidence")
+	}
+	if snapshot := state.Snapshot(); snapshot.AckSequence != 1 ||
+		!snapshot.MutationReadOnly ||
+		snapshot.ReadOnlyReason != "observer_pcc_boundary_archive_append_failed" {
+		t.Fatalf("unexpected post-failure state: %+v", snapshot)
+	}
+}

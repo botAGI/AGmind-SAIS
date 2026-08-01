@@ -519,6 +519,139 @@ func clonePCCBoundaryRecord(
 	)
 }
 
+// RetainsCommittedEvent proves that a protected boot-transition event is in
+// the V5-anchored archive. Callers hold publication then spool locks before
+// entering here; this method adds archive then state, preserving the global
+// publication -> spool -> archive -> state lock order.
+func (archive *PCCBoundaryArchive) RetainsCommittedEvent(
+	event contracts.EventEnvelopeV1,
+	following *contracts.EventEnvelopeV1,
+) error {
+	archive.mutex.Lock()
+	defer archive.mutex.Unlock()
+	if archive.closed || archive.journal == nil {
+		return ErrPCCJournalCorrupt
+	}
+	retentionRequired, err := pccArchiveRetentionRequired(event, following)
+	if err != nil {
+		return err
+	}
+	if !retentionRequired {
+		return nil
+	}
+	snapshot := archive.state.Snapshot()
+	if snapshot.PCCBoundaryCount != archive.anchor.Count ||
+		snapshot.PCCBoundaryBytes != archive.anchor.Bytes ||
+		snapshot.PCCBoundaryHeadHash != archive.anchor.HeadHash ||
+		archive.anchor.Count != uint64(len(archive.records)) {
+		return ErrPCCJournalCorrupt
+	}
+	want, err := contracts.CanonicalJSON(event)
+	if err != nil {
+		return pccArchiveCorrupt(err)
+	}
+	for _, record := range archive.records {
+		for _, archived := range []contracts.EventEnvelopeV1{
+			record.BoundaryEvent,
+		} {
+			have, canonicalErr := contracts.CanonicalJSON(archived)
+			if canonicalErr != nil {
+				return pccArchiveCorrupt(canonicalErr)
+			}
+			if bytes.Equal(have, want) {
+				return nil
+			}
+		}
+		if record.RotationCompanionEvent != nil {
+			have, canonicalErr := contracts.CanonicalJSON(
+				*record.RotationCompanionEvent,
+			)
+			if canonicalErr != nil {
+				return pccArchiveCorrupt(canonicalErr)
+			}
+			if bytes.Equal(have, want) {
+				return nil
+			}
+		}
+	}
+	return ErrPCCJournalCorrupt
+}
+
+// pccArchiveRetentionRequired identifies every event that can be the
+// boundary or companion of an A/B/C transition. The C transition itself is
+// deliberately not boot_transition-flagged, so it must inspect its adjacent
+// epoch-start event before ACK is allowed to discard it. A missing or
+// malformed successor is treated as protected until the pair is complete.
+func pccArchiveRetentionRequired(
+	event contracts.EventEnvelopeV1,
+	following *contracts.EventEnvelopeV1,
+) (bool, error) {
+	if !pccProtectedEnvelopeShape(event) {
+		return false, nil
+	}
+	switch event.EventType {
+	case "observer_boot_boundary":
+		fields, err := pccDecodeBootBoundary(event)
+		if err == nil &&
+			fields.ReasonCode == "observer_genesis" &&
+			fields.PreviousBootID == nil &&
+			fields.PreviousSourceSequence == 0 &&
+			event.SourceSequence == 1 &&
+			exactFlags(
+				event.CoverageFlags,
+				"boot_transition",
+				"reconcile_required",
+			) {
+			// Genesis has no predecessor and is intentionally outside the
+			// transition archive; RecordCommittedBoundary validates it before
+			// taking this no-record path.
+			return false, nil
+		}
+		return true, nil
+	case "observer_key_epoch_start":
+		return exactFlags(
+			event.CoverageFlags,
+			"boot_transition",
+			"key_rotation",
+		), nil
+	case "observer_key_transition":
+		if exactFlags(
+			event.CoverageFlags,
+			"boot_transition",
+			"key_rotation",
+		) {
+			return true, nil
+		}
+		if !exactFlags(event.CoverageFlags, "key_rotation") {
+			return false, nil
+		}
+		if following == nil {
+			return true, nil
+		}
+		if !pccProtectedEnvelopeShape(*following) ||
+			following.EventType != "observer_key_epoch_start" ||
+			!exactFlags(following.CoverageFlags, "key_rotation") {
+			return true, nil
+		}
+		if following.BootID == event.BootID {
+			// Same-boot key rotations are intentionally not PCC transitions.
+			return false, nil
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (archive *PCCBoundaryArchive) failPreAnchor(err error) error {
+	archive.failed = true
+	pccArchiveFailState(
+		archive.state,
+		"observer_pcc_boundary_archive_preanchor_invalid",
+	)
+	return err
+}
+
 func (archive *PCCBoundaryArchive) RecordCommittedBoundary(
 	boundary contracts.EventEnvelopeV1,
 	rotationCompanion *contracts.EventEnvelopeV1,
@@ -534,7 +667,7 @@ func (archive *PCCBoundaryArchive) RecordCommittedBoundary(
 		archive.keyring,
 	)
 	if err != nil {
-		return err
+		return archive.failPreAnchor(err)
 	}
 	if genesis {
 		return nil
@@ -546,14 +679,14 @@ func (archive *PCCBoundaryArchive) RecordCommittedBoundary(
 	}
 	canonical, err := contracts.CanonicalJSON(record)
 	if err != nil || len(canonical) > int(pccBoundaryArchiveMaxFrame) {
-		return pccArchiveCorrupt(err)
+		return archive.failPreAnchor(pccArchiveCorrupt(err))
 	}
 	if len(archive.records) > 0 {
 		lastCanonical, lastErr := contracts.CanonicalJSON(
 			archive.records[len(archive.records)-1],
 		)
 		if lastErr != nil {
-			return pccArchiveCorrupt(lastErr)
+			return archive.failPreAnchor(pccArchiveCorrupt(lastErr))
 		}
 		if bytes.Equal(lastCanonical, canonical) {
 			return nil
@@ -561,7 +694,7 @@ func (archive *PCCBoundaryArchive) RecordCommittedBoundary(
 	}
 	cloned, err := clonePCCBoundaryRecord(record)
 	if err != nil {
-		return pccArchiveCorrupt(err)
+		return archive.failPreAnchor(pccArchiveCorrupt(err))
 	}
 	nextRecords := append(
 		append([]PCCBoundaryArchiveRecord(nil), archive.records...),
@@ -572,13 +705,13 @@ func (archive *PCCBoundaryArchive) RecordCommittedBoundary(
 		archive.state.Snapshot(),
 		archive.keyring,
 	); err != nil {
-		return err
+		return archive.failPreAnchor(err)
 	}
 	frameBytes := uint64(len(canonical)) + 76
 	if archive.anchor.Count >= pccBoundaryArchiveMaxCount ||
 		frameBytes > pccBoundaryArchiveMaxBytes ||
 		archive.anchor.Bytes > pccBoundaryArchiveMaxBytes-frameBytes {
-		return ErrPCCJournalCorrupt
+		return archive.failPreAnchor(ErrPCCJournalCorrupt)
 	}
 	meta, err := archive.journal.Append(canonical, true)
 	if err != nil {

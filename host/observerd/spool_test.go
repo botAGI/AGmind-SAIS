@@ -240,6 +240,36 @@ func TestStartupRejectsSequenceRollbackAndSymlinkAlias(t *testing.T) {
 	}
 }
 
+func TestSpoolStartupRejectsUnownedPCCReceiptJournal(t *testing.T) {
+	root := t.TempDir()
+	privateKey := testKey(t, 233)
+	state, spool, _ := openSignerFixture(t, root, testBootID, privateKey)
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := durablefile.CreateOnly(
+		filepath.Join(root, "spool", "pcc-receipts.agf"),
+		[]byte("unowned"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSpool(
+		SpoolConfig{
+			StateDir:             root,
+			MaxBytes:             4 * 1024 * 1024,
+			PriorityReserveBytes: 1024 * 1024,
+		},
+		state,
+		pccArchiveKeyring(t, privateKey),
+	); !errors.Is(err, ErrSpoolCorrupt) {
+		t.Fatalf("V5 startup accepted unowned receipt journal: %v", err)
+	}
+	if snapshot := state.Snapshot(); !snapshot.MutationReadOnly ||
+		snapshot.ReadOnlyReason != "observer_spool_root_unknown" {
+		t.Fatalf("unowned receipt journal did not fail closed: %+v", snapshot)
+	}
+}
+
 func TestStateAndSpoolDirectoriesRejectUnsafeMode(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
