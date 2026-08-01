@@ -16,6 +16,7 @@ from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.clock import CoreClockProvider
 from agmind_immune.contracts import (
     MAX_UINT64,
+    FalcoConnectV1,
     PCCCorrelationSnapshotRequestV1,
     RetentionBlockedV1,
     RetentionTombstoneV2,
@@ -40,7 +41,10 @@ from agmind_immune.ingest.ack_journal import (
     AckJournal,
     AckJournalSnapshot,
 )
-from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
+from agmind_immune.ingest.correlation_journal import (
+    CorrelationRequestJournal,
+    _CorrelationRequestStateV1,
+)
 from agmind_immune.ingest.envelope import (
     MAX_CORE_EVENT_RESPONSE_BYTES,
     MAX_EVENTS_PAGE_BYTES,
@@ -78,6 +82,10 @@ _MAX_RETENTION_PREFLIGHT_PAGES = 64
 _MAX_RETENTION_PREFLIGHT_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_RETENTION_TOMBSTONE_REQUEST_BYTES = 16 * 1024
 _MAX_RETENTION_BLOCKED_REQUEST_BYTES = 4 * 1024
+_MAX_CORRELATION_PATH_EVENTS = 4_096
+_MAX_CORRELATION_PATH_PAGES = 64
+_MAX_CORRELATION_PATH_RESPONSE_BYTES = 64 * 1024 * 1024
+PCC_CORRELATION_TTL_SECONDS = 120
 
 
 @final
@@ -344,6 +352,11 @@ class ObserverCoreTransport(Protocol):
 
     async def ack_event(self, body: bytes) -> None: ...
 
+    async def publish_correlation_snapshot(
+        self,
+        canonical_body: bytes,
+    ) -> bytes: ...
+
     async def publish_repair_authorization(self, canonical_body: bytes) -> bytes: ...
 
     async def publish_repair_completion(self, canonical_body: bytes) -> bytes: ...
@@ -608,6 +621,18 @@ class HTTPXObserverCoreTransport:
             path,
             canonical_body,
             operation="repair",
+        )
+
+    async def publish_correlation_snapshot(
+        self,
+        canonical_body: bytes,
+    ) -> bytes:
+        return await self._publish_control(
+            "/v1/events/pcc-correlation-snapshot",
+            canonical_body,
+            operation="PCC correlation snapshot",
+            request_limit=4 * 1024,
+            request_limit_label="4 KiB",
         )
 
     async def publish_repair_authorization(self, canonical_body: bytes) -> bytes:
@@ -1155,25 +1180,34 @@ class DeliveryCoordinator:
             barrier = self._coverage_adapter.first_unclosed_sequence_gap()
         except Exception as error:  # noqa: BLE001 - fail closed at capability boundary
             raise self._latch("evidence-derived ACK barrier failed", error)
-        if barrier is None:
-            return acceptance_cursor
-        if (
-            isinstance(barrier, bool)
-            or not isinstance(barrier, int)
-            or not 1 <= barrier <= evidence_head
-            or barrier <= confirmed_through
-        ):
-            raise self._latch("evidence-derived ACK barrier is inconsistent")
-        bound = self._authenticated_refs(
-            after=barrier - 1,
-            through=barrier,
-            limit=1,
-        )
-        if len(bound) != 1 or bound[0].source_sequence != barrier:
-            raise self._latch(
-                "evidence-derived ACK barrier lacks an authenticated ref"
+        ceiling = acceptance_cursor
+        if barrier is not None:
+            if (
+                isinstance(barrier, bool)
+                or not isinstance(barrier, int)
+                or not 1 <= barrier <= evidence_head
+                or barrier <= confirmed_through
+            ):
+                raise self._latch("evidence-derived ACK barrier is inconsistent")
+            bound = self._authenticated_refs(
+                after=barrier - 1,
+                through=barrier,
+                limit=1,
             )
-        return min(acceptance_cursor, barrier - 1)
+            if len(bound) != 1 or bound[0].source_sequence != barrier:
+                raise self._latch(
+                    "evidence-derived ACK barrier lacks an authenticated ref"
+                )
+            ceiling = min(ceiling, barrier - 1)
+        ceiling = self._correlation_ack_ceiling(
+            ceiling=ceiling,
+            evidence_head=evidence_head,
+        )
+        if ceiling < confirmed_through:
+            raise self._latch(
+                "correlation ACK barrier is behind durable confirmation"
+            )
+        return ceiling
 
     def _local_state(
         self,
@@ -3010,6 +3044,524 @@ class DeliveryCoordinator:
             self._acceptance._repair_mode = False
             self._repair_mode = False
 
+    def _correlation_journal(self) -> CorrelationRequestJournal:
+        journal = self._correlation_requests
+        if type(journal) is not CorrelationRequestJournal:
+            raise self._latch(
+                "ordinary delivery lost its correlation-request authority"
+            )
+        return journal
+
+    def _correlation_pending(
+        self,
+    ) -> tuple[_CorrelationRequestStateV1, ...]:
+        try:
+            return self._correlation_journal().pending()
+        except DeliveryFatalError:
+            raise
+        except Exception as error:  # noqa: BLE001 - journal authority boundary
+            raise self._latch(
+                "correlation-request journal is unavailable",
+                error,
+            )
+
+    def _candidate_request(
+        self,
+        ref: EvidenceRef,
+    ) -> PCCCorrelationSnapshotRequestV1 | None:
+        try:
+            record = self._store.resolve_authenticated_ref(ref)
+            if record.envelope.get("event_type") != "falco_connect":
+                return None
+            fields = record.envelope.get("normalized_fields")
+            if type(fields) is not dict:
+                raise ValueError("Falco normalized_fields are not an exact object")
+            falco = FalcoConnectV1.model_validate(fields, strict=True)
+            authority = self._acceptance.authenticated_falco_input(ref)
+            if authority.evidence_ref != ref or authority.falco != falco:
+                raise ValueError("Falco candidate authority changed after acceptance")
+        except Exception as error:  # noqa: BLE001 - evidence authority boundary
+            raise self._latch(
+                "accepted Falco candidate authority is invalid",
+                error,
+            )
+        if not falco.successful_connect or falco.investigation_only:
+            return None
+        try:
+            return PCCCorrelationSnapshotRequestV1.model_validate(
+                {
+                    "schema_version": (
+                        "agmind.pcc-correlation-snapshot-request.v1"
+                    ),
+                    "trigger_event_id": ref.event_id,
+                    "trigger_content_sha256": ref.content_sha256,
+                    "trigger_source_sequence": ref.source_sequence,
+                    "requested_ttl_seconds": PCC_CORRELATION_TTL_SECONDS,
+                },
+                strict=True,
+            )
+        except Exception as error:  # noqa: BLE001 - fixed contract construction
+            raise self._latch(
+                "Core could not construct the exact correlation request",
+                error,
+            )
+
+    def _select_candidate(
+        self,
+        ref: EvidenceRef,
+    ) -> _CorrelationRequestStateV1 | None:
+        request = self._candidate_request(ref)
+        if request is None:
+            return None
+        try:
+            return self._correlation_journal().select(
+                ref,
+                canonical_json(request),
+            )
+        except Exception as error:  # noqa: BLE001 - journal authority boundary
+            raise self._latch(
+                "correlation request selection failed",
+                error,
+            )
+
+    def _discover_unselected_candidates(
+        self,
+        state: _DeliveryState,
+    ) -> tuple[_CorrelationRequestStateV1, ...]:
+        # Only refs reachable by this poll's ACK budget need pre-ACK
+        # classification.  Re-scanning the whole unconfirmed backlog would
+        # turn a long coverage gap into a permanent availability failure.
+        refs = self._authenticated_refs(
+            after=state.confirmed_through,
+            through=state.evidence_head,
+            limit=self._ack_budget,
+        )
+        for ref in refs:
+            self._select_candidate(ref)
+        return self._correlation_pending()
+
+    def _snapshot_ref(
+        self,
+        state: _CorrelationRequestStateV1,
+        *,
+        evidence_head: int | None = None,
+    ) -> EvidenceRef:
+        if (
+            state.phase not in {"proof_observed", "completed"}
+            or state.snapshot_event_id is None
+            or state.snapshot_content_sha256 is None
+        ):
+            raise self._latch(
+                "correlation phase has no exact observed snapshot identity"
+            )
+        head = (
+            self._store.status().evidence_head
+            if evidence_head is None
+            else evidence_head
+        )
+        after = state.request.trigger_source_sequence
+        examined = 0
+        while after < head:
+            remaining = _MAX_CORRELATION_PATH_EVENTS - examined
+            if remaining <= 0:
+                raise self._latch(
+                    "correlation snapshot lookup exceeded its event bound"
+                )
+            refs = self._authenticated_refs(
+                after=after,
+                through=head,
+                limit=min(MAX_PAGE_EVENTS, remaining),
+            )
+            if not refs:
+                break
+            for ref in refs:
+                examined += 1
+                if ref.event_id == state.snapshot_event_id:
+                    if ref.content_sha256 != state.snapshot_content_sha256:
+                        raise self._latch(
+                            "correlation snapshot event ID changed content"
+                        )
+                    try:
+                        self._acceptance.authenticated_pcc_input(
+                            ref,
+                            state.request,
+                        )
+                    except Exception as error:  # noqa: BLE001
+                        raise self._latch(
+                            "observed correlation snapshot lost PCC authority",
+                            error,
+                        )
+                    return ref
+                after = ref.source_sequence
+        raise self._latch(
+            "observed correlation snapshot is absent from authenticated evidence"
+        )
+
+    def _correlation_ack_ceiling(
+        self,
+        *,
+        ceiling: int,
+        evidence_head: int,
+    ) -> int:
+        if self._repair_mode:
+            return ceiling
+        for state in self._correlation_pending():
+            if state.phase == "selected":
+                ceiling = min(
+                    ceiling,
+                    state.request.trigger_source_sequence - 1,
+                )
+            elif state.phase == "proof_observed":
+                ceiling = min(
+                    ceiling,
+                    self._snapshot_ref(
+                        state,
+                        evidence_head=evidence_head,
+                    ).source_sequence,
+                )
+            else:
+                raise self._latch("pending correlation phase is invalid")
+        return ceiling
+
+    def _accept_live_item(
+        self,
+        item: CoreEventV1,
+        *,
+        request: PCCCorrelationSnapshotRequestV1 | None = None,
+    ) -> EvidenceRef:
+        receipt = self._live_receipt()
+        self._validate_acceptance_binding()
+        before = self._store.status()
+        if type(before) is not EvidenceStatus or not before.healthy:
+            raise DeliveryFatalError("pre-accept evidence status is unhealthy")
+        ref = (
+            self._acceptance.accept(item)
+            if request is None
+            else self._acceptance.accept_pcc(item, request)
+        )
+        self._validate_acceptance_binding()
+        after = self._store.status()
+        if (
+            type(after) is not EvidenceStatus
+            or not after.healthy
+            or type(ref) is not EvidenceRef
+            or ref.source_sequence != after.evidence_head
+            or ref.source_sequence <= before.evidence_head
+        ):
+            raise DeliveryFatalError(
+                "accepted ref did not advance the exact evidence head"
+            )
+        self._coverage_adapter.apply_live_accepted(ref, receipt)
+        return ref
+
+    async def _post_selected_correlation(
+        self,
+        state: _CorrelationRequestStateV1,
+    ) -> CoreEventV1 | None:
+        body = canonical_json(state.request)
+        try:
+            raw = await self._transport.publish_correlation_snapshot(body)
+        except asyncio.CancelledError:
+            raise
+        except DeliveryRetryableError:
+            return None
+        except DeliveryFatalError as error:
+            raise self._latch(
+                "observer PCC publication failed fatally",
+                error,
+            )
+        except (httpx.HTTPError, OSError, TimeoutError):
+            return None
+        except Exception as error:  # noqa: BLE001 - transport protocol boundary
+            raise self._latch(
+                "observer PCC publication violated its transport contract",
+                error,
+            )
+        try:
+            if type(raw) is not bytes:
+                raise TypeError("PCC publication returned non-exact bytes")
+            direct = decode_core_event(raw)
+            if (
+                direct.sequence <= state.request.trigger_source_sequence
+                or direct.sequence - state.request.trigger_source_sequence
+                > _MAX_CORRELATION_PATH_EVENTS
+                or direct.envelope.get("event_type")
+                != "pcc_correlation_snapshot"
+            ):
+                raise ValueError("PCC publication returned an invalid target")
+            return direct
+        except Exception as error:  # noqa: BLE001 - direct response boundary
+            raise self._latch(
+                "observer PCC publication response is invalid",
+                error,
+            )
+
+    async def _accept_path_to_snapshot(
+        self,
+        state: _CorrelationRequestStateV1,
+        target: CoreEventV1,
+    ) -> tuple[EvidenceRef | None, int, bool]:
+        local = self._local_state(apply_coverage_barrier=False)
+        head = local.evidence_head
+        if target.sequence <= head:
+            refs = self._authenticated_refs(
+                after=target.sequence - 1,
+                through=target.sequence,
+                limit=1,
+            )
+            if (
+                len(refs) != 1
+                or refs[0].event_id != target.event_id
+                or refs[0].content_sha256 != target.content_sha256
+            ):
+                raise self._latch(
+                    "persisted PCC target differs from the direct response"
+                )
+            try:
+                self._acceptance.authenticated_pcc_input(
+                    refs[0],
+                    state.request,
+                )
+            except Exception as error:  # noqa: BLE001 - PCC authority boundary
+                raise self._latch(
+                    "persisted PCC target lacks exact request authority",
+                    error,
+                )
+            return refs[0], 0, False
+
+        accepted = 0
+        pages = 0
+        response_bytes = 0
+        while head < target.sequence:
+            if pages >= _MAX_CORRELATION_PATH_PAGES:
+                return None, accepted, True
+            if accepted >= _MAX_CORRELATION_PATH_EVENTS:
+                return None, accepted, True
+            page, raw_size = await self._fetch_page_with_size(
+                after=head,
+                limit=min(
+                    MAX_PAGE_EVENTS,
+                    target.sequence - head,
+                    _MAX_CORRELATION_PATH_EVENTS - accepted,
+                ),
+                confirmed_through=local.confirmed_through,
+            )
+            pages += 1
+            response_bytes += raw_size
+            if response_bytes > _MAX_CORRELATION_PATH_RESPONSE_BYTES:
+                raise self._latch(
+                    "correlation path responses exceed their aggregate bound"
+                )
+            if any(
+                gap.start <= target.sequence and gap.end >= head + 1
+                for gap in page.uncovered_gaps
+            ):
+                return None, accepted, True
+            if not page.events or page.reserved_through < target.sequence:
+                return None, accepted, True
+            expected = head + 1
+            advanced = False
+            for item in page.events:
+                if item.sequence > target.sequence:
+                    raise self._latch(
+                        "correlation path advanced beyond its direct target"
+                    )
+                if item.sequence != expected:
+                    return None, accepted, True
+                if item.sequence == target.sequence:
+                    if (
+                        item.event_id != target.event_id
+                        or item.content_sha256 != target.content_sha256
+                    ):
+                        raise self._latch(
+                            "correlation target identity differs from direct response"
+                        )
+                    try:
+                        ref = self._accept_live_item(
+                            item,
+                            request=state.request,
+                        )
+                    except DeliveryFatalError:
+                        raise
+                    except Exception as error:  # noqa: BLE001
+                        raise self._latch(
+                            "PCC evidence or coverage acceptance failed",
+                            error,
+                        )
+                    return ref, accepted + 1, False
+                if (
+                    item.event_id == target.event_id
+                    or item.content_sha256 == target.content_sha256
+                ):
+                    raise self._latch(
+                        "correlation target identity appeared at the wrong sequence"
+                    )
+                try:
+                    intervening_ref = self._accept_live_item(item)
+                    self._select_candidate(intervening_ref)
+                except DeliveryFatalError:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    raise self._latch(
+                        "intervening evidence or coverage acceptance failed",
+                        error,
+                    )
+                accepted += 1
+                head = item.sequence
+                expected += 1
+                advanced = True
+            if not advanced:
+                return None, accepted, True
+        return None, accepted, True
+
+    async def _ack_correlation_through(
+        self,
+        state: _CorrelationRequestStateV1,
+        snapshot_ref: EvidenceRef,
+        *,
+        budget: int,
+    ) -> tuple[int, bool]:
+        confirmed = 0
+        while True:
+            local = self._local_state(apply_coverage_barrier=True)
+            if local.confirmed_through >= snapshot_ref.source_sequence:
+                try:
+                    self._correlation_journal().mark_completed(
+                        state.request_sha256
+                    )
+                except Exception as error:  # noqa: BLE001
+                    raise self._latch(
+                        "correlation completion durability is uncertain",
+                        error,
+                    )
+                return confirmed, False
+            if budget <= 0:
+                return confirmed, True
+            if local.pending is None:
+                refs = self._authenticated_refs(
+                    after=local.confirmed_through,
+                    through=min(
+                        local.delivery_ceiling,
+                        snapshot_ref.source_sequence,
+                    ),
+                    limit=1,
+                )
+                if not refs:
+                    return confirmed, True
+                try:
+                    self._ack_journal.record_pending(refs[0])
+                    local = self._local_state(apply_coverage_barrier=True)
+                except DeliveryFatalError:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    raise self._latch(
+                        "correlation ACK intent durability is uncertain",
+                        error,
+                    )
+            elif local.pending.sequence > snapshot_ref.source_sequence:
+                raise self._latch(
+                    "pending ACK advanced beyond the correlation snapshot"
+                )
+            try:
+                await self._post_pending(local)
+            except DeliveryAmbiguousAck:
+                return confirmed, True
+            confirmed += 1
+            budget -= 1
+
+    async def _drive_correlation(
+        self,
+        state: _CorrelationRequestStateV1,
+        *,
+        budget: int,
+    ) -> tuple[int, int, bool]:
+        # Re-prove the correlation ACK ceiling before any selected request can
+        # be promoted to proof_observed.  A recovered journal must never make
+        # an already-confirmed trigger look retroactively protected.
+        self._local_state(apply_coverage_barrier=True)
+        accepted = 0
+        if state.phase == "selected":
+            target = await self._post_selected_correlation(state)
+            if target is None:
+                return 0, 0, True
+            snapshot_ref, accepted, retry = await self._accept_path_to_snapshot(
+                state,
+                target,
+            )
+            if retry or snapshot_ref is None:
+                return accepted, 0, True
+            try:
+                state = self._correlation_journal().mark_proof_observed(
+                    state.request_sha256,
+                    snapshot_ref,
+                )
+            except Exception as error:  # noqa: BLE001 - journal authority boundary
+                raise self._latch(
+                    "correlation proof durability is uncertain",
+                    error,
+                )
+            self._discover_unselected_candidates(
+                self._local_state(apply_coverage_barrier=False)
+            )
+        elif state.phase == "proof_observed":
+            snapshot_ref = self._snapshot_ref(state)
+        else:
+            raise self._latch("delivery received an invalid pending correlation phase")
+        confirmed, retry = await self._ack_correlation_through(
+            state,
+            snapshot_ref,
+            budget=budget,
+        )
+        return accepted, confirmed, retry
+
+    async def _ingest_after_coverage_blocked_proof(
+        self,
+        pending: tuple[_CorrelationRequestStateV1, ...],
+        *,
+        limit: int,
+    ) -> int:
+        if not pending or any(state.phase == "selected" for state in pending):
+            return 0
+        local = self._local_state(apply_coverage_barrier=True)
+        if local.pending is not None:
+            # Never fetch past an ACK whose observer-side result is ambiguous.
+            return 0
+        snapshot_refs = tuple(self._snapshot_ref(state) for state in pending)
+        if any(
+            local.confirmed_through >= ref.source_sequence
+            for ref in snapshot_refs
+        ):
+            # Let the scheduler durably complete already-confirmed proofs first.
+            return 0
+        first_unconfirmed_snapshot = min(
+            ref.source_sequence for ref in snapshot_refs
+        )
+        if local.delivery_ceiling >= first_unconfirmed_snapshot:
+            # ACK can still progress under the current budget; no reconciliation
+            # ingest exception is needed.
+            return 0
+        page = await self._fetch_page(
+            after=local.evidence_head,
+            limit=limit,
+            confirmed_through=local.confirmed_through,
+        )
+        accepted = 0
+        for item in page.events:
+            try:
+                ref = self._accept_live_item(item)
+                selected = self._select_candidate(ref)
+            except DeliveryFatalError:
+                raise
+            except Exception as error:  # noqa: BLE001 - evidence boundary
+                raise self._latch(
+                    "coverage-reconciliation evidence acceptance failed",
+                    error,
+                )
+            accepted += 1
+            if selected is not None and selected.phase != "completed":
+                break
+        return accepted
+
     def _result(
         self,
         *,
@@ -3044,6 +3596,37 @@ class DeliveryCoordinator:
             accepted = 0
             confirmed = 0
             remaining_budget = self._ack_budget
+
+            pending_correlations = self._discover_unselected_candidates(state)
+            if pending_correlations:
+                next_correlation = next(
+                    (
+                        correlation
+                        for correlation in pending_correlations
+                        if correlation.phase == "selected"
+                    ),
+                    pending_correlations[0],
+                )
+                correlation_accepted, correlation_confirmed, retry = (
+                    await self._drive_correlation(
+                        next_correlation,
+                        budget=remaining_budget,
+                    )
+                )
+                remaining_correlations = self._correlation_pending()
+                correlation_accepted += (
+                    await self._ingest_after_coverage_blocked_proof(
+                        remaining_correlations,
+                        limit=limit,
+                    )
+                )
+                retry = retry or bool(remaining_correlations)
+                return self._result(
+                    accepted=correlation_accepted,
+                    confirmed=correlation_confirmed,
+                    retry_required=retry,
+                )
+
             if state.pending is not None:
                 state = self._local_state(apply_coverage_barrier=True)
                 try:
@@ -3063,35 +3646,40 @@ class DeliveryCoordinator:
                 limit=limit,
                 confirmed_through=state.confirmed_through,
             )
+            selected: _CorrelationRequestStateV1 | None = None
             for item in page.events:
-                receipt = self._live_receipt()
                 try:
-                    self._validate_acceptance_binding()
-                    before = self._store.status()
-                    if type(before) is not EvidenceStatus or not before.healthy:
-                        raise DeliveryFatalError(
-                            "pre-accept evidence status is unhealthy"
-                        )
-                    ref = self._acceptance.accept(item)
-                    self._validate_acceptance_binding()
-                    after = self._store.status()
-                    if (
-                        type(after) is not EvidenceStatus
-                        or not after.healthy
-                        or type(ref) is not EvidenceRef
-                        or ref.source_sequence != after.evidence_head
-                        or ref.source_sequence <= before.evidence_head
-                    ):
-                        raise DeliveryFatalError(
-                            "accepted ref did not advance the exact evidence head"
-                        )
-                    self._coverage_adapter.apply_live_accepted(ref, receipt)
+                    ref = self._accept_live_item(item)
                 except Exception as error:  # noqa: BLE001 - evidence boundary is fail-closed
                     raise self._latch(
                         "observer evidence or coverage acceptance failed",
                         error,
                     )
                 accepted += 1
+                selected = self._select_candidate(ref)
+                if selected is not None and selected.phase != "completed":
+                    break
+
+            if selected is not None and selected.phase != "completed":
+                correlation_accepted, correlation_confirmed, retry = (
+                    await self._drive_correlation(
+                        selected,
+                        budget=remaining_budget,
+                    )
+                )
+                remaining_correlations = self._correlation_pending()
+                correlation_accepted += (
+                    await self._ingest_after_coverage_blocked_proof(
+                        remaining_correlations,
+                        limit=limit,
+                    )
+                )
+                retry = retry or bool(remaining_correlations)
+                return self._result(
+                    accepted=accepted + correlation_accepted,
+                    confirmed=confirmed + correlation_confirmed,
+                    retry_required=retry,
+                )
 
             state = self._local_state(apply_coverage_barrier=True)
             refs = self._authenticated_refs(

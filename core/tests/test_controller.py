@@ -80,10 +80,13 @@ class _Transport:
         self,
         pages: list[bytes] | None = None,
         ack_count: int = 0,
+        publications: list[bytes | BaseException] | None = None,
     ) -> None:
         self.pages = pages or []
         self.ack_count = ack_count
+        self.publications = publications or []
         self.acked: list[int] = []
+        self.published: list[bytes] = []
 
     async def fetch_events(self, *, after: int, limit: int) -> bytes:
         assert 1 <= limit <= 100
@@ -97,6 +100,15 @@ class _Transport:
         import json
 
         self.acked.append(int(json.loads(body)["sequence"]))
+
+    async def publish_correlation_snapshot(self, canonical_body: bytes) -> bytes:
+        self.published.append(bytes(canonical_body))
+        if not self.publications:
+            raise AssertionError("unexpected PCC publication")
+        result = self.publications.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     async def close(self) -> None:
         return None

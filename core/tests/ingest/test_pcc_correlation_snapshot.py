@@ -17,6 +17,7 @@ from agmind_immune.contracts import (
     PCCCorrelationSnapshotRequestV1,
 )
 from agmind_immune.evidence.segments import SegmentStore
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
     EnvelopeConflict,
@@ -624,6 +625,43 @@ def test_coordinator_has_a_narrow_pcc_append_and_exact_retry(
 
     assert retry == first
     assert coordinator.verifier.accepted_ref(item.sequence) == first
+    coordinator.segment_store.close()
+
+
+def test_delivery_accepts_pcc_with_the_persisted_request_authority(
+    tmp_path: Path,
+) -> None:
+    key = private_key(11)
+    coordinator = _coordinator(tmp_path / "persisted-delivery-request", key)
+    _accept(coordinator, boot_boundary(key))
+    trigger = _candidate_trigger(key)
+    trigger_ref = _accept(coordinator, trigger)
+    request = _request(trigger, ttl_seconds=120)
+    journal = CorrelationRequestJournal.create_new(coordinator.segment_store)
+    journal.select(trigger_ref, canonical_json(request))
+    journal.close()
+
+    recovered = CorrelationRequestJournal.open_and_recover(
+        coordinator.segment_store
+    )
+    persisted = recovered.pending()[0]
+    snapshot_ref = coordinator.accept_pcc(
+        _item(
+            _snapshot_envelope(
+                key,
+                _failed_snapshot(trigger, persisted.request),
+            )
+        ),
+        persisted.request,
+    )
+
+    authority = coordinator.authenticated_pcc_input(
+        snapshot_ref,
+        persisted.request,
+    )
+    assert authority.evidence_ref == snapshot_ref
+    assert authority.request == persisted.request
+    recovered.close()
     coordinator.segment_store.close()
 
 

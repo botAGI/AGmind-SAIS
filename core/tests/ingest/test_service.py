@@ -36,7 +36,9 @@ from agmind_immune.ingest.ack_journal import (
     AckJournalAuthorityError,
     AckJournalStateError,
 )
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
+    MAX_CORE_EVENT_RESPONSE_BYTES,
     MAX_EVENTS_PAGE_BYTES,
     AnchoredPublicKeyChain,
     EnvelopeConflict,
@@ -282,6 +284,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
     service = importlib.import_module("agmind_immune.ingest.service")
     coordinator, store, verifier = _coordinator(tmp_path / "delivery-factory")
     journal = AckJournal.create_new(store)
+    correlation_requests = CorrelationRequestJournal.create_new(store)
     coverage = CoverageState.open_and_recover(store)
     clock = _DeliveryClock()
     transport = _ScriptedTransport()
@@ -295,6 +298,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
             store,
             verifier,
             journal,
+            correlation_requests,
             lease,
             transport,
             coverage_adapter=lambda: None,
@@ -306,6 +310,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
         DeliveryCoordinator.create(
             coordinator,
             journal,
+            correlation_requests,
             transport,
             coverage=coverage,
             clock=clock,
@@ -318,6 +323,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
         DeliveryCoordinator.create(
             coordinator,
             other_journal,
+            correlation_requests,
             transport,
             coverage=coverage,
             clock=clock,
@@ -329,6 +335,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
         DeliveryCoordinator.create(
             coordinator,
             journal,
+            correlation_requests,
             transport,
             coverage=coverage,
             clock=clock,
@@ -395,6 +402,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
     delivery = DeliveryCoordinator.create(
         coordinator,
         journal,
+        correlation_requests,
         transport,
         coverage=coverage,
         clock=clock,
@@ -415,6 +423,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
 
     failed, failed_store, _ = _coordinator(tmp_path / "coverage-failure")
     failed_journal = AckJournal.create_new(failed_store)
+    failed_correlation = CorrelationRequestJournal.create_new(failed_store)
     failed_coverage = CoverageState.open_and_recover(failed_store)
     failed_transport = _ScriptedTransport(
         [
@@ -441,6 +450,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
     failed_delivery = DeliveryCoordinator.create(
         failed,
         failed_journal,
+        failed_correlation,
         failed_transport,
         coverage=failed_coverage,
         clock=_DeliveryClock(),
@@ -462,10 +472,14 @@ async def test_delivery_factory_updates_coverage_before_ack(
             tmp_path / f"substitution-{label}"
         )
         substituted_journal = AckJournal.create_new(retained_store)
+        substituted_correlation = CorrelationRequestJournal.create_new(
+            retained_store
+        )
         substituted_coverage = CoverageState.open_and_recover(retained_store)
         substituted_delivery = DeliveryCoordinator.create(
             substituted,
             substituted_journal,
+            substituted_correlation,
             _ScriptedTransport(
                 [_page_bytes(boot_boundary(key), reserved_through=1)]
             ),
@@ -496,6 +510,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
             tmp_path / f"post-accept-{label}"
         )
         post_journal = AckJournal.create_new(post_store)
+        post_correlation = CorrelationRequestJournal.create_new(post_store)
         post_coverage = CoverageState.open_and_recover(post_store)
         post_transport = _ScriptedTransport(
             [_page_bytes(boot_boundary(key), reserved_through=1)]
@@ -503,6 +518,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
         post_delivery = DeliveryCoordinator.create(
             post,
             post_journal,
+            post_correlation,
             post_transport,
             coverage=post_coverage,
             clock=_DeliveryClock(),
@@ -562,6 +578,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
     ):
         lease_coordinator, lease_store, _ = _coordinator(tmp_path / label)
         lease_journal = AckJournal.create_new(lease_store)
+        lease_correlation = CorrelationRequestJournal.create_new(lease_store)
         lease_coverage = CoverageState.open_and_recover(lease_store)
         lease_clock = _DeliveryClock([None, receipt])
         lease_transport = _ScriptedTransport(
@@ -583,6 +600,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
         lease_delivery = DeliveryCoordinator.create(
             lease_coordinator,
             lease_journal,
+            lease_correlation,
             lease_transport,
             coverage=lease_coverage,
             clock=lease_clock,
@@ -612,6 +630,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
 
     interrupt_coordinator, interrupt_store, _ = _coordinator(tmp_path / "interrupt")
     interrupt_journal = AckJournal.create_new(interrupt_store)
+    interrupt_correlation = CorrelationRequestJournal.create_new(interrupt_store)
     interrupt_coverage = CoverageState.open_and_recover(interrupt_store)
 
     class InterruptClock(_DeliveryClock):
@@ -621,6 +640,7 @@ async def test_delivery_factory_updates_coverage_before_ack(
     interrupt_delivery = DeliveryCoordinator.create(
         interrupt_coordinator,
         interrupt_journal,
+        interrupt_correlation,
         _ScriptedTransport(
             [_page_bytes(boot_boundary(key), reserved_through=1)]
         ),
@@ -946,9 +966,11 @@ class _ScriptedTransport:
         self,
         pages: list[bytes | BaseException] | None = None,
         acknowledgements: list[None | BaseException] | None = None,
+        publications: list[bytes | BaseException] | None = None,
     ) -> None:
         self.pages = pages or []
         self.acknowledgements = acknowledgements or []
+        self.publications = publications or []
         self.actions: list[tuple[str, int | bytes, int | None]] = []
 
     async def fetch_events(self, *, after: int, limit: int) -> bytes:
@@ -967,6 +989,15 @@ class _ScriptedTransport:
         result = self.acknowledgements.pop(0)
         if isinstance(result, BaseException):
             raise result
+
+    async def publish_correlation_snapshot(self, canonical_body: bytes) -> bytes:
+        self.actions.append(("pcc", bytes(canonical_body), None))
+        if not self.publications:
+            raise AssertionError("unexpected PCC publication")
+        result = self.publications.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     async def close(self) -> None:
         pass
@@ -1003,6 +1034,15 @@ class _DeliveryClock:
         raise AssertionError("delivery must not sample the decision clock")
 
 
+def _test_correlation_requests(store: SegmentStore) -> CorrelationRequestJournal:
+    existing = store._correlation_journal_owner
+    if type(existing) is CorrelationRequestJournal:
+        return existing
+    if (store.root / "correlation-requests.agf").exists():
+        return CorrelationRequestJournal.open_and_recover(store)
+    return CorrelationRequestJournal.create_new(store)
+
+
 def _test_delivery(
     acceptance: AcceptanceCoordinator,
     journal: AckJournal,
@@ -1022,6 +1062,7 @@ def _test_delivery(
     return DeliveryCoordinator.create(
         acceptance,
         journal,
+        _test_correlation_requests(store),
         transport,
         coverage=coverage,
         clock=clock or _DeliveryClock(),
@@ -1072,12 +1113,77 @@ def _ack_sequences(transport: _ScriptedTransport) -> list[int]:
         ("ack", 409, {}, b"private", DeliveryFatalError),
         ("ack", 409, {}, OSError("private"), DeliveryFatalError),
         ("ack", 200, {}, b"", DeliveryFatalError),
+        (
+            "pcc",
+            200,
+            {"Content-Type": "application/json"},
+            b'{"event_id":"evt_accepted"}',
+            None,
+        ),
+        (
+            "pcc",
+            201,
+            {"Content-Type": "application/json"},
+            b'{"event_id":"evt_created"}',
+            None,
+        ),
+        ("pcc", 503, {}, b"private", DeliveryRetryableError),
+        ("pcc", 409, {}, b"private", DeliveryFatalError),
+        (
+            "pcc",
+            200,
+            {"Content-Type": "application/json; charset=utf-8"},
+            b"{}",
+            DeliveryFatalError,
+        ),
+        (
+            "pcc",
+            200,
+            {"Content-Type": "application/json", "Content-Encoding": "identity"},
+            b"{}",
+            DeliveryFatalError,
+        ),
+        (
+            "pcc",
+            200,
+            {"Content-Type": "application/json"},
+            b"x" * (MAX_CORE_EVENT_RESPONSE_BYTES + 1),
+            DeliveryFatalError,
+        ),
+        (
+            "pcc",
+            307,
+            {"Location": "http://observer/elsewhere"},
+            b"",
+            DeliveryFatalError,
+        ),
+        (
+            "pcc_max",
+            200,
+            {"Content-Type": "application/json"},
+            b"{}",
+            None,
+        ),
+        (
+            "pcc_oversize",
+            200,
+            {"Content-Type": "application/json"},
+            b"{}",
+            DeliveryFatalError,
+        ),
         pytest.param("close", 0, {}, b"", None, id="close_retry"),
     ],
 )
 async def test_delivery_transport_bounds_routes_and_statuses(
     monkeypatch: pytest.MonkeyPatch,
-    operation: Literal["fetch", "ack", "close"],
+    operation: Literal[
+        "fetch",
+        "ack",
+        "pcc",
+        "pcc_max",
+        "pcc_oversize",
+        "close",
+    ],
     status: int,
     headers: dict[str, str],
     body: bytes | BaseException,
@@ -1120,20 +1226,43 @@ async def test_delivery_transport_bounds_routes_and_statuses(
         + b"b" * 64
         + b'","schema_version":"agmind.observer-ack.v1","sequence":7}'
     )
-    call = (
-        transport.fetch_events(after=7, limit=3)
-        if operation == "fetch"
-        else transport.ack_event(ack_body)
+    pcc_body = (
+        b'{"requested_ttl_seconds":120,"schema_version":'
+        b'"agmind.pcc-correlation-snapshot-request.v1",'
+        b'"trigger_content_sha256":"'
+        + b"c" * 64
+        + b'","trigger_event_id":"evt_'
+        + b"d" * 64
+        + b'","trigger_source_sequence":7}'
     )
+    if operation == "fetch":
+        call = transport.fetch_events(after=7, limit=3)
+    elif operation == "ack":
+        call = transport.ack_event(ack_body)
+    elif operation == "pcc":
+        call = transport.publish_correlation_snapshot(pcc_body)
+    elif operation == "pcc_max":
+        pcc_body = b'{"padding":"' + b"x" * 4082 + b'"}'
+        assert len(pcc_body) == 4 * 1024
+        call = transport.publish_correlation_snapshot(pcc_body)
+    else:
+        assert operation == "pcc_oversize"
+        pcc_body = b'{"padding":"' + b"x" * 4083 + b'"}'
+        assert len(pcc_body) == 4 * 1024 + 1
+        call = transport.publish_correlation_snapshot(pcc_body)
     if error_type is None:
         result = await call
-        if operation == "fetch":
+        if operation in ("fetch", "pcc", "pcc_max"):
             assert isinstance(body, bytes)
             assert result == body
     else:
         with pytest.raises(error_type) as raised:
             await call
         assert "private" not in str(raised.value)
+    if operation == "pcc_oversize":
+        assert seen == []
+        await transport.close()
+        return
     if operation == "fetch":
         expected = (
             "GET",
@@ -1141,11 +1270,19 @@ async def test_delivery_transport_bounds_routes_and_statuses(
             b"",
             None,
         )
-    else:
+    elif operation == "ack":
         expected = (
             "POST",
             "http://observer/v1/events/ack",
             ack_body,
+            "application/json",
+        )
+    else:
+        assert operation in ("pcc", "pcc_max")
+        expected = (
+            "POST",
+            "http://observer/v1/events/pcc-correlation-snapshot",
+            pcc_body,
             "application/json",
         )
     assert seen == [expected]
@@ -1164,6 +1301,7 @@ async def test_delivery_commit_timeline_and_exact_pending_replay(
 ) -> None:
     coordinator, store, verifier = _coordinator(tmp_path / ack_outcome)
     journal = AckJournal.create_new(store)
+    correlation_requests = CorrelationRequestJournal.create_new(store)
     key = private_key(11)
     if ack_outcome == "lifecycle_authority":
         transport = _ScriptedTransport()
@@ -1174,6 +1312,7 @@ async def test_delivery_commit_timeline_and_exact_pending_replay(
                 store,
                 verifier,
                 journal,
+                correlation_requests,
                 lease,
                 transport,
                 coverage_adapter=lambda: None,
