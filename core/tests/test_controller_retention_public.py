@@ -430,14 +430,20 @@ async def test_public_retention_serializes_controller_operations(
     contender_kind: str,
 ) -> None:
     key = private_key(11)
-    acceptance, _store, journal, coverage, projection, _refs = _authorities(
-        tmp_path / contender_kind,
-        boot_boundary(key),
-    )
+    (
+        acceptance,
+        _store,
+        journal,
+        correlation,
+        coverage,
+        projection,
+        _refs,
+    ) = _authorities(tmp_path / contender_kind, boot_boundary(key))
     transport = _ObservedTransport()
     controller = CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         transport,

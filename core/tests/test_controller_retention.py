@@ -14,6 +14,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournal,
     AckJournalSnapshot,
 )
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import EnvelopeVerifier
 from agmind_immune.ingest.service import (
     AcceptanceCoordinator,
@@ -112,7 +113,7 @@ async def test_retention_rejects_unbound_confirmed_ack_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = private_key(11)
-    acceptance, _store, journal, coverage, projection, _ = _authorities(
+    acceptance, _store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "forged-ack",
         boot_boundary(key),
     )
@@ -129,6 +130,7 @@ async def test_retention_rejects_unbound_confirmed_ack_identity(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         _RetentionTransport(),
@@ -148,7 +150,7 @@ async def test_retention_rejects_unbound_pending_ack_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "forged-pending",
         boot_boundary(key),
     )
@@ -176,6 +178,7 @@ async def test_retention_rejects_unbound_pending_ack_identity(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         _RetentionTransport(),
@@ -194,7 +197,7 @@ async def test_retention_pending_ack_precedes_selection_state_and_post(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "pending",
         boot_boundary(key),
     )
@@ -214,6 +217,7 @@ async def test_retention_pending_ack_precedes_selection_state_and_post(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         transport,
@@ -249,7 +253,7 @@ async def test_retention_pending_ack_hides_preexisting_durable_request(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "pending-with-state",
         boot_boundary(key),
     )
@@ -274,6 +278,7 @@ async def test_retention_pending_ack_hides_preexisting_durable_request(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         transport,
@@ -307,7 +312,7 @@ async def test_retention_not_due_is_one_exact_noop(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "not-due",
         boot_boundary(key),
     )
@@ -315,6 +320,7 @@ async def test_retention_not_due_is_one_exact_noop(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         transport,
@@ -348,7 +354,7 @@ async def test_retention_reuses_authenticated_blocked_episode_without_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "reused-blocked",
         boot_boundary(key),
     )
@@ -382,6 +388,7 @@ async def test_retention_reuses_authenticated_blocked_episode_without_state(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         transport,
@@ -422,6 +429,8 @@ async def test_retention_clears_authenticated_blocked_state_in_same_scope(
         _seed_transport,
     ) = _bound_blocked_evidence_appended(tmp_path / "blocked-clear")
     acceptance = seed_delivery.acceptance
+    correlation = seed_delivery.correlation_requests
+    assert type(correlation) is CorrelationRequestJournal
     coverage = seed_delivery._coverage_adapter._coverage
     await seed_delivery.close()
     projection = ProjectionStore.open(
@@ -433,6 +442,7 @@ async def test_retention_clears_authenticated_blocked_state_in_same_scope(
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
+        correlation,
         coverage,
         projection,
         transport,
@@ -479,6 +489,8 @@ async def test_retention_evidence_appended_retryable_propagates(
         tmp_path / "evidence-appended-retry"
     )
     acceptance = seed_delivery.acceptance
+    correlation = seed_delivery.correlation_requests
+    assert type(correlation) is CorrelationRequestJournal
     coverage = seed_delivery._coverage_adapter._coverage
     await seed_delivery.close()
     projection = ProjectionStore.open(
@@ -491,6 +503,7 @@ async def test_retention_evidence_appended_retryable_propagates(
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
+        correlation,
         coverage,
         projection,
         _RetentionTransport(),
@@ -535,6 +548,7 @@ async def test_retention_requires_selected_prefix_then_one_surviving_ack(
         acknowledge=False,
     )
     acknowledgements = AckJournal.create_new(case.store)
+    correlation = CorrelationRequestJournal.create_new(case.store)
     for ref in case.store.authenticated_refs(
         after_sequence=0,
         through_sequence=confirmed_through,
@@ -561,6 +575,7 @@ async def test_retention_requires_selected_prefix_then_one_surviving_ack(
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
+        correlation,
         case.coverage,
         projection,
         _RetentionTransport(),
@@ -619,6 +634,7 @@ async def test_retention_selected_prefix_lag_blocks_post(
     )
     retention_journal.prepare_publication(decision)
     acknowledgements = AckJournal.create_new(store)
+    correlation = CorrelationRequestJournal.create_new(store)
     first_ref = store.authenticated_refs(
         after_sequence=0,
         through_sequence=1,
@@ -635,6 +651,7 @@ async def test_retention_selected_prefix_lag_blocks_post(
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
+        correlation,
         coverage,
         projection,
         transport,
@@ -659,7 +676,7 @@ async def test_retention_maps_retryable_only_after_durable_request(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "retryable",
         boot_boundary(key),
     )
@@ -673,6 +690,7 @@ async def test_retention_maps_retryable_only_after_durable_request(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         transport,
@@ -706,7 +724,7 @@ async def test_retention_retryable_rejects_cache_that_differs_from_durable_raw(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / "retryable-corrupt-cache",
         boot_boundary(key),
     )
@@ -732,6 +750,7 @@ async def test_retention_retryable_rejects_cache_that_differs_from_durable_raw(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         _CorruptingRetryableBlockedTransport(durable, altered),
@@ -774,6 +793,7 @@ async def test_retention_cancellation_propagates_with_selected_state_intact(
         for entry in state.entries
     )
     acknowledgements = AckJournal.create_new(store)
+    correlation = CorrelationRequestJournal.create_new(store)
     for ref in store.authenticated_refs(
         after_sequence=0,
         through_sequence=2,
@@ -790,6 +810,7 @@ async def test_retention_cancellation_propagates_with_selected_state_intact(
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
+        correlation,
         coverage,
         projection,
         transport,
@@ -821,7 +842,7 @@ async def test_retention_restart_only_phases_propagate(
     restart_phase: str,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
         tmp_path / restart_phase,
         boot_boundary(key),
     )
@@ -845,6 +866,7 @@ async def test_retention_restart_only_phases_propagate(
     controller = controller_module.CoreController.create(
         acceptance,
         journal,
+        correlation,
         coverage,
         projection,
         _RetentionTransport(),
@@ -873,6 +895,7 @@ async def test_retention_aborts_before_unlink_when_projection_catchup_fails(
     verifier = case.store._bound_verifier
     assert type(acknowledgements) is AckJournal
     assert type(verifier) is EnvelopeVerifier
+    correlation = CorrelationRequestJournal.create_new(case.store)
     acceptance = AcceptanceCoordinator(
         verifier,
         case.store,
@@ -886,6 +909,7 @@ async def test_retention_aborts_before_unlink_when_projection_catchup_fails(
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
+        correlation,
         case.coverage,
         projection,
         _RetentionTransport(),
@@ -928,6 +952,7 @@ async def test_retention_completes_unlink_rebuild_and_finalization(
     verifier = case.store._bound_verifier
     assert type(acknowledgements) is AckJournal
     assert type(verifier) is EnvelopeVerifier
+    correlation = CorrelationRequestJournal.create_new(case.store)
     acceptance = AcceptanceCoordinator(
         verifier,
         case.store,
@@ -942,6 +967,7 @@ async def test_retention_completes_unlink_rebuild_and_finalization(
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
+        correlation,
         case.coverage,
         projection,
         transport,
@@ -994,6 +1020,7 @@ async def test_retention_rebuild_failure_latches_and_does_not_finalize(
     verifier = case.store._bound_verifier
     assert type(acknowledgements) is AckJournal
     assert type(verifier) is EnvelopeVerifier
+    correlation = CorrelationRequestJournal.create_new(case.store)
     acceptance = AcceptanceCoordinator(
         verifier,
         case.store,
@@ -1007,6 +1034,7 @@ async def test_retention_rebuild_failure_latches_and_does_not_finalize(
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
+        correlation,
         case.coverage,
         projection,
         _RetentionTransport(),

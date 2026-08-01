@@ -31,6 +31,7 @@ from agmind_immune.evidence.segments import (
 from agmind_immune.ingest import envelope as envelope_module
 from agmind_immune.ingest import service as service_module
 from agmind_immune.ingest.ack_journal import AckJournal
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
     CoreEventV1,
     EnvelopeVerifier,
@@ -271,6 +272,11 @@ class _RetentionTransport:
     async def ack_event(self, body: bytes) -> None:
         raise AssertionError(f"retention preflight attempted ACK: {body!r}")
 
+    async def publish_correlation_snapshot(self, canonical_body: bytes) -> bytes:
+        raise AssertionError(
+            f"retention delivery attempted PCC publication: {canonical_body!r}"
+        )
+
     async def publish_repair_authorization(self, canonical_body: bytes) -> bytes:
         raise AssertionError(
             f"retention preflight used repair authorization: {canonical_body!r}"
@@ -318,6 +324,7 @@ def _bound_delivery(
         store,
     )
     acknowledgements = AckJournal.create_new(store)
+    correlation = CorrelationRequestJournal.create_new(store)
     coverage = CoverageState.open_and_recover(store)
     boot_ref = acceptance.accept(_item(boot_boundary(key)))
     store.flush_security_boundary()
@@ -327,6 +334,7 @@ def _bound_delivery(
     delivery = DeliveryCoordinator.create(
         acceptance,
         acknowledgements,
+        correlation,
         transport,
         coverage=coverage,
         clock=_Clock(),

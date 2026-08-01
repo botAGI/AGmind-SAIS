@@ -11,6 +11,7 @@ from agmind_immune.contracts import ObserverTrustRootV1
 from agmind_immune.coverage import CoverageState
 from agmind_immune.evidence.segments import EvidenceRef, SegmentStore
 from agmind_immune.ingest.ack_journal import AckJournal
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
     CoreEventV1,
@@ -111,6 +112,11 @@ class _Transport:
     async def ack_event(self, body: bytes) -> None:
         item = httpx.Response(200, content=body).json()
         self.timeline.append(f"post:{item['sequence']}")
+
+    async def publish_correlation_snapshot(self, canonical_body: bytes) -> bytes:
+        raise AssertionError(
+            f"repair delivery attempted PCC publication: {canonical_body!r}"
+        )
 
     async def publish_repair_authorization(self, canonical_body: bytes) -> bytes:
         raise AssertionError("unexpected authorization POST")
@@ -247,6 +253,7 @@ async def test_repair_drain_is_factory_only_and_rejects_target_mismatch_before_a
     service = importlib.import_module("agmind_immune.ingest.service")
     acceptance, store = _acceptance(tmp_path)
     journal = AckJournal.create_new(store)
+    correlation = CorrelationRequestJournal.create_new(store)
     coverage = CoverageState.open_and_recover(store)
     boot_ref = acceptance.accept(_item(boot_boundary(private_key(11))))
     store.flush_security_boundary()
@@ -346,6 +353,7 @@ async def test_repair_drain_is_factory_only_and_rejects_target_mismatch_before_a
         DeliveryCoordinator.create(
             acceptance,
             journal,
+            correlation,
             ordinary_transport,
             coverage=coverage,
             clock=_Clock(),
@@ -356,6 +364,7 @@ async def test_repair_drain_is_factory_only_and_rejects_target_mismatch_before_a
     ordinary = DeliveryCoordinator.create(
         acceptance,
         journal,
+        correlation,
         ordinary_transport,
         coverage=coverage,
         clock=_Clock(),
