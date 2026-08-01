@@ -67,6 +67,11 @@
 
 ## 6D — Historical coverage and projection V2
 
+Detailed authority design and executable TDD plan:
+
+- `../specs/2026-08-01-task6d-historical-projection-authority-design.md`
+- `2026-08-01-task6d-historical-projection-authority.md`
+
 1. Implement historical interval assessment and locked coverage hash.
 2. Add projection schema/reducer/snapshot V2 with incidents, candidates,
    candidate evidence, and append-only late invalidations.
