@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -330,6 +332,75 @@ func TestPCCPublishAtomicFrameAndPublicationFailures(t *testing.T) {
 	}
 }
 
+func TestPCCPublishPrepareFailureRetriesMandatoryFencePersistence(t *testing.T) {
+	fixture := newPCCFailedPublishFixture(t)
+	before := fixture.state.Snapshot()
+	sequence := before.LastSequence + 1
+	stageErr := errors.New("injected PCC publication prepare failure")
+	fenceErr := errors.New("injected first PCC fence persistence failure")
+	fixture.spool.preparePublication = func(string, []byte) error {
+		return stageErr
+	}
+
+	persist := fixture.state.persist
+	fenceAttempts := 0
+	fixture.state.persist = func(path string, next ObserverState) error {
+		if next.MutationReadOnly &&
+			next.ReadOnlyReason == "observer_spool_publication_prepare_failed" {
+			fenceAttempts++
+			if fenceAttempts == 1 {
+				return fenceErr
+			}
+		}
+		return persist(path, next)
+	}
+
+	publication, err := fixture.service.PublishPCCCorrelationSnapshot(
+		context.Background(),
+		fixture.request,
+	)
+	if !errors.Is(err, stageErr) || !errors.Is(err, fenceErr) {
+		t.Errorf(
+			"prepare/fence error=%v want both stage and first fence persistence errors",
+			err,
+		)
+	}
+	if !reflect.DeepEqual(publication, PCCCorrelationPublication{}) {
+		t.Errorf("prepare/fence failure exposed publication=%+v", publication)
+	}
+	if fenceAttempts != 2 {
+		t.Errorf("mandatory fence persistence attempts=%d want=2", fenceAttempts)
+	}
+	live := fixture.state.Snapshot()
+	if !live.MutationReadOnly ||
+		live.ReadOnlyReason != "observer_spool_publication_prepare_failed" ||
+		live.LastSequence != sequence {
+		t.Errorf("live mandatory fence state=%+v want sequence=%d", live, sequence)
+	}
+
+	if err := fixture.spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStateStore(
+		fixture.state.path,
+		StateIdentity{
+			HostID: live.HostID, BootID: live.BootID,
+			KeyID: live.KeyID, KeyEpoch: live.KeyEpoch,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable := reopened.Snapshot()
+	if !durable.MutationReadOnly ||
+		durable.ReadOnlyReason != "observer_spool_publication_prepare_failed" ||
+		durable.LastSequence != sequence ||
+		durable.PublicationHeadSequence != before.PublicationHeadSequence ||
+		durable.PCCReceiptCount != before.PCCReceiptCount {
+		t.Errorf("durable mandatory fence state=%+v want sequence=%d", durable, sequence)
+	}
+}
+
 func assertPCCReceiptAtomicRestartFailsClosed(
 	t *testing.T,
 	fixture *pccFailedPublishFixture,
@@ -515,6 +586,58 @@ func TestPCCPublishAtomicReceiptFailures(t *testing.T) {
 				sequence,
 				pccAtomicArtifacts{frame: true, published: true},
 			)
+
+			items, fetchErr := fixture.spool.Fetch(
+				before.state.LastSequence,
+				100,
+				4*1024*1024,
+			)
+			if !errors.Is(fetchErr, ErrPCCReceiptCorrupt) || len(items) != 0 {
+				t.Errorf(
+					"receiptless PCC direct fetch error=%v items=%d want ErrPCCReceiptCorrupt and zero items",
+					fetchErr,
+					len(items),
+				)
+			}
+
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(
+				http.MethodGet,
+				fmt.Sprintf(
+					"http://unix/v1/events?after=%d&limit=100",
+					before.state.LastSequence,
+				),
+				nil,
+			)
+			coreEventsHandler(fixture.service).ServeHTTP(response, request)
+			item := after.items[sequence]
+			body := response.Body.Bytes()
+			fixedBody := bytes.Equal(body, []byte("{\"error\":\"fetch_failed\"}\n"))
+			containsEventID := bytes.Contains(body, []byte(item.EventID))
+			containsContentSHA256 := bytes.Contains(
+				body,
+				[]byte(item.ContentSHA256),
+			)
+			if response.Code != http.StatusServiceUnavailable ||
+				!fixedBody || containsEventID || containsContentSHA256 {
+				t.Errorf(
+					"receiptless PCC core fetch status=%d fixed_body=%t contains_event_id=%t contains_content_sha256=%t",
+					response.Code,
+					fixedBody,
+					containsEventID,
+					containsContentSHA256,
+				)
+			}
+			postFetch := fixture.state.Snapshot()
+			if !postFetch.MutationReadOnly ||
+				postFetch.ReadOnlyReason != test.reason {
+				t.Errorf(
+					"receiptless PCC fetch replaced original fence reason=%q want=%q",
+					postFetch.ReadOnlyReason,
+					test.reason,
+				)
+			}
+
 			assertPCCReceiptAtomicRestartFailsClosed(
 				t,
 				fixture,

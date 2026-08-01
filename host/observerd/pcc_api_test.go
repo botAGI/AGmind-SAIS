@@ -21,6 +21,23 @@ type pccAPIPublisherStub struct {
 	requests    []contracts.PCCCorrelationSnapshotRequestV1
 }
 
+type pccAPIRecordingPublisher struct {
+	publisher pccCorrelationPublisher
+	err       error
+}
+
+func (recorder *pccAPIRecordingPublisher) PublishPCCCorrelationSnapshot(
+	ctx context.Context,
+	request contracts.PCCCorrelationSnapshotRequestV1,
+) (PCCCorrelationPublication, error) {
+	publication, err := recorder.publisher.PublishPCCCorrelationSnapshot(
+		ctx,
+		request,
+	)
+	recorder.err = err
+	return publication, err
+}
+
 func (stub *pccAPIPublisherStub) PublishPCCCorrelationSnapshot(
 	_ context.Context,
 	request contracts.PCCCorrelationSnapshotRequestV1,
@@ -290,5 +307,100 @@ func TestPCCAPISuccessStatusCanonicalResponseAndFixedErrors(t *testing.T) {
 				t.Fatalf("publisher calls=%d requests=%+v want=%+v", stub.calls, stub.requests, proofRequest)
 			}
 		})
+	}
+}
+
+func TestPCCAPIPermanentConflictFencePersistenceFailureIsUnavailable(
+	t *testing.T,
+) {
+	fixture := newPCCFailedPublishFixture(t)
+	first, err := fixture.service.PublishPCCCorrelationSnapshot(
+		context.Background(),
+		fixture.request,
+	)
+	if err != nil || !first.Created {
+		t.Fatalf("initial PCC publication=%+v err=%v", first, err)
+	}
+	before := fixture.state.Snapshot()
+	conflict := fixture.request
+	conflict.TriggerContentSHA256 = strings.Repeat("9", 64)
+	requestRaw, err := contracts.CanonicalJSON(conflict)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fenceErr := errors.New("injected permanent PCC conflict fence persistence failure")
+	persist := fixture.state.persist
+	fenceAttempts := 0
+	fixture.state.persist = func(path string, next ObserverState) error {
+		if next.MutationReadOnly &&
+			next.ReadOnlyReason == "observer_pcc_request_conflict" {
+			fenceAttempts++
+			return fenceErr
+		}
+		return persist(path, next)
+	}
+
+	response := httptest.NewRecorder()
+	recorder := &pccAPIRecordingPublisher{publisher: fixture.service}
+	pccCorrelationHandler(recorder).ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodPost,
+			"http://unix/v1/events/pcc-correlation-snapshot",
+			bytes.NewReader(requestRaw),
+		),
+	)
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Body.String() != "{\"error\":\"pcc_publication_unavailable\"}\n" {
+		t.Errorf(
+			"permanent conflict fence failure status=%d body=%q",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if !errors.Is(recorder.err, ErrPCCPublicationUnavailable) ||
+		errors.Is(recorder.err, ErrPCCReceiptConflict) ||
+		errors.Is(recorder.err, ErrPCCPublicationConflict) ||
+		!errors.Is(recorder.err, fenceErr) {
+		t.Errorf("permanent conflict publisher error classification=%v", recorder.err)
+	}
+	if fenceAttempts != 2 {
+		t.Errorf("permanent conflict fence persistence attempts=%d want=2", fenceAttempts)
+	}
+	live := fixture.state.Snapshot()
+	if !live.MutationReadOnly ||
+		live.ReadOnlyReason != "observer_pcc_request_conflict" ||
+		live.LastSequence != before.LastSequence ||
+		live.PublicationHeadSequence != before.PublicationHeadSequence ||
+		live.PublicationHeadHash != before.PublicationHeadHash ||
+		live.PCCReceiptCount != before.PCCReceiptCount ||
+		live.PCCReceiptBytes != before.PCCReceiptBytes ||
+		live.PCCReceiptHeadHash != before.PCCReceiptHeadHash {
+		t.Errorf("permanent conflict live state changed: before=%+v after=%+v", before, live)
+	}
+
+	if err := fixture.spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStateStore(
+		fixture.state.path,
+		StateIdentity{
+			HostID: live.HostID, BootID: live.BootID,
+			KeyID: live.KeyID, KeyEpoch: live.KeyEpoch,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable := reopened.Snapshot()
+	if durable.MutationReadOnly || durable.ReadOnlyReason != "" ||
+		durable.LastSequence != before.LastSequence ||
+		durable.PublicationHeadSequence != before.PublicationHeadSequence ||
+		durable.PublicationHeadHash != before.PublicationHeadHash ||
+		durable.PCCReceiptCount != before.PCCReceiptCount ||
+		durable.PCCReceiptBytes != before.PCCReceiptBytes ||
+		durable.PCCReceiptHeadHash != before.PCCReceiptHeadHash {
+		t.Errorf("permanent conflict durable state changed: before=%+v after=%+v", before, durable)
 	}
 }

@@ -3,6 +3,8 @@ package observerd
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -222,4 +224,54 @@ func TestPCCPublishGenericAppendRequiresSpecializedReceipt(t *testing.T) {
 	if _, found := after.receipts[operationKey]; found {
 		t.Errorf("generic priority PCC append exposed receipt metadata for %q", operationKey)
 	}
+}
+
+func TestPCCPublishGenericSignerRejectsBeforeReservation(t *testing.T) {
+	root := t.TempDir()
+	privateKey := testKey(t, 128)
+	state, spool, signer := openSignerFixture(
+		t,
+		root,
+		testBootID,
+		privateKey,
+	)
+	trigger, err := signer.Wrap(
+		context.Background(),
+		"falco_connect",
+		map[string]any{"kind": "pcc-generic-signer-trigger"},
+		metadata(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, _ := pccReceiptFields(t, spool.items[trigger.SourceSequence])
+	canonical, err := contracts.CanonicalJSON(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(canonical)
+
+	before := observePCCPublicationSurface(state, spool)
+	sequence := before.state.LastSequence + 1
+	event, err := signer.Wrap(
+		context.Background(),
+		"pcc_correlation_snapshot",
+		fields,
+		EventMetadata{
+			EventTime:           time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+			RedactionFlags:      []string{},
+			CoverageFlags:       []string{},
+			SourcePayloadHash:   hex.EncodeToString(digest[:]),
+			InventoryGeneration: 0,
+		},
+	)
+	if !errors.Is(err, ErrPCCReceiptRequired) {
+		t.Errorf("generic PCC signer error=%v want ErrPCCReceiptRequired", err)
+	}
+	if !reflect.DeepEqual(event, contracts.EventEnvelopeV1{}) {
+		t.Errorf("generic PCC signer exposed event=%+v", event)
+	}
+	after := observePCCPublicationSurface(state, spool)
+	assertPCCPublicationSurfaceUnchanged(t, before, after)
+	assertNoPCCSequenceArtifacts(t, spool, sequence)
 }

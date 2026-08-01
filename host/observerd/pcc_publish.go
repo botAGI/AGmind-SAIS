@@ -177,14 +177,24 @@ func pccCoverageProvenThroughLocked(
 		return true
 	}
 	start := covered + 1
-	needed := through - start + 1
-	if needed > uint64(len(spool.items)) {
-		return false
-	}
 	for sequence := start; sequence <= through; sequence++ {
 		item, found := spool.items[sequence]
-		if !found || item.Sequence != sequence ||
+		if !found {
+			return false
+		}
+		event, canonical, contentHash, frameBytes, identity, err :=
+			readStandaloneFrame(item.path, spool.keys)
+		if err != nil ||
+			item.Sequence != sequence ||
+			event.SourceSequence != item.Sequence ||
+			event.EventID != item.EventID ||
+			contentHash != item.ContentSHA256 ||
+			tierForEvent(event) != item.Tier ||
+			frameBytes != item.frameBytes ||
+			identity != item.identity ||
+			!bytes.Equal(canonical, item.Canonical) ||
 			validatePublicationItem(item) != nil {
+			_ = spool.state.PersistReadOnly("observer_pcc_coverage_corrupt")
 			return false
 		}
 		if sequence == math.MaxUint64 {
@@ -746,6 +756,9 @@ func (service *Service) PublishPCCCorrelationSnapshot(
 		operationKey,
 		requestSHA256,
 	)
+	if errors.Is(err, ErrPCCPublicationUnavailable) {
+		return PCCCorrelationPublication{}, err
+	}
 	if errors.Is(err, ErrPCCReceiptConflict) {
 		return PCCCorrelationPublication{}, errors.Join(
 			ErrPCCPublicationConflict,

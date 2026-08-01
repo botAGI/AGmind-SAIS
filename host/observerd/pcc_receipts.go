@@ -116,6 +116,40 @@ func pccReceiptFailState(state *StateStore, reason string) {
 	}
 }
 
+func persistMandatoryPCCFence(state *StateStore, reason string) error {
+	if state == nil {
+		return ErrPCCPublicationUnavailable
+	}
+	firstErr := state.PersistReadOnly(reason)
+	if firstErr == nil {
+		return nil
+	}
+	secondErr := state.PersistReadOnly(reason)
+	if secondErr == nil {
+		return firstErr
+	}
+	return errors.Join(
+		ErrPCCPublicationUnavailable,
+		firstErr,
+		secondErr,
+	)
+}
+
+func persistCurrentMandatoryPCCFence(
+	state *StateStore,
+	fallbackReason string,
+) error {
+	if state == nil {
+		return ErrPCCPublicationUnavailable
+	}
+	reason := fallbackReason
+	snapshot := state.Snapshot()
+	if snapshot.MutationReadOnly && snapshot.ReadOnlyReason != "" {
+		reason = snapshot.ReadOnlyReason
+	}
+	return persistMandatoryPCCFence(state, reason)
+}
+
 func OpenPCCReceiptStore(
 	stateDirectory string,
 	state *StateStore,
@@ -415,8 +449,17 @@ func (receipts *PCCReceiptStore) lookupMetadataLocked(
 		return PCCPublicationReceipt{}, false, nil
 	}
 	if receipt.RequestSHA256 != requestSHA256 {
-		pccReceiptFailState(receipts.state, "observer_pcc_request_conflict")
-		return PCCPublicationReceipt{}, false, ErrPCCReceiptConflict
+		fenceErr := persistMandatoryPCCFence(
+			receipts.state,
+			"observer_pcc_request_conflict",
+		)
+		if errors.Is(fenceErr, ErrPCCPublicationUnavailable) {
+			return PCCPublicationReceipt{}, false, fenceErr
+		}
+		return PCCPublicationReceipt{}, false, errors.Join(
+			ErrPCCReceiptConflict,
+			fenceErr,
+		)
 	}
 	owned, err := clonePCCPublicationReceipt(receipt)
 	if err != nil {
@@ -827,7 +870,9 @@ func (spool *Spool) requirePCCReceiptLocked(item SpoolItem) error {
 		return ErrPCCReceiptCorrupt
 	}
 	if err := spool.pccReceipts.requireItemLocked(item); err != nil {
-		_ = spool.state.PersistReadOnly("observer_pcc_receipt_missing")
+		if !spool.state.Snapshot().MutationReadOnly {
+			_ = spool.state.PersistReadOnly("observer_pcc_receipt_missing")
+		}
 		return err
 	}
 	return nil

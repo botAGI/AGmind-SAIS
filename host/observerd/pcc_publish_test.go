@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -154,6 +157,117 @@ func TestPCCPublishReceiptMetadataConflictPrecedesHardFence(t *testing.T) {
 		durable.PCCReceiptBytes != before.PCCReceiptBytes ||
 		durable.PCCReceiptHeadHash != before.PCCReceiptHeadHash {
 		t.Fatalf("metadata conflict durable state=%+v", durable)
+	}
+}
+
+func TestPCCPublishRequestConflictRetriesMandatoryFencePersistence(t *testing.T) {
+	fixture := newPCCFailedPublishFixture(t)
+	first, err := fixture.service.PublishPCCCorrelationSnapshot(
+		context.Background(),
+		fixture.request,
+	)
+	if err != nil || !first.Created {
+		t.Fatalf("initial PCC publication=%+v err=%v", first, err)
+	}
+	before := fixture.state.Snapshot()
+	conflict := fixture.request
+	conflict.TriggerContentSHA256 = strings.Repeat("9", 64)
+	conflictHash, err := contracts.PCCCorrelationRequestSHA256(conflict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHash, err := contracts.PCCCorrelationRequestSHA256(fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conflictHash == originalHash {
+		t.Fatal("request conflict fixture reused the original request hash")
+	}
+
+	fenceErr := errors.New("injected first PCC request-conflict fence persistence failure")
+	persist := fixture.state.persist
+	fenceAttempts := 0
+	fixture.state.persist = func(path string, next ObserverState) error {
+		if next.MutationReadOnly &&
+			next.ReadOnlyReason == "observer_pcc_request_conflict" {
+			fenceAttempts++
+			if fenceAttempts == 1 {
+				return fenceErr
+			}
+		}
+		return persist(path, next)
+	}
+
+	publication, err := fixture.service.PublishPCCCorrelationSnapshot(
+		context.Background(),
+		conflict,
+	)
+	if !errors.Is(err, ErrPCCPublicationConflict) ||
+		!errors.Is(err, fenceErr) {
+		t.Errorf(
+			"request conflict error=%v want conflict and first fence persistence errors",
+			err,
+		)
+	}
+	if !reflect.DeepEqual(publication, PCCCorrelationPublication{}) {
+		t.Errorf("request conflict exposed publication=%+v", publication)
+	}
+	if fenceAttempts != 2 {
+		t.Errorf("request conflict fence persistence attempts=%d want=2", fenceAttempts)
+	}
+	fixture.state.persist = persist
+	requestRaw, err := contracts.CanonicalJSON(conflict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	pccCorrelationHandler(fixture.service).ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodPost,
+			"http://unix/v1/events/pcc-correlation-snapshot",
+			bytes.NewReader(requestRaw),
+		),
+	)
+	if response.Code != http.StatusConflict ||
+		response.Body.String() != "{\"error\":\"pcc_request_conflict\"}\n" {
+		t.Errorf(
+			"recovered conflict status=%d body=%q",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	live := fixture.state.Snapshot()
+	if !live.MutationReadOnly ||
+		live.ReadOnlyReason != "observer_pcc_request_conflict" ||
+		live.LastSequence != before.LastSequence ||
+		live.PCCReceiptCount != before.PCCReceiptCount ||
+		live.PCCReceiptBytes != before.PCCReceiptBytes ||
+		live.PCCReceiptHeadHash != before.PCCReceiptHeadHash {
+		t.Errorf("live request conflict state changed: before=%+v after=%+v", before, live)
+	}
+
+	if err := fixture.spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStateStore(
+		fixture.state.path,
+		StateIdentity{
+			HostID: live.HostID, BootID: live.BootID,
+			KeyID: live.KeyID, KeyEpoch: live.KeyEpoch,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable := reopened.Snapshot()
+	if !durable.MutationReadOnly ||
+		durable.ReadOnlyReason != "observer_pcc_request_conflict" ||
+		durable.LastSequence != before.LastSequence ||
+		durable.PCCReceiptCount != before.PCCReceiptCount ||
+		durable.PCCReceiptBytes != before.PCCReceiptBytes ||
+		durable.PCCReceiptHeadHash != before.PCCReceiptHeadHash {
+		t.Errorf("durable request conflict state changed: before=%+v after=%+v", before, durable)
 	}
 }
 
@@ -459,6 +573,13 @@ func TestPCCPublishCompleteBindsOneGenerationPinsTimestampAndCoverage(
 	if receipt != wantReceipt {
 		t.Fatalf("receipt=%+v want=%+v", receipt, wantReceipt)
 	}
+	fetched, err := spool.Fetch(before.LastSequence, 1, 4*1024*1024)
+	if err != nil || len(fetched) != 1 ||
+		fetched[0].Sequence != first.Item.Sequence ||
+		fetched[0].EventID != first.Item.EventID ||
+		fetched[0].ContentSHA256 != first.Item.ContentSHA256 {
+		t.Fatalf("valid PCC fetch items=%d err=%v", len(fetched), err)
+	}
 	afterFirst := state.Snapshot()
 	if afterFirst.PCCReceiptCount != before.PCCReceiptCount+1 {
 		t.Fatalf("receipt count=%d want=%d", afterFirst.PCCReceiptCount, before.PCCReceiptCount+1)
@@ -489,6 +610,156 @@ func TestPCCPublishCompleteBindsOneGenerationPinsTimestampAndCoverage(
 	if afterRetry.LastSequence != afterFirst.LastSequence ||
 		afterRetry.PCCReceiptCount != afterFirst.PCCReceiptCount {
 		t.Fatalf("retry changed state: before=%+v after=%+v", afterFirst, afterRetry)
+	}
+}
+
+func TestPCCPublishAuthenticatesEntireCoveragePrefixBeforePublication(
+	t *testing.T,
+) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, SpoolItem, SpoolItem)
+	}{
+		{
+			name: "deleted frame",
+			mutate: func(t *testing.T, target SpoolItem, _ SpoolItem) {
+				t.Helper()
+				if err := os.Remove(target.path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "truncated frame",
+			mutate: func(t *testing.T, target SpoolItem, _ SpoolItem) {
+				t.Helper()
+				if err := os.WriteFile(target.path, []byte{0}, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "substituted valid frame",
+			mutate: func(t *testing.T, target SpoolItem, substitute SpoolItem) {
+				t.Helper()
+				raw, err := os.ReadFile(substitute.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target.path, raw, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newPCCFailedPublishFixture(t)
+			before := fixture.state.Snapshot()
+
+			var target SpoolItem
+			for sequence := before.AckSequence + 1; sequence < fixture.request.TriggerSourceSequence; sequence++ {
+				item, found := fixture.spool.items[sequence]
+				if found {
+					target = item
+					break
+				}
+			}
+			if target.Sequence == 0 {
+				t.Fatal("fixture has no earlier non-trigger coverage frame")
+			}
+			substitute := fixture.spool.items[fixture.request.TriggerSourceSequence]
+			if substitute.Sequence == 0 || substitute.Sequence == target.Sequence {
+				t.Fatal("fixture has no distinct valid substitute frame")
+			}
+			if _, err := os.Lstat(target.publicationPath); err != nil {
+				t.Fatalf("coverage sidecar is not present before frame mutation: %v", err)
+			}
+
+			fixture.spool.mutex.Lock()
+			beforeTotalBytes := fixture.spool.totalBytes
+			beforeItemCount := len(fixture.spool.items)
+			fixture.spool.pccReceipts.mutex.Lock()
+			beforeReceiptAnchor := fixture.spool.pccReceipts.anchor
+			beforeReceiptCount := len(fixture.spool.pccReceipts.receipts)
+			fixture.spool.pccReceipts.mutex.Unlock()
+			fixture.spool.mutex.Unlock()
+
+			test.mutate(t, target, substitute)
+			if _, found := fixture.spool.items[target.Sequence]; !found {
+				t.Fatal("frame mutation unexpectedly removed the in-memory coverage item")
+			}
+			if _, err := os.Lstat(target.publicationPath); err != nil {
+				t.Fatalf("frame mutation unexpectedly removed the coverage sidecar: %v", err)
+			}
+
+			publication, err := fixture.service.PublishPCCCorrelationSnapshot(
+				context.Background(),
+				fixture.request,
+			)
+			if !errors.Is(err, ErrPCCPublicationUnavailable) {
+				t.Errorf("unauthenticated coverage prefix error=%v want ErrPCCPublicationUnavailable", err)
+			}
+			if !reflect.DeepEqual(publication, PCCCorrelationPublication{}) {
+				t.Errorf(
+					"unauthenticated coverage prefix exposed publication created=%t sequence=%d event_id=%q",
+					publication.Created,
+					publication.Item.Sequence,
+					publication.Item.EventID,
+				)
+			}
+
+			after := fixture.state.Snapshot()
+			if after.LastSequence != before.LastSequence ||
+				after.PublicationHeadSequence != before.PublicationHeadSequence ||
+				after.PublicationHeadHash != before.PublicationHeadHash ||
+				after.PCCReceiptCount != before.PCCReceiptCount ||
+				after.PCCReceiptBytes != before.PCCReceiptBytes ||
+				after.PCCReceiptHeadHash != before.PCCReceiptHeadHash ||
+				!after.MutationReadOnly ||
+				after.ReadOnlyReason != "observer_pcc_coverage_corrupt" {
+				t.Errorf(
+					"unauthenticated coverage prefix state: sequence=%d/%d publication_head=%d/%d receipt_count=%d/%d receipt_bytes=%d/%d read_only=%t reason=%q",
+					before.LastSequence,
+					after.LastSequence,
+					before.PublicationHeadSequence,
+					after.PublicationHeadSequence,
+					before.PCCReceiptCount,
+					after.PCCReceiptCount,
+					before.PCCReceiptBytes,
+					after.PCCReceiptBytes,
+					after.MutationReadOnly,
+					after.ReadOnlyReason,
+				)
+			}
+			fixture.spool.mutex.Lock()
+			afterTotalBytes := fixture.spool.totalBytes
+			afterItemCount := len(fixture.spool.items)
+			fixture.spool.pccReceipts.mutex.Lock()
+			afterReceiptAnchor := fixture.spool.pccReceipts.anchor
+			afterReceiptCount := len(fixture.spool.pccReceipts.receipts)
+			_, receiptFound := fixture.spool.pccReceipts.receipts["pcc_correlation_snapshot:"+fixture.request.TriggerEventID]
+			fixture.spool.pccReceipts.mutex.Unlock()
+			fixture.spool.mutex.Unlock()
+			if afterTotalBytes != beforeTotalBytes ||
+				afterItemCount != beforeItemCount ||
+				afterReceiptAnchor != beforeReceiptAnchor ||
+				afterReceiptCount != beforeReceiptCount || receiptFound {
+				t.Errorf(
+					"unauthenticated coverage prefix mutated spool/receipt surface: bytes=%d/%d items=%d/%d receipt_anchor=%+v/%+v receipt_count=%d/%d receipt_found=%t",
+					beforeTotalBytes,
+					afterTotalBytes,
+					beforeItemCount,
+					afterItemCount,
+					beforeReceiptAnchor,
+					afterReceiptAnchor,
+					beforeReceiptCount,
+					afterReceiptCount,
+					receiptFound,
+				)
+			}
+		})
 	}
 }
 
@@ -881,7 +1152,9 @@ func TestPCCPublishEmitsExactLocallyProducibleFailedUnions(t *testing.T) {
 		}
 		after := fixture.state.Snapshot()
 		if after.LastSequence != reserved.LastSequence ||
-			after.PCCReceiptCount != reserved.PCCReceiptCount {
+			after.PCCReceiptCount != reserved.PCCReceiptCount ||
+			after.MutationReadOnly != reserved.MutationReadOnly ||
+			after.ReadOnlyReason != reserved.ReadOnlyReason {
 			t.Fatalf("source gap changed state: reserved=%+v after=%+v", reserved, after)
 		}
 	})

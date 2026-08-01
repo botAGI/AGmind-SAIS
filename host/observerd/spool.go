@@ -2246,23 +2246,36 @@ func (spool *Spool) publishPCCLocked(
 	}
 	item, err := spool.appendLocked(event, PriorityTier, nil, nil)
 	if err != nil {
-		if !spool.state.Snapshot().MutationReadOnly {
-			_ = spool.state.PersistReadOnly("observer_pcc_publication_failed")
-		}
-		return SpoolItem{}, err
+		return SpoolItem{}, errors.Join(
+			err,
+			persistCurrentMandatoryPCCFence(
+				spool.state,
+				"observer_pcc_publication_failed",
+			),
+		)
 	}
 	if err := spool.appendPCCReceiptLocked(receipt); err != nil {
-		if !spool.state.Snapshot().MutationReadOnly {
-			_ = spool.state.PersistReadOnly("observer_pcc_receipt_commit_failed")
-		}
-		return SpoolItem{}, err
+		return SpoolItem{}, errors.Join(
+			err,
+			persistCurrentMandatoryPCCFence(
+				spool.state,
+				"observer_pcc_receipt_commit_failed",
+			),
+		)
 	}
 	bound, err := spool.pccReceipts.rebindLocked(receipt)
 	if err != nil || bound.Sequence != item.Sequence ||
 		bound.EventID != item.EventID ||
 		bound.ContentSHA256 != item.ContentSHA256 {
-		_ = spool.state.PersistReadOnly("observer_pcc_publication_binding_invalid")
-		return SpoolItem{}, errors.Join(ErrPCCReceiptCorrupt, err)
+		fenceErr := persistCurrentMandatoryPCCFence(
+			spool.state,
+			"observer_pcc_publication_binding_invalid",
+		)
+		return SpoolItem{}, errors.Join(
+			ErrPCCReceiptCorrupt,
+			err,
+			fenceErr,
+		)
 	}
 	return cloneSpoolItem(item), nil
 }
@@ -2658,6 +2671,14 @@ func (spool *Spool) appendLocked(
 		}
 	}
 	if err := spool.preparePublication(preparedPath, publicationRaw); err != nil {
+		if event.EventType == "pcc_correlation_snapshot" {
+			return SpoolItem{}, errors.Join(
+				err,
+				spool.state.PersistReadOnly(
+					"observer_spool_publication_prepare_failed",
+				),
+			)
+		}
 		_ = spool.state.PersistReadOnly("observer_spool_publication_prepare_failed")
 		return SpoolItem{}, err
 	}
@@ -2802,10 +2823,15 @@ func (spool *Spool) Fetch(
 			_ = spool.state.PersistReadOnly("observer_spool_publication_fetch_corrupt")
 			return nil, ErrSpoolCorrupt
 		}
+		item.Canonical = canonical
+		if event.EventType == "pcc_correlation_snapshot" {
+			if err := spool.requirePCCReceiptLocked(item); err != nil {
+				return nil, err
+			}
+		}
 		if used+uint64(len(canonical)) > maxBytes {
 			break
 		}
-		item.Canonical = canonical
 		result = append(result, cloneSpoolItem(item))
 		used += uint64(len(canonical))
 	}

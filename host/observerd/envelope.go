@@ -1935,6 +1935,9 @@ func (signer *EnvelopeSigner) Wrap(
 	if coreControlEventType(eventType) {
 		return contracts.EventEnvelopeV1{}, ErrCoreControlReceiptRequired
 	}
+	if eventType == "pcc_correlation_snapshot" {
+		return contracts.EventEnvelopeV1{}, ErrPCCReceiptRequired
+	}
 	return signer.wrap(
 		ctx,
 		noBootBoundaryPublication,
