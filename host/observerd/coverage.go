@@ -41,6 +41,10 @@ func (signer *EnvelopeSigner) recordRoutineDrop() error {
 	if !emit {
 		return nil
 	}
+	return signer.emitRoutineDropCoverage()
+}
+
+func (signer *EnvelopeSigner) emitRoutineDropCoverage() error {
 	now := signer.config.Now().UTC()
 	fields := map[string]any{
 		"component":     "observer",

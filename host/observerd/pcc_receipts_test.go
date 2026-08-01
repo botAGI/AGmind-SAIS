@@ -131,30 +131,55 @@ func pccReceiptSnapshotFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	normalizedDigest := sha256.Sum256(normalized)
-	snapshot, err := signer.Wrap(
-		context.Background(),
-		"pcc_correlation_snapshot",
-		fields,
-		EventMetadata{
-			EventTime:         time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
-			RedactionFlags:    []string{},
-			CoverageFlags:     []string{},
-			SourcePayloadHash: hex.EncodeToString(normalizedDigest[:]),
-		},
+	proof, err := contracts.DecodeStrict[contracts.PCCCorrelationSnapshotV1](
+		bytes.NewReader(normalized),
+		65_536,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	item := spool.items[snapshot.SourceSequence]
-	return item, PCCPublicationReceipt{
+	state := spool.state
+	state.publicationMutex.Lock()
+	defer state.publicationMutex.Unlock()
+	spool.mutex.Lock()
+	defer spool.mutex.Unlock()
+	stateSnapshot := state.Snapshot()
+	sequence := stateSnapshot.LastSequence + 1
+	event, err := signPCCSnapshotAt(
+		signer,
+		stateSnapshot,
+		sequence,
+		time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+		proof,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventCanonical, err := contracts.CanonicalJSON(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentDigest := sha256.Sum256(eventCanonical)
+	receipt := PCCPublicationReceipt{
 		OperationKey: "pcc_correlation_snapshot:" +
 			triggerItem.EventID,
 		RequestSHA256:            requestSHA256,
-		SnapshotNormalizedSHA256: snapshot.NormalizedFieldsSHA256,
-		SnapshotEventID:          item.EventID,
-		SnapshotContentSHA256:    item.ContentSHA256,
+		SnapshotNormalizedSHA256: event.NormalizedFieldsSHA256,
+		SnapshotEventID:          event.EventID,
+		SnapshotContentSHA256:    hex.EncodeToString(contentDigest[:]),
 	}
+	identity := StateIdentity{
+		HostID: stateSnapshot.HostID, BootID: stateSnapshot.BootID,
+		KeyID: stateSnapshot.KeyID, KeyEpoch: stateSnapshot.KeyEpoch,
+	}
+	if _, err := state.reserveExpected(identity, sequence); err != nil {
+		t.Fatal(err)
+	}
+	item, err := spool.appendLocked(event, PriorityTier, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item, receipt
 }
 
 func pccReceiptKeys(

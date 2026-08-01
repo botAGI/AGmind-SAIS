@@ -2198,11 +2198,16 @@ func (signer *EnvelopeSigner) wrap(
 				// contract violation.
 				return contracts.EventEnvelopeV1{}, err
 			}
+			emit, dropErr := signer.state.incrementRoutineDrop()
 			locked = false
 			signer.state.publicationMutex.Unlock()
+			var emitErr error
+			if dropErr == nil && emit {
+				emitErr = signer.emitRoutineDropCoverage()
+			}
 			return contracts.EventEnvelopeV1{}, routineQuotaError(
 				err,
-				signer.recordRoutineDrop(),
+				errors.Join(dropErr, emitErr),
 			)
 		}
 		return contracts.EventEnvelopeV1{}, err

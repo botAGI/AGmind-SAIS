@@ -104,6 +104,81 @@ func TestPCCSafetyPinSnapshotReadsEveryFixedPathOnce(t *testing.T) {
 	}
 }
 
+func TestPCCSafetyPinSnapshotAggregatesIndependentFailures(t *testing.T) {
+	wantCalls := []string{
+		pccDetectorRulesPath,
+		pccSpecialUseRegistryPath,
+		pccOperatorDenylistPath,
+		pccManagementDestinationsPath,
+	}
+	wantSentinels := []error{
+		ErrPCCDetectorBundleUnavailable,
+		ErrPCCSpecialUseRegistryUnavailable,
+		ErrPCCOperatorDenylistUnavailable,
+		ErrPCCManagementDenylistUnavailable,
+	}
+	assertFailure := func(
+		t *testing.T,
+		calls []string,
+		got PCCSafetyPinSnapshot,
+		err error,
+		underlying ...error,
+	) {
+		t.Helper()
+		if !reflect.DeepEqual(calls, wantCalls) {
+			t.Fatalf("fixed path reads:\n got %q\nwant %q", calls, wantCalls)
+		}
+		if !reflect.DeepEqual(got, PCCSafetyPinSnapshot{}) {
+			t.Fatalf("partial snapshot escaped: %#v", got)
+		}
+		for _, target := range append(wantSentinels, underlying...) {
+			if !errors.Is(err, target) {
+				t.Fatalf("joined error %v does not expose %v", err, target)
+			}
+		}
+	}
+
+	t.Run("all four reads fail independently", func(t *testing.T) {
+		failures := map[string]error{
+			pccDetectorRulesPath:          errors.New("detector read failed"),
+			pccSpecialUseRegistryPath:     errors.New("registry read failed"),
+			pccOperatorDenylistPath:       errors.New("operator read failed"),
+			pccManagementDestinationsPath: errors.New("management read failed"),
+		}
+		var calls []string
+		got, err := loadPCCSafetyPinSnapshot(
+			func(path string, _ int64) ([]byte, error) {
+				calls = append(calls, path)
+				return nil, failures[path]
+			},
+			0,
+		)
+		assertFailure(t, calls, got, err,
+			failures[pccDetectorRulesPath],
+			failures[pccSpecialUseRegistryPath],
+			failures[pccOperatorDenylistPath],
+			failures[pccManagementDestinationsPath],
+		)
+	})
+
+	t.Run("mixed validation failures do not short circuit", func(t *testing.T) {
+		inputs := pccTestValidInputs(t)
+		inputs[pccDetectorRulesPath] = []byte{}
+		inputs[pccSpecialUseRegistryPath] = append(
+			bytes.Clone(inputs[pccSpecialUseRegistryPath]),
+			'\n',
+		)
+		inputs[pccOperatorDenylistPath] = []byte(`{`)
+		inputs[pccManagementDestinationsPath] = []byte(`{}`)
+		var calls []string
+		got, err := loadPCCSafetyPinSnapshot(
+			pccTestReader(inputs, &calls),
+			0,
+		)
+		assertFailure(t, calls, got, err)
+	})
+}
+
 func TestPCCSafetyPinSnapshotRejectsUnsafeOrMalformedInput(t *testing.T) {
 	type protectedPathCase struct {
 		name    string

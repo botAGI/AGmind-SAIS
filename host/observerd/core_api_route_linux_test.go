@@ -46,6 +46,7 @@ func TestCoreAPIRouteGroupOnlyChild(t *testing.T) {
 	}
 	for _, route := range []string{
 		"/v1/events/ack",
+		"/v1/events/pcc-correlation-snapshot",
 		"/v1/events/evidence-repair-authorize",
 		"/v1/events/evidence-repair-complete",
 		"/v1/events/retention-tombstone",

@@ -91,6 +91,8 @@ type Spool struct {
 	removePublication   func(string, durablefile.FileIdentity) error
 	syncDirectory       func(string) error
 	publish             func(string, []byte) error
+	preparePublication  func(string, []byte) error
+	promotePublication  func(string, string) error
 	beforeRemove        func(SpoolItem)
 }
 
@@ -1700,6 +1702,10 @@ func NewSpool(
 		publish: func(path string, payload []byte) error {
 			return durablefile.CreateOnly(path, payload)
 		},
+		preparePublication: func(path string, payload []byte) error {
+			return durablefile.CreateOnly(path, payload)
+		},
+		promotePublication: durablefile.PromoteNoReplace,
 	}
 	pccReceipts.spool = spool
 	if err := spool.cleanupAckedLocked(state.Snapshot().AckSequence); err != nil {
@@ -1864,6 +1870,9 @@ func (spool *Spool) Append(
 	event contracts.EventEnvelopeV1,
 	tier Tier,
 ) (SpoolItem, error) {
+	if event.EventType == "pcc_correlation_snapshot" {
+		return SpoolItem{}, ErrPCCReceiptRequired
+	}
 	return spool.append(event, tier, nil, nil)
 }
 
@@ -2125,6 +2134,137 @@ func (spool *Spool) publishControl(
 		return SpoolItem{}, err
 	}
 	return spool.appendLocked(event, PriorityTier, nil, &control)
+}
+
+func (spool *Spool) preflightPCCLocked(
+	event contracts.EventEnvelopeV1,
+	receipt PCCPublicationReceipt,
+) error {
+	if spool == nil || spool.closed || spool.pccReceipts == nil ||
+		spool.pccReceipts.spool != spool ||
+		event.EventType != "pcc_correlation_snapshot" ||
+		tierForEvent(event) != PriorityTier {
+		return ErrPCCReceiptRequired
+	}
+	snapshot := spool.state.Snapshot()
+	if snapshot.MutationReadOnly ||
+		snapshot.SequenceGapProtocol != sequenceGapProtocolC8 ||
+		snapshot.BootBoundaryState != bootBoundaryCommitted ||
+		snapshot.LastSequence == math.MaxUint64 ||
+		event.SourceSequence != snapshot.LastSequence+1 ||
+		event.HostID != snapshot.HostID || event.BootID != snapshot.BootID ||
+		event.KeyID != snapshot.KeyID || event.KeyEpoch != snapshot.KeyEpoch {
+		return ErrPCCPublicationUnavailable
+	}
+	canonical, err := contracts.CanonicalJSON(event)
+	if err != nil {
+		return err
+	}
+	validated, contentHash, err := validateSpoolPayload(canonical, spool.keys)
+	if err != nil || validated.SourceSequence != event.SourceSequence {
+		return errors.Join(ErrSpoolCorrupt, err)
+	}
+	frame, _, err := durablefile.EncodeFrame(canonical, [32]byte{}, 65_536)
+	if err != nil {
+		return err
+	}
+	publication := publicationFor(
+		validated,
+		PriorityTier,
+		contentHash,
+		snapshot.PublicationHeadHash,
+	)
+	publicationRaw, _, err := publicationNodeHash(publication)
+	if err != nil {
+		return err
+	}
+	prospective := SpoolItem{
+		Sequence:      validated.SourceSequence,
+		EventID:       validated.EventID,
+		ContentSHA256: contentHash,
+		Tier:          PriorityTier,
+		Canonical:     canonical,
+	}
+	receiptBytes, err := spool.pccReceipts.previewBoundLocked(
+		receipt,
+		prospective,
+	)
+	if err != nil {
+		return err
+	}
+	frameBytes := uint64(len(frame))
+	publicationBytes := uint64(len(publicationRaw))
+	if frameBytes > math.MaxUint64-publicationBytes {
+		return ErrPriorityQuota
+	}
+	itemBytes := frameBytes + publicationBytes
+	if spool.totalBytes > spool.config.MaxBytes ||
+		itemBytes > math.MaxUint64-spool.totalBytes ||
+		receiptBytes > math.MaxUint64-spool.totalBytes-itemBytes ||
+		spool.config.MaxBytes <= ackJournalMaxFrameBytes ||
+		spool.totalBytes+itemBytes+receiptBytes >
+			spool.config.MaxBytes-ackJournalMaxFrameBytes {
+		return ErrPriorityQuota
+	}
+	if _, found := spool.items[event.SourceSequence]; found {
+		return ErrSpoolCorrupt
+	}
+	paths := []string{
+		filepath.Join(
+			spool.directory(PriorityTier),
+			fmt.Sprintf("%020d.agf", event.SourceSequence),
+		),
+		publicationPreparedPath(spool.config.StateDir, event.SourceSequence),
+		publicationPublishedPath(spool.config.StateDir, event.SourceSequence),
+	}
+	for _, path := range paths {
+		if _, err := os.Lstat(path); err == nil {
+			return ErrSpoolCorrupt
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// publishPCCLocked atomically exposes success only after the exact protected
+// frame, publication binding, specialized receipt, and both state anchors are
+// durable. Its caller owns publicationMutex and spool.mutex in that order.
+func (spool *Spool) publishPCCLocked(
+	event contracts.EventEnvelopeV1,
+	receipt PCCPublicationReceipt,
+	reserve func() error,
+) (SpoolItem, error) {
+	if reserve == nil {
+		return SpoolItem{}, fmt.Errorf("nil PCC sequence reservation")
+	}
+	if err := spool.preflightPCCLocked(event, receipt); err != nil {
+		return SpoolItem{}, err
+	}
+	if err := reserve(); err != nil {
+		return SpoolItem{}, err
+	}
+	item, err := spool.appendLocked(event, PriorityTier, nil, nil)
+	if err != nil {
+		if !spool.state.Snapshot().MutationReadOnly {
+			_ = spool.state.PersistReadOnly("observer_pcc_publication_failed")
+		}
+		return SpoolItem{}, err
+	}
+	if err := spool.appendPCCReceiptLocked(receipt); err != nil {
+		if !spool.state.Snapshot().MutationReadOnly {
+			_ = spool.state.PersistReadOnly("observer_pcc_receipt_commit_failed")
+		}
+		return SpoolItem{}, err
+	}
+	bound, err := spool.pccReceipts.rebindLocked(receipt)
+	if err != nil || bound.Sequence != item.Sequence ||
+		bound.EventID != item.EventID ||
+		bound.ContentSHA256 != item.ContentSHA256 {
+		_ = spool.state.PersistReadOnly("observer_pcc_publication_binding_invalid")
+		return SpoolItem{}, errors.Join(ErrPCCReceiptCorrupt, err)
+	}
+	return cloneSpoolItem(item), nil
 }
 
 func (spool *Spool) appendRotationEpochStart(
@@ -2429,12 +2569,12 @@ func (spool *Spool) appendLocked(
 			record, raw, publicationIdentity, publicationErr =
 				readPublication(preparedPath)
 			if publicationErr == nil {
-				promoteErr := durablefile.PromoteNoReplace(
+				promoteErr := spool.promotePublication(
 					preparedPath,
 					publishedPath,
 				)
 				if errors.Is(promoteErr, durablefile.ErrCommitUncertain) {
-					promoteErr = durablefile.SyncDirectory(
+					promoteErr = spool.syncDirectory(
 						publicationDirectory(spool.config.StateDir),
 					)
 				}
@@ -2517,7 +2657,7 @@ func (spool *Spool) appendLocked(
 			return SpoolItem{}, ErrSpoolCorrupt
 		}
 	}
-	if err := durablefile.CreateOnly(preparedPath, publicationRaw); err != nil {
+	if err := spool.preparePublication(preparedPath, publicationRaw); err != nil {
 		_ = spool.state.PersistReadOnly("observer_spool_publication_prepare_failed")
 		return SpoolItem{}, err
 	}
@@ -2537,7 +2677,7 @@ func (spool *Spool) appendLocked(
 	}
 	if err := spool.publish(path, frame); err != nil {
 		if errors.Is(err, durablefile.ErrCommitUncertain) {
-			if syncErr := durablefile.SyncDirectory(spool.directory(tier)); syncErr == nil {
+			if syncErr := spool.syncDirectory(spool.directory(tier)); syncErr == nil {
 				err = nil
 			}
 		}
@@ -2557,9 +2697,9 @@ func (spool *Spool) appendLocked(
 		_ = spool.state.PersistReadOnly("observer_spool_write_uncertain")
 		return SpoolItem{}, ErrSpoolCorrupt
 	}
-	promoteErr := durablefile.PromoteNoReplace(preparedPath, publishedPath)
+	promoteErr := spool.promotePublication(preparedPath, publishedPath)
 	if errors.Is(promoteErr, durablefile.ErrCommitUncertain) {
-		promoteErr = durablefile.SyncDirectory(
+		promoteErr = spool.syncDirectory(
 			publicationDirectory(spool.config.StateDir),
 		)
 	}

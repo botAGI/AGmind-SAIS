@@ -94,6 +94,7 @@ func pccReceiptJournalPath(stateDirectory string) string {
 type PCCReceiptStore struct {
 	mutex    sync.Mutex
 	journal  *durablefile.Journal
+	options  []durablefile.Option
 	state    *StateStore
 	spool    *Spool
 	anchor   PCCReceiptAnchor
@@ -137,6 +138,7 @@ func openPCCReceiptStore(
 		return nil, pccReceiptCorrupt(err)
 	}
 	stateAnchor := pccReceiptAnchorFromState(state.Snapshot())
+	retainedOptions := append([]durablefile.Option(nil), options...)
 	if stateAnchor.validate() != nil {
 		pccReceiptFailState(state, "observer_pcc_receipt_corrupt")
 		return nil, ErrPCCReceiptCorrupt
@@ -155,6 +157,7 @@ func openPCCReceiptStore(
 		// re-verifies the fixed journal before writing.
 		return &PCCReceiptStore{
 			state:    state,
+			options:  retainedOptions,
 			anchor:   stateAnchor,
 			receipts: make(map[string]PCCPublicationReceipt),
 		}, nil
@@ -171,7 +174,7 @@ func openPCCReceiptStore(
 		},
 		append(
 			[]durablefile.Option{durablefile.WithMaxFrame(pccReceiptMaxFrame)},
-			options...,
+			retainedOptions...,
 		)...,
 	)
 	if err != nil {
@@ -232,6 +235,7 @@ func openPCCReceiptStore(
 	}
 	return &PCCReceiptStore{
 		journal:  journal,
+		options:  retainedOptions,
 		state:    state,
 		anchor:   anchor,
 		receipts: receipts,
@@ -249,7 +253,10 @@ func (receipts *PCCReceiptStore) ensureJournalLocked() error {
 	journal, recovery, err := durablefile.NewJournalWithTailIntent(
 		pccReceiptJournalPath(filepath.Dir(receipts.state.path)),
 		func(durablefile.TornTailIntent) error { return ErrPCCReceiptCorrupt },
-		durablefile.WithMaxFrame(pccReceiptMaxFrame),
+		append(
+			[]durablefile.Option{durablefile.WithMaxFrame(pccReceiptMaxFrame)},
+			receipts.options...,
+		)...,
 	)
 	if err != nil {
 		receipts.failed = true
@@ -379,6 +386,111 @@ func (receipts *PCCReceiptStore) Lookup(
 		pccReceiptFailState(receipts.state, "observer_pcc_receipt_binding_invalid")
 	}
 	return receipt, found, err
+}
+
+// lookupMetadataLocked is for a caller that already owns publicationMutex and
+// spool.mutex. It deliberately examines only receipt metadata, allowing a
+// different request hash to fence before either the hard-fence check or live
+// spool rebind. It must never be called through the public self-locking path.
+func (receipts *PCCReceiptStore) lookupMetadataLocked(
+	operationKey string,
+	requestSHA256 string,
+) (PCCPublicationReceipt, bool, error) {
+	if receipts == nil || receipts.spool == nil ||
+		!strings.HasPrefix(operationKey, "pcc_correlation_snapshot:") ||
+		!eventPattern.MatchString(strings.TrimPrefix(
+			operationKey,
+			"pcc_correlation_snapshot:",
+		)) ||
+		!hex64Pattern.MatchString(requestSHA256) {
+		return PCCPublicationReceipt{}, false, ErrPCCReceiptCorrupt
+	}
+	receipts.mutex.Lock()
+	defer receipts.mutex.Unlock()
+	if receipts.closed || receipts.failed || receipts.spool == nil {
+		return PCCPublicationReceipt{}, false, ErrPCCReceiptCorrupt
+	}
+	receipt, found := receipts.receipts[operationKey]
+	if !found {
+		return PCCPublicationReceipt{}, false, nil
+	}
+	if receipt.RequestSHA256 != requestSHA256 {
+		pccReceiptFailState(receipts.state, "observer_pcc_request_conflict")
+		return PCCPublicationReceipt{}, false, ErrPCCReceiptConflict
+	}
+	owned, err := clonePCCPublicationReceipt(receipt)
+	if err != nil {
+		return PCCPublicationReceipt{}, false, err
+	}
+	return owned, true, nil
+}
+
+// rebindLocked is the second half of producer retry lookup. Its caller already
+// owns publicationMutex and spool.mutex and has checked MutationReadOnly after
+// metadata conflict classification.
+func (receipts *PCCReceiptStore) rebindLocked(
+	receipt PCCPublicationReceipt,
+) (SpoolItem, error) {
+	if receipts == nil || receipts.spool == nil {
+		return SpoolItem{}, ErrPCCReceiptCorrupt
+	}
+	receipts.mutex.Lock()
+	defer receipts.mutex.Unlock()
+	if receipts.closed || receipts.failed {
+		return SpoolItem{}, ErrPCCReceiptCorrupt
+	}
+	stored, found := receipts.receipts[receipt.OperationKey]
+	if !found || stored != receipt {
+		return SpoolItem{}, ErrPCCReceiptCorrupt
+	}
+	item, err := receipts.spool.lookupUnacknowledgedEventLocked(
+		receipt.SnapshotEventID,
+		receipt.SnapshotContentSHA256,
+	)
+	if err != nil {
+		return SpoolItem{}, errors.Join(ErrPCCReceiptCorrupt, err)
+	}
+	if err := validatePCCReceiptBinding(receipt, item); err != nil {
+		return SpoolItem{}, errors.Join(ErrPCCReceiptCorrupt, err)
+	}
+	return cloneSpoolItem(item), nil
+}
+
+// previewBoundLocked validates the exact prospective snapshot binding and
+// returns the framed receipt bytes without creating or mutating any artifact.
+// Its caller already owns publicationMutex and spool.mutex.
+func (receipts *PCCReceiptStore) previewBoundLocked(
+	receipt PCCPublicationReceipt,
+	item SpoolItem,
+) (uint64, error) {
+	if receipts == nil || receipts.spool == nil {
+		return 0, ErrPCCReceiptCorrupt
+	}
+	receipts.mutex.Lock()
+	defer receipts.mutex.Unlock()
+	if receipts.closed || receipts.failed {
+		return 0, ErrPCCReceiptCorrupt
+	}
+	if existing, found := receipts.receipts[receipt.OperationKey]; found {
+		if existing.RequestSHA256 != receipt.RequestSHA256 {
+			return 0, ErrPCCReceiptConflict
+		}
+		return 0, ErrPCCReceiptCorrupt
+	}
+	if err := validatePCCReceiptBinding(receipt, item); err != nil {
+		return 0, err
+	}
+	for _, existing := range receipts.receipts {
+		if existing.SnapshotEventID == receipt.SnapshotEventID ||
+			existing.SnapshotContentSHA256 == receipt.SnapshotContentSHA256 {
+			return 0, ErrPCCReceiptCorrupt
+		}
+	}
+	_, meta, _, err := receipts.previewAppendLocked(receipt)
+	if err != nil {
+		return 0, err
+	}
+	return meta.Size, nil
 }
 
 func (receipts *PCCReceiptStore) lookupLocked(

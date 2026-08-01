@@ -26,13 +26,17 @@ import (
 var ErrDockerEventGap = errors.New("Docker event stream gap")
 
 type Service struct {
-	reconcileMutex sync.Mutex
-	eventMutex     sync.Mutex
-	daemon         *Daemon
-	inventory      *Inventory
-	docker         DockerReader
-	now            func() time.Time
-	eventSession   *dockerEventSession
+	reconcileMutex       sync.Mutex
+	eventMutex           sync.Mutex
+	daemon               *Daemon
+	inventory            *Inventory
+	docker               DockerReader
+	now                  func() time.Time
+	eventSession         *dockerEventSession
+	pccInventorySnapshot func(string) (CorrelationInventorySnapshot, error)
+	pccLoadPins          func() (PCCSafetyPinSnapshot, error)
+	pccBoundaryChain     func(string, string) ([]contracts.PCCBootTransitionHopV1, error)
+	pccNow               func() time.Time
 }
 
 type dockerEventSession struct {
@@ -193,12 +197,28 @@ func newObserverService(
 	docker DockerReader,
 	now func() time.Time,
 ) *Service {
-	return &Service{
+	service := &Service{
 		daemon:    daemon,
 		inventory: inventory,
 		docker:    docker,
 		now:       now,
+		pccNow:    now,
 	}
+	if inventory != nil {
+		service.pccInventorySnapshot = inventory.SnapshotForCorrelation
+	}
+	service.pccLoadPins = LoadPCCSafetyPinSnapshot
+	service.pccBoundaryChain = func(fromBootID, toBootID string) (
+		[]contracts.PCCBootTransitionHopV1,
+		error,
+	) {
+		if daemon == nil || daemon.spool == nil ||
+			daemon.spool.boundaryArchive == nil {
+			return nil, ErrPCCJournalCorrupt
+		}
+		return daemon.spool.boundaryArchive.Chain(fromBootID, toBootID)
+	}
+	return service
 }
 
 func falcoResolutionCoverage(err error) string {
@@ -460,7 +480,11 @@ func (service *Service) validateDockerReconcile(reason string) error {
 }
 
 func (service *Service) openDockerReconcileFences() error {
-	stateErr := service.daemon.state.requireDockerReconcile()
+	state := service.daemon.state
+	state.publicationMutex.Lock()
+	defer state.publicationMutex.Unlock()
+
+	stateErr := state.requireDockerReconcile()
 	inventoryErr := service.inventory.openReconcileGap()
 	return errors.Join(stateErr, inventoryErr)
 }

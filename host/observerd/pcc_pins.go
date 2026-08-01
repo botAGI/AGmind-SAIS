@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -20,6 +21,21 @@ const (
 
 	pccSafetyPinMaxBytes        = int64(65_536)
 	pccSpecialUseRegistrySHA256 = "e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73"
+)
+
+var (
+	ErrPCCDetectorBundleUnavailable = errors.New(
+		"PCC detector bundle unavailable",
+	)
+	ErrPCCSpecialUseRegistryUnavailable = errors.New(
+		"PCC special-use registry unavailable",
+	)
+	ErrPCCOperatorDenylistUnavailable = errors.New(
+		"PCC operator denylist unavailable",
+	)
+	ErrPCCManagementDenylistUnavailable = errors.New(
+		"PCC management denylist unavailable",
+	)
 )
 
 type PCCSafetyPinSnapshot struct {
@@ -98,41 +114,72 @@ func loadPCCSafetyPinSnapshot(
 	effectiveUID int,
 ) (PCCSafetyPinSnapshot, error) {
 	if effectiveUID != 0 {
-		return PCCSafetyPinSnapshot{}, fmt.Errorf(
-			"PCC safety pins require a root process",
+		return PCCSafetyPinSnapshot{}, errors.Join(
+			ErrPCCDetectorBundleUnavailable,
+			ErrPCCSpecialUseRegistryUnavailable,
+			ErrPCCOperatorDenylistUnavailable,
+			ErrPCCManagementDenylistUnavailable,
+			fmt.Errorf("PCC safety pins require a root process"),
 		)
 	}
+	var failures []error
+
 	detectorRaw, err := readPCCSafetyPin(read, pccDetectorRulesPath)
 	if err != nil {
-		return PCCSafetyPinSnapshot{}, err
+		failures = append(failures, errors.Join(
+			ErrPCCDetectorBundleUnavailable,
+			err,
+		))
 	}
-	detectorHash, err := contracts.PCCDetectorBundleSHA256(detectorRaw)
-	if err != nil {
-		return PCCSafetyPinSnapshot{}, err
+	var detectorHash string
+	if err == nil {
+		detectorHash, err = contracts.PCCDetectorBundleSHA256(detectorRaw)
+		if err != nil {
+			failures = append(failures, errors.Join(
+				ErrPCCDetectorBundleUnavailable,
+				err,
+			))
+		}
 	}
 
 	specialUseRaw, err := readPCCSafetyPin(read, pccSpecialUseRegistryPath)
 	if err != nil {
-		return PCCSafetyPinSnapshot{}, err
+		failures = append(failures, errors.Join(
+			ErrPCCSpecialUseRegistryUnavailable,
+			err,
+		))
 	}
-	specialUseSum := sha256.Sum256(specialUseRaw)
-	specialUseHash := hex.EncodeToString(specialUseSum[:])
-	if specialUseHash != pccSpecialUseRegistrySHA256 {
-		return PCCSafetyPinSnapshot{}, fmt.Errorf(
-			"PCC special-use registry pin mismatch",
-		)
+	var specialUseHash string
+	if err == nil {
+		specialUseSum := sha256.Sum256(specialUseRaw)
+		specialUseHash = hex.EncodeToString(specialUseSum[:])
+		if specialUseHash != pccSpecialUseRegistrySHA256 {
+			failures = append(failures, errors.Join(
+				ErrPCCSpecialUseRegistryUnavailable,
+				fmt.Errorf("PCC special-use registry pin mismatch"),
+			))
+		}
 	}
 
 	operator, err := readPCCDenylist(read, pccOperatorDenylistPath)
 	if err != nil {
-		return PCCSafetyPinSnapshot{}, err
+		failures = append(failures, errors.Join(
+			ErrPCCOperatorDenylistUnavailable,
+			err,
+		))
 	}
-	operatorHash, err := contracts.PCCOperatorDenylistSHA256(
-		operator.DeniedNetworks,
-		operator.DeniedAddresses,
-	)
-	if err != nil {
-		return PCCSafetyPinSnapshot{}, err
+	var operatorHash string
+	if err == nil {
+		operatorHash, err = contracts.PCCOperatorDenylistSHA256(
+			operator.DeniedNetworks,
+			operator.DeniedAddresses,
+		)
+		if err != nil {
+			failures = append(failures, errors.Join(
+				ErrPCCOperatorDenylistUnavailable,
+				err,
+			))
+		}
 	}
 
 	management, err := readPCCDenylist(
@@ -140,14 +187,27 @@ func loadPCCSafetyPinSnapshot(
 		pccManagementDestinationsPath,
 	)
 	if err != nil {
-		return PCCSafetyPinSnapshot{}, err
+		failures = append(failures, errors.Join(
+			ErrPCCManagementDenylistUnavailable,
+			err,
+		))
 	}
-	managementHash, err := contracts.PCCManagementDenylistSHA256(
-		management.DeniedNetworks,
-		management.DeniedAddresses,
-	)
-	if err != nil {
-		return PCCSafetyPinSnapshot{}, err
+	var managementHash string
+	if err == nil {
+		managementHash, err = contracts.PCCManagementDenylistSHA256(
+			management.DeniedNetworks,
+			management.DeniedAddresses,
+		)
+		if err != nil {
+			failures = append(failures, errors.Join(
+				ErrPCCManagementDenylistUnavailable,
+				err,
+			))
+		}
+	}
+
+	if len(failures) != 0 {
+		return PCCSafetyPinSnapshot{}, errors.Join(failures...)
 	}
 
 	return PCCSafetyPinSnapshot{

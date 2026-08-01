@@ -415,6 +415,12 @@ func newCoreAPI(
 		})(coreAckHandler(backend)),
 	)
 	mux.Handle(
+		"POST /v1/events/pcc-correlation-snapshot",
+		uds.RequirePeer(func(peer uds.Peer) bool {
+			return coreMutationPeerAuthorized(peer, coreUID)
+		})(pccCorrelationHandler(backend)),
+	)
+	mux.Handle(
 		"GET /v1/inventory/{full_id}",
 		authorize(coreInventoryHandler(backend)),
 	)
