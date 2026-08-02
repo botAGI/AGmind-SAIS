@@ -675,6 +675,12 @@ removed. The global projection snapshot may legitimately differ because the
 routine `events`, process, network, and direct-investigation rows were retired;
 the protected security facts above may not.
 
+That replay runs while retention is pending and therefore requires the exact
+retention-completion capability bound to the same evidence-store lifecycle and
+completed retained prefix. It is the only permitted pending-retention rebuild
+scope; ordinary correlation/history reads remain blocked. The reopened V2
+database is revalidated before the authority accepts its fresh rebuild epoch.
+
 ## Admission view boundary
 
 Projection exposes no `get_candidate()` method that returns action authority.
@@ -699,7 +705,8 @@ authority_snapshot_event_id
 projection cursor identity     host_id + sequence + event_id +
                                content_sha256 + frame_sha256
 exact terminal EvidenceRef fingerprint
-projection generation          increments on apply/rebuild/close
+restart-local rebuild epoch    increments on rebuild
+hidden authority revision      rotates on issue/apply/rebuild/close
 evidence lifecycle identity
 live readiness hash and cursors
 ```
@@ -710,8 +717,15 @@ its protected PCC/request/coverage bindings are reauthenticated before the view
 is issued. Task 7 must reacquire the controller lock and consume/revalidate the
 same view after the OPA response and before its decision journal commit. Any
 accepted-but-unprojected evidence makes live readiness false; any cursor or
-generation change, lifecycle change, new invalidation, row mismatch, unhealthy
+epoch/revision change, lifecycle change, new invalidation, row mismatch, unhealthy
 projection, rebuild, restart, or controller close invalidates the old view.
+
+The numeric rebuild epoch is not persisted projection data. After exact schema
+and authenticated-prefix verification, a fresh owner lifecycle starts at epoch
+1, including for an empty projection. Apply advances cursor and hidden revision;
+rebuild advances epoch and revision; close/restart changes lifecycle and
+revision. This keeps independent authenticated rebuild hashes byte-identical
+without creating rollbackable state outside the logical snapshot.
 
 The capability exists only for a currently valid candidate; it has no
 `valid=false` state. A separate frozen `CandidateStatusObservation` may report

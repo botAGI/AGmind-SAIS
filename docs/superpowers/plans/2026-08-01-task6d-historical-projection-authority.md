@@ -487,6 +487,9 @@ that demand:
 - candidate full-facts hash revalidation;
 - stable logical snapshot ordering for all four new tables;
 - schema/row/hash/index mismatch raises `ProjectionConflict`.
+- no durable projection-generation column, dynamic metadata value, or extra
+  state table: generation is a restart-local authority epoch, while identical
+  authenticated rebuilds retain identical logical snapshot hashes.
 
 Run and confirm RED:
 
@@ -510,6 +513,13 @@ Do not change active `schema.sql`, `_SCHEMA_PATH`, `_SCHEMA_META`,
 to create/open exact V1 until the complete V2 reducer and authenticated
 activation land together in Task 8. No fresh intermediate database may advance
 past a PCC snapshot without security rows.
+
+Projection generation is not persisted. A verified open starts a new local
+owner epoch at generation 1 (including an empty cursor), apply rotates the
+cursor/revision, rebuild rotates generation/revision, and close/restart rotates
+lifecycle/revision. Persisting the epoch would make byte-identical authenticated
+rebuilds history-dependent; omitting it from the snapshot would make it
+rollbackable unauthenticated state.
 
 Focused quality gate and commit:
 
@@ -701,6 +711,13 @@ Add the exact V1/new/V2 classification matrix and crash matrix:
 - failure before rename leaves V1 inode/bytes usable and unchanged;
 - uncertainty after rename latches unhealthy;
 - ACK/source change during build or reopen rejects activation;
+- retention replay while `retention_pending=true` succeeds only under the
+  exact retention-completion capability bound to the same store/lifecycle and
+  completed retained prefix; no general pending-retention bypass exists;
+- empty-to-empty and repeated authenticated rebuilds preserve identical
+  logical/security hashes while invalidating old local contexts by a fresh
+  rebuild generation; verified reopen may reset the numeric epoch to 1 because
+  old capabilities are invalidated by owner/lifecycle identity;
 - a protected historical PCC naming a detector hash unavailable from the fixed
   Core pin authority aborts V1 activation/rebuild with V1 untouched; it is not
   rewritten as a different rejection/candidate;
@@ -753,6 +770,13 @@ replaced without first passing V2 schema validation. Reuse checkpoint/fsync/
 replace/parent-fsync/reopen verification. Keep the old database untouched until
 the atomic replace. There is no intermediate active reducer version: a new/V1
 database becomes V2 only with PCC and invalidation reduction already enabled.
+
+The retention path must pass its exact completion capability into a narrow
+authority-rebuild scope that is valid only for that retained prefix while
+`retention_pending=true`. Revalidate the reopened V2 database before accepting
+the fresh generation. A pre-rename failure verifies the old database and
+rebases under another fresh generation; post-rename uncertainty closes the
+authority and latches projection unhealthy.
 
 Focused quality gate and commit:
 
@@ -820,10 +844,11 @@ Test:
 - accepted but unprojected late evidence blocks via live readiness before an
   invalidation row exists;
 - the capability binds full `ProjectionCursor`, terminal `EvidenceRef`,
-  projection generation, evidence/controller lifecycle, and live readiness;
+  restart-local rebuild generation plus hidden revision,
+  evidence/controller lifecycle, and live readiness;
 - copy/pickle/restart/rebuild/close/any cursor advance makes it unusable;
 - an `object.__setattr__` mutation matrix replacing candidate, candidate hash,
-  cursor, terminal ref, projection generation, readiness hash/cursors,
+  cursor, terminal ref, rebuild generation/revision, readiness hash/cursors,
   controller owner, or lifecycle makes consume/revalidate fail; cross-candidate
   and cross-controller reuse also fail;
 - non-authoritative `CandidateStatusObservation` can report invalidations but

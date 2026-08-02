@@ -126,3 +126,47 @@ resolutions for Task 6D. An entry is added only from observed command output.
 - Independent specification and code/security reviews found no
   Critical/Important defects. Both additionally confirmed non-root runtime
   execution (`uid=1000 gid=1000 sais`) and a clean worktree.
+
+### Task 4B — one-use projection correlation authority
+
+- Initial RED/GREEN progressed from `36 failed, 127 passed`, through review
+  regressions `5 failed, 163 passed` and the issuance-epoch RED
+  `1 failed, 168 passed`, to `169 passed`; commit `6f3633c`
+  (`feat(core): issue proof-bound correlation contexts`).
+- The first review fix round proved five lifecycle, ownership, detachment,
+  class-swap, and failed-path bypasses RED, then passed the six targeted tests
+  and the `175 passed` focused gate; commit `1286ca8`
+  (`fix(core): close correlation authority bypasses`).
+- A deterministic snapshot detach/restore race failed for both public
+  entrypoints, then passed four targeted cases and the `177 passed` gate;
+  commit `53829d4` (`fix(core): bind failed rejection to issued snapshot`).
+- Equality-laundered scalar authority failed for both public entrypoints, then
+  passed after exact-type PCC fingerprint and issued-registry validation;
+  commit `b24507b` (`fix(core): reject equality-laundered PCC facts`).
+- Final controller verification: exact correlation gate `179 passed in
+  6.48s`; Ruff and mypy passed; `git diff --check` and status were clean.
+  Native `make test-core-detector-pin-image` passed on Docker `29.4.0`
+  (`linux/arm64`) as non-root `sais` with no network and a read-only rootfs.
+- Independent final reviews found no remaining Critical/Important defect.
+  The authority has one exact store/lifecycle owner, one live context revision,
+  restart-local rebuild epochs, detached hidden proof facts, and candidate-free
+  failed-PCC handling.
+
+### Projection V2 preflight repairs
+
+- Fresh import-order RED exposed `coverage.historical -> correlation.pcc ->
+  correlation.__init__ -> authority -> coverage.historical`. A lazy public
+  authority re-export passed both fresh-process orders and review; commit
+  `9aaa0a5` (`fix(core): break correlation authority import cycle`).
+- The dormant V2 regression gate exposed a V1 rebuild contradiction: a valid
+  ACK extension beyond a frozen rebuild boundary was rejected after rename.
+  RED covered monotonic extension, rollback, substitution, pending replacement,
+  exact scalars, source-prefix mutation, and the real retention path. Initial
+  GREEN was `74 passed`; commit `cedfa9b`
+  (`fix(core): preserve frozen ACK rebuild authority`). Ordinary rebuild now
+  accepts only an authenticated monotonic extension while retention and future
+  activation remain strict. Post-review RED proved pre/post completion
+  validation could still leave retired state healthy; both seams turned GREEN
+  and the exact gate reached `76 passed`; commit `36f8586`
+  (`fix(core): latch failed retention rebuild authority`). Ruff and mypy passed;
+  every failed post-unlink rebuild now latches unhealthy.
