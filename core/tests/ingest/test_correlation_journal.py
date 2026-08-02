@@ -9,6 +9,7 @@ import pickle
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Thread
 
 import agmind_immune.ingest.correlation_journal as correlation_module
 import pytest
@@ -831,23 +832,25 @@ def test_completed_snapshot_authority_detects_state_and_request_mutation(
     )
     state = next(iter(journal._states_by_operation.values()))
     operation = state.operation_key
-    journal._states_by_operation[operation] = state.model_copy(deep=True)
-    with pytest.raises(CorrelationRequestJournalAuthorityError):
-        correlation_module._revalidate_completed_snapshot(authority)
+    canonical_copy = state.model_copy(deep=True)
+    journal._states_by_operation[operation] = canonical_copy
+    assert (
+        correlation_module._revalidate_completed_snapshot(authority).evidence_ref
+        == snapshot_ref
+    )
 
-    journal._states_by_operation[operation] = state
-    fresh_authority = journal.completed_for_snapshot(snapshot_ref)
-    original_request = state.request
-    state.__dict__["request"] = original_request.model_copy(
+    original_request = canonical_copy.request
+    canonical_copy.__dict__["request"] = original_request.model_copy(
         update={"requested_ttl_seconds": 30}
     )
     try:
-        with pytest.raises(CorrelationRequestJournalAuthorityError):
-            correlation_module._revalidate_completed_snapshot(fresh_authority)
+        with pytest.raises(CorrelationRequestJournalCorrupt):
+            correlation_module._revalidate_completed_snapshot(authority)
+        assert store.read_only_reason == "segment_corrupt"
     finally:
-        state.__dict__["request"] = original_request
+        canonical_copy.__dict__["request"] = original_request
     journal.close()
-    store.close()
+    store.close(flush=False)
 
 
 def test_completed_snapshot_authority_is_revoked_by_verifier_change_and_close(
@@ -957,3 +960,160 @@ def test_completed_snapshot_corrupt_current_bytes_trip_fence_without_authority(
     assert store.read_only_reason == "segment_corrupt"
     journal.close()
     store.close(flush=False)
+
+
+def test_completed_snapshot_rejects_injected_completed_cache_over_empty_journal(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, trigger_ref, trigger = seeded_correlation_store(tmp_path)
+    journal = CorrelationRequestJournal.create_new(store)
+    request = _request(trigger_ref)
+    snapshot_ref = _accept_snapshot(coordinator, trigger, request)
+    operation_key = f"pcc_correlation_snapshot:{trigger_ref.event_id}"
+    completed = correlation_module._CorrelationRequestStateV1.model_validate(
+        {
+            "schema_version": "agmind.correlation-request-state.v1",
+            "operation_key": operation_key,
+            "request_sha256": hashlib.sha256(canonical_json(request)).hexdigest(),
+            "request": request,
+            "phase": "completed",
+            "snapshot_event_id": snapshot_ref.event_id,
+            "snapshot_content_sha256": snapshot_ref.content_sha256,
+        },
+        strict=True,
+    )
+    journal._states_by_operation[operation_key] = completed
+    journal._operation_by_request[completed.request_sha256] = operation_key
+    journal._operation_by_snapshot[
+        (snapshot_ref.event_id, snapshot_ref.content_sha256)
+    ] = operation_key
+    assert read_correlation_frame_payloads(
+        tmp_path / "correlation-requests.agf"
+    ) == ()
+
+    with pytest.raises(CorrelationRequestJournalCorrupt):
+        journal.completed_for_snapshot(snapshot_ref)
+
+    assert store.read_only_reason == "segment_corrupt"
+    journal.close()
+    store.close(flush=False)
+
+
+def test_completed_snapshot_rejects_completed_cache_over_durable_proof_observed(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, trigger_ref, trigger = seeded_correlation_store(tmp_path)
+    journal = CorrelationRequestJournal.create_new(store)
+    request = _request(trigger_ref)
+    selected = journal.select(trigger_ref, canonical_json(request))
+    snapshot_ref = _accept_snapshot(coordinator, trigger, request)
+    observed = journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+    completed = correlation_module._CorrelationRequestStateV1.model_validate(
+        {**observed.model_dump(mode="python"), "phase": "completed"},
+        strict=True,
+    )
+    journal._states_by_operation[completed.operation_key] = completed
+    payloads = read_correlation_frame_payloads(
+        tmp_path / "correlation-requests.agf"
+    )
+    assert len(payloads) == 2
+    assert json.loads(payloads[-1])["phase"] == "proof_observed"
+
+    with pytest.raises(CorrelationRequestJournalCorrupt):
+        journal.completed_for_snapshot(snapshot_ref)
+
+    payloads_after = read_correlation_frame_payloads(
+        tmp_path / "correlation-requests.agf"
+    )
+    assert json.loads(payloads_after[-1])["phase"] == "proof_observed"
+    assert store.read_only_reason == "segment_corrupt"
+    journal.close()
+    store.close(flush=False)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["request_index", "state_remove", "state_remap", "snapshot_index"],
+)
+def test_completed_snapshot_revalidation_fences_cache_index_drift(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    root = tmp_path / damage
+    _coordinator_value, store, journal, _request_value, ref, authority = (
+        _completed_snapshot_case(root)
+    )
+    state = next(iter(journal._states_by_operation.values()))
+    if damage == "request_index":
+        journal._operation_by_request.pop(state.request_sha256)
+    elif damage == "state_remove":
+        journal._states_by_operation.pop(state.operation_key)
+    elif damage == "state_remap":
+        journal._states_by_operation["wrong-operation-key"] = (
+            journal._states_by_operation.pop(state.operation_key)
+        )
+    else:
+        journal._operation_by_snapshot[
+            (ref.event_id, ref.content_sha256)
+        ] = "wrong-operation-key"
+
+    try:
+        with pytest.raises(CorrelationRequestJournalCorrupt):
+            correlation_module._revalidate_completed_snapshot(authority)
+        assert store.read_only_reason == "segment_corrupt"
+    finally:
+        journal.close()
+        store.close(flush=False)
+
+
+def test_completed_snapshot_token_mutation_during_validation_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _coordinator_value, store, journal, _request_value, _ref, authority = (
+        _completed_snapshot_case(tmp_path)
+    )
+    entered = Event()
+    release = Event()
+    outcome: dict[str, object] = {}
+    validate = CorrelationRequestJournal._revalidate_completed_binding
+
+    def blocked_validation(
+        owner: CorrelationRequestJournal,
+        binding: object,
+    ) -> object:
+        entered.set()
+        assert release.wait(timeout=5)
+        return validate(owner, binding)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        CorrelationRequestJournal,
+        "_revalidate_completed_binding",
+        blocked_validation,
+    )
+
+    def worker() -> None:
+        try:
+            outcome["value"] = correlation_module._revalidate_completed_snapshot(
+                authority
+            )
+        except BaseException as error:  # noqa: BLE001 - thread result boundary
+            outcome["error"] = error
+
+    thread = Thread(target=worker)
+    thread.start()
+    try:
+        assert entered.wait(timeout=5)
+        object.__setattr__(authority, "_token", object())
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert "value" not in outcome
+    assert isinstance(
+        outcome.get("error"),
+        CorrelationRequestJournalAuthorityError,
+    )
+    journal.close()
+    store.close()
