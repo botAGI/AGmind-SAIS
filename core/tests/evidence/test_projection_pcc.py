@@ -65,6 +65,16 @@ class _CommitFailsBeforeDurable(sqlite3.Connection):
         return super().execute(sql, parameters)
 
 
+class _CloseFailsOnce(sqlite3.Connection):
+    close_attempts = 0
+
+    def close(self) -> None:
+        self.close_attempts += 1
+        if self.close_attempts == 1:
+            raise OSError("injected first close failure")
+        super().close()
+
+
 def _subject() -> Any:
     return importlib.import_module("agmind_immune.evidence.projection_v2")
 
@@ -240,6 +250,57 @@ def _accepted_complete_with_history(
 def _apply_all(owner: Any, coordinator: Any) -> None:
     for record in coordinator.segment_store.iter_authenticated_records():
         owner.apply(record.ref)
+
+
+def _forge_later_logical_primary(
+    connection: sqlite3.Connection,
+    first: Any,
+    second: Any,
+) -> None:
+    first_event_id = first.ref.event_id
+    second_event_id = second.ref.event_id
+    connection.execute(
+        "UPDATE events SET duplicate_of_event_id=? WHERE event_id=?",
+        (second_event_id, first_event_id),
+    )
+    connection.execute(
+        "UPDATE events SET duplicate_of_event_id=NULL WHERE event_id=?",
+        (second_event_id,),
+    )
+    connection.execute(
+        "UPDATE projection_dedup SET primary_event_id=?,is_primary=0 "
+        "WHERE event_id=?",
+        (second_event_id, first_event_id),
+    )
+    connection.execute(
+        "UPDATE projection_dedup SET primary_event_id=?,is_primary=1 "
+        "WHERE event_id=?",
+        (second_event_id, second_event_id),
+    )
+    for table in ("process_observations", "network_observations"):
+        connection.execute(
+            f"UPDATE {table} SET event_id=?,source_sequence=?,content_sha256=? "
+            "WHERE event_id=?",
+            (
+                second_event_id,
+                f"{second.ref.source_sequence:020d}",
+                second.ref.content_sha256,
+                first_event_id,
+            ),
+        )
+    connection.execute(
+        "UPDATE containers SET "
+        "first_event_id=?,first_source_sequence=?,first_content_sha256=?,"
+        "last_event_id=?,last_source_sequence=?,last_content_sha256=?",
+        (
+            second_event_id,
+            f"{second.ref.source_sequence:020d}",
+            second.ref.content_sha256,
+            second_event_id,
+            f"{second.ref.source_sequence:020d}",
+            second.ref.content_sha256,
+        ),
+    )
 
 
 def test_direct_investigation_incident_waits_only_for_no_pcc(
@@ -1879,3 +1940,517 @@ def test_pcc_authority_unavailable_rolls_back_without_cursor_advance(
         assert owner.status().cursor.source_sequence == 2
     finally:
         owner.close()
+
+
+@pytest.mark.parametrize("entrypoint", ["retry", "reopen"])
+def test_authenticated_source_order_cannot_be_rewritten_to_later_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    evidence_path = tmp_path / "evidence"
+    projection_path = tmp_path / "projection.sqlite3"
+    key = private_key(11)
+    coordinator = _coordinator(evidence_path, key)
+    _accept(coordinator, boot_boundary(key))
+    _accept(coordinator, _candidate_trigger(key, sequence=2))
+    _accept(coordinator, _candidate_trigger(key, sequence=3))
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    acknowledgements = AckJournal.create_new(store)
+    records = tuple(store.iter_authenticated_records())
+    _confirm_ack(acknowledgements, *[record.ref for record in records])
+    connection = subject._v2_connection_for_test(projection_path)
+    owner = subject._v2_projection_owner_for_test(
+        connection,
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+    )
+    for record in records:
+        owner.apply(record.ref)
+    assert connection.execute(
+        "SELECT duplicate_of_event_id FROM events WHERE event_id=?",
+        (records[2].ref.event_id,),
+    ).fetchone()[0] == records[1].ref.event_id
+    _forge_later_logical_primary(connection, records[1], records[2])
+
+    if entrypoint == "retry":
+        try:
+            with pytest.raises(subject.ProjectionConflict):
+                owner.apply(records[2].ref)
+            assert owner.status().healthy is False
+        finally:
+            owner.close()
+        return
+
+    owner.close()
+    _recovered_coordinator, recovered_store = _reopen_evidence(evidence_path)
+    recovered_journal = CorrelationRequestJournal.open_and_recover(recovered_store)
+    recovered_acknowledgements = AckJournal.open_and_recover(recovered_store)
+    recovered_connection = subject._v2_connection_for_test(projection_path)
+    recovered_owner = None
+    try:
+        with pytest.raises(subject.ProjectionConflict):
+            recovered_owner = subject._v2_projection_owner_for_test(
+                recovered_connection,
+                evidence=recovered_store,
+                acknowledgements=recovered_acknowledgements,
+                journal=recovered_journal,
+                registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            )
+    finally:
+        if recovered_owner is not None:
+            recovered_owner.close()
+
+
+def test_duplicate_retry_reauthenticates_rehashed_primary_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator, first, second = _accepted_two_complete(tmp_path / "evidence")
+    journal = CorrelationRequestJournal.create_new(coordinator.segment_store)
+    _complete_journal(journal, first)
+    _complete_journal(journal, second)
+    owner, connection = _owner(subject, coordinator, journal)
+    records = tuple(coordinator.segment_store.iter_authenticated_records())
+    try:
+        _apply_all(owner, coordinator)
+        row = connection.execute(
+            f"SELECT {','.join(subject._CANDIDATE_COLUMNS)} FROM candidates"
+        ).fetchone()
+        assert row is not None
+        candidate = subject._decode_candidate(row)
+        altered = ContainmentCandidateV1.model_validate(
+            {
+                **candidate.model_dump(mode="python"),
+                "ttl_seconds": candidate.ttl_seconds + 1,
+            },
+            strict=True,
+        )
+        values = subject._encode_candidate(altered)
+        assignments = ",".join(
+            f"{column}=?" for column in subject._CANDIDATE_COLUMNS
+        )
+        connection.execute(
+            f"UPDATE candidates SET {assignments} WHERE candidate_id=?",
+            (*values, candidate.candidate_id),
+        )
+
+        with pytest.raises(subject.ProjectionConflict):
+            owner.apply(records[-1].ref)
+
+        assert owner.status().healthy is False
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("mutation", ["rollback", "substitution"])
+def test_reopen_revalidates_ack_after_persisted_prefix_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    evidence_path = tmp_path / "evidence"
+    projection_path = tmp_path / "projection.sqlite3"
+    coordinator, proof = _accepted_complete(evidence_path, ttl_seconds=120)
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    _complete_journal(journal, proof)
+    acknowledgements = AckJournal.create_new(store)
+    records = tuple(store.iter_authenticated_records())
+    _confirm_ack(acknowledgements, *[record.ref for record in records])
+    connection = subject._v2_connection_for_test(projection_path)
+    owner = subject._v2_projection_owner_for_test(
+        connection,
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+    )
+    _apply_all(owner, coordinator)
+    owner.close()
+
+    _recovered_coordinator, recovered_store = _reopen_evidence(evidence_path)
+    recovered_records = tuple(recovered_store.iter_authenticated_records())
+    recovered_journal = CorrelationRequestJournal.open_and_recover(recovered_store)
+    recovered_acknowledgements = AckJournal.open_and_recover(recovered_store)
+    recovered_connection = subject._v2_connection_for_test(projection_path)
+    original_snapshot = recovered_acknowledgements.snapshot
+    original_completed = recovered_journal.completed_for_snapshot
+    changed = False
+
+    def completed_for_snapshot(ref: EvidenceRef) -> Any:
+        nonlocal changed
+        completed = original_completed(ref)
+        changed = True
+        return completed
+
+    def snapshot() -> AckJournalSnapshot:
+        frozen = original_snapshot()
+        if not changed:
+            return frozen
+        if mutation == "rollback":
+            return AckJournalSnapshot(
+                AckIdentity.from_ref(recovered_records[-2].ref),
+                frozen.pending,
+                True,
+            )
+        assert frozen.confirmed is not None
+        return AckJournalSnapshot(
+            AckIdentity(
+                frozen.confirmed.sequence,
+                "evt_" + "f" * 64,
+                frozen.confirmed.content_sha256,
+            ),
+            frozen.pending,
+            True,
+        )
+
+    monkeypatch.setattr(
+        recovered_journal,
+        "completed_for_snapshot",
+        completed_for_snapshot,
+    )
+    monkeypatch.setattr(recovered_acknowledgements, "snapshot", snapshot)
+    recovered_owner = None
+    try:
+        with pytest.raises(ProjectionAuthorityError):
+            recovered_owner = subject._v2_projection_owner_for_test(
+                recovered_connection,
+                evidence=recovered_store,
+                acknowledgements=recovered_acknowledgements,
+                journal=recovered_journal,
+                registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            )
+        assert changed is True
+        assert recovered_store._closed is True
+        assert recovered_journal._closed is True
+        assert recovered_acknowledgements._closed is True
+        with pytest.raises(sqlite3.ProgrammingError):
+            recovered_connection.execute("SELECT 1")
+    finally:
+        if recovered_owner is not None:
+            recovered_owner.close()
+
+
+@pytest.mark.parametrize("transition", ["extension", "rollback", "substitution"])
+def test_reopen_ack_stabilization_chains_each_observed_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    evidence_path = tmp_path / "evidence"
+    projection_path = tmp_path / "projection.sqlite3"
+    coordinator, proof = _accepted_complete(evidence_path, ttl_seconds=120)
+    extra_ref = _accept(
+        coordinator,
+        envelope_value(private_key(11), sequence=4),
+    )
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    _complete_journal(journal, proof)
+    acknowledgements = AckJournal.create_new(store)
+    records = tuple(store.iter_authenticated_records())
+    _confirm_ack(acknowledgements, *[record.ref for record in records[:3]])
+    connection = subject._v2_connection_for_test(projection_path)
+    owner = subject._v2_projection_owner_for_test(
+        connection,
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+    )
+    for record in records[:3]:
+        owner.apply(record.ref)
+    owner.close()
+
+    _recovered_coordinator, recovered_store = _reopen_evidence(evidence_path)
+    recovered_journal = CorrelationRequestJournal.open_and_recover(recovered_store)
+    recovered_acknowledgements = AckJournal.open_and_recover(recovered_store)
+    recovered_connection = subject._v2_connection_for_test(projection_path)
+    original_completed = recovered_journal.completed_for_snapshot
+    original_current_ack = subject._V2ProjectionOwner._current_ack_boundary
+    extended = False
+    frozen_boundary: Any | None = None
+    stabilization_reads = 0
+
+    def completed_for_snapshot(ref: EvidenceRef) -> Any:
+        nonlocal extended
+        completed = original_completed(ref)
+        if not extended:
+            _confirm_ack(recovered_acknowledgements, extra_ref)
+            extended = True
+        return completed
+
+    def current_ack(candidate: Any) -> Any:
+        nonlocal frozen_boundary, stabilization_reads
+        current = original_current_ack(candidate)
+        if frozen_boundary is None:
+            frozen_boundary = current
+            return current
+        if not extended or transition == "extension":
+            return current
+        stabilization_reads += 1
+        if stabilization_reads == 1:
+            return current
+        if transition == "rollback":
+            return frozen_boundary
+        assert current.confirmed is not None
+        return subject._ProjectionAckBoundaryV2(
+            confirmed=AckIdentity(
+                current.confirmed.sequence,
+                "evt_" + "f" * 64,
+                current.confirmed.content_sha256,
+            ),
+            pending=current.pending,
+            generation=current.generation,
+            prefix_size=current.prefix_size,
+            prefix_sha256=current.prefix_sha256,
+        )
+
+    monkeypatch.setattr(
+        recovered_journal,
+        "completed_for_snapshot",
+        completed_for_snapshot,
+    )
+    monkeypatch.setattr(
+        subject._V2ProjectionOwner,
+        "_current_ack_boundary",
+        current_ack,
+    )
+    recovered_owner = None
+    try:
+        if transition == "extension":
+            recovered_owner = subject._v2_projection_owner_for_test(
+                recovered_connection,
+                evidence=recovered_store,
+                acknowledgements=recovered_acknowledgements,
+                journal=recovered_journal,
+                registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            )
+            assert recovered_owner.status().cursor is not None
+            assert recovered_owner.status().cursor.source_sequence == 3
+            assert recovered_acknowledgements.snapshot().confirmed_through == 4
+        else:
+            with pytest.raises(ProjectionAuthorityError):
+                recovered_owner = subject._v2_projection_owner_for_test(
+                    recovered_connection,
+                    evidence=recovered_store,
+                    acknowledgements=recovered_acknowledgements,
+                    journal=recovered_journal,
+                    registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+                )
+            assert stabilization_reads == 2
+    finally:
+        if recovered_owner is not None:
+            recovered_owner.close()
+
+
+def test_owner_close_retries_a_failed_connection_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator, _authenticated = _accepted_direct_falco(
+        tmp_path / "evidence",
+        investigation_only=True,
+    )
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    acknowledgements = AckJournal.create_new(store)
+    records = tuple(store.iter_authenticated_records())
+    _confirm_ack(acknowledgements, *[record.ref for record in records])
+    connection = sqlite3.connect(
+        ":memory:",
+        isolation_level=None,
+        factory=_CloseFailsOnce,
+    )
+    subject._configure_v2_connection(connection, file_backed=False)
+    subject._create_v2_schema(connection)
+    subject._verify_v2_schema(connection)
+    owner = subject._v2_projection_owner_for_test(
+        connection,
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+    )
+    try:
+        with pytest.raises(subject.ProjectionUnhealthy):
+            owner.close()
+        assert owner._connection is connection
+
+        owner.close()
+
+        assert connection.close_attempts == 2
+        assert owner._connection is None
+        with pytest.raises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+    finally:
+        connection.close()
+
+
+def test_unhealthy_latch_retains_authority_until_close_is_proven(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator, _authenticated = _accepted_direct_falco(
+        tmp_path / "evidence",
+        investigation_only=True,
+    )
+    journal = CorrelationRequestJournal.create_new(coordinator.segment_store)
+    owner, _connection = _owner(subject, coordinator, journal)
+    saved_authority = owner._authority
+    assert saved_authority is not None
+    predecessor = subject._predecessor_v2(1, None)
+    real_close = subject._close_correlation_projection_authority
+    close_calls = 0
+
+    def fail_once(candidate: Any) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise OSError("injected authority close failure")
+        real_close(candidate)
+
+    monkeypatch.setattr(
+        subject,
+        "_close_correlation_projection_authority",
+        fail_once,
+    )
+    try:
+        owner._latch_unhealthy(RuntimeError("primary failure"))
+        assert owner._authority is saved_authority
+
+        owner.close()
+
+        assert close_calls == 2
+        assert owner._authority is None
+        with pytest.raises(authority.CorrelationProjectionError):
+            authority._validate_correlation_projection_predecessor(
+                saved_authority,
+                predecessor,
+            )
+    finally:
+        real_close(saved_authority)
+        owner.close()
+
+
+def test_factory_retries_cleanup_and_annotates_the_primary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator, _authenticated = _accepted_direct_falco(
+        tmp_path / "evidence",
+        investigation_only=True,
+    )
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    acknowledgements = AckJournal.create_new(store)
+    records = tuple(store.iter_authenticated_records())
+    _confirm_ack(acknowledgements, *[record.ref for record in records])
+    connection = subject._v2_connection_for_test()
+    real_close = subject._close_correlation_projection_authority
+    closed_authorities: list[Any] = []
+    close_calls = 0
+
+    def fail_validation(*_args: object, **_kwargs: object) -> None:
+        raise subject.ProjectionConflict("injected prefix failure")
+
+    def fail_once(candidate: Any) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        closed_authorities.append(candidate)
+        if close_calls == 1:
+            raise OSError("injected factory authority-close failure")
+        real_close(candidate)
+
+    monkeypatch.setattr(
+        subject._V2ProjectionOwner,
+        "_validate_persisted_prefix",
+        fail_validation,
+    )
+    monkeypatch.setattr(
+        subject,
+        "_close_correlation_projection_authority",
+        fail_once,
+    )
+    try:
+        with pytest.raises(subject.ProjectionConflict) as raised:
+            subject._v2_projection_owner_for_test(
+                connection,
+                evidence=store,
+                acknowledgements=acknowledgements,
+                journal=journal,
+                registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            )
+
+        assert close_calls == 2
+        assert closed_authorities[0] is closed_authorities[1]
+        assert any(
+            "factory cleanup failure" in note
+            for note in getattr(raised.value, "__notes__", ())
+        )
+        assert store._closed is True
+        assert journal._closed is True
+        assert acknowledgements._closed is True
+        with pytest.raises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+        with pytest.raises(authority.CorrelationProjectionError):
+            authority._validate_correlation_projection_predecessor(
+                closed_authorities[0],
+                subject._predecessor_v2(1, None),
+            )
+    finally:
+        for candidate in closed_authorities:
+            real_close(candidate)

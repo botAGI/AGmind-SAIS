@@ -1312,27 +1312,71 @@ class _V2ProjectionOwner:
                 predecessor,
             )
             owner._authority = created_authority
-            owner._validate_persisted_prefix(
+            prefix_sha256 = owner._validate_persisted_prefix(
                 connection,
                 created_authority,
                 predecessor,
                 cursor,
             )
-        except ProjectionConflict:
+            owner._revalidate_reopen_authority(
+                connection,
+                created_authority,
+                predecessor,
+                cursor,
+                acceptance_cursor,
+                ack_boundary,
+                prefix_sha256,
+            )
+        except ProjectionConflict as error:
             owner._healthy = False
-            owner._close_resources()
+            owner._close_after_factory_failure(error)
             raise
         except Exception as error:
             owner._healthy = False
-            owner._close_resources()
+            owner._close_after_factory_failure(error)
             raise ProjectionAuthorityError(
                 "Projection V2 owner authority could not be created"
             ) from error
-        except BaseException:
+        except BaseException as error:
             owner._healthy = False
-            owner._close_resources()
+            owner._close_after_factory_failure(error)
             raise
         return owner
+
+    def _revalidate_reopen_authority(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        cursor: ProjectionCursor | None,
+        acceptance_cursor: int,
+        ack_boundary: _ProjectionAckBoundaryV2,
+        prefix_sha256: str,
+    ) -> None:
+        observed_ack_boundary = ack_boundary
+        for _pass in range(2):
+            if self._healthy_acceptance_cursor() != acceptance_cursor:
+                raise ProjectionAuthorityError(
+                    "Projection V2 acceptance changed during reopen"
+                )
+            current_cursor = _current_v2_cursor(connection)
+            if current_cursor != cursor:
+                raise ProjectionConflict(
+                    "Projection V2 cursor changed during reopen"
+                )
+            self._validate_cursor_evidence(connection, current_cursor)
+            if _v2_snapshot_hash(connection) != prefix_sha256:
+                raise ProjectionConflict(
+                    "Projection V2 persisted prefix changed during reopen"
+                )
+            _validate_correlation_projection_predecessor(
+                authority,
+                predecessor,
+            )
+            observed_ack_boundary = self._revalidate_ack_boundary(
+                observed_ack_boundary,
+                acceptance_cursor,
+            )
 
     def _healthy_acceptance_cursor(self) -> int:
         return _healthy_acceptance_cursor_v2(
@@ -1477,7 +1521,7 @@ class _V2ProjectionOwner:
         self,
         frozen: _ProjectionAckBoundaryV2,
         acceptance_cursor: int,
-    ) -> None:
+    ) -> _ProjectionAckBoundaryV2:
         if type(frozen) is not _ProjectionAckBoundaryV2:
             raise ProjectionAuthorityError(
                 "Projection V2 frozen ACK boundary is not exact"
@@ -1529,6 +1573,7 @@ class _V2ProjectionOwner:
             raise ProjectionAuthorityError(
                 "Projection V2 frozen ACK prefix is unavailable"
             ) from error
+        return current
 
     def _require_usable(self) -> tuple[sqlite3.Connection, CorrelationProjectionAuthority]:
         if self._closed:
@@ -1574,17 +1619,18 @@ class _V2ProjectionOwner:
     def _latch_unhealthy(self, primary: BaseException | None = None) -> None:
         self._healthy = False
         authority = self._authority
-        self._authority = None
         if authority is None:
             return
         try:
             _close_correlation_projection_authority(authority)
-        except Exception as error:  # noqa: BLE001 - preserve primary ambiguity
+        except BaseException as error:  # noqa: BLE001 - retain ambiguous handle
             if primary is not None:
                 primary.add_note(
                     "secondary Projection V2 authority-close failure: "
                     f"{type(error).__name__}: {error}"
                 )
+        else:
+            self._authority = None
 
     @staticmethod
     def _retry_rows_for_authority(
@@ -1962,8 +2008,8 @@ class _V2ProjectionOwner:
         authority: CorrelationProjectionAuthority,
         predecessor: _ProjectionPredecessor,
         cursor: ProjectionCursor | None,
-    ) -> None:
-        _v2_snapshot_hash(connection)
+    ) -> str:
+        prefix_sha256 = _v2_snapshot_hash(connection)
         if cursor is None:
             nonempty = tuple(
                 table
@@ -1977,7 +2023,7 @@ class _V2ProjectionOwner:
                 raise ProjectionConflict(
                     "Projection V2 has facts without a cursor"
                 )
-            return
+            return prefix_sha256
         try:
             records = tuple(
                 self._evidence.iter_authenticated_records(
@@ -2009,9 +2055,23 @@ class _V2ProjectionOwner:
             tuple[str, str, str],
             tuple[_PreparedV2Record, _PreparedV2Record],
         ] = {}
+        logical_primaries: dict[tuple[str, str], str] = {}
         selected = ",".join(_TABLE_LAYOUT_V2[1][1])
         for record in records:
             prepared = _prepare_v2(record)
+            logical_key = (
+                prepared.dedup_kind,
+                prepared.logical_key_sha256,
+            )
+            source_primary = logical_primaries.setdefault(
+                logical_key,
+                prepared.envelope.event_id,
+            )
+            expected_duplicate = (
+                None
+                if source_primary == prepared.envelope.event_id
+                else source_primary
+            )
             row = connection.execute(
                 f"SELECT {selected} FROM events WHERE event_id=?",
                 (prepared.envelope.event_id,),
@@ -2028,15 +2088,16 @@ class _V2ProjectionOwner:
                 raise ProjectionConflict(
                     "Projection V2 persisted duplicate identity is invalid"
                 )
-            if tuple(row) != _event_values_v2(prepared, duplicate):
+            if duplicate != expected_duplicate:
+                raise ProjectionConflict(
+                    "Projection V2 persisted logical primary differs from "
+                    "authenticated source order"
+                )
+            if tuple(row) != _event_values_v2(prepared, expected_duplicate):
                 raise ProjectionConflict(
                     "Projection V2 persisted event facts changed"
                 )
-            expected_primary = (
-                prepared.envelope.event_id
-                if duplicate is None
-                else duplicate
-            )
+            is_primary = expected_duplicate is None
             dedup = connection.execute(
                 "SELECT dedup_kind,logical_key_sha256,primary_event_id,is_primary "
                 "FROM projection_dedup WHERE event_id=?",
@@ -2045,28 +2106,27 @@ class _V2ProjectionOwner:
             if dedup is None or tuple(dedup) != (
                 prepared.dedup_kind,
                 prepared.logical_key_sha256,
-                expected_primary,
-                int(duplicate is None),
+                source_primary,
+                int(is_primary),
             ):
                 raise ProjectionConflict(
                     "Projection V2 persisted dedup facts changed"
                 )
-            if duplicate is not None:
+            if expected_duplicate is not None:
                 primary = connection.execute(
                     "SELECT dedup_kind,logical_key_sha256,primary_event_id,is_primary "
                     "FROM projection_dedup WHERE event_id=?",
-                    (duplicate,),
+                    (source_primary,),
                 ).fetchone()
                 if primary is None or tuple(primary) != (
                     prepared.dedup_kind,
                     prepared.logical_key_sha256,
-                    duplicate,
+                    source_primary,
                     1,
                 ):
                     raise ProjectionConflict(
                         "Projection V2 persisted logical primary changed"
                     )
-            is_primary = duplicate is None
             self._validate_retry_closure(
                 connection,
                 authority,
@@ -2117,6 +2177,7 @@ class _V2ProjectionOwner:
             raise ProjectionConflict(
                 "Projection V2 persisted container closure changed"
             )
+        return prefix_sha256
 
     def _exact_retry(
         self,
@@ -2165,12 +2226,23 @@ class _V2ProjectionOwner:
             self._latch_unhealthy()
             raise ProjectionConflict("Projection V2 retry is ahead of its cursor")
         try:
-            self._validate_retry_closure(
+            prefix_sha256 = self._validate_persisted_prefix(
                 connection,
                 authority,
                 predecessor,
-                prepared,
-                is_primary=duplicate is None,
+                cursor,
+            )
+            if (
+                _current_v2_cursor(connection) != cursor
+                or _v2_snapshot_hash(connection) != prefix_sha256
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 persisted prefix changed during retry"
+                )
+            self._validate_cursor_evidence(connection, cursor)
+            _validate_correlation_projection_predecessor(
+                authority,
+                predecessor,
             )
         except ProjectionConflict:
             self._latch_unhealthy()
@@ -2893,19 +2965,21 @@ class _V2ProjectionOwner:
     def _close_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
         authority = self._authority
-        self._authority = None
         if authority is not None:
             try:
                 _close_correlation_projection_authority(authority)
             except BaseException as error:  # noqa: BLE001 - close all owned resources
                 errors.append(error)
+            else:
+                self._authority = None
         connection = self._connection
-        self._connection = None
         if connection is not None:
             try:
                 connection.close()
             except BaseException as error:  # noqa: BLE001 - close all owned resources
                 errors.append(error)
+            else:
+                self._connection = None
         if not getattr(self._journal, "_closed", True):
             try:
                 self._journal.close()
@@ -2923,9 +2997,34 @@ class _V2ProjectionOwner:
                 errors.append(error)
         return errors
 
+    def _resources_released(self) -> bool:
+        return (
+            self._authority is None
+            and self._connection is None
+            and getattr(self._journal, "_closed", False) is True
+            and getattr(self._acknowledgements, "_closed", False) is True
+            and getattr(self._evidence, "_closed", False) is True
+        )
+
+    def _close_after_factory_failure(self, primary: BaseException) -> None:
+        errors = self._close_resources()
+        for error in errors:
+            primary.add_note(
+                "Projection V2 factory cleanup failure (attempt 1): "
+                f"{type(error).__name__}: {error}"
+            )
+        if not errors:
+            return
+        retry_errors = self._close_resources()
+        for error in retry_errors:
+            primary.add_note(
+                "Projection V2 factory cleanup failure (attempt 2): "
+                f"{type(error).__name__}: {error}"
+            )
+
     def close(self) -> None:
         with self._mutex:
-            if self._closed:
+            if self._closed and self._resources_released():
                 return
             self._closed = True
             errors = self._close_resources()
