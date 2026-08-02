@@ -444,12 +444,23 @@ class _IssuedContextBinding:
     registry_facts: object
 
 
+@dataclass(frozen=True, slots=True)
+class _StoreLifecycleOwner:
+    store_ref: weakref.ReferenceType[SegmentStore]
+    lifecycle: object
+    authority_ref: weakref.ReferenceType[CorrelationProjectionAuthority]
+
+
 _ISSUED_AUTHORITIES: dict[
     int,
     tuple[
         weakref.ReferenceType[CorrelationProjectionAuthority],
         _ProjectionAuthorityBinding,
     ],
+] = {}
+_STORE_LIFECYCLE_OWNERS: dict[
+    tuple[int, int],
+    _StoreLifecycleOwner,
 ] = {}
 _ISSUED_AUTHORITIES_LOCK = Lock()
 
@@ -597,6 +608,7 @@ def _create_correlation_projection_authority(
         lock=RLockType(),
     )
     identity = id(authority)
+    owner_identity = (id(store), id(lifecycle))
 
     def cleanup(
         reference: weakref.ReferenceType[CorrelationProjectionAuthority],
@@ -605,10 +617,31 @@ def _create_correlation_projection_authority(
             current = _ISSUED_AUTHORITIES.get(identity)
             if current is not None and current[0] is reference:
                 _ISSUED_AUTHORITIES.pop(identity, None)
+            owner = _STORE_LIFECYCLE_OWNERS.get(owner_identity)
+            if owner is not None and owner.authority_ref is reference:
+                _STORE_LIFECYCLE_OWNERS.pop(owner_identity, None)
 
     reference = weakref.ref(authority, cleanup)
+    store_reference = weakref.ref(store)
     with _ISSUED_AUTHORITIES_LOCK:
+        current_owner = _STORE_LIFECYCLE_OWNERS.get(owner_identity)
+        if (
+            current_owner is not None
+            and current_owner.store_ref() is store
+            and current_owner.lifecycle is lifecycle
+            and current_owner.authority_ref() is not None
+        ):
+            raise CorrelationProjectionError(
+                "correlation projection store lifecycle already has a live owner"
+            )
+        if current_owner is not None:
+            _STORE_LIFECYCLE_OWNERS.pop(owner_identity, None)
         _ISSUED_AUTHORITIES[identity] = (reference, binding)
+        _STORE_LIFECYCLE_OWNERS[owner_identity] = _StoreLifecycleOwner(
+            store_ref=store_reference,
+            lifecycle=lifecycle,
+            authority_ref=reference,
+        )
     return authority
 
 
@@ -638,11 +671,25 @@ def _issue_hidden_pcc(
             "correlation projection store lost verifier authority"
         )
     try:
+        public_ref = public_proof.evidence_ref
+        if type(public_ref) is not EvidenceRef:
+            raise TypeError("public PCC evidence ref is not exact")
+        detached_ref = EvidenceRef(
+            segment_id=public_ref.segment_id,
+            segment_relative_path=public_ref.segment_relative_path,
+            frame_offset=public_ref.frame_offset,
+            frame_size=public_ref.frame_size,
+            frame_sha256=public_ref.frame_sha256,
+            event_id=public_ref.event_id,
+            source_sequence=public_ref.source_sequence,
+            content_sha256=public_ref.content_sha256,
+        )
         hidden = store._authenticated_pcc_input(
             verifier,
-            cast(EvidenceRef, public_proof.evidence_ref),
+            detached_ref,
             public_proof.request,
         )
+        object.__setattr__(hidden, "_evidence_ref", detached_ref)
     except Exception as error:
         raise CorrelationProjectionError(
             "correlation projection could not reissue private PCC facts"
@@ -651,6 +698,8 @@ def _issue_hidden_pcc(
         hidden is public_proof
         or hidden.canonical != public_proof.canonical
         or hidden.evidence_ref != public_proof.evidence_ref
+        or hidden.evidence_ref is public_proof.evidence_ref
+        or not store._authenticated_pcc_input_is_exact(hidden)
     ):
         raise CorrelationProjectionError(
             "private PCC reissue changed authenticated facts"
@@ -1027,3 +1076,13 @@ def _close_correlation_projection_authority(
             return
         binding.closed = True
         binding.revision = object()
+        owner_identity = (id(binding.store), id(binding.store_lifecycle))
+        with _ISSUED_AUTHORITIES_LOCK:
+            owner = _STORE_LIFECYCLE_OWNERS.get(owner_identity)
+            if (
+                owner is not None
+                and owner.store_ref() is binding.store
+                and owner.lifecycle is binding.store_lifecycle
+                and owner.authority_ref() is authority
+            ):
+                _STORE_LIFECYCLE_OWNERS.pop(owner_identity, None)

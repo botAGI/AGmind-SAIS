@@ -808,11 +808,13 @@ def _correlation_context_protocol() -> tuple[
             issued[identity] = (reference, binding)
 
     def claim(value: object) -> _ClaimedCorrelationContext | None:
-        if type(value) is not CorrelationContext:
-            return None
         with lock:
             registered = issued.pop(id(value), None)
-        if registered is None or registered[0]() is not value:
+        if (
+            registered is None
+            or registered[0]() is not value
+            or type(value) is not CorrelationContext
+        ):
             return None
         return registered[1]
 
@@ -891,13 +893,14 @@ def _evaluate_claimed_context(
     return cast(CorrelationResult, result)
 
 
-def _incident(
-    authenticated: AuthenticatedPCCInput,
+def _incident_from_snapshot(
+    snapshot: PCCCorrelationSnapshotV1,
+    authority_event_id: str,
     reasons: tuple[CorrelationReasonCode, ...],
 ) -> IncidentV1:
-    trigger = authenticated.snapshot.trigger
+    trigger = snapshot.trigger
     evidence_ids = tuple(
-        sorted((trigger.event_id, authenticated.event_id))
+        sorted((trigger.event_id, authority_event_id))
     )
     fields: dict[str, object] = {
         "schema_version": "agmind.incident.v1",
@@ -924,9 +927,20 @@ def _incident(
         "coverage_flags": trigger.coverage_flags,
         "evidence_ids": evidence_ids,
         "reason_codes": reasons,
-        "authority_event_id": authenticated.event_id,
+        "authority_event_id": authority_event_id,
     }
     return IncidentV1.model_validate(fields, strict=True)
+
+
+def _incident(
+    authenticated: AuthenticatedPCCInput,
+    reasons: tuple[CorrelationReasonCode, ...],
+) -> IncidentV1:
+    return _incident_from_snapshot(
+        authenticated.snapshot,
+        authenticated.event_id,
+        reasons,
+    )
 
 
 def incident_from_verified_falco(
@@ -1021,6 +1035,47 @@ def _one_rejection(
     reason: CorrelationReasonCode,
 ) -> Rejected:
     return _rejected(authenticated, (reason,))
+
+
+def _failed_snapshot_rejection(
+    authenticated: AuthenticatedPCCInput,
+) -> Rejected:
+    fingerprint = _pcc_live_fingerprint(authenticated)
+    snapshot = authenticated.snapshot
+    if fingerprint is None or snapshot.outcome != "failed":
+        raise CorrelationProjectionError(
+            "failed PCC authority changed before rejection"
+        )
+    try:
+        snapshot_canonical = canonical_json(snapshot)
+        detached_snapshot = snapshot.model_copy(deep=True)
+        authority_event_id = authenticated.event_id
+    except (AttributeError, RecursionError, TypeError, ValueError) as error:
+        raise CorrelationProjectionError(
+            "failed PCC facts could not be detached"
+        ) from error
+    reasons = detached_snapshot.failure_reasons
+    if (
+        type(detached_snapshot) is not PCCCorrelationSnapshotV1
+        or detached_snapshot.outcome != "failed"
+        or type(reasons) is not tuple
+        or not reasons
+        or canonical_json(detached_snapshot) != snapshot_canonical
+        or _pcc_live_fingerprint(authenticated) != fingerprint
+        or not authenticated_pcc_input_is_issued(authenticated)
+    ):
+        raise CorrelationProjectionError(
+            "failed PCC authority changed during rejection"
+        )
+    exact_reasons = cast(tuple[CorrelationReasonCode, ...], reasons)
+    return Rejected(
+        incident=_incident_from_snapshot(
+            detached_snapshot,
+            authority_event_id,
+            exact_reasons,
+        ),
+        reason_codes=exact_reasons,
+    )
 
 
 def _duplicate_key(
@@ -1504,8 +1559,8 @@ def correlate_pcc_facts(
     """Evaluate proof-bound facts only under issued local context authority."""
     claimed = _claim_correlation_context(context)
     _validate_pcc_facts_binding(trigger, proof, context)
-    if proof.snapshot.outcome != "complete":
-        return _correlate_pcc_kernel(proof, context)
+    if proof.snapshot.outcome == "failed":
+        return _failed_snapshot_rejection(proof)
     if claimed is None:
         return _one_rejection(
             proof,
@@ -1534,8 +1589,8 @@ def correlate_pcc(
         raise TypeError(
             "correlate_pcc requires exact issued authenticated input and context"
         )
-    if authenticated.snapshot.outcome != "complete":
-        return _correlate_pcc_kernel(authenticated, context)
+    if authenticated.snapshot.outcome == "failed":
+        return _failed_snapshot_rejection(authenticated)
     if claimed is None:
         return _one_rejection(
             authenticated,

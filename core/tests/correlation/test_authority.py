@@ -42,7 +42,12 @@ from agmind_immune.evidence.segments import EvidenceRef, SegmentStore
 from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import AuthenticatedPCCInput
 from agmind_immune.ingest.service import AcceptanceCoordinator
-from tests.correlation.test_pcc import _accepted_complete, _context, _duplicate_key
+from tests.correlation.test_pcc import (
+    _accepted_complete,
+    _accepted_failed,
+    _context,
+    _duplicate_key,
+)
 from tests.evidence.test_retention_restart import _fresh_verifier
 from tests.ingest.test_correlation_journal import (
     _append_payload,
@@ -58,6 +63,10 @@ _MAX_RULE_BYTES = 65_536
 _PINNED_RULE_HASH = "9adde9efa900af138a8785b7f313582e8e3688e6ec39fd8045c275841b3880cc"
 _PCC_DETECTOR_HASH = "1" * 64
 _REGISTRY_PATH = Path("contracts/v1/ipv4-special-use.csv")
+
+
+class _LayoutCompatibleCorrelationContext(CorrelationContext):
+    __slots__ = ()
 
 
 def _authority_module() -> ModuleType:
@@ -724,6 +733,175 @@ def test_private_kernel_uses_deep_detached_proof_context_and_registry(
         assert result.candidate.destination_port == 443
     finally:
         case.close()
+
+
+def test_hidden_pcc_evidence_ref_is_detached_under_mutate_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _projection_case(tmp_path, monkeypatch)
+    pcc_module = importlib.import_module("agmind_immune.correlation.pcc")
+    real_kernel = pcc_module._correlate_pcc_kernel
+    public_ref = cast(EvidenceRef, case.proof.evidence_ref)
+    original_event_id = public_ref.event_id
+
+    def mutate_restore_kernel(
+        trusted_proof: AuthenticatedPCCInput,
+        trusted_context: CorrelationContext,
+    ) -> object:
+        trusted_ref = cast(EvidenceRef, trusted_proof.evidence_ref)
+        assert trusted_ref is not public_ref
+        assert trusted_ref == public_ref
+        try:
+            object.__setattr__(
+                public_ref,
+                "event_id",
+                "00000000-0000-4000-8000-000000000099",
+            )
+            assert trusted_ref.event_id == original_event_id
+            return real_kernel(trusted_proof, trusted_context)
+        finally:
+            object.__setattr__(public_ref, "event_id", original_event_id)
+
+    monkeypatch.setattr(
+        pcc_module,
+        "_correlate_pcc_kernel",
+        mutate_restore_kernel,
+    )
+    try:
+        assert type(correlate_pcc(case.proof, case.context)) is CandidateCreated
+    finally:
+        case.close()
+
+
+def test_layout_compatible_class_swap_probe_burns_issued_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _projection_case(tmp_path, monkeypatch)
+    try:
+        object.__setattr__(
+            case.context,
+            "__class__",
+            _LayoutCompatibleCorrelationContext,
+        )
+        try:
+            with pytest.raises(TypeError):
+                correlate_pcc(case.proof, case.context)
+        finally:
+            object.__setattr__(case.context, "__class__", CorrelationContext)
+
+        _assert_mismatch(correlate_pcc(case.proof, case.context))
+    finally:
+        case.close()
+
+
+def test_exact_store_lifecycle_allows_only_one_live_authority_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _projection_case(tmp_path, monkeypatch)
+    authority = _authority_module()
+    try:
+        with pytest.raises(CorrelationProjectionError, match="owner"):
+            authority._create_correlation_projection_authority(  # type: ignore[attr-defined]
+                case.coordinator.segment_store,
+                case.registry,
+                case.predecessor,
+            )
+    finally:
+        case.close()
+
+
+def test_store_lifecycle_owner_releases_on_close_and_garbage_collection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _projection_case(tmp_path, monkeypatch)
+    authority = _authority_module()
+    replacement: object | None = None
+    final_owner: object | None = None
+    try:
+        authority._close_correlation_projection_authority(  # type: ignore[attr-defined]
+            case.authority
+        )
+        abandoned = authority._create_correlation_projection_authority(  # type: ignore[attr-defined]
+            case.coordinator.segment_store,
+            case.registry,
+            case.predecessor,
+        )
+        abandoned_ref = weakref.ref(abandoned)
+        del abandoned
+        gc.collect()
+        assert abandoned_ref() is None
+
+        replacement = authority._create_correlation_projection_authority(  # type: ignore[attr-defined]
+            case.coordinator.segment_store,
+            case.registry,
+            case.predecessor,
+        )
+        authority._close_correlation_projection_authority(replacement)  # type: ignore[attr-defined]
+        final_owner = authority._create_correlation_projection_authority(  # type: ignore[attr-defined]
+            case.coordinator.segment_store,
+            case.registry,
+            case.predecessor,
+        )
+    finally:
+        if final_owner is not None:
+            authority._close_correlation_projection_authority(final_owner)  # type: ignore[attr-defined]
+        if replacement is not None:
+            authority._close_correlation_projection_authority(replacement)  # type: ignore[attr-defined]
+        case.close()
+
+
+@pytest.mark.parametrize("entrypoint", ["proof", "facts"])
+def test_failed_snapshot_race_never_enters_candidate_capable_kernel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    failed_coordinator, failed = _accepted_failed(tmp_path / "failed")
+    complete_coordinator, complete = _accepted_complete(
+        tmp_path / "complete",
+        ttl_seconds=120,
+    )
+    raw_complete_context = _context(complete)
+    pcc_module = importlib.import_module("agmind_immune.correlation.pcc")
+    real_is_issued = pcc_module.authenticated_pcc_input_is_issued
+    failed_snapshot = failed.snapshot
+    failed_trigger = failed_snapshot.trigger
+    checks = 0
+
+    def swap_after_kernel_issued_check(value: object) -> bool:
+        nonlocal checks
+        result = real_is_issued(value)
+        if value is failed:
+            checks += 1
+            if checks == 2:
+                object.__setattr__(failed, "_snapshot", complete.snapshot)
+        return result
+
+    monkeypatch.setattr(
+        pcc_module,
+        "authenticated_pcc_input_is_issued",
+        swap_after_kernel_issued_check,
+    )
+    try:
+        if entrypoint == "proof":
+            result = correlate_pcc(failed, raw_complete_context)
+        else:
+            result = correlate_pcc_facts(
+                failed_trigger,
+                failed,
+                raw_complete_context,
+            )
+
+        assert type(result) is Rejected
+        assert result.reason_codes == ("inventory_stale",)
+    finally:
+        object.__setattr__(failed, "_snapshot", failed_snapshot)
+        failed_coordinator.segment_store.close()
+        complete_coordinator.segment_store.close()
 
 
 def test_abandoned_issued_context_is_weakly_released(
