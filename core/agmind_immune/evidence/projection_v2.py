@@ -6,28 +6,83 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Sequence
+from _thread import RLock as RLockType
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
+from typing import cast
 
 from pydantic import ValidationError
 
 from agmind_immune.canonicaljson import candidate_facts_sha256, canonical_json
 from agmind_immune.contracts import (
+    MAX_UINT64,
     CoverageEventV1,
     EventEnvelopeV1,
     FalcoConnectV1,
     decode_strict,
 )
+from agmind_immune.correlation.authority import (
+    CorrelationProjectionAuthority,
+    _advance_correlation_projection_authority,
+    _close_correlation_projection_authority,
+    _create_correlation_projection_authority,
+    _issue_correlation_context,
+    _ProjectionPredecessor,
+    _same_exact_pcc,
+    _validate_correlation_projection_predecessor,
+)
+from agmind_immune.correlation.pcc import (
+    ActiveCandidateObservation,
+    CandidateCreated,
+    CandidateDuplicateKey,
+    CorrelationContext,
+    CorrelationProjectionError,
+    Duplicate,
+    InvestigationOnly,
+    Rejected,
+    _duplicate_key,
+    correlate_pcc,
+    incident_from_verified_falco,
+)
+from agmind_immune.correlation.primitives import SpecialUseRegistry
+from agmind_immune.coverage.historical import (
+    HistoricalCoverageConflict,
+    HistoricalCoverageUnavailable,
+    derive_historical_coverage,
+)
 from agmind_immune.evidence.dedup import _logical_primary_identity_v2
-from agmind_immune.evidence.projection import ProjectionConflict, ProjectionValidationError
+from agmind_immune.evidence.projection import (
+    ProjectionApplyResult,
+    ProjectionAuthorityError,
+    ProjectionConflict,
+    ProjectionCursor,
+    ProjectionStatus,
+    ProjectionUnhealthy,
+    ProjectionValidationError,
+)
 from agmind_immune.evidence.segments import (
     EvidenceRef,
+    EvidenceStatus,
+    EvidenceStoreError,
+    SegmentStore,
     StoredEvidenceRecord,
     _exact_coverage_record_key,
 )
 from agmind_immune.incidents.models import ContainmentCandidateV1, IncidentV1
+from agmind_immune.ingest.ack_journal import (
+    AckIdentity,
+    AckJournal,
+    AckJournalSnapshot,
+)
+from agmind_immune.ingest.correlation_journal import (
+    CorrelationRequestJournal,
+    CorrelationRequestJournalError,
+    _revalidate_completed_snapshot,
+)
+from agmind_immune.ingest.envelope import AuthenticatedPCCInput
 
 _SCHEMA_V2_PATH = Path(__file__).with_name("schema_v2.sql")
 _SCHEMA_V2_SHA256 = "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
@@ -42,6 +97,9 @@ _UINT64_V2 = re.compile(r"^[0-9]{20}$")
 _EVENT_ID_V2 = re.compile(r"^evt_[0-9a-f]{64}$")
 _CANDIDATE_ID_V2 = re.compile(r"^cand_[0-9a-f]{64}$")
 _HEX64_V2 = re.compile(r"^[0-9a-f]{64}$")
+_UUID4_V2 = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 _ACCEPTED_AT_V2 = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?Z$"
@@ -239,6 +297,13 @@ _TABLE_LAYOUT_V2: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ),
 )
 _TABLE_NAMES_V2 = frozenset(item[0] for item in _TABLE_LAYOUT_V2)
+_APPLY_STEPS_V2 = ("event", "dedup", "reducer", "cursor")
+_CANDIDATE_STEPS_V2 = (
+    "incident",
+    "candidate",
+    "candidate_evidence_trigger",
+    "candidate_evidence_snapshot",
+)
 
 
 @dataclass(frozen=True)
@@ -663,7 +728,12 @@ def _v2_connection_for_test(path: Path | None = None) -> sqlite3.Connection:
     connection = sqlite3.connect(":memory:" if path is None else path, isolation_level=None)
     try:
         _configure_v2_connection(connection, file_backed=path is not None)
-        _create_v2_schema(connection)
+        existing_tables = connection.execute(
+            "SELECT count(*) FROM sqlite_schema "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+        if existing_tables == 0:
+            _create_v2_schema(connection)
         _verify_v2_schema(connection)
     except BaseException:
         connection.close()
@@ -783,6 +853,2113 @@ def _prepare_v2(record: StoredEvidenceRecord) -> _PreparedV2Record:
             raise ProjectionValidationError("Projection V2 coverage input is invalid") from error
     kind, identity = _logical_primary_identity_v2(envelope)
     return _PreparedV2Record(record, envelope, kind, identity, falco, coverage)
+
+
+def _optional_uint64_v2(value: int | None) -> str | None:
+    return None if value is None else _encode_uint64_v2(value)
+
+
+def _event_values_v2(
+    prepared: _PreparedV2Record,
+    duplicate: str | None,
+) -> tuple[object, ...]:
+    envelope = prepared.envelope
+    ref = prepared.record.ref
+    canonical = prepared.record.canonical_envelope
+    return (
+        envelope.event_id,
+        envelope.host_id,
+        _encode_uint64_v2(envelope.source_sequence),
+        envelope.event_type,
+        envelope.source_id,
+        envelope.source_version,
+        envelope.key_id,
+        _encode_uint64_v2(envelope.key_epoch),
+        envelope.boot_id,
+        envelope.event_time,
+        envelope.ingest_time,
+        envelope.clock_uncertainty_ms,
+        envelope.container_id,
+        envelope.container_start_time,
+        envelope.release_id,
+        _encode_uint64_v2(envelope.inventory_generation),
+        _optional_uint64_v2(envelope.inventory_revision),
+        canonical_json(envelope.normalized_fields).decode("utf-8"),
+        envelope.normalized_fields_sha256,
+        canonical_json(envelope.redaction_flags).decode("utf-8"),
+        canonical_json(envelope.coverage_flags).decode("utf-8"),
+        envelope.source_payload_hash,
+        envelope.source_signature,
+        ref.segment_id,
+        ref.segment_relative_path,
+        _encode_uint64_v2(ref.frame_offset),
+        _encode_uint64_v2(ref.frame_size),
+        ref.frame_sha256,
+        hashlib.sha256(canonical).hexdigest(),
+        ref.content_sha256,
+        duplicate,
+    )
+
+
+def _v2_cursor_from_row(row: sqlite3.Row | None) -> ProjectionCursor | None:
+    if row is None:
+        return None
+    if tuple(row.keys()) != (
+        "host_id",
+        "source_sequence",
+        "event_id",
+        "content_sha256",
+        "frame_sha256",
+    ):
+        raise ProjectionConflict("Projection V2 cursor columns are not exact")
+    host_id = row["host_id"]
+    event_id = row["event_id"]
+    content_sha256 = row["content_sha256"]
+    frame_sha256 = row["frame_sha256"]
+    if (
+        type(host_id) is not str
+        or _UUID4_V2.fullmatch(host_id) is None
+        or type(event_id) is not str
+        or _EVENT_ID_V2.fullmatch(event_id) is None
+        or type(content_sha256) is not str
+        or _HEX64_V2.fullmatch(content_sha256) is None
+        or type(frame_sha256) is not str
+        or _HEX64_V2.fullmatch(frame_sha256) is None
+    ):
+        raise ProjectionConflict("Projection V2 cursor identity is invalid")
+    return ProjectionCursor(
+        host_id=host_id,
+        source_sequence=_decode_uint64_v2(row["source_sequence"]),
+        event_id=event_id,
+        content_sha256=content_sha256,
+        frame_sha256=frame_sha256,
+    )
+
+
+def _current_v2_cursor(connection: sqlite3.Connection) -> ProjectionCursor | None:
+    rows = connection.execute(
+        "SELECT host_id,source_sequence,event_id,content_sha256,frame_sha256 "
+        "FROM ingest_cursors ORDER BY host_id"
+    ).fetchall()
+    if len(rows) > 1:
+        raise ProjectionConflict("Projection V2 has multiple single-host cursors")
+    return _v2_cursor_from_row(rows[0] if rows else None)
+
+
+def _current_v2_cursor_ref(connection: sqlite3.Connection) -> EvidenceRef | None:
+    rows = connection.execute(
+        "SELECT source_sequence,event_id,content_sha256,segment_id,"
+        "segment_relative_path,frame_offset,frame_size,frame_sha256 "
+        "FROM ingest_cursors ORDER BY host_id"
+    ).fetchall()
+    if len(rows) > 1:
+        raise ProjectionConflict("Projection V2 has multiple single-host cursor refs")
+    if not rows:
+        return None
+    row = rows[0]
+    values = tuple(row)
+    if len(values) != 8 or any(type(value) is not str for value in values):
+        raise ProjectionConflict("Projection V2 cursor ref fields are not exact text")
+    try:
+        return EvidenceRef(
+            segment_id=cast(str, row["segment_id"]),
+            segment_relative_path=cast(str, row["segment_relative_path"]),
+            frame_offset=_decode_uint64_v2(row["frame_offset"]),
+            frame_size=_decode_uint64_v2(row["frame_size"]),
+            frame_sha256=_validate_identity_v2(
+                row["frame_sha256"], _HEX64_V2, "cursor frame hash"
+            ),
+            event_id=_validate_identity_v2(
+                row["event_id"], _EVENT_ID_V2, "cursor event ID"
+            ),
+            source_sequence=_decode_uint64_v2(row["source_sequence"]),
+            content_sha256=_validate_identity_v2(
+                row["content_sha256"], _HEX64_V2, "cursor content hash"
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise ProjectionConflict("Projection V2 cursor ref is invalid") from error
+
+
+def _predecessor_v2(
+    generation: int,
+    cursor: ProjectionCursor | None,
+) -> _ProjectionPredecessor:
+    if type(generation) is not int or not 1 <= generation <= MAX_UINT64:
+        raise ProjectionConflict("Projection V2 generation must be a positive uint64")
+    if cursor is None:
+        return _ProjectionPredecessor(
+            generation=generation,
+            host_id=None,
+            source_sequence=0,
+            event_id=None,
+            content_sha256=None,
+            frame_sha256=None,
+        )
+    return _ProjectionPredecessor(
+        generation=generation,
+        host_id=cursor.host_id,
+        source_sequence=cursor.source_sequence,
+        event_id=cursor.event_id,
+        content_sha256=cursor.content_sha256,
+        frame_sha256=cursor.frame_sha256,
+    )
+
+
+@dataclass(frozen=True)
+class _ProjectionAckBoundaryV2:
+    confirmed: AckIdentity | None
+    pending: AckIdentity | None
+    generation: int
+    prefix_size: int
+    prefix_sha256: str
+
+    @property
+    def confirmed_through(self) -> int:
+        confirmed = self.confirmed
+        return 0 if confirmed is None else confirmed.sequence
+
+
+def _exact_ack_identity_v2(value: object) -> AckIdentity | None:
+    if value is None:
+        return None
+    if (
+        type(value) is not AckIdentity
+        or type(value.sequence) is not int
+        or not 1 <= value.sequence <= MAX_UINT64
+        or type(value.event_id) is not str
+        or _EVENT_ID_V2.fullmatch(value.event_id) is None
+        or type(value.content_sha256) is not str
+        or _HEX64_V2.fullmatch(value.content_sha256) is None
+    ):
+        raise ProjectionAuthorityError(
+            "Projection V2 ACK identity is not exact"
+        )
+    return value
+
+
+def _healthy_acceptance_cursor_v2(
+    store: SegmentStore,
+    lifecycle: object,
+) -> int:
+    try:
+        status = store.status()
+    except Exception as error:
+        raise ProjectionAuthorityError(
+            "Projection V2 evidence status is unavailable"
+        ) from error
+    if (
+        type(status) is not EvidenceStatus
+        or store._lifecycle_identity is not lifecycle
+        or getattr(store, "_closed", True)
+        or status.healthy is not True
+        or status.repair_pending is not False
+        or status.retention_pending is not False
+        or type(status.acceptance_cursor) is not int
+        or not 0 <= status.acceptance_cursor <= MAX_UINT64
+    ):
+        raise ProjectionAuthorityError(
+            "Projection V2 evidence acceptance cursor is not exact and healthy"
+        )
+    return status.acceptance_cursor
+
+
+def _same_stored_record_v2(
+    left: StoredEvidenceRecord,
+    right: StoredEvidenceRecord,
+) -> bool:
+    try:
+        left_key = _exact_coverage_record_key(left)
+        right_key = _exact_coverage_record_key(right)
+        return left_key == right_key
+    except (AttributeError, TypeError, UnicodeError, ValueError):
+        return False
+
+
+def _insert_v2_incident(
+    connection: sqlite3.Connection,
+    incident: IncidentV1,
+    result_kind: str,
+) -> None:
+    placeholders = ",".join("?" for _ in _INCIDENT_COLUMNS)
+    connection.execute(
+        f"INSERT INTO incidents({','.join(_INCIDENT_COLUMNS)}) VALUES({placeholders})",
+        _encode_incident(incident, result_kind),
+    )
+
+
+def _insert_v2_candidate(
+    connection: sqlite3.Connection,
+    candidate: ContainmentCandidateV1,
+) -> None:
+    placeholders = ",".join("?" for _ in _CANDIDATE_COLUMNS)
+    connection.execute(
+        f"INSERT INTO candidates({','.join(_CANDIDATE_COLUMNS)}) VALUES({placeholders})",
+        _encode_candidate(candidate),
+    )
+
+
+def _candidate_key_tuple_v2(
+    key: CandidateDuplicateKey,
+) -> tuple[str, str, str, str, str, str]:
+    if type(key) is not CandidateDuplicateKey:
+        raise CorrelationProjectionError("candidate duplicate key is not exact")
+    return (
+        key.host_id,
+        key.boot_id,
+        key.docker_container_id,
+        key.docker_started_at,
+        key.detector_bundle_sha256,
+        key.destination_ipv4,
+    )
+
+
+def _active_duplicate_v2(
+    connection: sqlite3.Connection,
+    key: CandidateDuplicateKey,
+    *,
+    current_trigger_order: tuple[int, str],
+) -> ActiveCandidateObservation | None:
+    if (
+        type(current_trigger_order) is not tuple
+        or len(current_trigger_order) != 2
+        or type(current_trigger_order[0]) is not int
+        or type(current_trigger_order[1]) is not str
+    ):
+        raise CorrelationProjectionError("current trigger order is not exact")
+    columns = ",".join(_CANDIDATE_COLUMNS)
+    rows = connection.execute(
+        f"SELECT {columns} FROM candidates WHERE "
+        "host_id=? AND boot_id=? AND docker_container_id=? AND docker_started_at=? "
+        "AND detector_bundle_sha256=? AND destination_ipv4=? "
+        "ORDER BY primary_source_sequence COLLATE BINARY,"
+        "primary_event_id COLLATE BINARY,candidate_id COLLATE BINARY LIMIT 2",
+        _candidate_key_tuple_v2(key),
+    ).fetchall()
+    if len(rows) > 1:
+        raise ProjectionConflict(
+            "Projection V2 has multiple active candidates for one duplicate key"
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    if _candidate_duplicate_key_from_row(row) != _candidate_key_tuple_v2(key):
+        raise ProjectionConflict("Projection V2 duplicate lookup returned another key")
+    candidate = _decode_candidate(row)
+    if (
+        candidate.primary_source_sequence,
+        candidate.primary_event_id,
+    ) >= current_trigger_order:
+        raise ProjectionConflict(
+            "Projection V2 active primary is not before the current trigger"
+        )
+    return ActiveCandidateObservation(
+        key=key,
+        candidate_id=candidate.candidate_id,
+        primary_source_sequence=candidate.primary_source_sequence,
+        primary_event_id=candidate.primary_event_id,
+    )
+
+
+def _historical_active_duplicate_v2(
+    connection: sqlite3.Connection,
+    key: CandidateDuplicateKey,
+    *,
+    current_trigger_order: tuple[int, str],
+) -> ActiveCandidateObservation | None:
+    if (
+        type(current_trigger_order) is not tuple
+        or len(current_trigger_order) != 2
+        or type(current_trigger_order[0]) is not int
+        or type(current_trigger_order[1]) is not str
+    ):
+        raise CorrelationProjectionError("historical trigger order is not exact")
+    sequence, event_id = current_trigger_order
+    columns = ",".join(_CANDIDATE_COLUMNS)
+    rows = connection.execute(
+        f"SELECT {columns} FROM candidates WHERE "
+        "host_id=? AND boot_id=? AND docker_container_id=? AND docker_started_at=? "
+        "AND detector_bundle_sha256=? AND destination_ipv4=? AND "
+        "(primary_source_sequence<? OR "
+        "(primary_source_sequence=? AND primary_event_id<?)) "
+        "ORDER BY primary_source_sequence COLLATE BINARY,"
+        "primary_event_id COLLATE BINARY,candidate_id COLLATE BINARY LIMIT 2",
+        (
+            *_candidate_key_tuple_v2(key),
+            _encode_uint64_v2(sequence),
+            _encode_uint64_v2(sequence),
+            event_id,
+        ),
+    ).fetchall()
+    if len(rows) > 1:
+        raise ProjectionConflict(
+            "Projection V2 has multiple historical active candidates"
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    if _candidate_duplicate_key_from_row(row) != _candidate_key_tuple_v2(key):
+        raise ProjectionConflict(
+            "Projection V2 historical lookup returned another key"
+        )
+    candidate = _decode_candidate(row)
+    if (
+        candidate.primary_source_sequence,
+        candidate.primary_event_id,
+    ) >= current_trigger_order:
+        raise ProjectionConflict(
+            "Projection V2 historical active primary is not before its trigger"
+        )
+    return ActiveCandidateObservation(
+        key=key,
+        candidate_id=candidate.candidate_id,
+        primary_source_sequence=candidate.primary_source_sequence,
+        primary_event_id=candidate.primary_event_id,
+    )
+
+
+class _V2ProjectionOwner:
+    """Dormant single-owner reducer for exact authenticated V2 projection tests."""
+
+    _connection: sqlite3.Connection | None
+    _evidence: SegmentStore
+    _acknowledgements: AckJournal
+    _journal: CorrelationRequestJournal
+    _registry: SpecialUseRegistry
+    _evidence_lifecycle: object
+    _ack_lifecycle: object
+    _authority: CorrelationProjectionAuthority | None
+    _generation: int
+    _step_hook: Callable[[str], None]
+    _mutex: RLockType
+    _healthy: bool
+    _closed: bool
+
+    def __init__(self) -> None:
+        raise TypeError("use the module-private Projection V2 owner factory")
+
+    @classmethod
+    def _take_ownership(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        evidence: SegmentStore,
+        acknowledgements: AckJournal,
+        journal: CorrelationRequestJournal,
+        registry: SpecialUseRegistry,
+        step_hook: Callable[[str], None] | None,
+    ) -> _V2ProjectionOwner:
+        if (
+            not isinstance(connection, sqlite3.Connection)
+            or type(evidence) is not SegmentStore
+            or type(acknowledgements) is not AckJournal
+            or type(journal) is not CorrelationRequestJournal
+            or type(registry) is not SpecialUseRegistry
+            or getattr(acknowledgements, "_store", None) is not evidence
+            or getattr(journal, "_store", None) is not evidence
+            or (step_hook is not None and not callable(step_hook))
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 owner requires exact same-lifecycle resources"
+            )
+        try:
+            journal_is_live = journal._is_bound_to(evidence)
+        except Exception as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 journal lifecycle cannot be validated"
+            ) from error
+        if journal_is_live is not True:
+            raise ProjectionAuthorityError(
+                "Projection V2 journal is not live on the evidence lifecycle"
+            )
+        generation = 1
+        owner = object.__new__(cls)
+        owner._connection = connection
+        owner._evidence = evidence
+        owner._acknowledgements = acknowledgements
+        owner._journal = journal
+        owner._registry = registry
+        owner._evidence_lifecycle = evidence._lifecycle_identity
+        owner._ack_lifecycle = acknowledgements._lifecycle_identity
+        owner._authority = None
+        owner._generation = generation
+        owner._step_hook = step_hook or (lambda _step: None)
+        owner._mutex = RLock()
+        owner._healthy = True
+        owner._closed = False
+        try:
+            if connection.in_transaction:
+                raise ProjectionConflict(
+                    "Projection V2 owner cannot adopt an active transaction"
+                )
+            _verify_v2_schema(connection)
+            cursor = _current_v2_cursor(connection)
+            acceptance_cursor = owner._healthy_acceptance_cursor()
+            ack_boundary = owner._freeze_ack_boundary(acceptance_cursor)
+            if cursor is not None and cursor.source_sequence > acceptance_cursor:
+                raise ProjectionConflict(
+                    "Projection V2 cursor exceeds authenticated acceptance"
+                )
+            if cursor is not None and cursor.source_sequence > ack_boundary.confirmed_through:
+                raise ProjectionConflict(
+                    "Projection V2 cursor exceeds authenticated ACK confirmation"
+                )
+            owner._validate_cursor_evidence(connection, cursor)
+            predecessor = _predecessor_v2(generation, cursor)
+            created_authority = _create_correlation_projection_authority(
+                evidence,
+                registry,
+                predecessor,
+            )
+            owner._authority = created_authority
+            owner._validate_persisted_prefix(
+                connection,
+                created_authority,
+                predecessor,
+                cursor,
+            )
+        except ProjectionConflict:
+            owner._healthy = False
+            owner._close_resources()
+            raise
+        except Exception as error:
+            owner._healthy = False
+            owner._close_resources()
+            raise ProjectionAuthorityError(
+                "Projection V2 owner authority could not be created"
+            ) from error
+        except BaseException:
+            owner._healthy = False
+            owner._close_resources()
+            raise
+        return owner
+
+    def _healthy_acceptance_cursor(self) -> int:
+        return _healthy_acceptance_cursor_v2(
+            self._evidence,
+            self._evidence_lifecycle,
+        )
+
+    def _current_ack_boundary(self) -> _ProjectionAckBoundaryV2:
+        acknowledgements = self._acknowledgements
+        if (
+            type(acknowledgements) is not AckJournal
+            or acknowledgements._store is not self._evidence
+            or acknowledgements._lifecycle_identity is not self._ack_lifecycle
+            or self._ack_lifecycle is not self._evidence_lifecycle
+            or getattr(self._evidence, "_ack_journal_owner", None)
+            is not acknowledgements
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 ACK journal changed lifecycle"
+            )
+        try:
+            snapshot = acknowledgements.snapshot()
+            self._evidence._validate_ack_journal_owner(
+                acknowledgements,
+                self._ack_lifecycle,
+            )
+            commitment = self._evidence._validate_ack_commitment_binding()
+        except Exception as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 ACK authority is unavailable"
+            ) from error
+        if type(snapshot) is not AckJournalSnapshot or snapshot.healthy is not True:
+            raise ProjectionAuthorityError(
+                "Projection V2 ACK snapshot is not exact and healthy"
+            )
+        confirmed = _exact_ack_identity_v2(snapshot.confirmed)
+        pending = _exact_ack_identity_v2(snapshot.pending)
+        private_confirmed = _exact_ack_identity_v2(
+            getattr(acknowledgements, "_confirmed", None)
+        )
+        private_pending = _exact_ack_identity_v2(
+            getattr(acknowledgements, "_pending", None)
+        )
+        generation = getattr(acknowledgements, "_confirmed_generation", None)
+        prefix_size = getattr(acknowledgements, "_committed_prefix_size", None)
+        prefix_sha256 = getattr(
+            acknowledgements,
+            "_committed_prefix_sha256",
+            None,
+        )
+        if (
+            confirmed != private_confirmed
+            or pending != private_pending
+            or type(generation) is not int
+            or not 0 <= generation <= MAX_UINT64
+            or type(prefix_size) is not int
+            or prefix_size < 0
+            or type(prefix_sha256) is not str
+            or _HEX64_V2.fullmatch(prefix_sha256) is None
+            or (confirmed is None) != (generation == 0)
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 ACK committed boundary is inconsistent"
+            )
+        durable_confirmed = getattr(commitment, "confirmed", None)
+        if confirmed is None:
+            durable_identity_matches = durable_confirmed is None
+        else:
+            durable_identity_matches = (
+                durable_confirmed is not None
+                and getattr(durable_confirmed, "sequence", None)
+                == confirmed.sequence
+                and getattr(durable_confirmed, "event_id", None)
+                == confirmed.event_id
+                and getattr(durable_confirmed, "content_sha256", None)
+                == confirmed.content_sha256
+            )
+        if (
+            getattr(commitment, "phase", None) != "ready"
+            or getattr(commitment, "generation", None) != generation
+            or getattr(commitment, "journal_prefix_size", None) != prefix_size
+            or getattr(commitment, "journal_prefix_sha256", None)
+            != prefix_sha256
+            or not durable_identity_matches
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 ACK cache differs from durable commitment"
+            )
+        try:
+            if acknowledgements._hash_held_prefix(prefix_size).hex() != prefix_sha256:
+                raise ProjectionAuthorityError(
+                    "Projection V2 ACK committed prefix changed"
+                )
+            if confirmed is not None:
+                self._evidence._validate_ack_identity(
+                    acknowledgements,
+                    self._ack_lifecycle,
+                    sequence=confirmed.sequence,
+                    event_id=confirmed.event_id,
+                    content_sha256=confirmed.content_sha256,
+                )
+            if pending is not None:
+                next_record = next(
+                    self._evidence.iter_authenticated_records(
+                        after=0 if confirmed is None else confirmed.sequence,
+                    ),
+                    None,
+                )
+                if (
+                    next_record is None
+                    or AckIdentity.from_ref(next_record.ref) != pending
+                ):
+                    raise ProjectionAuthorityError(
+                        "Projection V2 pending ACK is not the next evidence ref"
+                    )
+        except ProjectionAuthorityError:
+            raise
+        except Exception as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 ACK boundary does not bind evidence"
+            ) from error
+        return _ProjectionAckBoundaryV2(
+            confirmed=confirmed,
+            pending=pending,
+            generation=generation,
+            prefix_size=prefix_size,
+            prefix_sha256=prefix_sha256,
+        )
+
+    def _freeze_ack_boundary(
+        self,
+        acceptance_cursor: int,
+    ) -> _ProjectionAckBoundaryV2:
+        boundary = self._current_ack_boundary()
+        if boundary.confirmed_through > acceptance_cursor:
+            raise ProjectionAuthorityError(
+                "Projection V2 ACK confirmation exceeds authenticated acceptance"
+            )
+        return boundary
+
+    def _revalidate_ack_boundary(
+        self,
+        frozen: _ProjectionAckBoundaryV2,
+        acceptance_cursor: int,
+    ) -> None:
+        if type(frozen) is not _ProjectionAckBoundaryV2:
+            raise ProjectionAuthorityError(
+                "Projection V2 frozen ACK boundary is not exact"
+            )
+        current = self._freeze_ack_boundary(acceptance_cursor)
+        if (
+            current.confirmed_through < frozen.confirmed_through
+            or current.generation < frozen.generation
+            or current.prefix_size < frozen.prefix_size
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 ACK boundary moved backwards"
+            )
+        if current.confirmed_through == frozen.confirmed_through:
+            if (
+                current.confirmed != frozen.confirmed
+                or current.generation != frozen.generation
+                or current.prefix_size != frozen.prefix_size
+                or current.prefix_sha256 != frozen.prefix_sha256
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 ACK boundary was substituted"
+                )
+            if frozen.pending is not None and current.pending != frozen.pending:
+                raise ProjectionAuthorityError(
+                    "Projection V2 frozen pending ACK was replaced"
+                )
+        try:
+            if (
+                self._acknowledgements._hash_held_prefix(
+                    frozen.prefix_size
+                ).hex()
+                != frozen.prefix_sha256
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 frozen ACK prefix changed"
+                )
+            if frozen.confirmed is not None:
+                self._evidence._validate_ack_identity(
+                    self._acknowledgements,
+                    self._ack_lifecycle,
+                    sequence=frozen.confirmed.sequence,
+                    event_id=frozen.confirmed.event_id,
+                    content_sha256=frozen.confirmed.content_sha256,
+                )
+        except ProjectionAuthorityError:
+            raise
+        except Exception as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 frozen ACK prefix is unavailable"
+            ) from error
+
+    def _require_usable(self) -> tuple[sqlite3.Connection, CorrelationProjectionAuthority]:
+        if self._closed:
+            raise ProjectionUnhealthy("Projection V2 owner is closed")
+        if not self._healthy:
+            raise ProjectionUnhealthy("Projection V2 owner is unhealthy")
+        connection = self._connection
+        authority = self._authority
+        if connection is None or authority is None:
+            self._healthy = False
+            raise ProjectionUnhealthy("Projection V2 owner lost its resources")
+        return connection, authority
+
+    def _validate_cursor_evidence(
+        self,
+        connection: sqlite3.Connection,
+        cursor: ProjectionCursor | None,
+    ) -> None:
+        cursor_ref = _current_v2_cursor_ref(connection)
+        if (cursor is None) != (cursor_ref is None):
+            raise ProjectionConflict("Projection V2 cursor identity is incomplete")
+        if cursor is None:
+            return
+        assert cursor_ref is not None
+        if (
+            cursor_ref.source_sequence != cursor.source_sequence
+            or cursor_ref.event_id != cursor.event_id
+            or cursor_ref.content_sha256 != cursor.content_sha256
+            or cursor_ref.frame_sha256 != cursor.frame_sha256
+        ):
+            raise ProjectionConflict("Projection V2 cursor ref changed")
+        try:
+            resolved = self._evidence.resolve_authenticated_ref(cursor_ref)
+        except EvidenceStoreError as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 cursor is outside authenticated evidence"
+            ) from error
+        if resolved.ref != cursor_ref:
+            raise ProjectionAuthorityError(
+                "Projection V2 cursor does not bind exact authenticated evidence"
+            )
+
+    def _latch_unhealthy(self, primary: BaseException | None = None) -> None:
+        self._healthy = False
+        authority = self._authority
+        self._authority = None
+        if authority is None:
+            return
+        try:
+            _close_correlation_projection_authority(authority)
+        except Exception as error:  # noqa: BLE001 - preserve primary ambiguity
+            if primary is not None:
+                primary.add_note(
+                    "secondary Projection V2 authority-close failure: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+    @staticmethod
+    def _retry_rows_for_authority(
+        connection: sqlite3.Connection,
+        table: str,
+        columns: tuple[str, ...],
+        authority_column: str,
+        authority_event_id: str,
+        *,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        selected = ",".join(columns)
+        primary_key = next(
+            item[2] for item in _TABLE_LAYOUT_V2 if item[0] == table
+        )
+        order = ",".join(
+            f"{column} COLLATE BINARY" for column in primary_key
+        )
+        return connection.execute(
+            f"SELECT {selected} FROM {table} WHERE {authority_column}=? "
+            f"ORDER BY {order} LIMIT {limit}",
+            (authority_event_id,),
+        ).fetchall()
+
+    def _validate_retry_base_closure(
+        self,
+        connection: sqlite3.Connection,
+        prepared: _PreparedV2Record,
+        *,
+        is_primary: bool,
+    ) -> None:
+        event_id = prepared.envelope.event_id
+        coverage_rows = connection.execute(
+            "SELECT host_id,component,kind,severity,opened_at,closed_at,"
+            "affected_source_sequence_start,affected_source_sequence_end,"
+            "dropped_count,reason_code,reconcile_generation,source_sequence,"
+            "content_sha256 FROM coverage_intervals WHERE event_id=? LIMIT 2",
+            (event_id,),
+        ).fetchall()
+        process_rows = connection.execute(
+            "SELECT host_id,container_id,container_started_at,proc_name,"
+            "proc_exe_path,proc_parent_name,source_sequence,content_sha256 "
+            "FROM process_observations WHERE event_id=? LIMIT 2",
+            (event_id,),
+        ).fetchall()
+        network_rows = connection.execute(
+            "SELECT host_id,container_id,container_started_at,successful_connect,"
+            "destination_ipv4,destination_port,l4_protocol,investigation_only,"
+            "source_sequence,content_sha256 FROM network_observations "
+            "WHERE event_id=? LIMIT 2",
+            (event_id,),
+        ).fetchall()
+        if not is_primary:
+            if coverage_rows or process_rows or network_rows:
+                raise ProjectionConflict(
+                    "Projection V2 duplicate retry has reducer side effects"
+                )
+            return
+        ref = prepared.record.ref
+        sequence = _encode_uint64_v2(ref.source_sequence)
+        if prepared.coverage is not None:
+            coverage = prepared.coverage
+            expected_coverage = (
+                prepared.envelope.host_id,
+                coverage.component,
+                coverage.kind,
+                coverage.severity,
+                coverage.opened_at,
+                coverage.closed_at,
+                _optional_uint64_v2(coverage.affected_source_sequence_start),
+                _optional_uint64_v2(coverage.affected_source_sequence_end),
+                _optional_uint64_v2(coverage.dropped_count),
+                coverage.reason_code,
+                _optional_uint64_v2(coverage.reconcile_generation),
+                sequence,
+                ref.content_sha256,
+            )
+            if (
+                len(coverage_rows) != 1
+                or tuple(coverage_rows[0]) != expected_coverage
+                or process_rows
+                or network_rows
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 coverage retry closure changed"
+                )
+            return
+        falco = prepared.falco
+        if falco is None:
+            if coverage_rows or process_rows or network_rows:
+                raise ProjectionConflict(
+                    "Projection V2 generic retry has reducer side effects"
+                )
+            return
+        expected_process = (
+            prepared.envelope.host_id,
+            falco.docker_container_id,
+            falco.docker_started_at,
+            falco.proc_name,
+            falco.proc_exe_path,
+            falco.proc_parent_name,
+            sequence,
+            ref.content_sha256,
+        )
+        expected_network = (
+            prepared.envelope.host_id,
+            falco.docker_container_id,
+            falco.docker_started_at,
+            int(falco.successful_connect),
+            falco.destination_ipv4,
+            falco.destination_port,
+            falco.l4_protocol,
+            int(falco.investigation_only),
+            sequence,
+            ref.content_sha256,
+        )
+        if (
+            coverage_rows
+            or len(process_rows) != 1
+            or tuple(process_rows[0]) != expected_process
+            or len(network_rows) != 1
+            or tuple(network_rows[0]) != expected_network
+        ):
+            raise ProjectionConflict(
+                "Projection V2 Falco retry closure changed"
+            )
+
+    def _retry_pcc_result(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        prepared: _PreparedV2Record,
+    ) -> tuple[
+        AuthenticatedPCCInput,
+        CandidateCreated | Duplicate | InvestigationOnly | Rejected,
+    ]:
+        completed = self._journal.completed_for_snapshot(prepared.record.ref)
+        proof = _revalidate_completed_snapshot(completed)
+        if (
+            type(proof) is not AuthenticatedPCCInput
+            or not self._evidence._authenticated_pcc_input_is_exact(proof)
+            or type(proof.evidence_ref) is not EvidenceRef
+            or proof.evidence_ref != prepared.record.ref
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 retry lost completed PCC authority"
+            )
+        if proof.snapshot.outcome == "failed":
+            result = correlate_pcc(proof, CorrelationContext.failed_snapshot())
+        else:
+            key = _duplicate_key(proof, proof.snapshot)
+            trigger = proof.snapshot.trigger
+            active = _historical_active_duplicate_v2(
+                connection,
+                key,
+                current_trigger_order=(
+                    trigger.source_sequence,
+                    trigger.event_id,
+                ),
+            )
+            issued_proof, context = _issue_correlation_context(
+                authority,
+                completed,
+                expected_predecessor=predecessor,
+                active_duplicate=active,
+            )
+            if not _same_exact_pcc(proof, issued_proof):
+                raise ProjectionAuthorityError(
+                    "Projection V2 retry issued a changed PCC"
+                )
+            result = correlate_pcc(issued_proof, context)
+        final = _revalidate_completed_snapshot(completed)
+        if not _same_exact_pcc(proof, final):
+            raise ProjectionAuthorityError(
+                "Projection V2 completed PCC changed during retry"
+            )
+        if not isinstance(
+            result,
+            (CandidateCreated, Duplicate, InvestigationOnly, Rejected),
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 retry correlation result is not closed"
+            )
+        return proof, result
+
+    def _validate_retry_security_closure(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        prepared: _PreparedV2Record,
+        *,
+        is_primary: bool,
+    ) -> None:
+        event_id = prepared.envelope.event_id
+        incident_rows = self._retry_rows_for_authority(
+            connection,
+            "incidents",
+            _INCIDENT_COLUMNS,
+            "authority_event_id",
+            event_id,
+            limit=2,
+        )
+        candidate_rows = self._retry_rows_for_authority(
+            connection,
+            "candidates",
+            _CANDIDATE_COLUMNS,
+            "correlation_snapshot_event_id",
+            event_id,
+            limit=2,
+        )
+        evidence_rows = self._retry_rows_for_authority(
+            connection,
+            "candidate_evidence",
+            _TABLE_LAYOUT_V2[9][1],
+            "authority_snapshot_event_id",
+            event_id,
+            limit=3,
+        )
+        if not is_primary:
+            if incident_rows or candidate_rows or evidence_rows:
+                raise ProjectionConflict(
+                    "Projection V2 duplicate retry has security side effects"
+                )
+            return
+        if prepared.envelope.event_type == "pcc_correlation_snapshot":
+            proof, result = self._retry_pcc_result(
+                connection,
+                authority,
+                predecessor,
+                prepared,
+            )
+            if isinstance(result, CandidateCreated):
+                result_kind = "candidate"
+            elif isinstance(result, Duplicate):
+                result_kind = "duplicate"
+            elif isinstance(result, InvestigationOnly):
+                result_kind = "investigation"
+            else:
+                result_kind = "rejected"
+            if (
+                len(incident_rows) != 1
+                or tuple(incident_rows[0])
+                != _encode_incident(result.incident, result_kind)
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 PCC retry incident closure changed"
+                )
+            if isinstance(result, CandidateCreated):
+                candidate_id = result.candidate.candidate_id
+                expected_roles = (
+                    ("primary_trigger", proof.snapshot.trigger),
+                    ("correlation_snapshot", proof),
+                )
+                if (
+                    len(candidate_rows) != 1
+                    or tuple(candidate_rows[0])
+                    != _encode_candidate(result.candidate)
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 PCC retry candidate closure changed"
+                    )
+            elif isinstance(result, Duplicate):
+                candidate_id = result.existing_candidate_id
+                expected_roles = (
+                    ("supporting_trigger", proof.snapshot.trigger),
+                    ("supporting_snapshot", proof),
+                )
+                if candidate_rows:
+                    raise ProjectionConflict(
+                        "Projection V2 duplicate retry created a candidate"
+                    )
+                retained = connection.execute(
+                    f"SELECT {','.join(_CANDIDATE_COLUMNS)} FROM candidates "
+                    "WHERE candidate_id=? LIMIT 2",
+                    (candidate_id,),
+                ).fetchall()
+                if len(retained) != 1:
+                    raise ProjectionConflict(
+                        "Projection V2 duplicate retry lost its candidate"
+                    )
+                _decode_candidate(retained[0])
+            else:
+                if candidate_rows or evidence_rows:
+                    raise ProjectionConflict(
+                        "Projection V2 non-candidate retry has candidate facts"
+                    )
+                return
+            expected_evidence = sorted(
+                _encode_candidate_evidence(
+                    candidate_id,
+                    evidence.event_id,
+                    evidence.source_sequence,
+                    evidence.content_sha256,
+                    role,
+                    proof.event_id,
+                )
+                for role, evidence in expected_roles
+            )
+            actual_evidence = sorted(tuple(row) for row in evidence_rows)
+            if actual_evidence != expected_evidence:
+                raise ProjectionConflict(
+                    "Projection V2 PCC retry evidence closure changed"
+                )
+            return
+        if candidate_rows or evidence_rows:
+            raise ProjectionConflict(
+                "Projection V2 non-PCC retry has candidate facts"
+            )
+        falco = prepared.falco
+        incident_expected = (
+            falco is not None
+            and (
+                not falco.successful_connect
+                or bool(falco.missing_required_fields)
+                or falco.investigation_only
+            )
+        )
+        if not incident_expected:
+            if incident_rows:
+                raise ProjectionConflict(
+                    "Projection V2 retry has an unexpected incident"
+                )
+            return
+        verifier = self._evidence._bound_verifier
+        if verifier is None:
+            raise ProjectionAuthorityError(
+                "Projection V2 retry lost Falco verifier authority"
+            )
+        try:
+            authenticated = self._evidence._authenticated_falco_input(
+                verifier,
+                prepared.record.ref,
+            )
+            incident = incident_from_verified_falco(authenticated)
+        except Exception as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 retry Falco authority is unavailable"
+            ) from error
+        if (
+            len(incident_rows) != 1
+            or tuple(incident_rows[0])
+            != _encode_incident(incident, "investigation")
+        ):
+            raise ProjectionConflict(
+                "Projection V2 direct-incident retry closure changed"
+            )
+
+    def _validate_retry_closure(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        prepared: _PreparedV2Record,
+        *,
+        is_primary: bool,
+    ) -> None:
+        self._validate_retry_base_closure(
+            connection,
+            prepared,
+            is_primary=is_primary,
+        )
+        self._validate_retry_security_closure(
+            connection,
+            authority,
+            predecessor,
+            prepared,
+            is_primary=is_primary,
+        )
+
+    def _validate_persisted_prefix(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        cursor: ProjectionCursor | None,
+    ) -> None:
+        _v2_snapshot_hash(connection)
+        if cursor is None:
+            nonempty = tuple(
+                table
+                for table, _columns, _primary_key in _TABLE_LAYOUT_V2[1:]
+                if connection.execute(
+                    f"SELECT count(*) FROM {table}"
+                ).fetchone()[0]
+                != 0
+            )
+            if nonempty:
+                raise ProjectionConflict(
+                    "Projection V2 has facts without a cursor"
+                )
+            return
+        try:
+            records = tuple(
+                self._evidence.iter_authenticated_records(
+                    after=0,
+                    through=cursor.source_sequence,
+                )
+            )
+        except Exception as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 persisted prefix is unavailable"
+            ) from error
+        if (
+            not records
+            or records[-1].ref.source_sequence != cursor.source_sequence
+            or records[-1].ref.event_id != cursor.event_id
+            or records[-1].ref.content_sha256 != cursor.content_sha256
+            or records[-1].ref.frame_sha256 != cursor.frame_sha256
+            or connection.execute("SELECT count(*) FROM events").fetchone()[0]
+            != len(records)
+            or connection.execute(
+                "SELECT count(*) FROM projection_dedup"
+            ).fetchone()[0]
+            != len(records)
+        ):
+            raise ProjectionConflict(
+                "Projection V2 persisted prefix does not match its cursor"
+            )
+        expected_containers: dict[
+            tuple[str, str, str],
+            tuple[_PreparedV2Record, _PreparedV2Record],
+        ] = {}
+        selected = ",".join(_TABLE_LAYOUT_V2[1][1])
+        for record in records:
+            prepared = _prepare_v2(record)
+            row = connection.execute(
+                f"SELECT {selected} FROM events WHERE event_id=?",
+                (prepared.envelope.event_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectionConflict(
+                    "Projection V2 persisted prefix lost an event"
+                )
+            duplicate = row["duplicate_of_event_id"]
+            if duplicate is not None and (
+                type(duplicate) is not str
+                or _EVENT_ID_V2.fullmatch(duplicate) is None
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 persisted duplicate identity is invalid"
+                )
+            if tuple(row) != _event_values_v2(prepared, duplicate):
+                raise ProjectionConflict(
+                    "Projection V2 persisted event facts changed"
+                )
+            expected_primary = (
+                prepared.envelope.event_id
+                if duplicate is None
+                else duplicate
+            )
+            dedup = connection.execute(
+                "SELECT dedup_kind,logical_key_sha256,primary_event_id,is_primary "
+                "FROM projection_dedup WHERE event_id=?",
+                (prepared.envelope.event_id,),
+            ).fetchone()
+            if dedup is None or tuple(dedup) != (
+                prepared.dedup_kind,
+                prepared.logical_key_sha256,
+                expected_primary,
+                int(duplicate is None),
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 persisted dedup facts changed"
+                )
+            if duplicate is not None:
+                primary = connection.execute(
+                    "SELECT dedup_kind,logical_key_sha256,primary_event_id,is_primary "
+                    "FROM projection_dedup WHERE event_id=?",
+                    (duplicate,),
+                ).fetchone()
+                if primary is None or tuple(primary) != (
+                    prepared.dedup_kind,
+                    prepared.logical_key_sha256,
+                    duplicate,
+                    1,
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 persisted logical primary changed"
+                    )
+            is_primary = duplicate is None
+            self._validate_retry_closure(
+                connection,
+                authority,
+                predecessor,
+                prepared,
+                is_primary=is_primary,
+            )
+            falco = prepared.falco
+            if (
+                is_primary
+                and falco is not None
+                and falco.docker_container_id is not None
+                and falco.docker_started_at is not None
+            ):
+                key = (
+                    prepared.envelope.host_id,
+                    falco.docker_container_id,
+                    falco.docker_started_at,
+                )
+                first = expected_containers.get(key, (prepared, prepared))[0]
+                expected_containers[key] = (first, prepared)
+        actual_containers = _ordered_v2_rows_unverified(
+            connection,
+            "containers",
+        )
+        expected_rows: list[tuple[object, ...]] = []
+        for key, (first, last) in expected_containers.items():
+            first_falco = first.falco
+            last_falco = last.falco
+            if first_falco is None or last_falco is None:
+                raise AssertionError("Projection V2 container facts lost Falco input")
+            expected_rows.append(
+                (
+                    *key,
+                    last_falco.image_id,
+                    canonical_json(last_falco.repo_digests).decode("utf-8"),
+                    last_falco.immutable_spec_sha256,
+                    _optional_uint64_v2(last_falco.inventory_revision),
+                    first.envelope.event_id,
+                    _encode_uint64_v2(first.record.ref.source_sequence),
+                    first.record.ref.content_sha256,
+                    last.envelope.event_id,
+                    _encode_uint64_v2(last.record.ref.source_sequence),
+                    last.record.ref.content_sha256,
+                )
+            )
+        if actual_containers != sorted(expected_rows):
+            raise ProjectionConflict(
+                "Projection V2 persisted container closure changed"
+            )
+
+    def _exact_retry(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        prepared: _PreparedV2Record,
+    ) -> ProjectionApplyResult | None:
+        selected = ",".join(_TABLE_LAYOUT_V2[1][1])
+        row = connection.execute(
+            f"SELECT {selected} FROM events WHERE event_id=?",
+            (prepared.envelope.event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            _v2_snapshot_hash(connection)
+        except ProjectionConflict:
+            self._latch_unhealthy()
+            raise
+        duplicate = row["duplicate_of_event_id"]
+        if duplicate is not None and (
+            type(duplicate) is not str or _EVENT_ID_V2.fullmatch(duplicate) is None
+        ):
+            self._latch_unhealthy()
+            raise ProjectionConflict("Projection V2 retry duplicate identity is invalid")
+        if tuple(row) != _event_values_v2(prepared, duplicate):
+            self._latch_unhealthy()
+            raise ProjectionConflict("Projection V2 event retry facts changed")
+        dedup = connection.execute(
+            "SELECT dedup_kind,logical_key_sha256,primary_event_id,is_primary "
+            "FROM projection_dedup WHERE event_id=?",
+            (prepared.envelope.event_id,),
+        ).fetchone()
+        expected_primary = prepared.envelope.event_id if duplicate is None else duplicate
+        if dedup is None or tuple(dedup) != (
+            prepared.dedup_kind,
+            prepared.logical_key_sha256,
+            expected_primary,
+            int(duplicate is None),
+        ):
+            self._latch_unhealthy()
+            raise ProjectionConflict("Projection V2 retry dedup facts changed")
+        cursor = _current_v2_cursor(connection)
+        if cursor is None or cursor.source_sequence < prepared.envelope.source_sequence:
+            self._latch_unhealthy()
+            raise ProjectionConflict("Projection V2 retry is ahead of its cursor")
+        try:
+            self._validate_retry_closure(
+                connection,
+                authority,
+                predecessor,
+                prepared,
+                is_primary=duplicate is None,
+            )
+        except ProjectionConflict:
+            self._latch_unhealthy()
+            raise
+        except (
+            ProjectionAuthorityError,
+            CorrelationProjectionError,
+            CorrelationRequestJournalError,
+            EvidenceStoreError,
+            HistoricalCoverageConflict,
+            HistoricalCoverageUnavailable,
+            AttributeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            self._latch_unhealthy(error)
+            raise ProjectionAuthorityError(
+                "Projection V2 retry authority could not be revalidated"
+            ) from error
+        return ProjectionApplyResult(
+            event_id=prepared.envelope.event_id,
+            duplicate_of_event_id=duplicate,
+            reducer_applied=False,
+            cursor=cursor,
+        )
+
+    def apply(self, ref: EvidenceRef) -> ProjectionApplyResult:
+        with self._mutex:
+            connection, authority = self._require_usable()
+            if type(ref) is not EvidenceRef:
+                raise ProjectionAuthorityError(
+                    "Projection V2 apply requires an exact evidence ref"
+                )
+            try:
+                _verify_v2_schema(connection)
+                record = self._evidence.resolve_authenticated_ref(ref)
+            except ProjectionConflict:
+                self._latch_unhealthy()
+                raise
+            except Exception as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 ref is not exact authenticated evidence"
+                ) from error
+            prepared = _prepare_v2(record)
+            acceptance_cursor = self._healthy_acceptance_cursor()
+            ack_boundary = self._freeze_ack_boundary(acceptance_cursor)
+            if prepared.record.ref.source_sequence > acceptance_cursor:
+                raise ProjectionAuthorityError(
+                    "Projection V2 ref exceeds contiguous authenticated acceptance"
+                )
+            if prepared.record.ref.source_sequence > ack_boundary.confirmed_through:
+                raise ProjectionAuthorityError(
+                    "Projection V2 ref exceeds authenticated ACK confirmation"
+                )
+            cursor = _current_v2_cursor(connection)
+            self._validate_cursor_evidence(connection, cursor)
+            if cursor is not None and cursor.host_id != prepared.envelope.host_id:
+                self._latch_unhealthy()
+                raise ProjectionConflict("Projection V2 cursor host changed")
+            predecessor = _predecessor_v2(self._generation, cursor)
+            _validate_correlation_projection_predecessor(authority, predecessor)
+            retry = self._exact_retry(
+                connection,
+                authority,
+                predecessor,
+                prepared,
+            )
+            if retry is not None:
+                self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+                _validate_correlation_projection_predecessor(authority, predecessor)
+                return retry
+            after = 0 if cursor is None else cursor.source_sequence
+            try:
+                records = self._evidence.iter_authenticated_records(
+                    after=after,
+                    through=ack_boundary.confirmed_through,
+                )
+                next_record = next(records, None)
+            except Exception as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 source-order authority is unavailable"
+                ) from error
+            if next_record is None or next_record.ref != prepared.record.ref:
+                raise ProjectionAuthorityError(
+                    "Projection V2 ref is not the next authenticated record"
+                )
+            return self._apply_prepared(
+                connection,
+                authority,
+                predecessor,
+                prepared,
+                acceptance_cursor,
+                ack_boundary,
+            )
+
+    def _revalidate_transaction_predecessor(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        prepared: _PreparedV2Record,
+        acceptance_cursor: int,
+        ack_boundary: _ProjectionAckBoundaryV2,
+    ) -> None:
+        if self._healthy_acceptance_cursor() != acceptance_cursor:
+            raise ProjectionAuthorityError(
+                "Projection V2 acceptance cursor changed inside transaction"
+            )
+        self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+        current = _current_v2_cursor(connection)
+        if _predecessor_v2(self._generation, current) != predecessor:
+            raise ProjectionConflict(
+                "Projection V2 predecessor changed inside its transaction"
+            )
+        self._validate_cursor_evidence(connection, current)
+        _validate_correlation_projection_predecessor(authority, predecessor)
+        self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+        if self._healthy_acceptance_cursor() != acceptance_cursor:
+            raise ProjectionAuthorityError(
+                "Projection V2 acceptance cursor changed during validation"
+            )
+        try:
+            current_record = self._evidence.resolve_authenticated_ref(
+                prepared.record.ref
+            )
+        except EvidenceStoreError as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 input lost authenticated evidence authority"
+            ) from error
+        if not _same_stored_record_v2(current_record, prepared.record):
+            raise ProjectionAuthorityError(
+                "Projection V2 authenticated input changed during transaction"
+            )
+        _validate_correlation_projection_predecessor(authority, predecessor)
+
+    def _apply_prepared(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        prepared: _PreparedV2Record,
+        acceptance_cursor: int,
+        ack_boundary: _ProjectionAckBoundaryV2,
+    ) -> ProjectionApplyResult:
+        envelope = prepared.envelope
+        ref = prepared.record.ref
+        duplicate: str | None = None
+        is_primary = False
+        transaction_started = False
+        commit_attempted = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            transaction_started = True
+            self._revalidate_transaction_predecessor(
+                connection,
+                authority,
+                predecessor,
+                prepared,
+                acceptance_cursor,
+                ack_boundary,
+            )
+            duplicate_row = connection.execute(
+                "SELECT primary_event_id FROM projection_dedup "
+                "WHERE dedup_kind=? AND logical_key_sha256=? AND is_primary=1",
+                (prepared.dedup_kind, prepared.logical_key_sha256),
+            ).fetchone()
+            if duplicate_row is not None:
+                duplicate_value = duplicate_row["primary_event_id"]
+                if (
+                    type(duplicate_value) is not str
+                    or _EVENT_ID_V2.fullmatch(duplicate_value) is None
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 logical primary identity is invalid"
+                    )
+                duplicate = duplicate_value
+            is_primary = duplicate is None
+            primary_event_id = envelope.event_id if is_primary else duplicate
+            placeholders = ",".join("?" for _ in _TABLE_LAYOUT_V2[1][1])
+            connection.execute(
+                f"INSERT INTO events({','.join(_TABLE_LAYOUT_V2[1][1])}) "
+                f"VALUES({placeholders})",
+                _event_values_v2(prepared, duplicate),
+            )
+            self._step_hook(_APPLY_STEPS_V2[0])
+            connection.execute(
+                "INSERT INTO projection_dedup("
+                "event_id,dedup_kind,logical_key_sha256,primary_event_id,is_primary"
+                ") VALUES(?,?,?,?,?)",
+                (
+                    envelope.event_id,
+                    prepared.dedup_kind,
+                    prepared.logical_key_sha256,
+                    primary_event_id,
+                    int(is_primary),
+                ),
+            )
+            self._step_hook(_APPLY_STEPS_V2[1])
+            final_authority_check: Callable[[], None] | None = None
+            if is_primary:
+                final_authority_check = self._reduce_primary(
+                    connection,
+                    authority,
+                    predecessor,
+                    prepared,
+                    acceptance_cursor,
+            )
+            self._step_hook(_APPLY_STEPS_V2[2])
+            self._revalidate_transaction_predecessor(
+                connection,
+                authority,
+                predecessor,
+                prepared,
+                acceptance_cursor,
+                ack_boundary,
+            )
+            connection.execute(
+                "INSERT INTO ingest_cursors("
+                "host_id,source_sequence,event_id,content_sha256,segment_id,"
+                "segment_relative_path,frame_offset,frame_size,frame_sha256"
+                ") VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(host_id) DO UPDATE SET "
+                "source_sequence=excluded.source_sequence,event_id=excluded.event_id,"
+                "content_sha256=excluded.content_sha256,segment_id=excluded.segment_id,"
+                "segment_relative_path=excluded.segment_relative_path,"
+                "frame_offset=excluded.frame_offset,frame_size=excluded.frame_size,"
+                "frame_sha256=excluded.frame_sha256",
+                (
+                    envelope.host_id,
+                    _encode_uint64_v2(ref.source_sequence),
+                    ref.event_id,
+                    ref.content_sha256,
+                    ref.segment_id,
+                    ref.segment_relative_path,
+                    _encode_uint64_v2(ref.frame_offset),
+                    _encode_uint64_v2(ref.frame_size),
+                    ref.frame_sha256,
+                ),
+            )
+            self._step_hook(_APPLY_STEPS_V2[3])
+            if final_authority_check is not None:
+                final_authority_check()
+            try:
+                final_record = self._evidence.resolve_authenticated_ref(ref)
+            except EvidenceStoreError as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 input authority disappeared before commit"
+                ) from error
+            if not _same_stored_record_v2(final_record, prepared.record):
+                raise ProjectionAuthorityError(
+                    "Projection V2 input changed before commit"
+                )
+            if self._healthy_acceptance_cursor() != acceptance_cursor:
+                raise ProjectionAuthorityError(
+                    "Projection V2 acceptance cursor changed before commit"
+                )
+            self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+            _validate_correlation_projection_predecessor(
+                authority,
+                predecessor,
+            )
+            commit_attempted = True
+            connection.execute("COMMIT")
+            transaction_started = False
+            self._step_hook("commit")
+            successor = _ProjectionPredecessor(
+                generation=self._generation,
+                host_id=envelope.host_id,
+                source_sequence=ref.source_sequence,
+                event_id=ref.event_id,
+                content_sha256=ref.content_sha256,
+                frame_sha256=ref.frame_sha256,
+            )
+            _advance_correlation_projection_authority(
+                authority,
+                predecessor,
+                successor,
+            )
+        except sqlite3.IntegrityError as error:
+            self._settle_failed_transaction(
+                connection,
+                error,
+                transaction_started=transaction_started,
+                commit_attempted=commit_attempted,
+            )
+            self._latch_unhealthy(error)
+            raise ProjectionConflict(
+                "Projection V2 facts conflict with authenticated evidence"
+            ) from error
+        except BaseException as error:
+            rollback_proven = self._settle_failed_transaction(
+                connection,
+                error,
+                transaction_started=transaction_started,
+                commit_attempted=commit_attempted,
+            )
+            if not rollback_proven:
+                self._latch_unhealthy(error)
+            else:
+                try:
+                    _validate_correlation_projection_predecessor(
+                        authority,
+                        predecessor,
+                    )
+                except Exception:  # noqa: BLE001 - any authority drift is fatal
+                    self._latch_unhealthy(error)
+            raise
+        cursor = ProjectionCursor(
+            host_id=envelope.host_id,
+            source_sequence=ref.source_sequence,
+            event_id=ref.event_id,
+            content_sha256=ref.content_sha256,
+            frame_sha256=ref.frame_sha256,
+        )
+        return ProjectionApplyResult(
+            event_id=envelope.event_id,
+            duplicate_of_event_id=duplicate,
+            reducer_applied=is_primary,
+            cursor=cursor,
+        )
+
+    def _settle_failed_transaction(
+        self,
+        connection: sqlite3.Connection,
+        primary: BaseException,
+        *,
+        transaction_started: bool,
+        commit_attempted: bool,
+    ) -> bool:
+        try:
+            in_transaction = connection.in_transaction
+        except BaseException as error:  # noqa: BLE001 - health ambiguity
+            self._latch_unhealthy(primary)
+            primary.add_note(f"transaction state could not be read: {error!r}")
+            return False
+        if commit_attempted and not in_transaction:
+            self._latch_unhealthy(primary)
+            primary.add_note("Projection V2 COMMIT may have completed")
+            return False
+        if not transaction_started and not in_transaction:
+            return True
+        if not in_transaction:
+            self._latch_unhealthy(primary)
+            primary.add_note("Projection V2 transaction ended without proven rollback")
+            return False
+        try:
+            connection.execute("ROLLBACK")
+            self._step_hook("rollback")
+            return True
+        except BaseException as error:  # noqa: BLE001 - preserve primary
+            self._latch_unhealthy(primary)
+            primary.add_note(f"Projection V2 rollback could not be proven: {error!r}")
+            return False
+
+    def _reduce_primary(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        prepared: _PreparedV2Record,
+        acceptance_cursor: int,
+    ) -> Callable[[], None] | None:
+        self._reduce_base(connection, prepared)
+        if prepared.envelope.event_type != "pcc_correlation_snapshot":
+            return None
+        try:
+            return self._reduce_pcc(
+                connection,
+                authority,
+                predecessor,
+                prepared,
+                acceptance_cursor,
+            )
+        except ProjectionConflict:
+            raise
+        except ProjectionAuthorityError:
+            raise
+        except (
+            CorrelationProjectionError,
+            CorrelationRequestJournalError,
+            EvidenceStoreError,
+            HistoricalCoverageConflict,
+            HistoricalCoverageUnavailable,
+            AttributeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 PCC authority could not be revalidated"
+            ) from error
+
+    def _reduce_base(
+        self,
+        connection: sqlite3.Connection,
+        prepared: _PreparedV2Record,
+    ) -> None:
+        envelope = prepared.envelope
+        ref = prepared.record.ref
+        sequence = _encode_uint64_v2(ref.source_sequence)
+        if prepared.coverage is not None:
+            coverage = prepared.coverage
+            connection.execute(
+                "INSERT INTO coverage_intervals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    envelope.event_id,
+                    envelope.host_id,
+                    coverage.component,
+                    coverage.kind,
+                    coverage.severity,
+                    coverage.opened_at,
+                    coverage.closed_at,
+                    _optional_uint64_v2(coverage.affected_source_sequence_start),
+                    _optional_uint64_v2(coverage.affected_source_sequence_end),
+                    _optional_uint64_v2(coverage.dropped_count),
+                    coverage.reason_code,
+                    _optional_uint64_v2(coverage.reconcile_generation),
+                    sequence,
+                    ref.content_sha256,
+                ),
+            )
+            return
+        falco = prepared.falco
+        if falco is None:
+            return
+        if falco.docker_container_id is not None and falco.docker_started_at is not None:
+            connection.execute(
+                "INSERT INTO containers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(host_id,container_id,container_started_at) DO UPDATE SET "
+                "image_id=excluded.image_id,repo_digests_json=excluded.repo_digests_json,"
+                "immutable_spec_sha256=excluded.immutable_spec_sha256,"
+                "inventory_revision=excluded.inventory_revision,"
+                "last_event_id=excluded.last_event_id,"
+                "last_source_sequence=excluded.last_source_sequence,"
+                "last_content_sha256=excluded.last_content_sha256 "
+                "WHERE excluded.last_source_sequence > containers.last_source_sequence",
+                (
+                    envelope.host_id,
+                    falco.docker_container_id,
+                    falco.docker_started_at,
+                    falco.image_id,
+                    canonical_json(falco.repo_digests).decode("utf-8"),
+                    falco.immutable_spec_sha256,
+                    _optional_uint64_v2(falco.inventory_revision),
+                    envelope.event_id,
+                    sequence,
+                    ref.content_sha256,
+                    envelope.event_id,
+                    sequence,
+                    ref.content_sha256,
+                ),
+            )
+        connection.execute(
+            "INSERT INTO process_observations VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                envelope.event_id,
+                envelope.host_id,
+                falco.docker_container_id,
+                falco.docker_started_at,
+                falco.proc_name,
+                falco.proc_exe_path,
+                falco.proc_parent_name,
+                sequence,
+                ref.content_sha256,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO network_observations VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                envelope.event_id,
+                envelope.host_id,
+                falco.docker_container_id,
+                falco.docker_started_at,
+                int(falco.successful_connect),
+                falco.destination_ipv4,
+                falco.destination_port,
+                falco.l4_protocol,
+                int(falco.investigation_only),
+                sequence,
+                ref.content_sha256,
+            ),
+        )
+        if (
+            not falco.successful_connect
+            or falco.missing_required_fields
+            or falco.investigation_only
+        ):
+            verifier = self._evidence._bound_verifier
+            if verifier is None:
+                raise ProjectionAuthorityError(
+                    "Projection V2 direct incident lacks verifier authority"
+                )
+            try:
+                authenticated = self._evidence._authenticated_falco_input(
+                    verifier,
+                    ref,
+                )
+                incident = incident_from_verified_falco(authenticated)
+                revalidated = self._evidence.resolve_authenticated_ref(ref)
+            except Exception as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 direct incident lost Falco authority"
+                ) from error
+            if not _same_stored_record_v2(revalidated, prepared.record):
+                raise ProjectionAuthorityError(
+                    "Projection V2 direct Falco evidence changed"
+                )
+            _insert_v2_incident(connection, incident, "investigation")
+
+    def _reduce_pcc(
+        self,
+        connection: sqlite3.Connection,
+        authority: CorrelationProjectionAuthority,
+        predecessor: _ProjectionPredecessor,
+        prepared: _PreparedV2Record,
+        acceptance_cursor: int,
+    ) -> Callable[[], None]:
+        if self._healthy_acceptance_cursor() != acceptance_cursor:
+            raise ProjectionAuthorityError(
+                "Projection V2 acceptance changed before PCC history"
+            )
+        ref = prepared.record.ref
+        completed = self._journal.completed_for_snapshot(ref)
+        initial = _revalidate_completed_snapshot(completed)
+        if (
+            type(initial) is not AuthenticatedPCCInput
+            or not self._evidence._authenticated_pcc_input_is_exact(initial)
+        ):
+            raise CorrelationProjectionError(
+                "completed PCC is not exact same-store authority"
+            )
+        active: ActiveCandidateObservation | None = None
+        if initial.snapshot.outcome == "failed":
+            result = correlate_pcc(initial, CorrelationContext.failed_snapshot())
+        else:
+            path = self._evidence._historical_path_authority(initial)
+            coverage_before = derive_historical_coverage(initial, path)
+            if derive_historical_coverage(initial, path) != coverage_before:
+                raise CorrelationProjectionError(
+                    "historical coverage changed before duplicate lookup"
+                )
+            revalidated = _revalidate_completed_snapshot(completed)
+            if not _same_exact_pcc(initial, revalidated):
+                raise CorrelationProjectionError(
+                    "completed PCC changed before duplicate lookup"
+                )
+            key = _duplicate_key(initial, initial.snapshot)
+            if self._healthy_acceptance_cursor() != acceptance_cursor:
+                raise ProjectionAuthorityError(
+                    "Projection V2 acceptance changed before duplicate lookup"
+                )
+            _validate_correlation_projection_predecessor(
+                authority,
+                predecessor,
+            )
+            trigger = initial.snapshot.trigger
+            active = _active_duplicate_v2(
+                connection,
+                key,
+                current_trigger_order=(
+                    trigger.source_sequence,
+                    trigger.event_id,
+                ),
+            )
+            proof, context = _issue_correlation_context(
+                authority,
+                completed,
+                expected_predecessor=predecessor,
+                active_duplicate=active,
+            )
+            if not _same_exact_pcc(initial, proof):
+                raise CorrelationProjectionError(
+                    "issued PCC changed after duplicate lookup"
+                )
+            result = correlate_pcc(proof, context)
+            if self._healthy_acceptance_cursor() != acceptance_cursor:
+                raise ProjectionAuthorityError(
+                    "Projection V2 acceptance changed during correlation"
+                )
+        final = _revalidate_completed_snapshot(completed)
+        if not _same_exact_pcc(initial, final):
+            raise CorrelationProjectionError(
+                "completed PCC changed during correlation"
+            )
+
+        def final_authority_check() -> None:
+            try:
+                persisted = _revalidate_completed_snapshot(completed)
+                if not _same_exact_pcc(initial, persisted):
+                    raise CorrelationProjectionError(
+                        "completed PCC changed after result persistence"
+                    )
+                if self._healthy_acceptance_cursor() != acceptance_cursor:
+                    raise CorrelationProjectionError(
+                        "evidence acceptance changed after result persistence"
+                    )
+                if initial.snapshot.outcome == "complete":
+                    fresh_proof, _fresh_context = _issue_correlation_context(
+                        authority,
+                        completed,
+                        expected_predecessor=predecessor,
+                        active_duplicate=active,
+                    )
+                    if not _same_exact_pcc(initial, fresh_proof):
+                        raise CorrelationProjectionError(
+                            "PCC authority changed during final live validation"
+                        )
+            except ProjectionAuthorityError:
+                raise
+            except Exception as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 PCC authority changed after persistence"
+                ) from error
+
+        if isinstance(result, CandidateCreated):
+            self._persist_candidate_created(connection, result, initial)
+            return final_authority_check
+        if isinstance(result, Duplicate):
+            if active is None or result.existing_candidate_id != active.candidate_id:
+                raise ProjectionConflict(
+                    "Projection V2 duplicate result changed its active primary"
+            )
+            self._persist_duplicate(connection, result, initial)
+            return final_authority_check
+        if isinstance(result, InvestigationOnly):
+            _insert_v2_incident(connection, result.incident, "investigation")
+            self._step_hook(_CANDIDATE_STEPS_V2[0])
+            return final_authority_check
+        if isinstance(result, Rejected):
+            _insert_v2_incident(connection, result.incident, "rejected")
+            self._step_hook(_CANDIDATE_STEPS_V2[0])
+            return final_authority_check
+        raise CorrelationProjectionError("correlation returned an unknown result type")
+
+    def _persist_candidate_created(
+        self,
+        connection: sqlite3.Connection,
+        result: CandidateCreated,
+        proof: AuthenticatedPCCInput,
+    ) -> None:
+        candidate = result.candidate
+        _insert_v2_incident(connection, result.incident, "candidate")
+        self._step_hook(_CANDIDATE_STEPS_V2[0])
+        _insert_v2_candidate(connection, candidate)
+        self._step_hook(_CANDIDATE_STEPS_V2[1])
+        self._insert_candidate_evidence(
+            connection,
+            candidate.candidate_id,
+            proof,
+            trigger_role="primary_trigger",
+            snapshot_role="correlation_snapshot",
+        )
+
+    def _persist_duplicate(
+        self,
+        connection: sqlite3.Connection,
+        result: Duplicate,
+        proof: AuthenticatedPCCInput,
+    ) -> None:
+        _insert_v2_incident(connection, result.incident, "duplicate")
+        self._step_hook(_CANDIDATE_STEPS_V2[0])
+        self._insert_candidate_evidence(
+            connection,
+            result.existing_candidate_id,
+            proof,
+            trigger_role="supporting_trigger",
+            snapshot_role="supporting_snapshot",
+        )
+
+    def _insert_candidate_evidence(
+        self,
+        connection: sqlite3.Connection,
+        candidate_id: str,
+        proof: AuthenticatedPCCInput,
+        *,
+        trigger_role: str,
+        snapshot_role: str,
+    ) -> None:
+        trigger = proof.snapshot.trigger
+        connection.execute(
+            "INSERT INTO candidate_evidence VALUES(?,?,?,?,?,?)",
+            _encode_candidate_evidence(
+                candidate_id,
+                trigger.event_id,
+                trigger.source_sequence,
+                trigger.content_sha256,
+                trigger_role,
+                proof.event_id,
+            ),
+        )
+        self._step_hook(_CANDIDATE_STEPS_V2[2])
+        connection.execute(
+            "INSERT INTO candidate_evidence VALUES(?,?,?,?,?,?)",
+            _encode_candidate_evidence(
+                candidate_id,
+                proof.event_id,
+                proof.source_sequence,
+                proof.content_sha256,
+                snapshot_role,
+                proof.event_id,
+            ),
+        )
+        self._step_hook(_CANDIDATE_STEPS_V2[3])
+
+    def status(self) -> ProjectionStatus:
+        with self._mutex:
+            connection = self._connection
+            cursor: ProjectionCursor | None = None
+            if connection is not None:
+                try:
+                    cursor = _current_v2_cursor(connection)
+                except (ProjectionConflict, sqlite3.DatabaseError):
+                    self._latch_unhealthy()
+            return ProjectionStatus(healthy=self._healthy and not self._closed, cursor=cursor)
+
+    def snapshot_hash(self) -> str:
+        with self._mutex:
+            connection, _authority = self._require_usable()
+            return _v2_snapshot_hash(connection)
+
+    def _close_resources(self) -> list[BaseException]:
+        errors: list[BaseException] = []
+        authority = self._authority
+        self._authority = None
+        if authority is not None:
+            try:
+                _close_correlation_projection_authority(authority)
+            except BaseException as error:  # noqa: BLE001 - close all owned resources
+                errors.append(error)
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            try:
+                connection.close()
+            except BaseException as error:  # noqa: BLE001 - close all owned resources
+                errors.append(error)
+        if not getattr(self._journal, "_closed", True):
+            try:
+                self._journal.close()
+            except BaseException as error:  # noqa: BLE001 - close all owned resources
+                errors.append(error)
+        if not getattr(self._acknowledgements, "_closed", True):
+            try:
+                self._acknowledgements.close()
+            except BaseException as error:  # noqa: BLE001 - close all owned resources
+                errors.append(error)
+        if not getattr(self._evidence, "_closed", True):
+            try:
+                self._evidence.close()
+            except BaseException as error:  # noqa: BLE001 - close all owned resources
+                errors.append(error)
+        return errors
+
+    def close(self) -> None:
+        with self._mutex:
+            if self._closed:
+                return
+            self._closed = True
+            errors = self._close_resources()
+            if errors:
+                self._healthy = False
+                primary = errors[0]
+                for error in errors[1:]:
+                    primary.add_note(
+                        "secondary Projection V2 close failure: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                raise ProjectionUnhealthy(
+                    "Projection V2 owner close could not be proven"
+                ) from primary
+
+
+def _v2_projection_owner_for_test(
+    connection: sqlite3.Connection,
+    *,
+    evidence: SegmentStore,
+    acknowledgements: AckJournal,
+    journal: CorrelationRequestJournal,
+    registry: SpecialUseRegistry,
+    step_hook: Callable[[str], None] | None = None,
+) -> _V2ProjectionOwner:
+    """Transfer exact test resources into one dormant V2 projection owner."""
+    return _V2ProjectionOwner._take_ownership(
+        connection,
+        evidence=evidence,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=registry,
+        step_hook=step_hook,
+    )
 
 
 __all__: list[str] = []
