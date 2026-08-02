@@ -1,8 +1,10 @@
 # AGmind-SAIS: Security AI Sensor
 # Многоступенчатая сборка для минимального размера образа
 
+ARG PYTHON_IMAGE=python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
+
 # ===== Stage 1: Build =====
-FROM python:3.12-slim AS builder
+FROM ${PYTHON_IMAGE} AS builder
 
 WORKDIR /build
 
@@ -15,10 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Копируем и устанавливаем зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN python -m venv /opt/agmind-venv && \
+    /opt/agmind-venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # ===== Stage 2: Runtime =====
-FROM python:3.12-slim
+FROM ${PYTHON_IMAGE}
 
 # Метки
 LABEL org.opencontainers.image.title="AGmind-SAIS"
@@ -36,14 +39,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем Python-пакеты из builder
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+# Копируем root-owned virtualenv из builder
+COPY --from=builder /opt/agmind-venv /opt/agmind-venv
+ENV PATH="/opt/agmind-venv/bin:${PATH}"
 
 # Создаём пользователя (не root)
 RUN useradd -m -s /bin/bash sais && \
     mkdir -p /var/log/sais /var/log/sais/ledger /app && \
     chown -R sais:sais /var/log/sais /app
+
+# Фиксированный root-owned detector bundle для Core
+RUN install -d -o root -g root -m 0755 /etc/falco /etc/falco/rules.d
+COPY --chown=0:0 --chmod=0444 deploy/falco/rules.d/agmind-pcc.yaml \
+  /etc/falco/rules.d/agmind-pcc.yaml
 
 # Копируем приложение
 COPY --chown=sais:sais . /app/

@@ -1,6 +1,6 @@
 include deploy/versions.env
 
-.PHONY: contracts observer sensor fmt iana-check
+.PHONY: contracts observer sensor fmt iana-check test-core-detector-pin-image
 
 UV_RUN = docker run --rm --mount "type=image,src=$(UV_IMAGE),dst=/uv-image" -v "$(PWD):/src" -w /src "$(PYTHON_IMAGE)" /uv-image/uv
 GO_RUN = docker run --rm -v "$(PWD):/src" -w /src -e GOFLAGS=-mod=readonly "$(GO_IMAGE)"
@@ -55,3 +55,9 @@ iana-check:
 fmt:
 	$(UV_RUN) run --frozen ruff format core tests
 	docker run --rm -v "$(PWD):/src" -w /src "$(GO_IMAGE)" gofmt -w internal/contracts internal/specialuse internal/durablefile internal/uds host/observerd
+
+CORE_DETECTOR_PIN_IMAGE ?= agmind-sais:core-detector-pin-test
+
+test-core-detector-pin-image:
+	docker build --pull=false --build-arg PYTHON_IMAGE="$(PYTHON_IMAGE)" --tag "$(CORE_DETECTOR_PIN_IMAGE)" .
+	docker run --rm --network none --read-only --mount "type=bind,src=$(PWD)/deploy/falco/rules.d/agmind-pcc.yaml,dst=/expected/agmind-pcc.yaml,readonly" -e PYTHONPATH=/app/core "$(CORE_DETECTOR_PIN_IMAGE)" python -c 'import os, pwd; from pathlib import Path; from agmind_immune.canonicaljson import pcc_detector_bundle_sha256; from agmind_immune.correlation.authority import _load_pinned_detector_bundle; assert pwd.getpwuid(os.geteuid()).pw_name == "sais"; actual = _load_pinned_detector_bundle(); expected = pcc_detector_bundle_sha256(Path("/expected/agmind-pcc.yaml").read_bytes()); assert actual == expected, (actual, expected)'
