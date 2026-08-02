@@ -18,7 +18,11 @@ from agmind_immune.evidence.segments import (
     StoredEvidenceRecord,
 )
 from agmind_immune.ingest import service as service_module
-from agmind_immune.ingest.ack_journal import AckJournal
+from agmind_immune.ingest.ack_journal import (
+    AckIdentity,
+    AckJournal,
+    AckJournalSnapshot,
+)
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
     EnvelopeVerifier,
@@ -576,6 +580,147 @@ def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
     interrupt_store.close()
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "monotonic_extension",
+        "strict_extension",
+        "rollback_after_rename",
+        "same_sequence_substitution",
+        "invalid_confirmed_scalar",
+        "frozen_pending_replacement",
+        "source_prefix_mutation",
+    ],
+)
+def test_rebuild_revalidates_frozen_ack_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    projection = _projection()
+    coordinator, store, acknowledgements = _system(
+        tmp_path / case / "evidence"
+    )
+    key = private_key(11)
+    refs = (
+        _accept(coordinator, boot_boundary(key)),
+        _accept(
+            coordinator,
+            envelope_value(
+                key,
+                sequence=2,
+                boot_id=BOOT_A,
+                normalized_fields={"kind": "two"},
+            ),
+        ),
+        _accept(
+            coordinator,
+            envelope_value(
+                key,
+                sequence=3,
+                boot_id=BOOT_A,
+                normalized_fields={"kind": "three"},
+            ),
+        ),
+    )
+    _confirm(acknowledgements, refs[0])
+    acknowledgements.record_pending(refs[1])
+    frozen = acknowledgements.snapshot()
+    original_snapshot = acknowledgements.snapshot
+    original_records = store.iter_authenticated_records
+    changed = False
+
+    def snapshot() -> AckJournalSnapshot:
+        if not changed or case in {
+            "monotonic_extension",
+            "strict_extension",
+            "source_prefix_mutation",
+        }:
+            return original_snapshot()
+        if case == "rollback_after_rename":
+            return AckJournalSnapshot(None, None, True)
+        if case == "same_sequence_substitution":
+            return AckJournalSnapshot(
+                AckIdentity(
+                    frozen.confirmed_through,
+                    refs[1].event_id,
+                    refs[1].content_sha256,
+                ),
+                frozen.pending,
+                True,
+            )
+        if case == "invalid_confirmed_scalar":
+            assert frozen.confirmed is not None
+            invalid = AckIdentity(
+                frozen.confirmed.sequence,
+                frozen.confirmed.event_id,
+                frozen.confirmed.content_sha256,
+            )
+            object.__setattr__(invalid, "sequence", True)
+            return AckJournalSnapshot(invalid, frozen.pending, True)
+        assert case == "frozen_pending_replacement"
+        return AckJournalSnapshot(
+            frozen.confirmed,
+            AckIdentity.from_ref(refs[2]),
+            True,
+        )
+
+    def records(
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> Any:
+        if (
+            changed
+            and case == "source_prefix_mutation"
+            and after == 0
+            and through == frozen.confirmed_through
+        ):
+            return iter(())
+        return original_records(after=after, through=through)
+
+    monkeypatch.setattr(acknowledgements, "snapshot", snapshot)
+    monkeypatch.setattr(store, "iter_authenticated_records", records)
+
+    def mutate_authority(step: str) -> None:
+        nonlocal changed
+        target = (
+            "parent_fsync"
+            if case == "rollback_after_rename"
+            else "apply"
+        )
+        if step != target or changed:
+            return
+        changed = True
+        if case in {"monotonic_extension", "strict_extension"}:
+            acknowledgements.record_confirmed(refs[1])
+
+    cache = projection.ProjectionStore.open(
+        tmp_path / case / "projection.sqlite3",
+        evidence=store,
+        acknowledgements=acknowledgements,
+        step_hook=mutate_authority,
+    )
+    try:
+        if case == "monotonic_extension":
+            report = cache.rebuild()
+            assert report.source_record_count == 1
+            assert report.cursor is not None
+            assert report.cursor.source_sequence == 1
+            assert acknowledgements.snapshot().confirmed_through == 2
+        else:
+            rebuild = cache.rebuild
+            if case == "strict_extension":
+                rebuild = lambda: cache._rebuild(require_existing_prefix=False)
+            with pytest.raises(projection.ProjectionConflict):
+                rebuild()
+            assert cache._healthy is (case != "rollback_after_rename")
+    finally:
+        cache.close()
+        acknowledgements.close()
+        store.close(flush=False)
+
+
 def test_projection_open_rejects_corruption_without_retired_ranges(
     tmp_path: Path,
 ) -> None:
@@ -725,6 +870,58 @@ def _retention_case_with_surviving_falco(
     )
     assert [ref.source_sequence for ref in refs] == [1, 2, 3, 4]
     return case, capability, acknowledgements, refs
+
+
+def test_retention_rebuild_ack_conflict_latches_projection_unhealthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection = _projection()
+    raw_hash = hashlib.sha256(b"retention rebuild ACK conflict").hexdigest()
+    case, capability, acknowledgements, refs = (
+        _retention_case_with_surviving_falco(
+            tmp_path / "retention-ack-conflict" / "evidence",
+            raw_hash=raw_hash,
+        )
+    )
+    cache = projection.ProjectionStore.open(
+        tmp_path / "retention-ack-conflict" / "projection.sqlite3",
+        evidence=case.store,
+        acknowledgements=acknowledgements,
+    )
+    try:
+        for ref in refs:
+            cache.apply(ref)
+        completion = case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        original_snapshot = acknowledgements.snapshot
+        changed = False
+
+        def changed_snapshot() -> AckJournalSnapshot:
+            if changed:
+                return AckJournalSnapshot(None, None, True)
+            return original_snapshot()
+
+        def change_ack_after_apply(step: str) -> None:
+            nonlocal changed
+            if step == "apply":
+                changed = True
+
+        monkeypatch.setattr(acknowledgements, "snapshot", changed_snapshot)
+        cache._step_hook = change_ack_after_apply
+        with pytest.raises(projection.ProjectionConflict):
+            cache._rebuild_after_authenticated_retention(
+                completion,
+                _factory=projection._RETENTION_REBUILD_FACTORY,
+            )
+        assert cache.status() == projection.ProjectionStatus(False, None)
+    finally:
+        cache.close()
+        acknowledgements.close()
+        case.coverage.close()
+        case.store.close(flush=False)
 
 
 def test_projection_open_promotes_surviving_duplicate_after_primary_retired(

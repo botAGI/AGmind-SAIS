@@ -42,7 +42,11 @@ from agmind_immune.evidence.segments import (
     SegmentStore,
     StoredEvidenceRecord,
 )
-from agmind_immune.ingest.ack_journal import AckJournal, AckJournalSnapshot
+from agmind_immune.ingest.ack_journal import (
+    AckIdentity,
+    AckJournal,
+    AckJournalSnapshot,
+)
 from agmind_immune.ingest.envelope import EnvelopeVerifier, KeyMetadataError
 
 _UINT64 = re.compile(r"^[0-9]{20}$")
@@ -1167,6 +1171,82 @@ class ProjectionStore:
             raise ProjectionAuthorityError("confirmed prefix has no authenticated terminal")
         return records
 
+    def _authenticated_ack_snapshot(
+        self,
+        snapshot: AckJournalSnapshot,
+    ) -> tuple[
+        tuple[StoredEvidenceRecord, ...],
+        StoredEvidenceRecord | None,
+    ]:
+        if type(snapshot) is not AckJournalSnapshot or snapshot.healthy is not True:
+            raise ProjectionAuthorityError("rebuild ACK snapshot is not exact and healthy")
+        for identity in (snapshot.confirmed, snapshot.pending):
+            if identity is not None and (
+                type(identity) is not AckIdentity
+                or type(identity.sequence) is not int
+                or not 1 <= identity.sequence < 2**64
+                or type(identity.event_id) is not str
+                or _EVENT_ID.fullmatch(identity.event_id) is None
+                or type(identity.content_sha256) is not str
+                or HEX64.fullmatch(identity.content_sha256) is None
+            ):
+                raise ProjectionAuthorityError("rebuild ACK identity is not exact")
+        records = self._records_for_snapshot(snapshot)
+        if snapshot.pending is None:
+            return records, None
+        pending = next(
+            self._evidence.iter_authenticated_records(
+                after=snapshot.confirmed_through,
+            ),
+            None,
+        )
+        if pending is None or AckIdentity.from_ref(pending.ref) != snapshot.pending:
+            raise ProjectionAuthorityError(
+                "pending ACK is not the next authenticated evidence record"
+            )
+        return records, pending
+
+    def _validate_rebuild_ack_authority(
+        self,
+        frozen_records: tuple[StoredEvidenceRecord, ...],
+        frozen_snapshot: AckJournalSnapshot,
+        *,
+        permit_monotonic_extension: bool,
+    ) -> None:
+        try:
+            authenticated_frozen, frozen_pending = (
+                self._authenticated_ack_snapshot(frozen_snapshot)
+            )
+            live_snapshot = self._acknowledgements.snapshot()
+            live_records, _live_pending = self._authenticated_ack_snapshot(
+                live_snapshot
+            )
+        except ProjectionAuthorityError as error:
+            raise ProjectionConflict(
+                "rebuild ACK authority is no longer authenticated"
+            ) from error
+        if authenticated_frozen != frozen_records:
+            raise ProjectionConflict("frozen rebuild evidence prefix changed")
+        if not permit_monotonic_extension:
+            if live_snapshot != frozen_snapshot:
+                raise ProjectionConflict("rebuild ACK authority changed")
+            return
+        if (
+            live_snapshot.confirmed_through < frozen_snapshot.confirmed_through
+            or len(live_records) < len(frozen_records)
+            or live_records[: len(frozen_records)] != frozen_records
+        ):
+            raise ProjectionConflict("rebuild ACK authority did not extend monotonically")
+        if frozen_pending is None:
+            return
+        if live_snapshot.confirmed_through == frozen_snapshot.confirmed_through:
+            if live_snapshot.pending != frozen_snapshot.pending:
+                raise ProjectionConflict("frozen pending ACK was replaced")
+            return
+        extension = live_records[len(frozen_records) :]
+        if not extension or extension[0] != frozen_pending:
+            raise ProjectionConflict("frozen pending ACK was not confirmed exactly")
+
     def _records_for_current_cursor(
         self,
         connection: sqlite3.Connection,
@@ -1843,7 +1923,10 @@ class ProjectionStore:
         return self._records_for_snapshot(snapshot), snapshot
 
     def rebuild(self) -> RebuildReport:
-        return self._rebuild(require_existing_prefix=True)
+        return self._rebuild(
+            require_existing_prefix=True,
+            permit_ack_extension=True,
+        )
 
     def _rebuild_after_authenticated_retention(
         self,
@@ -1871,7 +1954,11 @@ class ProjectionStore:
                 completion,
                 binding,
             )
-            report = self._rebuild(require_existing_prefix=False)
+            try:
+                report = self._rebuild(require_existing_prefix=False)
+            except BaseException:
+                self._healthy = False
+                raise
             current = (
                 self._evidence
                 ._authenticated_retention_unlink_completion
@@ -1891,6 +1978,7 @@ class ProjectionStore:
         self,
         *,
         require_existing_prefix: bool,
+        permit_ack_extension: bool = False,
     ) -> RebuildReport:
         with self._mutex:
             old_connection = self._require_usable()
@@ -2020,6 +2108,11 @@ class ProjectionStore:
                     temp_binding,
                     label="temporary projection before rename",
                 )
+                self._validate_rebuild_ack_authority(
+                    records,
+                    snapshot,
+                    permit_monotonic_extension=permit_ack_extension,
+                )
                 os.replace(
                     temp_name,
                     self._path.name,
@@ -2048,11 +2141,15 @@ class ProjectionStore:
                 reopened_hash = self._snapshot_hash(reopened_connection)
                 reopened_counts = self._counts(reopened_connection)
                 reopened_cursor = _current_cursor(reopened_connection)
+                self._validate_rebuild_ack_authority(
+                    records,
+                    snapshot,
+                    permit_monotonic_extension=permit_ack_extension,
+                )
                 if (
                     reopened_hash != report.snapshot_hash
                     or reopened_counts != report.table_counts
                     or reopened_cursor != report.cursor
-                    or self._acknowledgements.snapshot() != snapshot
                 ):
                     reopened_connection.close()
                     reopened_connection = None
