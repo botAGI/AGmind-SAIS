@@ -106,3 +106,23 @@ resolutions for Task 6D. An entry is added only from observed command output.
   head; token/registry identity is rechecked under the journal lock before and
   after validation. All findings are addressed with no new Critical/Important
   breakage.
+
+### Task 4A — fixed detector pin and runtime image contract
+
+- RED/GREEN: the focused detector/runtime gate moved from `64 failed` to
+  `64 passed in 0.22s`; commit `2baab09`
+  (`feat(core): pin correlation detector runtime`).
+- The production loader is fixed to the packaged Falco rule, walks the path
+  through held descriptors, rejects links/type/ownership/mode/size and
+  metadata drift fail-closed, and returns the canonical bundle hash.
+- The runtime image uses a digest-pinned Python base, a root-owned virtualenv,
+  a root-owned mode-`0444` rule below protected parents, and runs as UID 1000
+  user `sais`.
+- Controller verification: focused pytest `64 passed in 0.21s`; Ruff and mypy
+  passed; `git diff --check` was clean.
+- Native image verification: `make test-core-detector-pin-image` built and ran
+  successfully on Docker `29.4.0` (`linux/arm64`) with `--network none` and
+  `--read-only`; the real production loader hash matched the repository rule.
+- Independent specification and code/security reviews found no
+  Critical/Important defects. Both additionally confirmed non-root runtime
+  execution (`uid=1000 gid=1000 sais`) and a clean worktree.
