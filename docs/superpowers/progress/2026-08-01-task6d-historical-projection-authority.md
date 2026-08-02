@@ -42,3 +42,25 @@ resolutions for Task 6D. An entry is added only from observed command output.
 - Refinement reviews: coverage/repo-fit `APPROVE`; bounded-state `APPROVE`;
   store/dedup/path authority `APPROVE`. No Task 2 production result has been
   claimed.
+
+#### Task 2A — shared grammar, exact time, and boot scope
+
+- Initial RED: focused Task 2A gate: `37 failed, 37 passed`; failures covered
+  the absent strict classifier/window facts and the prior boot/key behavior.
+- Initial GREEN: the same gate: `75 passed in 1.60s`; commit `e0b3196`
+  (`fix(core): normalize historical coverage grammar`).
+- Independent task review found one Important fail-open Docker reason grammar
+  and one missing counted exact-replay regression.
+- Fix round 1 RED/GREEN: `1 failed, 1 passed` to `2 passed`; full gate
+  `80 passed in 1.57s`; commit `bfce55a`
+  (`fix(core): close Docker coverage reason grammar`). The scoped re-review
+  confirmed both findings but exposed a producer/consumer protocol mismatch.
+- Fix round 2 RED proved an unknown observer Docker reason was signed and
+  mutated state, spool, and inventory. The focused three-test Go GREEN passed;
+  full Python Task 2A GREEN was `80 passed in 1.53s`; commit `b0d6314`
+  (`fix(observer): close Docker reconcile reason grammar`).
+- Controller verification on the final commits: focused Go gate passed in
+  `4.402s`; Python gate `80 passed in 1.78s`; Ruff and mypy passed; `gofmt -d`
+  and commit whitespace checks were clean.
+- Final scoped re-review: all findings addressed, no new Critical/Important
+  breakage. Task 2B remains unimplemented and required.
