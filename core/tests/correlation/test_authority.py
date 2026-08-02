@@ -23,6 +23,7 @@ from agmind_immune.canonicaljson import (
     canonical_json,
     pcc_detector_bundle_sha256,
 )
+from agmind_immune.contracts import PCCCorrelationSnapshotV1
 from agmind_immune.correlation.pcc import (
     ActiveCandidateObservation,
     CandidateCreated,
@@ -902,6 +903,94 @@ def test_failed_snapshot_race_never_enters_candidate_capable_kernel(
         object.__setattr__(failed, "_snapshot", failed_snapshot)
         failed_coordinator.segment_store.close()
         complete_coordinator.segment_store.close()
+
+
+@pytest.mark.parametrize("entrypoint", ["proof", "facts"])
+def test_failed_rejection_binds_detached_facts_to_initial_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    coordinator, failed = _accepted_failed(tmp_path / entrypoint)
+    pcc_module = importlib.import_module("agmind_immune.correlation.pcc")
+    real_fingerprint = pcc_module._pcc_live_fingerprint
+    original_snapshot = failed.snapshot
+    original_event_id = failed.event_id
+    swapped_snapshot = PCCCorrelationSnapshotV1.model_validate(
+        {
+            **original_snapshot.model_dump(mode="python", exclude_none=True),
+            "failure_reasons": ("reconcile_required",),
+        },
+        strict=True,
+    )
+    swapped_event_id = "evt_" + "b" * 64
+    initial_captured = Event()
+    allow_detach = Event()
+    final_check_entered = Event()
+    allow_final_check = Event()
+    calls = 0
+    outcomes: list[object] = []
+
+    def paused_fingerprint(value: object) -> object:
+        nonlocal calls
+        if value is not failed:
+            return real_fingerprint(value)
+        calls += 1
+        if calls == 1:
+            result = real_fingerprint(value)
+            initial_captured.set()
+            assert allow_detach.wait(timeout=5)
+            return result
+        if calls == 2:
+            final_check_entered.set()
+            assert allow_final_check.wait(timeout=5)
+        return real_fingerprint(value)
+
+    monkeypatch.setattr(
+        pcc_module,
+        "_pcc_live_fingerprint",
+        paused_fingerprint,
+    )
+
+    def consume() -> None:
+        try:
+            if entrypoint == "proof":
+                outcomes.append(
+                    correlate_pcc(failed, CorrelationContext.failed_snapshot())
+                )
+            else:
+                outcomes.append(
+                    correlate_pcc_facts(
+                        original_snapshot.trigger,
+                        failed,
+                        CorrelationContext.failed_snapshot(),
+                    )
+                )
+        except BaseException as error:  # noqa: BLE001 - asserted by caller.
+            outcomes.append(error)
+
+    consumer = Thread(target=consume)
+    try:
+        consumer.start()
+        assert initial_captured.wait(timeout=5)
+        object.__setattr__(failed, "_snapshot", swapped_snapshot)
+        object.__setattr__(failed, "_event_id", swapped_event_id)
+        allow_detach.set()
+        assert final_check_entered.wait(timeout=5)
+        object.__setattr__(failed, "_snapshot", original_snapshot)
+        object.__setattr__(failed, "_event_id", original_event_id)
+        allow_final_check.set()
+        consumer.join(timeout=5)
+
+        assert not consumer.is_alive()
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], CorrelationProjectionError)
+    finally:
+        allow_detach.set()
+        allow_final_check.set()
+        object.__setattr__(failed, "_snapshot", original_snapshot)
+        object.__setattr__(failed, "_event_id", original_event_id)
+        coordinator.segment_store.close()
 
 
 def test_abandoned_issued_context_is_weakly_released(

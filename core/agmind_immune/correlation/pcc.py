@@ -1048,6 +1048,7 @@ def _failed_snapshot_rejection(
         )
     try:
         snapshot_canonical = canonical_json(snapshot)
+        snapshot_fields_set = frozenset(snapshot.model_fields_set)
         detached_snapshot = snapshot.model_copy(deep=True)
         authority_event_id = authenticated.event_id
     except (AttributeError, RecursionError, TypeError, ValueError) as error:
@@ -1062,6 +1063,12 @@ def _failed_snapshot_rejection(
         or not reasons
         or canonical_json(detached_snapshot) != snapshot_canonical
         or _pcc_live_fingerprint(authenticated) != fingerprint
+        or id(snapshot) != fingerprint[2]
+        or authority_event_id != fingerprint[7]
+        or snapshot_canonical != fingerprint[-2]
+        or snapshot_fields_set != fingerprint[-1]
+        or canonical_json(detached_snapshot) != fingerprint[-2]
+        or frozenset(detached_snapshot.model_fields_set) != fingerprint[-1]
         or not authenticated_pcc_input_is_issued(authenticated)
     ):
         raise CorrelationProjectionError(
