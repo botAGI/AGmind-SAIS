@@ -85,3 +85,24 @@ resolutions for Task 6D. An entry is added only from observed command output.
 - Final scoped re-review: all confirmed findings addressed, withdrawn
   cumulative semantics unchanged, production 4,096/4,097 and lifecycle tests
   materially lock the brief, and no new Critical/Important breakage was found.
+
+### Task 3 — completed correlation delivery authority
+
+- Initial RED/GREEN: the focused two-file gate moved from
+  `13 failed, 53 passed` to `66 passed in 2.96s`; commit `124bc46`
+  (`feat(core): reauthenticate completed PCC delivery`).
+- Independent review found one Critical durable-authority gap: authenticated
+  journal bytes were not replay-bound to the mutable in-memory phase caches.
+  It also found missing request/state index validation and a capability-token
+  mutation race during JIT validation.
+- Fix round 1 RED/GREEN: six targeted bypasses moved from
+  `6 failed, 67 passed` to `73 passed`; commit `fdc32c3`
+  (`fix(core): bind completed authority to journal replay`).
+- Controller verification on the final commits: exact Task 3 gate
+  `73 passed in 3.25s`; Ruff passed; mypy passed; `git diff --check` and
+  worktree status were clean.
+- Two scoped re-reviews confirmed that strict held-byte replay now derives and
+  binds the complete phase maps, indexes, digest, size, record count, and chain
+  head; token/registry identity is rechecked under the journal lock before and
+  after validation. All findings are addressed with no new Critical/Important
+  breakage.
