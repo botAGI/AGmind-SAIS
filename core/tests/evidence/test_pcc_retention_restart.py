@@ -18,6 +18,7 @@ from agmind_immune.evidence.retention import (
 )
 from agmind_immune.evidence.segments import (
     EvidenceCorrupt,
+    EvidencePriority,
     EvidenceRef,
     SegmentStore,
 )
@@ -286,10 +287,16 @@ def test_historical_path_survives_routine_trigger_retirement(
         from agmind_immune.coverage.historical import derive_historical_coverage
 
         assessment = derive_historical_coverage(authenticated, authority)
+        repeated = derive_historical_coverage(authenticated, authority)
 
         assert assessment.complete is True
+        assert repeated == assessment
         assert assessment.trigger_event_id == case.trigger_ref.event_id
         assert assessment.coverage_through_sequence == case.ref.source_sequence - 1
         assert assessment.coverage_snapshot_sha256 is not None
+        assert authority._binding.retired_ranges == (
+            (case.trigger_ref.source_sequence, case.trigger_ref.source_sequence),
+        )
+        assert store.resolve_authenticated_ref(case.ref).priority is EvidencePriority.PROTECTED
     finally:
         store.close(flush=False)

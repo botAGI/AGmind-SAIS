@@ -14,6 +14,7 @@ import stat
 import sys
 import time
 import uuid
+import weakref
 from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -353,6 +354,20 @@ class EvidenceStatus:
     key_healthy: bool
     repair_pending: bool = False
     retention_pending: bool = False
+
+
+@dataclass(frozen=True)
+class _StoreIssuedPCCBinding:
+    lifecycle: object
+    verifier: EnvelopeVerifier
+    verifier_authority: object
+    verifier_generation: int
+    evidence_ref: tuple[str, str, int, int, str, str, int, str]
+    canonical: bytes
+    request_canonical: bytes
+    request_fields_set: frozenset[str]
+    snapshot_canonical: bytes
+    snapshot_fields_set: frozenset[str]
 
 
 def _exact_coverage_ref_key(
@@ -2406,6 +2421,10 @@ class SegmentStore:
         self._date_descriptors: dict[str, int] = {}
         self._lifecycle_identity = object()
         self._bound_verifier: EnvelopeVerifier | None = None
+        self._issued_pcc_inputs: weakref.WeakKeyDictionary[
+            AuthenticatedPCCInput,
+            _StoreIssuedPCCBinding,
+        ] = weakref.WeakKeyDictionary()
         self._authority_state: Literal[
             "unbound",
             "recovering",
@@ -6431,7 +6450,7 @@ class SegmentStore:
                 "PCC correlation input does not name protected PCC evidence"
             )
         try:
-            return verifier._issue_authenticated_pcc_input(
+            authenticated = verifier._issue_authenticated_pcc_input(
                 record.ref,
                 request,
                 self._lifecycle_identity,
@@ -6440,6 +6459,58 @@ class SegmentStore:
             raise EvidenceSealError(
                 "PCC correlation input lacks committed verifier authority"
             ) from error
+        self._issued_pcc_inputs[authenticated] = _StoreIssuedPCCBinding(
+            lifecycle=self._lifecycle_identity,
+            verifier=verifier,
+            verifier_authority=verifier._authority,
+            verifier_generation=verifier._authority.generation,
+            evidence_ref=_exact_coverage_ref_key(record.ref),
+            canonical=authenticated.canonical,
+            request_canonical=canonical_json(authenticated.request),
+            request_fields_set=frozenset(
+                authenticated.request.model_fields_set
+            ),
+            snapshot_canonical=canonical_json(authenticated.snapshot),
+            snapshot_fields_set=frozenset(
+                authenticated.snapshot.model_fields_set
+            ),
+        )
+        return authenticated
+
+    def _authenticated_pcc_input_is_exact(
+        self,
+        authenticated: object,
+    ) -> bool:
+        if type(authenticated) is not AuthenticatedPCCInput:
+            return False
+        binding = self._issued_pcc_inputs.get(authenticated)
+        verifier = self._bound_verifier
+        if binding is None or verifier is None:
+            return False
+        try:
+            return (
+                not self._closed
+                and self._authority_state == "ready"
+                and self._lifecycle_identity is binding.lifecycle
+                and verifier is binding.verifier
+                and self._is_bound_verifier(verifier)
+                and verifier._authority is binding.verifier_authority
+                and verifier._authority.generation
+                == binding.verifier_generation
+                and _exact_coverage_ref_key(authenticated.evidence_ref)
+                == binding.evidence_ref
+                and authenticated.canonical == binding.canonical
+                and canonical_json(authenticated.request)
+                == binding.request_canonical
+                and frozenset(authenticated.request.model_fields_set)
+                == binding.request_fields_set
+                and canonical_json(authenticated.snapshot)
+                == binding.snapshot_canonical
+                and frozenset(authenticated.snapshot.model_fields_set)
+                == binding.snapshot_fields_set
+            )
+        except (AttributeError, TypeError, UnicodeError, ValueError):
+            return False
 
     def _historical_path_authority(
         self,

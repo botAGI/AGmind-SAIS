@@ -66,3 +66,51 @@ def test_other_events_are_identified_only_by_event_id_in_both_versions() -> None
 
     assert v1[0] == v2[0] == "other"
     assert v1[1] != v2[1]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "fields", "v1_expected", "v2_expected"),
+    [
+        (
+            "coverage",
+            {
+                "component": "observer",
+                "kind": "x",
+                "severity": "INFO",
+                "opened_at": "2026-07-28T10:00:00Z",
+                "closed_at": "2026-07-28T10:00:00Z",
+                "reason_code": "x",
+            },
+            "58e562ea526465d2e5a9d53b74054a3d2880328133712ed88f7bec7904ae2de4",
+            "5cee5c0119e7a2bcd9bdb26babf51a40bed1170e8926865dce09cf20d756733d",
+        ),
+        (
+            "ordinary",
+            {"kind": "ordinary"},
+            "454b7dbaa2074300c1d3e9ed5d185ecb745b1b0df7209329ac7f009425f1437b",
+            "0ff0b63cf5d1a978d62814a0699c47fca9924338442d3be8c177a4222e8f0305",
+        ),
+    ],
+)
+def test_literal_coverage_and_other_v1_v2_vectors(
+    event_type: str,
+    fields: dict[str, object],
+    v1_expected: str,
+    v2_expected: str,
+) -> None:
+    subject = _subject()
+    key = private_key(11)
+    kwargs: dict[str, object] = {
+        "sequence": 1,
+        "boot_id": BOOT_A,
+        "normalized_fields": fields,
+    }
+    if event_type == "coverage":
+        kwargs["event_type"] = "coverage"
+    envelope = EventEnvelopeV1.model_validate(
+        envelope_value(key, **kwargs),
+        strict=True,
+    )
+
+    assert subject._logical_primary_identity_v1(envelope)[1] == v1_expected
+    assert subject._logical_primary_identity_v2(envelope)[1] == v2_expected

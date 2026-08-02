@@ -146,6 +146,20 @@ def _append_bounded[T](collection: list[T], value: T, label: str) -> None:
     collection.append(value)
 
 
+def _retain_closed_summary(
+    pretrigger: list[_ClosedSummary],
+    recent: list[_ClosedSummary],
+    summary: _ClosedSummary,
+    *,
+    source_sequence: int,
+    trigger_source_sequence: int,
+) -> None:
+    if source_sequence <= trigger_source_sequence:
+        _append_bounded(pretrigger, summary, "pre-trigger summaries")
+    else:
+        _append_bounded(recent, summary, "recent path events")
+
+
 def _prepare_historical_record(record: StoredEvidenceRecord) -> _PreparedHistoricalRecord:
     if type(record) is not StoredEvidenceRecord or type(record.ref) is not EvidenceRef:
         raise HistoricalCoverageConflict("historical record is not exact evidence")
@@ -387,6 +401,7 @@ def _reduce_historical_coverage(
     )
     active: dict[tuple[object, ...], _OpenEpisode] = {}
     pretrigger: list[_ClosedSummary] = []
+    recent_summaries: list[_ClosedSummary] = []
     recent_primary_ids: list[str] = []
     docker_active: dict[tuple[str, int], _OpenEpisode] = {}
     latest_recovery: _DockerRecovery | None = None
@@ -474,13 +489,15 @@ def _reduce_historical_coverage(
                 envelope.event_id,
             )
             if _interval_intersects_window(episode.opened_at, episode.closed_at, window):
-                _append_bounded(
+                _retain_closed_summary(
                     pretrigger,
+                    recent_summaries,
                     _ClosedSummary(
                         episode,
                         (docker_opened.open_event_id, envelope.event_id),
                     ),
-                    "pre-trigger summaries",
+                    source_sequence=envelope.source_sequence,
+                    trigger_source_sequence=trigger_source_sequence,
                 )
             latest_recovery = _DockerRecovery(
                 generation,
@@ -559,8 +576,9 @@ def _reduce_historical_coverage(
                     or sequence_opened.affected_start > coverage_through_sequence
                 )
             ):
-                _append_bounded(
+                _retain_closed_summary(
                     pretrigger,
+                    recent_summaries,
                     _ClosedSummary(
                         HistoricalCriticalEpisode(
                             "observer",
@@ -572,7 +590,8 @@ def _reduce_historical_coverage(
                         ),
                         tuple(dependency_ids),
                     ),
-                    "pre-trigger summaries",
+                    source_sequence=envelope.source_sequence,
+                    trigger_source_sequence=trigger_source_sequence,
                 )
         elif action in {"generic_open", "generic_close"} and coverage is not None:
             episode_key = _episode_key(prepared)
@@ -650,8 +669,9 @@ def _reduce_historical_coverage(
                     envelope.event_id,
                 )
                 if _interval_intersects_window(episode.opened_at, episode.closed_at, window):
-                    _append_bounded(
+                    _retain_closed_summary(
                         pretrigger,
+                        recent_summaries,
                         _ClosedSummary(
                             episode,
                             (
@@ -660,7 +680,8 @@ def _reduce_historical_coverage(
                                 envelope.event_id,
                             ),
                         ),
-                        "pre-trigger summaries",
+                        source_sequence=envelope.source_sequence,
+                        trigger_source_sequence=trigger_source_sequence,
                     )
             else:
                 # A self-contained close is legal only when no earlier primary used the key.
@@ -686,20 +707,40 @@ def _reduce_historical_coverage(
                     envelope.event_id,
                 )
                 if _interval_intersects_window(episode.opened_at, episode.closed_at, window):
-                    _append_bounded(
+                    _retain_closed_summary(
                         pretrigger,
+                        recent_summaries,
                         _ClosedSummary(
                             episode,
                             (envelope.event_id,),
                         ),
-                        "pre-trigger summaries",
+                        source_sequence=envelope.source_sequence,
+                        trigger_source_sequence=trigger_source_sequence,
                     )
 
+        elif action == "falco_stop" and coverage is not None:
+            point = HistoricalCriticalEpisode(
+                component=coverage.component,
+                kind=coverage.kind,
+                opened_at=coverage.opened_at,
+                closed_at=coverage.closed_at,
+                open_event_id=envelope.event_id,
+                close_event_id=envelope.event_id,
+            )
+            if _interval_intersects_window(point.opened_at, point.closed_at, window):
+                _retain_closed_summary(
+                    pretrigger,
+                    recent_summaries,
+                    _ClosedSummary(point, (envelope.event_id,)),
+                    source_sequence=envelope.source_sequence,
+                    trigger_source_sequence=trigger_source_sequence,
+                )
+
     intervals: list[HistoricalCriticalEpisode] = [
-        summary.episode for summary in pretrigger
+        summary.episode for summary in (*pretrigger, *recent_summaries)
     ]
     final_ids = list(recent_primary_ids)
-    for summary in pretrigger:
+    for summary in (*pretrigger, *recent_summaries):
         for identifier in summary.dependency_ids:
             if identifier not in final_ids:
                 _append_bounded(final_ids, identifier, "final coverage IDs")
@@ -721,7 +762,11 @@ def _reduce_historical_coverage(
 
     structural_incomplete = False
     for open_sequence in sequence_active.values():
-        if not (
+        if _interval_intersects_window(
+            open_sequence.opened_at,
+            None,
+            window,
+        ) or not (
             open_sequence.affected_end < trigger_source_sequence
             or open_sequence.affected_start > coverage_through_sequence
         ):
@@ -929,6 +974,7 @@ def _new_path_binding(
         type(store) is not SegmentStore
         or type(authenticated) is not AuthenticatedPCCInput
         or not authenticated_pcc_input_is_issued(authenticated)
+        or not store._authenticated_pcc_input_is_exact(authenticated)
     ):
         raise HistoricalCoverageUnavailable("historical path lacks issued PCC authority")
     status = store.status()

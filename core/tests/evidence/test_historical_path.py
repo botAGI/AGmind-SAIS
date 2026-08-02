@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib
 import pickle
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -87,3 +88,49 @@ def test_raw_retired_ranges_and_cross_store_authority_are_rejected(
 
     first_store.close(flush=False)
     second_store.close(flush=False)
+
+
+def test_byte_identical_clone_cannot_issue_path_for_original_store_input(
+    tmp_path: Path,
+) -> None:
+    subject = _subject()
+    original_path = tmp_path / "original"
+    clone_path = tmp_path / "clone"
+    case = _build_pcc_retention_case(original_path, finalize_retention=False)
+
+    original_store = SegmentStore(original_path)
+    original_recovered = AcceptanceCoordinator.open_and_recover(
+        _fresh_verifier(), original_store
+    )
+    original_input = original_recovered.authenticated_pcc_input(
+        case.ref,
+        case.request,
+    )
+    original_store.close(flush=False)
+    shutil.copytree(original_path, clone_path)
+
+    clone_store = SegmentStore(clone_path)
+    try:
+        AcceptanceCoordinator.open_and_recover(_fresh_verifier(), clone_store)
+        with pytest.raises(subject.HistoricalCoverageUnavailable):
+            clone_store._historical_path_authority(original_input)
+    finally:
+        clone_store.close(flush=False)
+
+
+def test_retention_range_drift_revokes_path_authority(tmp_path: Path) -> None:
+    subject = _subject()
+    case = _build_pcc_retention_case(tmp_path, finalize_retention=False)
+    store = SegmentStore(tmp_path)
+    recovered = AcceptanceCoordinator.open_and_recover(_fresh_verifier(), store)
+    authenticated = recovered.authenticated_pcc_input(case.ref, case.request)
+    authority = store._historical_path_authority(authenticated)
+
+    original_ranges = store._authenticated_retired_ranges
+    store._authenticated_retired_ranges = ((case.trigger_ref.source_sequence,) * 2,)
+    try:
+        with pytest.raises(subject.HistoricalCoverageUnavailable):
+            subject.derive_historical_coverage(authenticated, authority)
+    finally:
+        store._authenticated_retired_ranges = original_ranges
+        store.close(flush=False)
