@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -142,6 +143,53 @@ func observerServiceFixture(
 		docker
 }
 
+func TestReconcileDockerRejectsUnknownReasonBeforeMutation(t *testing.T) {
+	service, state, spool, inventory, _ := observerServiceFixture(t)
+	beforeState := state.Snapshot()
+	beforeGeneration := inventory.Generation()
+	spool.mutex.Lock()
+	beforeTotalBytes := spool.totalBytes
+	beforeItems := len(spool.items)
+	spool.mutex.Unlock()
+
+	err := service.ReconcileDocker(
+		context.Background(),
+		"docker_reason_not_in_protocol",
+	)
+
+	afterState := state.Snapshot()
+	spool.mutex.Lock()
+	afterTotalBytes := spool.totalBytes
+	afterItems := len(spool.items)
+	spool.mutex.Unlock()
+	if err == nil {
+		t.Error("unknown Docker reconcile reason was accepted")
+	}
+	if !reflect.DeepEqual(afterState, beforeState) {
+		t.Errorf(
+			"unknown Docker reconcile reason changed state: before=%+v after=%+v",
+			beforeState,
+			afterState,
+		)
+	}
+	if afterTotalBytes != beforeTotalBytes || afterItems != beforeItems {
+		t.Errorf(
+			"unknown Docker reconcile reason changed spool: bytes %d->%d items %d->%d",
+			beforeTotalBytes,
+			afterTotalBytes,
+			beforeItems,
+			afterItems,
+		)
+	}
+	if afterGeneration := inventory.Generation(); afterGeneration != beforeGeneration {
+		t.Errorf(
+			"unknown Docker reconcile reason changed inventory generation: %d->%d",
+			beforeGeneration,
+			afterGeneration,
+		)
+	}
+}
+
 func TestServiceReconcileClosesDockerGapOnlyAfterSignedCoverage(
 	t *testing.T,
 ) {
@@ -236,7 +284,7 @@ func TestServiceDockerEventDisconnectFencesUntilFullReconcile(
 	docker.listErr = nil
 	if err := service.ReconcileDocker(
 		context.Background(),
-		"docker_event_stream_recovered",
+		"docker_event_reconcile_retry",
 	); err != nil {
 		t.Fatal(err)
 	}

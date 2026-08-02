@@ -466,6 +466,17 @@ func (service *Service) signDockerLoggingCoverage(
 	return err
 }
 
+func validDockerReconcileReason(reason string) bool {
+	switch reason {
+	case "observer_startup",
+		"docker_event_stream_error",
+		"docker_event_reconcile_retry":
+		return true
+	default:
+		return false
+	}
+}
+
 func (service *Service) validateDockerReconcile(reason string) error {
 	if service == nil ||
 		service.daemon == nil ||
@@ -473,7 +484,7 @@ func (service *Service) validateDockerReconcile(reason string) error {
 		service.inventory == nil ||
 		service.docker == nil ||
 		service.now == nil ||
-		!safeASCII(reason, 1, 64) {
+		!validDockerReconcileReason(reason) {
 		return fmt.Errorf("invalid Docker reconcile service")
 	}
 	return nil
