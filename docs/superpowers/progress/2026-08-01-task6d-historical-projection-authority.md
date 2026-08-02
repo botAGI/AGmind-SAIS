@@ -63,4 +63,25 @@ resolutions for Task 6D. An entry is added only from observed command output.
   `4.402s`; Python gate `80 passed in 1.78s`; Ruff and mypy passed; `gofmt -d`
   and commit whitespace checks were clean.
 - Final scoped re-review: all findings addressed, no new Critical/Important
-  breakage. Task 2B remains unimplemented and required.
+  breakage.
+
+#### Task 2B — bounded historical reducer and store-bound path authority
+
+- Initial RED/GREEN: focused Task 2 gate moved from `12 failed, 80 passed` to
+  `96 passed`; Projection V1 preservation gate was `29 passed`; commit
+  `b3133f1` (`feat(core): derive historical coverage proofs`).
+- Independent review found three Critical defects: PCC input authority was not
+  bound to its exact `SegmentStore` lifecycle, open sequence gaps ignored
+  timestamp-only intersections, and CRITICAL `falco_stop` points were omitted.
+  A proposed cumulative-ID finding was withdrawn after reconciling it with the
+  locked post-trigger-primary rule. The review also required production-path
+  boundary and lifecycle regressions instead of helper-only cap checks.
+- Fix round 1 RED/GREEN: the exact clone-store, timestamp-only sequence-gap,
+  and Falco-stop regressions moved from `3 failed, 1 passed` to `4 passed`;
+  commit `00edb9d` (`fix(core): bind historical coverage authority`).
+- Controller verification on the final commits: exact Task 2B gate
+  `125 passed in 40.49s`; Ruff passed; mypy passed for all four production
+  files; `git diff --check` and worktree status were clean.
+- Final scoped re-review: all confirmed findings addressed, withdrawn
+  cumulative semantics unchanged, production 4,096/4,097 and lifecycle tests
+  materially lock the brief, and no new Critical/Important breakage was found.
