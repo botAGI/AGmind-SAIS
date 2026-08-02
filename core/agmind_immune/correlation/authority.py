@@ -554,6 +554,32 @@ def _require_authority_locked(
         ) from error
 
 
+def _validate_correlation_projection_predecessor(
+    authority: CorrelationProjectionAuthority,
+    expected: _ProjectionPredecessor,
+) -> None:
+    try:
+        expected_before = _clone_predecessor(expected)
+        binding = _authority_binding(authority)
+        with binding.lock:
+            _require_authority_locked(authority, binding)
+            expected_after = _clone_predecessor(expected)
+            binding_predecessor = _clone_predecessor(binding.predecessor)
+            if (
+                expected_after != expected_before
+                or binding_predecessor != expected_before
+            ):
+                raise CorrelationProjectionError(
+                    "correlation projection predecessor is stale or changed"
+                )
+    except CorrelationProjectionError:
+        raise
+    except Exception as error:
+        raise CorrelationProjectionError(
+            "correlation projection predecessor validation failed"
+        ) from error
+
+
 def _create_correlation_projection_authority(
     store: SegmentStore,
     registry: SpecialUseRegistry,

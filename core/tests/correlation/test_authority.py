@@ -509,6 +509,172 @@ def test_projection_authority_issues_exact_context_once_from_real_completed_path
         case.close()
 
 
+def test_prelookup_predecessor_validation_is_exact_and_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = _authority_module()
+    case = _projection_case(tmp_path, monkeypatch)
+    try:
+        binding = authority._authority_binding(case.authority)  # type: ignore[attr-defined]
+        predecessor_identity = binding.predecessor
+        revision_identity = binding.revision
+
+        result = authority._validate_correlation_projection_predecessor(  # type: ignore[attr-defined]
+            case.authority,
+            case.predecessor,
+        )
+
+        assert result is None
+        assert binding.predecessor is predecessor_identity
+        assert binding.revision is revision_identity
+        assert type(correlate_pcc(case.proof, case.context)) is CandidateCreated
+    finally:
+        case.close()
+
+
+@pytest.mark.parametrize("corruption", ["stale", "forged", "subclass", "equality"])
+def test_prelookup_predecessor_validation_rejects_nonexact_or_stale_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    authority = _authority_module()
+    case = _projection_case(tmp_path / corruption, monkeypatch)
+    expected = case.predecessor
+    try:
+        if corruption == "stale":
+            authority._advance_correlation_projection_authority(  # type: ignore[attr-defined]
+                case.authority,
+                case.predecessor,
+                _present_predecessor(case.proof),
+            )
+        elif corruption == "forged":
+            expected = object.__new__(type(case.predecessor))
+        elif corruption == "subclass":
+            predecessor_type = type(case.predecessor)
+
+            class PredecessorSubclass(predecessor_type):  # type: ignore[misc, valid-type]
+                pass
+
+            expected = PredecessorSubclass(
+                generation=1,
+                host_id=None,
+                source_sequence=0,
+                event_id=None,
+                content_sha256=None,
+                frame_sha256=None,
+            )
+        else:
+            expected = _empty_predecessor()
+            object.__setattr__(expected, "generation", True)
+            assert expected == case.predecessor
+
+        with pytest.raises(CorrelationProjectionError):
+            authority._validate_correlation_projection_predecessor(  # type: ignore[attr-defined]
+                case.authority,
+                expected,
+            )
+    finally:
+        case.close()
+
+
+def test_prelookup_predecessor_validation_rejects_closed_and_cross_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = _authority_module()
+    closed = _projection_case(tmp_path / "closed", monkeypatch)
+    cross = _projection_case(tmp_path / "cross", monkeypatch)
+    cross_predecessor = _present_predecessor(cross.proof)
+    try:
+        authority._close_correlation_projection_authority(closed.authority)  # type: ignore[attr-defined]
+        authority._advance_correlation_projection_authority(  # type: ignore[attr-defined]
+            cross.authority,
+            cross.predecessor,
+            cross_predecessor,
+        )
+        with pytest.raises(CorrelationProjectionError):
+            authority._validate_correlation_projection_predecessor(  # type: ignore[attr-defined]
+                closed.authority,
+                closed.predecessor,
+            )
+        with pytest.raises(CorrelationProjectionError):
+            authority._validate_correlation_projection_predecessor(  # type: ignore[attr-defined]
+                cross.authority,
+                closed.predecessor,
+            )
+    finally:
+        cross.close()
+        closed.close()
+
+
+@pytest.mark.parametrize("mutation_point", ["before_lookup", "while_locked"])
+def test_prelookup_predecessor_validation_rejects_expected_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation_point: str,
+) -> None:
+    authority = _authority_module()
+    case = _projection_case(tmp_path / mutation_point, monkeypatch)
+    expected = _empty_predecessor()
+
+    def mutate_expected() -> None:
+        object.__setattr__(expected, "generation", 2)
+
+    if mutation_point == "before_lookup":
+        real_binding = authority._authority_binding  # type: ignore[attr-defined]
+
+        def binding_after_mutation(owner: object) -> object:
+            mutate_expected()
+            return real_binding(owner)
+
+        monkeypatch.setattr(authority, "_authority_binding", binding_after_mutation)
+    else:
+        real_require = authority._require_authority_locked  # type: ignore[attr-defined]
+
+        def require_after_mutation(
+            owner: object,
+            binding: object,
+            *,
+            allow_closed: bool = False,
+        ) -> None:
+            real_require(owner, binding, allow_closed=allow_closed)
+            mutate_expected()
+
+        monkeypatch.setattr(authority, "_require_authority_locked", require_after_mutation)
+    try:
+        with pytest.raises(CorrelationProjectionError):
+            authority._validate_correlation_projection_predecessor(  # type: ignore[attr-defined]
+                case.authority,
+                expected,
+            )
+    finally:
+        case.close()
+
+
+def test_prelookup_predecessor_validation_normalizes_unexpected_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = _authority_module()
+    case = _projection_case(tmp_path, monkeypatch)
+
+    def fail_lookup(_owner: object) -> object:
+        raise RuntimeError("lookup failed")
+
+    try:
+        with monkeypatch.context() as failure_patch:
+            failure_patch.setattr(authority, "_authority_binding", fail_lookup)
+            with pytest.raises(CorrelationProjectionError):
+                authority._validate_correlation_projection_predecessor(  # type: ignore[attr-defined]
+                    case.authority,
+                    case.predecessor,
+                )
+    finally:
+        case.close()
+
+
 def test_new_context_issuance_revokes_every_older_outstanding_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
