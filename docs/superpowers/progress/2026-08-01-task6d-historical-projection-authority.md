@@ -204,3 +204,27 @@ resolutions for Task 6D. An entry is added only from observed command output.
 - Controller verification passed `184` authority/PCC tests in `7.11s`; Ruff,
   mypy, and diff checks passed. Independent re-review found no remaining
   Critical/Important defect in this boundary.
+
+### Task 6 — atomic direct/PCC Projection V2 reducer
+
+- Initial implementation commit `19e5501` (`feat(core): project authenticated
+  containment candidates`) added the dormant, private V2 owner. It binds one
+  exact evidence lifecycle, ACK journal, completed-correlation journal, fixed
+  registry/detector authority, SQLite connection, and correlation predecessor.
+  One `BEGIN IMMEDIATE` now covers event/dedup facts, historical correlation,
+  incident/candidate/evidence rows, cursor, and commit. The controller-focused
+  gate passed `104` tests in `10.46s`; Ruff and mypy passed.
+- Independent reviews found four blocking integrity gaps: source-order logical
+  primary direction was trusted from SQLite, duplicate retry did not
+  reauthenticate the retained primary candidate, reopen lacked a final ACK
+  stabilization pass, and fail-once cleanup discarded retry handles. All eight
+  focused regressions failed before the fix.
+- Fix commit `631d45a` (`fix(core): authenticate Projection V2 retry state`)
+  derives each logical primary from authenticated source order, validates the
+  full authenticated prefix before exact retry, chains two final reopen
+  acceptance/cursor/snapshot/ACK checks while permitting proven monotonic ACK
+  extension, and retains failed close handles for a later cleanup attempt.
+- Final controller verification passed the exact Task 6 gate with `115 passed
+  in 13.24s`; Ruff, mypy, and `git diff --check` passed on clean HEAD. Scoped
+  re-review marked all four findings addressed and found no new Critical or
+  Important breakage.
