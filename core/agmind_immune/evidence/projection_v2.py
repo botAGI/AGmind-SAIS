@@ -8,18 +8,29 @@ import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from agmind_immune.canonicaljson import candidate_facts_sha256, canonical_json
-from agmind_immune.contracts import CoverageEventV1, EventEnvelopeV1, FalcoConnectV1
+from agmind_immune.contracts import (
+    CoverageEventV1,
+    EventEnvelopeV1,
+    FalcoConnectV1,
+    decode_strict,
+)
 from agmind_immune.evidence.dedup import _logical_primary_identity_v2
 from agmind_immune.evidence.projection import ProjectionConflict, ProjectionValidationError
-from agmind_immune.evidence.segments import EvidenceRef, StoredEvidenceRecord
+from agmind_immune.evidence.segments import (
+    EvidenceRef,
+    StoredEvidenceRecord,
+    _exact_coverage_record_key,
+)
 from agmind_immune.incidents.models import ContainmentCandidateV1, IncidentV1
 
 _SCHEMA_V2_PATH = Path(__file__).with_name("schema_v2.sql")
+_SCHEMA_V2_SHA256 = "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
 _SCHEMA_META_V2 = {
     "schema_version": "agmind.projection-schema.v2",
     "reducer_version": "agmind.projection-reducer.v2",
@@ -31,6 +42,11 @@ _UINT64_V2 = re.compile(r"^[0-9]{20}$")
 _EVENT_ID_V2 = re.compile(r"^evt_[0-9a-f]{64}$")
 _CANDIDATE_ID_V2 = re.compile(r"^cand_[0-9a-f]{64}$")
 _HEX64_V2 = re.compile(r"^[0-9a-f]{64}$")
+_ACCEPTED_AT_V2 = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?Z$"
+)
+_MAX_CANONICAL_ENVELOPE_BYTES_V2 = 64 * 1024
 _RESULT_KINDS_V2 = frozenset({"candidate", "investigation", "duplicate", "rejected"})
 _EVIDENCE_ROLES_V2 = frozenset(
     {
@@ -297,12 +313,49 @@ def _row_values_v2(
     return values
 
 
+def _validated_incident_for_encoding(incident: IncidentV1) -> IncidentV1:
+    fields_set = incident.model_fields_set
+    known_fields = frozenset(IncidentV1.model_fields)
+    if type(fields_set) is not set or not fields_set <= known_fields:
+        raise ValueError("Projection V2 incident fields-set is invalid")
+    document = {field: getattr(incident, field) for field in fields_set}
+    validated = IncidentV1.model_validate(document, strict=True)
+    if validated.model_fields_set != fields_set:
+        raise ValueError("Projection V2 incident fields-set changed during validation")
+    for field in IncidentV1.model_fields:
+        original_value = getattr(incident, field)
+        validated_value = getattr(validated, field)
+        if type(original_value) is not type(validated_value) or original_value != validated_value:
+            raise ValueError("Projection V2 incident changed during strict reconstruction")
+    return validated
+
+
+def _validated_candidate_for_encoding(
+    candidate: ContainmentCandidateV1,
+) -> ContainmentCandidateV1:
+    fields_set = candidate.model_fields_set
+    known_fields = frozenset(ContainmentCandidateV1.model_fields)
+    if type(fields_set) is not set or not fields_set <= known_fields:
+        raise ValueError("Projection V2 candidate fields-set is invalid")
+    document = {field: getattr(candidate, field) for field in fields_set}
+    validated = ContainmentCandidateV1.model_validate(document, strict=True)
+    if validated.model_fields_set != fields_set:
+        raise ValueError("Projection V2 candidate fields-set changed during validation")
+    for field in ContainmentCandidateV1.model_fields:
+        original_value = getattr(candidate, field)
+        validated_value = getattr(validated, field)
+        if type(original_value) is not type(validated_value) or original_value != validated_value:
+            raise ValueError("Projection V2 candidate changed during strict reconstruction")
+    return validated
+
+
 def _encode_incident(incident: IncidentV1, result_kind: str) -> tuple[object, ...]:
     if type(incident) is not IncidentV1:
         raise TypeError("Projection V2 incident must use the exact model type")
     if type(result_kind) is not str or result_kind not in _RESULT_KINDS_V2:
         raise ValueError("Projection V2 incident result kind is not closed")
-    document = incident.model_dump(mode="python", exclude_unset=True)
+    validated = _validated_incident_for_encoding(incident)
+    document = validated.model_dump(mode="python", exclude_unset=True)
     encoded: list[object] = []
     for field in IncidentV1.model_fields:
         value = document.get(field)
@@ -351,7 +404,8 @@ def _decode_incident(
 def _encode_candidate(candidate: ContainmentCandidateV1) -> tuple[object, ...]:
     if type(candidate) is not ContainmentCandidateV1:
         raise TypeError("Projection V2 candidate must use the exact model type")
-    document = candidate.model_dump(mode="python")
+    validated = _validated_candidate_for_encoding(candidate)
+    document = validated.model_dump(mode="python")
     encoded: list[object] = []
     for field in ContainmentCandidateV1.model_fields:
         value = document[field]
@@ -360,7 +414,7 @@ def _encode_candidate(candidate: ContainmentCandidateV1) -> tuple[object, ...]:
         elif field in _CANDIDATE_TUPLE_FIELDS:
             value = _encode_tuple_v2(value)
         encoded.append(value)
-    encoded.append(candidate_facts_sha256(candidate))
+    encoded.append(candidate_facts_sha256(validated))
     return tuple(encoded)
 
 
@@ -547,7 +601,17 @@ def _verify_v2_pragmas(connection: sqlite3.Connection) -> None:
 
 
 def _create_v2_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(_SCHEMA_V2_PATH.read_text(encoding="utf-8"))
+    try:
+        raw = _SCHEMA_V2_PATH.read_bytes()
+    except OSError as error:
+        raise ProjectionConflict("Projection V2 trusted schema bytes are unavailable") from error
+    if hashlib.sha256(raw).hexdigest() != _SCHEMA_V2_SHA256:
+        raise ProjectionConflict("Projection V2 trusted schema bytes changed")
+    try:
+        script = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ProjectionConflict("Projection V2 trusted schema is not UTF-8") from error
+    connection.executescript(script)
 
 
 def _schema_rows(connection: sqlite3.Connection) -> list[tuple[object, ...]]:
@@ -652,21 +716,24 @@ def _v2_snapshot_hash(connection: sqlite3.Connection) -> str:
     _verify_v2_schema(connection)
     digest = hashlib.sha256()
     digest.update(_SNAPSHOT_DOMAIN_V2)
+    owns_transaction = not connection.in_transaction
     try:
-        connection.execute("BEGIN")
+        if owns_transaction:
+            connection.execute("BEGIN")
         for table, columns, _primary_key in _TABLE_LAYOUT_V2:
             digest.update(canonical_json({"table": table, "columns": columns}))
             digest.update(b"\n")
             for row in _ordered_v2_rows_unverified(connection, table):
                 digest.update(canonical_json({"row": list(row)}))
                 digest.update(b"\n")
-        connection.execute("COMMIT")
+        if owns_transaction:
+            connection.execute("COMMIT")
     except ProjectionConflict:
-        if connection.in_transaction:
+        if owns_transaction and connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
     except (sqlite3.DatabaseError, TypeError, ValueError, UnicodeError) as error:
-        if connection.in_transaction:
+        if owns_transaction and connection.in_transaction:
             connection.execute("ROLLBACK")
         raise ProjectionConflict("Projection V2 logical snapshot is invalid") from error
     return digest.hexdigest()
@@ -676,9 +743,19 @@ def _prepare_v2(record: StoredEvidenceRecord) -> _PreparedV2Record:
     if type(record) is not StoredEvidenceRecord or type(record.ref) is not EvidenceRef:
         raise ProjectionValidationError("Projection V2 record is not exact evidence")
     try:
-        raw = json.loads(record.canonical_envelope)
-        envelope = EventEnvelopeV1.model_validate(raw, strict=True)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValidationError) as error:
+        _exact_coverage_record_key(record)
+        if _ACCEPTED_AT_V2.fullmatch(record.accepted_at) is None:
+            raise ValueError("accepted_at is not exact UTC")
+        datetime.fromisoformat(record.accepted_at)
+        envelope = decode_strict(
+            record.canonical_envelope,
+            EventEnvelopeV1,
+            _MAX_CANONICAL_ENVELOPE_BYTES_V2,
+        )
+        raw = envelope.model_dump(exclude_none=True)
+        if raw != record.envelope:
+            raise ValueError("typed envelope differs from stored envelope")
+    except (TypeError, ValueError, ValidationError) as error:
         raise ProjectionValidationError("Projection V2 envelope cannot be reparsed") from error
     ref = record.ref
     if (

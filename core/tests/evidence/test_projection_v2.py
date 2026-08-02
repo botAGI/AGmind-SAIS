@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -56,16 +57,27 @@ def _record(*, boot_id: str = BOOT_A) -> StoredEvidenceRecord:
         priority=EvidencePriority.ROUTINE,
         accepted_at="2026-07-28T10:00:00Z",
         ref=EvidenceRef(
-            segment_id="00000000-0000-4000-8000-000000000001",
-            segment_relative_path="segments/controlled.open",
+            segment_id="523e4567-e89b-42d3-a456-426614174000",
+            segment_relative_path=(
+                "segments/2026-07-28/"
+                "00000000000000000001-523e4567-e89b-42d3-a456-426614174000.agseg"
+            ),
             frame_offset=0,
-            frame_size=1,
+            frame_size=len(encoded) + 76,
             frame_sha256="f" * 64,
             event_id=str(value["event_id"]),
             source_sequence=1,
             content_sha256=hashlib.sha256(encoded).hexdigest(),
         ),
     )
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _BytesSubclass(bytes):
+    pass
 
 
 def _schema_objects(connection: sqlite3.Connection) -> dict[str, str]:
@@ -361,8 +373,10 @@ def test_schema_v1_is_the_exact_active_v1_bytes() -> None:
 def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
     subject = _subject()
     root = Path(__file__).parents[2] / "agmind_immune" / "evidence"
+    expected_schema_hash = "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
+    assert subject._SCHEMA_V2_SHA256 == expected_schema_hash
     assert hashlib.sha256((root / "schema_v2.sql").read_bytes()).hexdigest() == (
-        "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
+        expected_schema_hash
     )
     active = importlib.import_module("agmind_immune.evidence.projection")
     assert active._SCHEMA_META == {
@@ -397,6 +411,48 @@ def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
         assert dict(connection.execute("SELECT key,value FROM schema_meta")) == active._SCHEMA_META
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("corruption", ["removed_fk", "missing", "unreadable", "non_utf8"])
+def test_v2_schema_bytes_are_trusted_before_create_or_verify(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    subject = _subject()
+    verified = subject._v2_connection_for_test()
+    blank = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        if corruption == "removed_fk":
+            raw = subject._SCHEMA_V2_PATH.read_bytes()
+            authority_fks = (
+                b"    FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id),\n"
+                b"    FOREIGN KEY(authority_snapshot_event_id) REFERENCES events(event_id)\n"
+            )
+            assert authority_fks in raw
+            path = tmp_path / "schema-removed-fk.sql"
+            path.write_bytes(
+                raw.replace(
+                    authority_fks,
+                    b"    FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id)\n",
+                )
+            )
+        elif corruption == "missing":
+            path = tmp_path / "missing.sql"
+        elif corruption == "unreadable":
+            path = tmp_path / "schema-directory"
+            path.mkdir()
+        else:
+            path = tmp_path / "schema-invalid-utf8.sql"
+            path.write_bytes(b"\xff\xfe")
+        monkeypatch.setattr(subject, "_SCHEMA_V2_PATH", path)
+        with pytest.raises(subject.ProjectionConflict):
+            subject._create_v2_schema(blank)
+        with pytest.raises(subject.ProjectionConflict):
+            subject._verify_v2_schema(verified)
+    finally:
+        blank.close()
+        verified.close()
 
 
 def test_v2_schema_identity_table_order_and_indexes_are_frozen() -> None:
@@ -517,6 +573,67 @@ def test_prepare_v2_uses_only_the_boot_aware_identity(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.parametrize(
+    "corruption",
+    [
+        "canonical_bytes_subclass",
+        "priority_string",
+        "accepted_at_subclass",
+        "accepted_at_invalid",
+        "source_sequence_bool",
+        "frame_offset_bool",
+        "frame_offset_negative",
+        "frame_size_float",
+        "frame_size_oversized",
+        "segment_id",
+        "segment_path",
+        "event_id_subclass",
+        "frame_hash_subclass",
+        "content_hash_subclass",
+    ],
+)
+def test_prepare_v2_rejects_non_exact_record_and_ref_facts(corruption: str) -> None:
+    subject = _subject()
+    record = _record()
+    ref = record.ref
+    if corruption == "canonical_bytes_subclass":
+        record = replace(record, canonical_envelope=_BytesSubclass(record.canonical_envelope))
+    elif corruption == "priority_string":
+        record = replace(record, priority="routine")
+    elif corruption == "accepted_at_subclass":
+        record = replace(record, accepted_at=_StringSubclass(record.accepted_at))
+    elif corruption == "accepted_at_invalid":
+        record = replace(record, accepted_at="2026-07-28 10:00:00")
+    elif corruption == "source_sequence_bool":
+        record = replace(record, ref=replace(ref, source_sequence=True))
+    elif corruption == "frame_offset_bool":
+        record = replace(record, ref=replace(ref, frame_offset=True))
+    elif corruption == "frame_offset_negative":
+        record = replace(record, ref=replace(ref, frame_offset=-1))
+    elif corruption == "frame_size_float":
+        record = replace(record, ref=replace(ref, frame_size=float(ref.frame_size)))
+    elif corruption == "frame_size_oversized":
+        record = replace(record, ref=replace(ref, frame_size=2**64))
+    elif corruption == "segment_id":
+        record = replace(record, ref=replace(ref, segment_id="not-a-segment"))
+    elif corruption == "segment_path":
+        record = replace(record, ref=replace(ref, segment_relative_path="segments/controlled"))
+    elif corruption == "event_id_subclass":
+        record = replace(record, ref=replace(ref, event_id=_StringSubclass(ref.event_id)))
+    elif corruption == "frame_hash_subclass":
+        record = replace(
+            record,
+            ref=replace(ref, frame_sha256=_StringSubclass(ref.frame_sha256)),
+        )
+    else:
+        record = replace(
+            record,
+            ref=replace(ref, content_sha256=_StringSubclass(ref.content_sha256)),
+        )
+    with pytest.raises(subject.ProjectionValidationError):
+        subject._prepare_v2(record)
+
+
+@pytest.mark.parametrize(
     ("incident", "result_kind"),
     [(_incident(), "candidate"), (_incident(direct=True), "investigation")],
 )
@@ -562,6 +679,27 @@ def test_candidate_codec_round_trips_and_binds_the_full_facts_hash() -> None:
         DETECTOR_BUNDLE_SHA256,
         "1.1.1.1",
     )
+
+
+def test_incident_encoder_rejects_model_copy_explicit_null_laundering() -> None:
+    subject = _subject()
+    forged = _incident().model_copy(update={"docker_container_id": None})
+    assert "docker_container_id" in forged.model_fields_set
+    with pytest.raises((TypeError, ValueError)):
+        subject._encode_incident(forged, "candidate")
+
+
+@pytest.mark.parametrize("forgery", ["model_copy", "object_setattr"])
+def test_candidate_encoder_rejects_unvalidated_detector_hash(forgery: str) -> None:
+    subject = _subject()
+    candidate = _candidate()
+    if forgery == "model_copy":
+        forged = candidate.model_copy(update={"detector_bundle_sha256": "invalid"})
+    else:
+        object.__setattr__(candidate, "detector_bundle_sha256", "invalid")
+        forged = candidate
+    with pytest.raises((TypeError, ValueError)):
+        subject._encode_candidate(forged)
 
 
 def test_evidence_and_invalidation_codecs_round_trip_exact_rows() -> None:
@@ -753,3 +891,50 @@ def test_shuffled_insertion_has_stable_full_pk_order_and_v2_snapshot() -> None:
         empty_second.close()
         forward.close()
         reverse.close()
+
+
+def test_snapshot_hash_preserves_caller_owned_transaction_and_uncommitted_rows() -> None:
+    subject = _subject()
+    connection = subject._v2_connection_for_test()
+    try:
+        baseline = subject._v2_snapshot_hash(connection)
+        connection.execute("BEGIN")
+        _insert_event(connection, PRIMARY_EVENT_ID, 1)
+        assert connection.in_transaction
+        transaction_hash = subject._v2_snapshot_hash(connection)
+        assert transaction_hash != baseline
+        assert connection.in_transaction
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+        connection.execute("ROLLBACK")
+        assert not connection.in_transaction
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        assert subject._v2_snapshot_hash(connection) == baseline
+    finally:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        connection.close()
+
+
+def test_snapshot_hash_conflict_does_not_rollback_caller_owned_transaction() -> None:
+    subject = _subject()
+    connection = _snapshot_fixture(subject, reverse=False)
+    try:
+        baseline = subject._v2_snapshot_hash(connection)
+        connection.execute("BEGIN")
+        connection.execute(
+            "UPDATE candidates SET candidate_facts_sha256=? WHERE candidate_id=?",
+            ("0" * 64, CANDIDATE_ID),
+        )
+        with pytest.raises(subject.ProjectionConflict):
+            subject._v2_snapshot_hash(connection)
+        assert connection.in_transaction
+        assert connection.execute(
+            "SELECT candidate_facts_sha256 FROM candidates WHERE candidate_id=?",
+            (CANDIDATE_ID,),
+        ).fetchone()[0] == "0" * 64
+        connection.execute("ROLLBACK")
+        assert subject._v2_snapshot_hash(connection) == baseline
+    finally:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        connection.close()
