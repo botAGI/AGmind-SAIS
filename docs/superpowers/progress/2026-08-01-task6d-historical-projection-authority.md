@@ -190,3 +190,17 @@ resolutions for Task 6D. An entry is added only from observed command output.
   `d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d`.
   Both scoped re-reviews were clean with no remaining Critical/Important
   finding.
+
+### Task 6 preflight — predecessor before duplicate lookup
+
+- Repo-fit audit proved the existing context issuer validated the projection
+  predecessor only after the caller had already observed duplicate state.
+  Nine focused cases reproduced the missing pre-query boundary RED.
+- Commit `5634480` (`feat(core): validate correlation predecessor before
+  lookup`) added an exact, read-only validation under the authority lock. It
+  rejects stale, closed, mutated, subclassed, and equality-laundered facts
+  without advancing the clock or revoking an issued context; context issuance
+  independently revalidates the predecessor again after the lookup.
+- Controller verification passed `184` authority/PCC tests in `7.11s`; Ruff,
+  mypy, and diff checks passed. Independent re-review found no remaining
+  Critical/Important defect in this boundary.

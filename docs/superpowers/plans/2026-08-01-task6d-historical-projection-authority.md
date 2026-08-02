@@ -540,7 +540,9 @@ git commit -m "feat(core): define Projection V2 facts"
 
 **Files**
 
+- Modify: `core/agmind_immune/correlation/authority.py`
 - Modify: `core/agmind_immune/evidence/projection_v2.py`
+- Modify: `core/tests/correlation/test_authority.py`
 - Modify: `core/tests/evidence/test_projection_v2.py`
 - Create: `core/tests/evidence/test_projection_pcc.py`
 
@@ -594,6 +596,12 @@ only from the same-store authenticated protected coverage timeline plus exact
 authenticated/retired path authority, issue/consume the context, and persist
 the result before the cursor in one `BEGIN IMMEDIATE` transaction. Cached
 SQLite coverage rows are never historical authority.
+
+Add a private authority check that validates the exact projection predecessor
+under the authority lock before the reducer queries SQLite duplicate state.
+The existing context issuer must validate the same predecessor again after the
+query. The pre-query check is read-only: it neither advances the predecessor
+nor rotates/revokes the current context revision.
 
 Inside that transaction, revalidate the exact predecessor cursor, completed
 journal capability, evidence lifecycle, and authenticated path before querying

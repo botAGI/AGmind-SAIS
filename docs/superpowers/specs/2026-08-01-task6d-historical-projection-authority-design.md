@@ -468,9 +468,10 @@ The projection issuer:
 1. revalidates the exact post-commit PCC capability;
 2. creates the historical assessment from the same prefix;
 3. computes the duplicate key from the PCC facts;
-4. reads the active duplicate observation inside the same SQLite transaction;
-5. binds the Core pin authority;
-6. registers a one-use context binding over the exact PCC canonical bytes,
+4. validates the exact projection predecessor under the Core authority lock;
+5. reads the active duplicate observation inside the same SQLite transaction;
+6. revalidates that predecessor while binding the Core pin authority;
+7. registers a one-use context binding over the exact PCC canonical bytes,
    `EvidenceRef`, request hash, completed-journal capability, predecessor
    cursor/generation, every context fact, and evidence lifecycle.
 
