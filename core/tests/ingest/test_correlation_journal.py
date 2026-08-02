@@ -146,6 +146,32 @@ def _completed_snapshot_case(
     return coordinator, store, journal, request, snapshot_ref, authority
 
 
+def _two_completed_snapshot_case(
+    path: Path,
+) -> tuple[SegmentStore, CorrelationRequestJournal, EvidenceRef, EvidenceRef]:
+    key = private_key(11)
+    coordinator = _coordinator(path, key)
+    _accept(coordinator, boot_boundary(key))
+    journal = CorrelationRequestJournal.create_new(coordinator.segment_store)
+    refs: list[EvidenceRef] = []
+    for trigger_sequence in (2, 4):
+        trigger = _candidate_trigger(key, sequence=trigger_sequence)
+        trigger_ref = _accept(coordinator, trigger)
+        assert isinstance(trigger_ref, EvidenceRef)
+        request = _request(trigger_ref)
+        selected = journal.select(trigger_ref, canonical_json(request))
+        snapshot_ref = _accept_snapshot(
+            coordinator,
+            trigger,
+            request,
+            sequence=trigger_sequence + 1,
+        )
+        journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+        journal.mark_completed(selected.request_sha256)
+        refs.append(snapshot_ref)
+    return coordinator.segment_store, journal, refs[0], refs[1]
+
+
 def test_correlation_journal_selected_record_has_exact_schema_and_ttl_120(
     tmp_path: Path,
 ) -> None:
@@ -528,7 +554,7 @@ def test_correlation_journal_recovers_each_phase_and_quota_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert correlation_module._MAX_RECORDS == 4_096
+    assert correlation_module._MAX_RECORDS == 12_291
     assert correlation_module._MAX_VERIFIED_BYTES == 16 * 1024 * 1024
     assert correlation_module._MAX_FRAME_PAYLOAD == 64 * 1024
     for phase in ("selected", "proof_observed", "completed"):
@@ -562,6 +588,30 @@ def test_correlation_journal_recovers_each_phase_and_quota_boundary(
     with pytest.raises(CorrelationRequestJournalCorrupt):
         CorrelationRequestJournal.open_and_recover(store)
     store.close(flush=False)
+
+
+def test_correlation_journal_12291st_record_is_inclusive_and_next_fails(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, trigger_ref, trigger = seeded_correlation_store(tmp_path)
+    journal = CorrelationRequestJournal.create_new(store)
+    request = _request(trigger_ref)
+    journal._record_count = 12_290
+    selected = journal.select(trigger_ref, canonical_json(request))
+    assert journal._record_count == 12_291
+    assert correlation_module._MAX_VERIFIED_BYTES == 16 * 1024 * 1024
+    snapshot_ref = _accept_snapshot(coordinator, trigger, request)
+
+    with pytest.raises(
+        CorrelationRequestJournalStateError,
+        match="record quota is exhausted",
+    ):
+        journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+
+    journal._record_count = 1
+    journal.close()
+    store.close()
+
 
 @pytest.mark.parametrize(
     "damage",
@@ -636,6 +686,108 @@ def test_correlation_startup_rejects_unexpected_root_artifact(
 
     with pytest.raises(EvidenceCorrupt, match="unexpected evidence-root artifact"):
         SegmentStore(root)
+
+
+def test_completed_snapshot_batch_is_ordered_and_replays_exactly_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, journal, first, second = _two_completed_snapshot_case(tmp_path)
+    real_replay = journal._authenticated_journal_replay
+    replay_count = 0
+
+    def counted_replay() -> object:
+        nonlocal replay_count
+        replay_count += 1
+        return real_replay()
+
+    monkeypatch.setattr(journal, "_authenticated_journal_replay", counted_replay)
+    try:
+        result = correlation_module._evaluate_completed_snapshot_batch(
+            journal,
+            (second, first),
+            lambda proofs: tuple(proof.event_id for proof in proofs),
+        )
+
+        assert result == (second.event_id, first.event_id)
+        assert replay_count == 2
+    finally:
+        journal.close()
+        store.close()
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "subclass", "overflow"])
+def test_completed_snapshot_batch_rejects_invalid_ref_sets(
+    tmp_path: Path,
+    invalid: str,
+) -> None:
+    store, journal, first, second = _two_completed_snapshot_case(tmp_path)
+    callback_called = False
+
+    def callback(proofs: tuple[AuthenticatedPCCInput, ...]) -> tuple[str, ...]:
+        nonlocal callback_called
+        callback_called = True
+        return tuple(proof.event_id for proof in proofs)
+
+    if invalid == "duplicate":
+        refs: tuple[EvidenceRef, ...] = (first, first)
+    elif invalid == "subclass":
+        class SubclassedRef(EvidenceRef):
+            pass
+
+        refs = (
+            SubclassedRef(
+                segment_id=first.segment_id,
+                segment_relative_path=first.segment_relative_path,
+                frame_offset=first.frame_offset,
+                frame_size=first.frame_size,
+                frame_sha256=first.frame_sha256,
+                event_id=first.event_id,
+                source_sequence=first.source_sequence,
+                content_sha256=first.content_sha256,
+            ),
+            second,
+        )
+    else:
+        refs = (first,) * 4_097
+    try:
+        with pytest.raises(CorrelationRequestJournalAuthorityError):
+            correlation_module._evaluate_completed_snapshot_batch(
+                journal,
+                refs,
+                callback,
+            )
+        assert callback_called is False
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_completed_snapshot_batch_withholds_result_on_journal_drift(
+    tmp_path: Path,
+) -> None:
+    store, journal, first, second = _two_completed_snapshot_case(tmp_path)
+    result_observed = False
+
+    def drift(
+        proofs: tuple[AuthenticatedPCCInput, ...],
+    ) -> tuple[str, ...]:
+        nonlocal result_observed
+        result_observed = True
+        journal._states_by_operation = {}
+        return tuple(proof.event_id for proof in proofs)
+
+    try:
+        with pytest.raises(CorrelationRequestJournalCorrupt):
+            correlation_module._evaluate_completed_snapshot_batch(
+                journal,
+                (first, second),
+                drift,
+            )
+        assert result_observed is True
+    finally:
+        journal.close()
+        store.close()
 
 
 @pytest.mark.parametrize("phase", ["selected", "proof_observed"])

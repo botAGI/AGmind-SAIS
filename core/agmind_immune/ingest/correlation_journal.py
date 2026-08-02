@@ -59,9 +59,10 @@ from agmind_immune.ingest.envelope import (
 )
 
 _JOURNAL_NAME = "correlation-requests.agf"
-_MAX_RECORDS = 4_096
+_MAX_RECORDS = 12_291
 _MAX_VERIFIED_BYTES = 16 * 1024 * 1024
 _MAX_FRAME_PAYLOAD = 64 * 1024
+_MAX_COMPLETED_BATCH = 4_096
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _OPERATION_PREFIX = "pcc_correlation_snapshot:"
@@ -1959,6 +1960,180 @@ class CorrelationRequestJournal:
                 raise CorrelationRequestJournalUnhealthy(
                     "correlation journal close cleanup failed"
                 ) from cleanup_errors[0]
+
+
+def _evaluate_completed_snapshot_batch[T](
+    journal: CorrelationRequestJournal,
+    snapshot_refs: tuple[EvidenceRef, ...],
+    evaluator: Callable[[tuple[AuthenticatedPCCInput, ...]], T],
+) -> T:
+    """Evaluate one bounded pure callback over an authenticated completed batch."""
+    if type(journal) is not CorrelationRequestJournal or not callable(evaluator):
+        raise CorrelationRequestJournalAuthorityError(
+            "completed correlation batch requires exact journal authority"
+        )
+    if (
+        type(snapshot_refs) is not tuple
+        or not snapshot_refs
+        or len(snapshot_refs) > _MAX_COMPLETED_BATCH
+        or any(type(ref) is not EvidenceRef for ref in snapshot_refs)
+    ):
+        raise CorrelationRequestJournalAuthorityError(
+            "completed correlation batch refs are not exact and bounded"
+        )
+    fingerprints = tuple(_evidence_ref_fingerprint(ref) for ref in snapshot_refs)
+    if len(set(fingerprints)) != len(fingerprints):
+        raise CorrelationRequestJournalAuthorityError(
+            "completed correlation batch refs are not unique"
+        )
+    with journal._lock:
+        journal._require_usable()
+        journal_lifecycle = journal._lifecycle_identity
+        store = journal._store
+        store_lifecycle = store._lifecycle_identity
+        verifier = store._bound_verifier
+        if verifier is None or not store._is_bound_verifier(verifier):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation batch lost verifier authority"
+            )
+        verifier_authority = verifier._authority
+        verifier_generation = verifier_authority.generation
+        if type(verifier_generation) is not int or verifier_generation < 0:
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation batch verifier generation is invalid"
+            )
+        replay_before = journal._authenticated_journal_replay()
+        entries: list[
+            tuple[
+                EvidenceRef,
+                _EvidenceRefFingerprint,
+                bytes,
+                frozenset[str],
+                AuthenticatedPCCInput,
+                bytes,
+                bytes,
+                frozenset[str],
+                bytes,
+                frozenset[str],
+            ]
+        ] = []
+        proofs: list[AuthenticatedPCCInput] = []
+        for ref, fingerprint in zip(snapshot_refs, fingerprints, strict=True):
+            state = journal._completed_state_from_replay(replay_before, ref)
+            if not journal._state_canonical_is_exact(state):
+                raise CorrelationRequestJournalAuthorityError(
+                    "completed correlation batch state is not canonical"
+                )
+            proof = journal._authenticated_pcc_for_completed_state(state, ref)
+            snapshot = proof.snapshot
+            entries.append(
+                (
+                    ref,
+                    fingerprint,
+                    canonical_json(state),
+                    frozenset(state.model_fields_set),
+                    proof,
+                    proof.canonical,
+                    canonical_json(proof.request),
+                    frozenset(proof.request.model_fields_set),
+                    canonical_json(snapshot),
+                    frozenset(snapshot.model_fields_set),
+                )
+            )
+            proofs.append(proof)
+        result = evaluator(tuple(proofs))
+        reauthenticated: list[AuthenticatedPCCInput] = []
+        for (
+            ref,
+            fingerprint,
+            state_canonical,
+            state_fields_set,
+            proof,
+            proof_canonical,
+            request_canonical,
+            request_fields_set,
+            snapshot_canonical,
+            snapshot_fields_set,
+        ) in entries:
+            state = journal._completed_state_from_replay(replay_before, ref)
+            current = journal._authenticated_pcc_for_completed_state(state, ref)
+            if (
+                canonical_json(state) != state_canonical
+                or frozenset(state.model_fields_set) != state_fields_set
+                or not journal._state_canonical_is_exact(state)
+                or current.canonical != proof_canonical
+                or _evidence_ref_fingerprint(current.evidence_ref) != fingerprint
+                or canonical_json(current.request) != request_canonical
+                or frozenset(current.request.model_fields_set)
+                != request_fields_set
+                or canonical_json(current.snapshot) != snapshot_canonical
+                or frozenset(current.snapshot.model_fields_set)
+                != snapshot_fields_set
+                or not journal._pcc_matches_completed_state(
+                    proof,
+                    state,
+                    fingerprint,
+                )
+            ):
+                raise CorrelationRequestJournalAuthorityError(
+                    "completed correlation batch changed during evaluation"
+                )
+            reauthenticated.append(current)
+        replay_after = journal._authenticated_journal_replay()
+        if (
+            not journal._replays_match(replay_before, replay_after)
+            or journal._lifecycle_identity is not journal_lifecycle
+            or journal._store is not store
+            or store._lifecycle_identity is not store_lifecycle
+            or store._bound_verifier is not verifier
+            or not store._is_bound_verifier(verifier)
+            or verifier._authority is not verifier_authority
+            or verifier._authority.generation != verifier_generation
+        ):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation batch authority changed"
+            )
+        for entry, current in zip(entries, reauthenticated, strict=True):
+            (
+                ref,
+                fingerprint,
+                state_canonical,
+                state_fields_set,
+                proof,
+                proof_canonical,
+                request_canonical,
+                request_fields_set,
+                snapshot_canonical,
+                snapshot_fields_set,
+            ) = entry
+            state_after = journal._completed_state_from_replay(replay_after, ref)
+            if (
+                canonical_json(state_after) != state_canonical
+                or frozenset(state_after.model_fields_set) != state_fields_set
+                or not journal._state_canonical_is_exact(state_after)
+                or current.canonical != proof_canonical
+                or proof.canonical != proof_canonical
+                or canonical_json(current.request) != request_canonical
+                or frozenset(current.request.model_fields_set)
+                != request_fields_set
+                or canonical_json(current.snapshot) != snapshot_canonical
+                or frozenset(current.snapshot.model_fields_set)
+                != snapshot_fields_set
+                or not journal._pcc_matches_completed_state(
+                    current,
+                    state_after,
+                    fingerprint,
+                )
+                or not journal._pcc_matches_completed_state(
+                    proof,
+                    state_after,
+                    fingerprint,
+                )
+            ):
+                raise CorrelationRequestJournalAuthorityError(
+                    "completed correlation batch changed during final proof"
+                )
+        return result
 
 
 def _completed_snapshot_authority_protocol() -> tuple[

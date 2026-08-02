@@ -180,6 +180,29 @@ def test_hash_canonicalizes_interval_order_optional_omission_and_id_set() -> Non
     assert first == second
 
 
+def test_late_coverage_candidate_relevance_is_closed_to_critical_actions() -> None:
+    key = private_key(11)
+    critical = _generic_critical(
+        key,
+        2,
+        component="falco-adapter",
+        kind="falco_heartbeat_gap",
+        opened_at=T0,
+        closed_at=T0,
+    )
+    lease = _falco_point(
+        key,
+        3,
+        kind="falco_heartbeat_lease",
+        severity="INFO",
+        at=T0,
+        reason="valid_heartbeat",
+    )
+
+    assert _subject()._late_coverage_may_invalidate_candidate(critical) is True
+    assert _subject()._late_coverage_may_invalidate_candidate(lease) is False
+
+
 def test_pretrigger_episode_uses_open_latest_effective_update_and_close_ids() -> None:
     subject = _subject()
     key = private_key(11)

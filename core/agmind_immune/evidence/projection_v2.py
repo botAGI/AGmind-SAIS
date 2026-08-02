@@ -51,6 +51,8 @@ from agmind_immune.correlation.primitives import SpecialUseRegistry
 from agmind_immune.coverage.historical import (
     HistoricalCoverageConflict,
     HistoricalCoverageUnavailable,
+    _late_coverage_invalidates_candidate,
+    _late_coverage_may_invalidate_candidate,
     derive_historical_coverage,
 )
 from agmind_immune.evidence.dedup import _logical_primary_identity_v2
@@ -80,6 +82,7 @@ from agmind_immune.ingest.ack_journal import (
 from agmind_immune.ingest.correlation_journal import (
     CorrelationRequestJournal,
     CorrelationRequestJournalError,
+    _evaluate_completed_snapshot_batch,
     _revalidate_completed_snapshot,
 )
 from agmind_immune.ingest.envelope import AuthenticatedPCCInput
@@ -115,6 +118,7 @@ _EVIDENCE_ROLES_V2 = frozenset(
     }
 )
 _INVALIDATION_REASON_V2 = "late_critical_coverage_gap"
+_INVALIDATION_CANDIDATE_CAP_V2 = 4_096
 _INCIDENT_UINT64_FIELDS = frozenset({"primary_source_sequence"})
 _INCIDENT_BOOL_FIELDS = frozenset({"successful_connect", "investigation_only"})
 _INCIDENT_TUPLE_FIELDS = frozenset(
@@ -314,6 +318,12 @@ class _PreparedV2Record:
     logical_key_sha256: str
     falco: FalcoConnectV1 | None
     coverage: CoverageEventV1 | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LateCandidateV2:
+    candidate: ContainmentCandidateV1
+    snapshot_ref: EvidenceRef
 
 
 def _encode_uint64_v2(value: object) -> str:
@@ -1827,6 +1837,11 @@ class _V2ProjectionOwner:
         is_primary: bool,
     ) -> None:
         event_id = prepared.envelope.event_id
+        self._validate_coverage_invalidation_closure(
+            connection,
+            prepared,
+            is_primary=is_primary,
+        )
         incident_rows = self._retry_rows_for_authority(
             connection,
             "incidents",
@@ -2606,6 +2621,56 @@ class _V2ProjectionOwner:
         acceptance_cursor: int,
     ) -> Callable[[], None] | None:
         self._reduce_base(connection, prepared)
+        if prepared.coverage is not None:
+            try:
+                expected = self._expected_coverage_invalidations(
+                    connection,
+                    prepared,
+                )
+                for row in expected:
+                    connection.execute(
+                        "INSERT INTO candidate_invalidations VALUES(?,?,?,?,?)",
+                        row,
+                    )
+                    self._step_hook("candidate_invalidation")
+            except ProjectionConflict:
+                raise
+            except (
+                CorrelationRequestJournalError,
+                EvidenceStoreError,
+                HistoricalCoverageConflict,
+                HistoricalCoverageUnavailable,
+                AttributeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 late coverage authority is unavailable"
+                ) from error
+
+            def final_coverage_authority_check() -> None:
+                try:
+                    self._validate_coverage_invalidation_closure(
+                        connection,
+                        prepared,
+                        is_primary=True,
+                    )
+                except (ProjectionConflict, ProjectionAuthorityError):
+                    raise
+                except (
+                    CorrelationRequestJournalError,
+                    EvidenceStoreError,
+                    HistoricalCoverageConflict,
+                    HistoricalCoverageUnavailable,
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 late coverage authority changed after persistence"
+                    ) from error
+
+            return final_coverage_authority_check
         if prepared.envelope.event_type != "pcc_correlation_snapshot":
             return None
         try:
@@ -2633,6 +2698,165 @@ class _V2ProjectionOwner:
             raise ProjectionAuthorityError(
                 "Projection V2 PCC authority could not be revalidated"
             ) from error
+
+    def _expected_coverage_invalidations(
+        self,
+        connection: sqlite3.Connection,
+        prepared: _PreparedV2Record,
+    ) -> list[tuple[object, ...]]:
+        if prepared.coverage is None:
+            return []
+        candidate_columns = ",".join(f"c.{column}" for column in _CANDIDATE_COLUMNS)
+        rows = connection.execute(
+            f"SELECT {candidate_columns} FROM candidates AS c "
+            "JOIN events AS snapshot "
+            "ON snapshot.event_id=c.correlation_snapshot_event_id "
+            "WHERE c.host_id=? AND snapshot.source_sequence<? "
+            "ORDER BY c.candidate_id COLLATE BINARY LIMIT ?",
+            (
+                prepared.envelope.host_id,
+                _encode_uint64_v2(prepared.record.ref.source_sequence),
+                _INVALIDATION_CANDIDATE_CAP_V2 + 1,
+            ),
+        ).fetchall()
+        if len(rows) > _INVALIDATION_CANDIDATE_CAP_V2:
+            raise HistoricalCoverageUnavailable(
+                "late coverage candidate matches exceed 4096"
+            )
+        if not _late_coverage_may_invalidate_candidate(prepared.record):
+            return []
+        verifier = self._evidence._bound_verifier
+        if verifier is None:
+            raise ProjectionAuthorityError(
+                "Projection V2 late coverage lost verifier authority"
+            )
+        candidates: list[_LateCandidateV2] = []
+        for row in rows:
+            _candidate_duplicate_key_from_row(row)
+            candidate = _decode_candidate(row)
+            snapshot_rows = connection.execute(
+                "SELECT candidate_id,evidence_event_id,evidence_source_sequence,"
+                "evidence_content_sha256,role,authority_snapshot_event_id "
+                "FROM candidate_evidence WHERE candidate_id=? AND "
+                "evidence_event_id=? AND role='correlation_snapshot' AND "
+                "authority_snapshot_event_id=? LIMIT 2",
+                (
+                    candidate.candidate_id,
+                    candidate.correlation_snapshot_event_id,
+                    candidate.correlation_snapshot_event_id,
+                ),
+            ).fetchall()
+            if len(snapshot_rows) != 1:
+                raise ProjectionConflict(
+                    "Projection V2 late candidate lost snapshot evidence"
+                )
+            (
+                evidence_candidate_id,
+                evidence_event_id,
+                snapshot_sequence,
+                evidence_hash,
+                role,
+                authority_event_id,
+            ) = _decode_candidate_evidence(snapshot_rows[0])
+            if (
+                evidence_candidate_id != candidate.candidate_id
+                or evidence_event_id != candidate.correlation_snapshot_event_id
+                or authority_event_id != candidate.correlation_snapshot_event_id
+                or role != "correlation_snapshot"
+                or snapshot_sequence >= prepared.record.ref.source_sequence
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 late candidate snapshot binding changed"
+                )
+            snapshot_ref = verifier.accepted_ref(snapshot_sequence)
+            if (
+                type(snapshot_ref) is not EvidenceRef
+                or snapshot_ref.event_id != evidence_event_id
+                or snapshot_ref.content_sha256 != evidence_hash
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 late candidate snapshot is not authenticated"
+                )
+            candidates.append(_LateCandidateV2(candidate, snapshot_ref))
+        if not candidates:
+            return []
+
+        def evaluate(
+            proofs: tuple[AuthenticatedPCCInput, ...],
+        ) -> tuple[tuple[object, ...], ...]:
+            if len(proofs) != len(candidates):
+                raise ProjectionAuthorityError(
+                    "Projection V2 late candidate batch length changed"
+                )
+            expected: list[tuple[object, ...]] = []
+            for selected, proof in zip(candidates, proofs, strict=True):
+                candidate = selected.candidate
+                trigger = proof.snapshot.trigger
+                if (
+                    type(proof) is not AuthenticatedPCCInput
+                    or type(proof.evidence_ref) is not EvidenceRef
+                    or proof.evidence_ref != selected.snapshot_ref
+                    or proof.event_id != candidate.correlation_snapshot_event_id
+                    or proof.host_id != candidate.host_id
+                    or proof.boot_id != candidate.boot_id
+                    or trigger.event_id != candidate.primary_event_id
+                    or trigger.source_sequence != candidate.primary_source_sequence
+                ):
+                    raise ProjectionAuthorityError(
+                        "Projection V2 late candidate PCC binding changed"
+                    )
+                if _late_coverage_invalidates_candidate(proof, prepared.record):
+                    expected.append(
+                        _encode_candidate_invalidation(
+                            candidate.candidate_id,
+                            prepared.envelope.event_id,
+                            prepared.record.ref.source_sequence,
+                            prepared.record.ref.content_sha256,
+                            _INVALIDATION_REASON_V2,
+                        )
+                    )
+            return tuple(expected)
+
+        return list(
+            _evaluate_completed_snapshot_batch(
+                self._journal,
+                tuple(selected.snapshot_ref for selected in candidates),
+                evaluate,
+            )
+        )
+
+    def _validate_coverage_invalidation_closure(
+        self,
+        connection: sqlite3.Connection,
+        prepared: _PreparedV2Record,
+        *,
+        is_primary: bool,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT candidate_id,coverage_event_id,coverage_source_sequence,"
+            "coverage_content_sha256,reason_code FROM candidate_invalidations "
+            "WHERE coverage_event_id=? ORDER BY candidate_id COLLATE BINARY LIMIT ?",
+            (
+                prepared.envelope.event_id,
+                _INVALIDATION_CANDIDATE_CAP_V2 + 1,
+            ),
+        ).fetchall()
+        if len(rows) > _INVALIDATION_CANDIDATE_CAP_V2:
+            raise ProjectionConflict(
+                "Projection V2 coverage invalidation closure exceeds 4096"
+            )
+        for row in rows:
+            _decode_candidate_invalidation(row)
+        actual = [tuple(row) for row in rows]
+        expected = (
+            self._expected_coverage_invalidations(connection, prepared)
+            if is_primary and prepared.coverage is not None
+            else []
+        )
+        if actual != expected:
+            raise ProjectionConflict(
+                "Projection V2 coverage invalidation closure changed"
+            )
 
     def _reduce_base(
         self,

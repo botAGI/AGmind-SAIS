@@ -131,6 +131,92 @@ class _ClosedSummary:
     dependency_ids: tuple[str, ...]
 
 
+def _late_coverage_may_invalidate_candidate(record: StoredEvidenceRecord) -> bool:
+    if type(record) is not StoredEvidenceRecord:
+        raise HistoricalCoverageUnavailable(
+            "late coverage classification requires exact evidence"
+        )
+    prepared = _prepare_historical_record(record)
+    return prepared.coverage is not None and prepared.fact.classification.action in {
+        "docker_open",
+        "docker_close",
+        "sequence_open",
+        "sequence_close",
+        "generic_open",
+        "generic_close",
+        "falco_stop",
+    }
+
+
+def _late_coverage_invalidates_candidate(
+    authenticated: AuthenticatedPCCInput,
+    record: StoredEvidenceRecord,
+) -> bool:
+    """Derive late coverage impact from an issued PCC and exact evidence bytes."""
+    if (
+        type(authenticated) is not AuthenticatedPCCInput
+        or not authenticated_pcc_input_is_issued(authenticated)
+        or type(record) is not StoredEvidenceRecord
+    ):
+        raise HistoricalCoverageUnavailable(
+            "late coverage requires exact issued evidence authority"
+        )
+    prepared = _prepare_historical_record(record)
+    coverage = prepared.coverage
+    if coverage is None:
+        return False
+    envelope = prepared.envelope
+    snapshot = authenticated.snapshot
+    trigger = snapshot.trigger
+    if (
+        snapshot.outcome != "complete"
+        or authenticated.host_id != trigger.host_id
+        or authenticated.boot_id != trigger.boot_id
+        or authenticated.source_sequence <= trigger.source_sequence
+        or snapshot.coverage_through_sequence != authenticated.source_sequence - 1
+        or envelope.host_id != authenticated.host_id
+        or envelope.source_sequence <= authenticated.source_sequence
+    ):
+        raise HistoricalCoverageConflict(
+            "late coverage candidate authority is inconsistent"
+        )
+    action = prepared.fact.classification.action
+    sequence_intersects = False
+    if action in {"sequence_open", "sequence_close"}:
+        affected_start = coverage.affected_source_sequence_start
+        affected_end = coverage.affected_source_sequence_end
+        if affected_start is None or affected_end is None:
+            raise HistoricalCoverageConflict("late sequence coverage lost its range")
+        sequence_intersects = not (
+            affected_end < trigger.source_sequence
+            or affected_start > snapshot.coverage_through_sequence
+        )
+    time_intersects = False
+    if action in {
+        "docker_open",
+        "docker_close",
+        "sequence_open",
+        "sequence_close",
+        "generic_open",
+        "generic_close",
+        "falco_stop",
+    } and (
+        prepared.fact.classification.scope != "process"
+        or envelope.boot_id == authenticated.boot_id
+    ):
+        window = _historical_coverage_window(
+            trigger.event_time,
+            trigger.clock_uncertainty_ms,
+            snapshot.decision_time,
+        )
+        time_intersects = _interval_intersects_window(
+            coverage.opened_at,
+            coverage.closed_at,
+            window,
+        )
+    return time_intersects or sequence_intersects
+
+
 def _bounded_for_test(label: str, values: Iterable[object]) -> tuple[object, ...]:
     selected: list[object] = []
     for value in values:
