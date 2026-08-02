@@ -170,3 +170,23 @@ resolutions for Task 6D. An entry is added only from observed command output.
   and the exact gate reached `76 passed`; commit `36f8586`
   (`fix(core): latch failed retention rebuild authority`). Ruff and mypy passed;
   every failed post-unlink rebuild now latches unhealthy.
+
+### Task 5 — Projection V2 schema and strict facts
+
+- Four TDD slices froze the dormant V2 schema, strict incident/candidate/link
+  codecs, hostile-row rejection, and deterministic full-primary-key snapshot;
+  commit `a00af2a` (`feat(core): define Projection V2 facts`). The first exact
+  controller gate passed `106` tests while active V1 remained byte-identical.
+- Independent review found runtime schema self-definition, non-exact evidence
+  locators, forged Pydantic encoder inputs, and caller-transaction rollback.
+  Each exploit was reproduced RED and closed in commit `6e40dd5`
+  (`fix(core): harden Projection V2 authority boundaries`). V2 now pins the
+  literal schema SHA-256, strictly reconstructs all persisted security facts,
+  rejects equality-laundered record/ref values, and never commits or rolls back
+  a caller-owned snapshot transaction.
+- Final controller verification passed the exact `129`-test gate in `3.86s`;
+  Ruff, mypy, V1 schema byte comparison, and `git diff --check` passed. The V2
+  schema hash remains
+  `d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d`.
+  Both scoped re-reviews were clean with no remaining Critical/Important
+  finding.
