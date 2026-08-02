@@ -70,6 +70,18 @@ class _LayoutCompatibleCorrelationContext(CorrelationContext):
     __slots__ = ()
 
 
+class _EqualityLaunderedEventId(str):
+    def __eq__(self, other: object) -> bool:
+        del other
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        return False
+
+    __hash__ = str.__hash__
+
+
 def _authority_module() -> ModuleType:
     try:
         return importlib.import_module("agmind_immune.correlation.authority")
@@ -989,6 +1001,78 @@ def test_failed_rejection_binds_detached_facts_to_initial_proof(
         allow_detach.set()
         allow_final_check.set()
         object.__setattr__(failed, "_snapshot", original_snapshot)
+        object.__setattr__(failed, "_event_id", original_event_id)
+        coordinator.segment_store.close()
+
+
+@pytest.mark.parametrize("entrypoint", ["proof", "facts"])
+def test_failed_rejection_rejects_equality_laundered_event_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    coordinator, failed = _accepted_failed(tmp_path / entrypoint)
+    pcc_module = importlib.import_module("agmind_immune.correlation.pcc")
+    real_fingerprint = pcc_module._pcc_live_fingerprint
+    original_snapshot = failed.snapshot
+    original_event_id = failed.event_id
+    initial_captured = Event()
+    allow_event_swap = Event()
+    calls = 0
+    outcomes: list[object] = []
+
+    def paused_fingerprint(value: object) -> object:
+        nonlocal calls
+        if value is not failed:
+            return real_fingerprint(value)
+        calls += 1
+        result = real_fingerprint(value)
+        if calls == 1:
+            initial_captured.set()
+            assert allow_event_swap.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        pcc_module,
+        "_pcc_live_fingerprint",
+        paused_fingerprint,
+    )
+
+    def consume() -> None:
+        try:
+            if entrypoint == "proof":
+                outcomes.append(
+                    correlate_pcc(failed, CorrelationContext.failed_snapshot())
+                )
+            else:
+                outcomes.append(
+                    correlate_pcc_facts(
+                        original_snapshot.trigger,
+                        failed,
+                        CorrelationContext.failed_snapshot(),
+                    )
+                )
+        except BaseException as error:  # noqa: BLE001 - asserted by caller.
+            outcomes.append(error)
+
+    consumer = Thread(target=consume)
+    try:
+        consumer.start()
+        assert initial_captured.wait(timeout=5)
+        object.__setattr__(
+            failed,
+            "_event_id",
+            _EqualityLaunderedEventId("evt_" + "b" * 64),
+        )
+        assert not pcc_module.authenticated_pcc_input_is_issued(failed)
+        allow_event_swap.set()
+        consumer.join(timeout=5)
+
+        assert not consumer.is_alive()
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], CorrelationProjectionError)
+    finally:
+        allow_event_swap.set()
         object.__setattr__(failed, "_event_id", original_event_id)
         coordinator.segment_store.close()
 

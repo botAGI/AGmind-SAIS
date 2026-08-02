@@ -17,6 +17,7 @@ from agmind_immune.canonicaljson import (
 )
 from agmind_immune.contracts import (
     MAX_UINT64,
+    PCCCorrelationSnapshotRequestV1,
     PCCCorrelationSnapshotV1,
     PCCFalcoTriggerProjectionV1,
 )
@@ -417,25 +418,30 @@ def _evidence_ref_fingerprint(value: object) -> tuple[object, ...]:
     )
 
 
+def _evidence_ref_fingerprint_is_exact(
+    value: tuple[object, ...],
+) -> bool:
+    return (
+        len(value) == 9
+        and type(value[0]) is type
+        and type(value[1]) is str
+        and type(value[2]) is str
+        and type(value[3]) is int
+        and type(value[4]) is int
+        and type(value[5]) is str
+        and type(value[6]) is str
+        and type(value[7]) is int
+        and type(value[8]) is str
+    )
+
+
 def _pcc_canonical_facts(
     value: AuthenticatedPCCInput,
 ) -> _PCCFactsFingerprint:
-    request = value.request
-    snapshot = value.snapshot
-    return (
-        value.boot_id,
-        value.canonical,
-        value.content_sha256,
-        value.event_id,
-        value.event_type,
-        value.host_id,
-        value.source_sequence,
-        _evidence_ref_fingerprint(value.evidence_ref),
-        canonical_json(request),
-        frozenset(request.model_fields_set),
-        canonical_json(snapshot),
-        frozenset(snapshot.model_fields_set),
-    )
+    fingerprint = _pcc_live_fingerprint(value)
+    if fingerprint is None:
+        raise TypeError("PCC facts are not exact")
+    return fingerprint[4:]
 
 
 def _pcc_live_fingerprint(
@@ -444,14 +450,59 @@ def _pcc_live_fingerprint(
     if type(value) is not AuthenticatedPCCInput:
         return None
     try:
+        evidence_ref = value.evidence_ref
         request = value.request
         snapshot = value.snapshot
+        trigger = snapshot.trigger
+        boot_id = value.boot_id
+        canonical = value.canonical
+        content_sha256 = value.content_sha256
+        event_id = value.event_id
+        event_type = value.event_type
+        host_id = value.host_id
+        source_sequence = value.source_sequence
+        evidence_fingerprint = _evidence_ref_fingerprint(evidence_ref)
+        request_canonical = canonical_json(request)
+        request_fields_set = frozenset(request.model_fields_set)
+        snapshot_canonical = canonical_json(snapshot)
+        snapshot_fields_set = frozenset(snapshot.model_fields_set)
+        if (
+            type(request) is not PCCCorrelationSnapshotRequestV1
+            or type(snapshot) is not PCCCorrelationSnapshotV1
+            or type(trigger) is not PCCFalcoTriggerProjectionV1
+            or type(boot_id) is not str
+            or type(canonical) is not bytes
+            or type(content_sha256) is not str
+            or type(event_id) is not str
+            or type(event_type) is not str
+            or type(host_id) is not str
+            or type(source_sequence) is not int
+            or not _evidence_ref_fingerprint_is_exact(
+                evidence_fingerprint
+            )
+            or type(request_canonical) is not bytes
+            or any(type(field) is not str for field in request_fields_set)
+            or type(snapshot_canonical) is not bytes
+            or any(type(field) is not str for field in snapshot_fields_set)
+        ):
+            return None
         return (
-            id(value.evidence_ref),
+            id(evidence_ref),
             id(request),
             id(snapshot),
-            id(snapshot.trigger),
-            *_pcc_canonical_facts(value),
+            id(trigger),
+            boot_id,
+            canonical,
+            content_sha256,
+            event_id,
+            event_type,
+            host_id,
+            source_sequence,
+            evidence_fingerprint,
+            request_canonical,
+            request_fields_set,
+            snapshot_canonical,
+            snapshot_fields_set,
         )
     except (
         AttributeError,
@@ -1047,10 +1098,13 @@ def _failed_snapshot_rejection(
             "failed PCC authority changed before rejection"
         )
     try:
+        authority_event_id = _exact_event_id(
+            fingerprint[7],
+            "authority_event_id",
+        )
         snapshot_canonical = canonical_json(snapshot)
         snapshot_fields_set = frozenset(snapshot.model_fields_set)
         detached_snapshot = snapshot.model_copy(deep=True)
-        authority_event_id = authenticated.event_id
     except (AttributeError, RecursionError, TypeError, ValueError) as error:
         raise CorrelationProjectionError(
             "failed PCC facts could not be detached"
@@ -1064,7 +1118,6 @@ def _failed_snapshot_rejection(
         or canonical_json(detached_snapshot) != snapshot_canonical
         or _pcc_live_fingerprint(authenticated) != fingerprint
         or id(snapshot) != fingerprint[2]
-        or authority_event_id != fingerprint[7]
         or snapshot_canonical != fingerprint[-2]
         or snapshot_fields_set != fingerprint[-1]
         or canonical_json(detached_snapshot) != fingerprint[-2]

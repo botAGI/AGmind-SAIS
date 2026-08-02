@@ -1233,6 +1233,25 @@ def _evidence_ref_fingerprint(value: object) -> _EvidenceRefFingerprint:
     )
 
 
+def _evidence_ref_fingerprint_is_exact(
+    value: _EvidenceRefFingerprint,
+) -> bool:
+    evidence_type, facts = value
+    return (
+        type(evidence_type) is type
+        and type(facts) is tuple
+        and len(facts) == 8
+        and type(facts[0]) is str
+        and type(facts[1]) is str
+        and type(facts[2]) is int
+        and type(facts[3]) is int
+        and type(facts[4]) is str
+        and type(facts[5]) is str
+        and type(facts[6]) is int
+        and type(facts[7]) is str
+    )
+
+
 @dataclass(frozen=True)
 class _IssuedFalcoBinding:
     boot_id: str
@@ -1445,27 +1464,55 @@ def _authenticated_input_issuers() -> tuple[
         if binding is None:
             return False
         try:
+            boot_id = value._boot_id
+            canonical = value._canonical
+            content_sha256 = value._content_sha256
+            event_id = value._event_id
+            event_type = value._event_type
+            evidence_ref = _evidence_ref_fingerprint(
+                value._evidence_ref
+            )
+            host_id = value._host_id
+            request = value._request
+            snapshot = value._snapshot
+            source_sequence = value._source_sequence
+            request_canonical = canonical_json(request)
+            request_fields_set = frozenset(request.model_fields_set)
+            snapshot_canonical = canonical_json(snapshot)
+            snapshot_fields_set = frozenset(snapshot.model_fields_set)
             return (
-                value._boot_id == binding.boot_id
-                and value._canonical == binding.canonical
-                and value._content_sha256 == binding.content_sha256
-                and value._event_id == binding.event_id
-                and value._event_type == binding.event_type
-                and _evidence_ref_fingerprint(value._evidence_ref)
-                == binding.evidence_ref
-                and value._host_id == binding.host_id
-                and type(value._request)
-                is PCCCorrelationSnapshotRequestV1
-                and canonical_json(value._request)
-                == binding.request_canonical
-                and frozenset(value._request.model_fields_set)
-                == binding.request_fields_set
-                and type(value._snapshot) is PCCCorrelationSnapshotV1
-                and canonical_json(value._snapshot)
-                == binding.snapshot_canonical
-                and frozenset(value._snapshot.model_fields_set)
-                == binding.snapshot_fields_set
-                and value._source_sequence == binding.source_sequence
+                type(boot_id) is str
+                and boot_id == binding.boot_id
+                and type(canonical) is bytes
+                and canonical == binding.canonical
+                and type(content_sha256) is str
+                and content_sha256 == binding.content_sha256
+                and type(event_id) is str
+                and event_id == binding.event_id
+                and type(event_type) is str
+                and event_type == binding.event_type
+                and _evidence_ref_fingerprint_is_exact(evidence_ref)
+                and evidence_ref == binding.evidence_ref
+                and type(host_id) is str
+                and host_id == binding.host_id
+                and type(request) is PCCCorrelationSnapshotRequestV1
+                and type(request_canonical) is bytes
+                and request_canonical == binding.request_canonical
+                and all(
+                    type(field) is str
+                    for field in request_fields_set
+                )
+                and request_fields_set == binding.request_fields_set
+                and type(snapshot) is PCCCorrelationSnapshotV1
+                and type(snapshot_canonical) is bytes
+                and snapshot_canonical == binding.snapshot_canonical
+                and all(
+                    type(field) is str
+                    for field in snapshot_fields_set
+                )
+                and snapshot_fields_set == binding.snapshot_fields_set
+                and type(source_sequence) is int
+                and source_sequence == binding.source_sequence
             )
         except (
             AttributeError,
