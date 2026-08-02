@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
+import agmind_immune.ingest.correlation_journal as correlation_module
 import pytest
 from agmind_immune.canonicaljson import (
     canonical_json,
@@ -12,7 +13,10 @@ from agmind_immune.canonicaljson import (
 from agmind_immune.coverage import CoverageState
 from agmind_immune.evidence.segments import EvidenceRef, SegmentStore
 from agmind_immune.ingest.ack_journal import AckJournal
-from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
+from agmind_immune.ingest.correlation_journal import (
+    CorrelationRequestJournal,
+    CorrelationRequestJournalAuthorityError,
+)
 from agmind_immune.ingest.service import (
     AcceptanceCoordinator,
     DeliveryCoordinator,
@@ -289,6 +293,71 @@ async def test_candidate_trigger_is_selected_after_accept_before_any_ack(
     correlation.close()
     acknowledgements.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_issues_completed_authority_only_after_snapshot_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _trigger = _candidate_case()
+    _acceptance, store, acknowledgements, correlation, coverage, delivery = (
+        _runtime(tmp_path, transport)
+    )
+    completed_sequences: list[int] = []
+    mark_completed = CorrelationRequestJournal.mark_completed
+
+    def traced_completion(
+        owner: CorrelationRequestJournal,
+        request_sha256: str,
+    ) -> object:
+        assert owner is correlation
+        pending = owner.pending()
+        assert len(pending) == 1
+        state = pending[0]
+        assert state.phase == "proof_observed"
+        refs = store.authenticated_refs(
+            after_sequence=state.request.trigger_source_sequence,
+            through_sequence=store.status().evidence_head,
+            limit=100,
+        )
+        snapshot_ref = next(
+            ref for ref in refs if ref.event_id == state.snapshot_event_id
+        )
+        confirmed = acknowledgements.snapshot().confirmed
+        assert confirmed is not None
+        assert confirmed.sequence >= snapshot_ref.source_sequence
+        with pytest.raises(CorrelationRequestJournalAuthorityError):
+            owner.completed_for_snapshot(snapshot_ref)
+
+        completed = mark_completed(owner, request_sha256)
+        authority = owner.completed_for_snapshot(snapshot_ref)
+        authenticated = correlation_module._revalidate_completed_snapshot(
+            authority
+        )
+        assert authenticated.evidence_ref == snapshot_ref
+        completed_sequences.append(snapshot_ref.source_sequence)
+        return completed
+
+    monkeypatch.setattr(
+        CorrelationRequestJournal,
+        "mark_completed",
+        traced_completion,
+    )
+
+    result = await delivery.poll_once()
+
+    assert result.retry_required is False
+    assert result.confirmed_through == 3
+    assert completed_sequences == [3]
+    assert correlation.pending() == ()
+    await _close_runtime(
+        delivery,
+        coverage,
+        correlation,
+        acknowledgements,
+        store,
+    )
 
 
 @pytest.mark.asyncio

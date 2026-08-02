@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
 import os
+import pickle
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,7 +23,7 @@ from agmind_immune.ingest.correlation_journal import (
     CorrelationRequestJournalStateError,
     CorrelationRequestJournalUnhealthy,
 )
-from agmind_immune.ingest.envelope import EnvelopeVerifier
+from agmind_immune.ingest.envelope import AuthenticatedPCCInput, EnvelopeVerifier
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from tests.ingest.test_pcc_correlation_snapshot import (
     _accept,
@@ -119,6 +122,27 @@ def _reopen_correlation_store(path: Path) -> SegmentStore:
         store,
     )
     return store
+
+
+def _completed_snapshot_case(
+    path: Path,
+) -> tuple[
+    object,
+    SegmentStore,
+    CorrelationRequestJournal,
+    PCCCorrelationSnapshotRequestV1,
+    EvidenceRef,
+    object,
+]:
+    coordinator, store, trigger_ref, trigger = seeded_correlation_store(path)
+    journal = CorrelationRequestJournal.create_new(store)
+    request = _request(trigger_ref)
+    selected = journal.select(trigger_ref, canonical_json(request))
+    snapshot_ref = _accept_snapshot(coordinator, trigger, request)
+    journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+    journal.mark_completed(selected.request_sha256)
+    authority = journal.completed_for_snapshot(snapshot_ref)
+    return coordinator, store, journal, request, snapshot_ref, authority
 
 
 def test_correlation_journal_selected_record_has_exact_schema_and_ttl_120(
@@ -611,3 +635,325 @@ def test_correlation_startup_rejects_unexpected_root_artifact(
 
     with pytest.raises(EvidenceCorrupt, match="unexpected evidence-root artifact"):
         SegmentStore(root)
+
+
+@pytest.mark.parametrize("phase", ["selected", "proof_observed"])
+def test_completed_snapshot_authority_requires_completed_phase(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    coordinator, store, trigger_ref, trigger = seeded_correlation_store(
+        tmp_path / phase
+    )
+    journal = CorrelationRequestJournal.create_new(store)
+    request = _request(trigger_ref)
+    selected = journal.select(trigger_ref, canonical_json(request))
+    snapshot_ref = _accept_snapshot(coordinator, trigger, request)
+    if phase == "proof_observed":
+        journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        journal.completed_for_snapshot(snapshot_ref)
+
+    journal.close()
+    store.close()
+
+
+def test_completed_snapshot_authority_reauthenticates_exact_completed_pcc(
+    tmp_path: Path,
+) -> None:
+    _coordinator_value, store, journal, request, snapshot_ref, authority = (
+        _completed_snapshot_case(tmp_path)
+    )
+
+    authenticated = correlation_module._revalidate_completed_snapshot(authority)
+
+    assert type(authenticated) is AuthenticatedPCCInput
+    assert store._authenticated_pcc_input_is_exact(authenticated)
+    assert authenticated.evidence_ref == snapshot_ref
+    assert authenticated.canonical == store.resolve_authenticated_ref(
+        snapshot_ref
+    ).canonical_envelope
+    assert authenticated.request == request
+    assert authenticated.snapshot.request_sha256 == hashlib.sha256(
+        canonical_json(request)
+    ).hexdigest()
+    assert (
+        authenticated.snapshot.trigger.event_id,
+        authenticated.snapshot.trigger.content_sha256,
+        authenticated.snapshot.trigger.source_sequence,
+    ) == (
+        request.trigger_event_id,
+        request.trigger_content_sha256,
+        request.trigger_source_sequence,
+    )
+    journal.close()
+    store.close()
+
+
+def test_completed_snapshot_authority_rejects_direct_pcc_and_changed_ref(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, trigger_ref, trigger = seeded_correlation_store(
+        tmp_path / "direct"
+    )
+    journal = CorrelationRequestJournal.create_new(store)
+    request = _request(trigger_ref)
+    snapshot_ref = _accept_snapshot(coordinator, trigger, request)
+
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        journal.completed_for_snapshot(snapshot_ref)
+
+    journal.close()
+    store.close()
+
+    (
+        _coordinator_value,
+        store,
+        journal,
+        _request_value,
+        snapshot_ref,
+        _authority,
+    ) = _completed_snapshot_case(tmp_path / "changed")
+    changed_refs = (
+        replace(snapshot_ref, frame_offset=snapshot_ref.frame_offset + 1),
+        replace(snapshot_ref, content_sha256="0" * 64),
+        replace(snapshot_ref, event_id="evt_" + "0" * 64),
+    )
+    for changed in changed_refs:
+        with pytest.raises(CorrelationRequestJournalAuthorityError):
+            journal.completed_for_snapshot(changed)
+    journal.close()
+    store.close()
+
+
+def test_completed_snapshot_authority_rejects_byte_identical_cross_store_pcc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    clone = tmp_path / "clone"
+    (
+        _coordinator_value,
+        store,
+        journal,
+        request,
+        snapshot_ref,
+        authority,
+    ) = _completed_snapshot_case(source)
+    original = correlation_module._revalidate_completed_snapshot(authority)
+    shutil.copytree(source, clone)
+    clone_store = _reopen_correlation_store(clone)
+    clone_verifier = clone_store._bound_verifier
+    assert clone_verifier is not None
+    clone_pcc = clone_store._authenticated_pcc_input(
+        clone_verifier,
+        snapshot_ref,
+        request,
+    )
+    assert clone_pcc.canonical == original.canonical
+
+    def issue_clone(
+        _verifier: object,
+        _ref: EvidenceRef,
+        _request_value: PCCCorrelationSnapshotRequestV1,
+    ) -> AuthenticatedPCCInput:
+        return clone_pcc
+
+    monkeypatch.setattr(store, "_authenticated_pcc_input", issue_clone)
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        journal.completed_for_snapshot(snapshot_ref)
+
+    clone_store.close()
+    journal.close()
+    store.close()
+
+
+def test_completed_snapshot_capability_is_opaque_final_and_unforgeable(
+    tmp_path: Path,
+) -> None:
+    _coordinator_value, store, journal, _request_value, _ref, authority = (
+        _completed_snapshot_case(tmp_path)
+    )
+    capability_type = type(authority)
+
+    with pytest.raises(TypeError):
+        capability_type()
+    with pytest.raises(TypeError):
+        type("ForgedCompletedSnapshotAuthority", (capability_type,), {})
+    with pytest.raises(AttributeError):
+        authority._token = object()
+    with pytest.raises(TypeError):
+        copy.copy(authority)
+    with pytest.raises(TypeError):
+        copy.deepcopy(authority)
+    with pytest.raises(TypeError):
+        pickle.dumps(authority)
+
+    fabricated = object.__new__(capability_type)
+    object.__setattr__(fabricated, "_token", object())
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        correlation_module._revalidate_completed_snapshot(fabricated)
+
+    object.__setattr__(authority, "_token", object())
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        correlation_module._revalidate_completed_snapshot(authority)
+    journal.close()
+    store.close()
+
+
+def test_completed_snapshot_authority_is_revoked_by_unrelated_journal_append(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, journal, _request_value, snapshot_ref, old_authority = (
+        _completed_snapshot_case(tmp_path)
+    )
+    key = private_key(11)
+    second_trigger = _candidate_trigger(key, sequence=4)
+    second_ref = coordinator.accept(_item(second_trigger))  # type: ignore[attr-defined]
+    assert isinstance(second_ref, EvidenceRef)
+    fresh_authority = journal.completed_for_snapshot(snapshot_ref)
+    assert fresh_authority is not old_authority
+
+    journal.select(second_ref, canonical_json(_request(second_ref)))
+
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        correlation_module._revalidate_completed_snapshot(fresh_authority)
+    journal.close()
+    store.close()
+
+
+def test_completed_snapshot_authority_detects_state_and_request_mutation(
+    tmp_path: Path,
+) -> None:
+    _coordinator_value, store, journal, _request_value, snapshot_ref, authority = (
+        _completed_snapshot_case(tmp_path)
+    )
+    state = next(iter(journal._states_by_operation.values()))
+    operation = state.operation_key
+    journal._states_by_operation[operation] = state.model_copy(deep=True)
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        correlation_module._revalidate_completed_snapshot(authority)
+
+    journal._states_by_operation[operation] = state
+    fresh_authority = journal.completed_for_snapshot(snapshot_ref)
+    original_request = state.request
+    state.__dict__["request"] = original_request.model_copy(
+        update={"requested_ttl_seconds": 30}
+    )
+    try:
+        with pytest.raises(CorrelationRequestJournalAuthorityError):
+            correlation_module._revalidate_completed_snapshot(fresh_authority)
+    finally:
+        state.__dict__["request"] = original_request
+    journal.close()
+    store.close()
+
+
+def test_completed_snapshot_authority_is_revoked_by_verifier_change_and_close(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, journal, _request_value, _ref, authority = (
+        _completed_snapshot_case(tmp_path / "generation")
+    )
+    coordinator.accept(  # type: ignore[attr-defined]
+        _item(_candidate_trigger(private_key(11), sequence=4))
+    )
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        correlation_module._revalidate_completed_snapshot(authority)
+    journal.close()
+    store.close()
+
+    _coordinator_value, store, journal, _request_value, _ref, authority = (
+        _completed_snapshot_case(tmp_path / "close")
+    )
+    journal.close()
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        correlation_module._revalidate_completed_snapshot(authority)
+    store.close()
+
+
+def test_completed_snapshot_recovery_reissues_fresh_lifecycle_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restart"
+    _coordinator_value, store, journal, _request_value, snapshot_ref, authority = (
+        _completed_snapshot_case(root)
+    )
+    journal.close()
+    store.close()
+
+    with pytest.raises(CorrelationRequestJournalAuthorityError):
+        correlation_module._revalidate_completed_snapshot(authority)
+
+    recovered_store = _reopen_correlation_store(root)
+    recovered = CorrelationRequestJournal.open_and_recover(recovered_store)
+    fresh = recovered.completed_for_snapshot(snapshot_ref)
+    authenticated = correlation_module._revalidate_completed_snapshot(fresh)
+
+    assert fresh is not authority
+    assert authenticated.evidence_ref == snapshot_ref
+    assert recovered_store._authenticated_pcc_input_is_exact(authenticated)
+    recovered.close()
+    recovered_store.close()
+
+
+def test_correlation_recovery_rejects_duplicate_completed_snapshot_owner(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "duplicate-snapshot-owner"
+    coordinator, store, journal, _request_value, snapshot_ref, _authority = (
+        _completed_snapshot_case(root)
+    )
+    second_trigger = _candidate_trigger(private_key(11), sequence=4)
+    second_ref = coordinator.accept(_item(second_trigger))  # type: ignore[attr-defined]
+    assert isinstance(second_ref, EvidenceRef)
+    journal.select(second_ref, canonical_json(_request(second_ref)))
+    journal.close()
+    store.close()
+
+    path = root / "correlation-requests.agf"
+    payloads = read_correlation_frame_payloads(path)
+    assert len(payloads) == 4
+    selected = json.loads(payloads[-1])
+    observed = {
+        **selected,
+        "phase": "proof_observed",
+        "snapshot_event_id": snapshot_ref.event_id,
+        "snapshot_content_sha256": snapshot_ref.content_sha256,
+    }
+    completed = {**observed, "phase": "completed"}
+    _rewrite_payloads(
+        path,
+        (*payloads, canonical_json(observed), canonical_json(completed)),
+    )
+    recovered_store = _reopen_correlation_store(root)
+
+    with pytest.raises(CorrelationRequestJournalCorrupt):
+        CorrelationRequestJournal.open_and_recover(recovered_store)
+
+    assert recovered_store.read_only_reason == "segment_corrupt"
+    recovered_store.close(flush=False)
+
+
+def test_completed_snapshot_corrupt_current_bytes_trip_fence_without_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "corrupt-current"
+    _coordinator_value, store, journal, _request_value, snapshot_ref, authority = (
+        _completed_snapshot_case(root)
+    )
+    offset = min(64, journal._size - 1)
+    original = os.pread(journal._descriptor, 1, offset)
+    assert len(original) == 1
+    os.pwrite(journal._descriptor, bytes((original[0] ^ 1,)), offset)
+    os.fsync(journal._descriptor)
+
+    with pytest.raises(CorrelationRequestJournalCorrupt):
+        correlation_module._revalidate_completed_snapshot(authority)
+    with pytest.raises(CorrelationRequestJournalUnhealthy):
+        journal.completed_for_snapshot(snapshot_ref)
+
+    assert store.read_only_reason == "segment_corrupt"
+    journal.close()
+    store.close(flush=False)

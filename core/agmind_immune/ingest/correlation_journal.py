@@ -6,9 +6,21 @@ import hashlib
 import os
 import re
 import stat
+import weakref
 from _thread import LockType
+from collections.abc import Callable
+from dataclasses import dataclass
 from threading import Lock
-from typing import BinaryIO, Literal, Never, Protocol, cast
+from typing import (
+    BinaryIO,
+    Literal,
+    Never,
+    Protocol,
+    Self,
+    SupportsIndex,
+    cast,
+    final,
+)
 
 from pydantic import ConfigDict, ValidationError, field_validator, model_validator
 
@@ -19,6 +31,7 @@ from agmind_immune.canonicaljson import (
 from agmind_immune.contracts import (
     ContractModel,
     PCCCorrelationSnapshotRequestV1,
+    PCCCorrelationSnapshotV1,
     decode_strict,
 )
 from agmind_immune.evidence.frames import (
@@ -37,7 +50,12 @@ from agmind_immune.evidence.segments import (
     _CorrelationJournalLifecycleCorrupt,
     _CorrelationJournalLifecycleIoUncertain,
     _CorrelationJournalLifecycleStateError,
+    _exact_coverage_ref_key,
     _full_write,
+)
+from agmind_immune.ingest.envelope import (
+    AuthenticatedPCCInput,
+    authenticated_pcc_input_is_issued,
 )
 
 _JOURNAL_NAME = "correlation-requests.agf"
@@ -162,6 +180,87 @@ def _same_file(actual: os.stat_result, expected: os.stat_result) -> bool:
     )
 
 
+type _SnapshotKey = tuple[str, str]
+type _EvidenceRefFingerprint = tuple[str, str, int, int, str, str, int, str]
+
+
+def _evidence_ref_fingerprint(ref: object) -> _EvidenceRefFingerprint:
+    try:
+        return _exact_coverage_ref_key(ref)
+    except (TypeError, ValueError) as error:
+        raise CorrelationRequestJournalAuthorityError(
+            "completed correlation authority requires an exact EvidenceRef"
+        ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedSnapshotBinding:
+    journal: CorrelationRequestJournal
+    store: SegmentStore
+    journal_lifecycle: object
+    store_lifecycle: object
+    verifier: object
+    verifier_authority: object
+    verifier_generation: int
+    state: _CorrelationRequestStateV1
+    state_canonical: bytes
+    state_fields_set: frozenset[str]
+    operation_key: str
+    request_sha256: str
+    request_canonical: bytes
+    request_fields_set: frozenset[str]
+    trigger_event_id: str
+    trigger_content_sha256: str
+    trigger_source_sequence: int
+    snapshot_ref: _EvidenceRefFingerprint
+    pcc: AuthenticatedPCCInput
+    pcc_canonical: bytes
+    pcc_request_canonical: bytes
+    pcc_request_fields_set: frozenset[str]
+    pcc_snapshot_canonical: bytes
+    pcc_snapshot_fields_set: frozenset[str]
+    journal_stat: os.stat_result
+    journal_digest: bytes
+    journal_size: int
+    journal_record_count: int
+    journal_chain_head: bytes
+    token: object
+
+
+@final
+class _CompletedSnapshotAuthority:
+    """Opaque authority for one exact durable completed PCC delivery."""
+
+    __slots__ = ("__weakref__", "_token")
+    _token: object
+
+    def __new__(cls, *args: object, **kwargs: object) -> Self:
+        del cls, args, kwargs
+        raise TypeError("completed snapshot authorities are factory-only")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("completed snapshot authorities are immutable")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("completed snapshot authorities are final")
+
+    def __copy__(self) -> Never:
+        raise TypeError("completed snapshot authorities cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        del memo
+        raise TypeError("completed snapshot authorities cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("completed snapshot authorities cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError("completed snapshot authorities cannot be serialized")
+
+
 class _BoundedReader:
     def __init__(self, stream: BinaryIO, limit: int) -> None:
         self._stream = stream
@@ -187,6 +286,7 @@ class CorrelationRequestJournal:
     _previous_hash: bytes
     _states_by_operation: dict[str, _CorrelationRequestStateV1]
     _operation_by_request: dict[str, str]
+    _operation_by_snapshot: dict[_SnapshotKey, str]
     _healthy: bool
     _closed: bool
     _closing: bool
@@ -226,6 +326,7 @@ class CorrelationRequestJournal:
         journal._previous_hash = bytes(32)
         journal._states_by_operation = {}
         journal._operation_by_request = {}
+        journal._operation_by_snapshot = {}
         journal._healthy = True
         journal._closed = False
         journal._closing = False
@@ -388,6 +489,7 @@ class CorrelationRequestJournal:
 
         states: dict[str, _CorrelationRequestStateV1] = {}
         request_index: dict[str, str] = {}
+        snapshot_index: dict[_SnapshotKey, str] = {}
         previous_hash = bytes(32)
         verified_size = 0
         record_count = 0
@@ -406,7 +508,12 @@ class CorrelationRequestJournal:
                                 "correlation-request journal exceeds its record bound"
                             )
                         state = self._decode_frame_state(frame)
-                        self._replay_state(state, states, request_index)
+                        self._replay_state(
+                            state,
+                            states,
+                            request_index,
+                            snapshot_index,
+                        )
                         authenticated_frame = encode_frame(
                             frame.payload,
                             previous_hash=frame.previous_hash,
@@ -447,6 +554,7 @@ class CorrelationRequestJournal:
             )
         self._states_by_operation = states
         self._operation_by_request = request_index
+        self._operation_by_snapshot = snapshot_index
         self._previous_hash = previous_hash
         self._size = verified_size
         self._record_count = record_count
@@ -476,6 +584,7 @@ class CorrelationRequestJournal:
         state: _CorrelationRequestStateV1,
         states: dict[str, _CorrelationRequestStateV1],
         request_index: dict[str, str],
+        snapshot_index: dict[_SnapshotKey, str],
     ) -> None:
         existing = states.get(state.operation_key)
         indexed_operation = request_index.get(state.request_sha256)
@@ -501,6 +610,16 @@ class CorrelationRequestJournal:
                 raise CorrelationRequestJournalCorrupt(
                     "correlation proof phase skips or repeats a transition"
                 )
+            snapshot_key = CorrelationRequestJournal._snapshot_key(state)
+            indexed_snapshot = snapshot_index.get(snapshot_key)
+            if (
+                indexed_snapshot is not None
+                and indexed_snapshot != state.operation_key
+            ):
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation snapshot identity has multiple operations"
+                )
+            snapshot_index[snapshot_key] = state.operation_key
         elif (
             existing.phase != "proof_observed"
             or state.snapshot_event_id != existing.snapshot_event_id
@@ -510,7 +629,23 @@ class CorrelationRequestJournal:
             raise CorrelationRequestJournalCorrupt(
                 "correlation completion does not match its observed proof"
             )
+        else:
+            snapshot_key = CorrelationRequestJournal._snapshot_key(state)
+            if snapshot_index.get(snapshot_key) != state.operation_key:
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation completion lost its unique snapshot owner"
+                )
         states[state.operation_key] = state
+
+    @staticmethod
+    def _snapshot_key(state: _CorrelationRequestStateV1) -> _SnapshotKey:
+        event_id = state.snapshot_event_id
+        content_sha256 = state.snapshot_content_sha256
+        if event_id is None or content_sha256 is None:
+            raise CorrelationRequestJournalCorrupt(
+                "observed correlation state lost snapshot identity"
+            )
+        return event_id, content_sha256
 
     def _bind_published(self) -> os.stat_result:
         opened = os.fstat(self._descriptor)
@@ -812,6 +947,7 @@ class CorrelationRequestJournal:
                     self._raise_conflict(
                         "correlation request was rebound to a different proof"
                     )
+                self._require_unique_snapshot_owner(state)
                 return state.model_copy(deep=True)
 
             self._authenticate_snapshot(state, snapshot_ref)
@@ -824,8 +960,18 @@ class CorrelationRequestJournal:
                 snapshot_event_id=snapshot_ref.event_id,
                 snapshot_content_sha256=snapshot_ref.content_sha256,
             )
+            snapshot_key = self._snapshot_key(observed)
+            indexed_operation = self._operation_by_snapshot.get(snapshot_key)
+            if (
+                indexed_operation is not None
+                and indexed_operation != state.operation_key
+            ):
+                self._raise_journal_corruption(
+                    "correlation snapshot identity has multiple live operations"
+                )
             self._append(observed)
             self._states_by_operation[state.operation_key] = observed
+            self._operation_by_snapshot[snapshot_key] = state.operation_key
             return observed.model_copy(deep=True)
 
     def _authenticate_snapshot(
@@ -885,11 +1031,13 @@ class CorrelationRequestJournal:
             self._require_usable()
             state = self._state_for_request(request_sha256)
             if state.phase == "completed":
+                self._require_unique_snapshot_owner(state)
                 return state.model_copy(deep=True)
             if state.phase != "proof_observed":
                 raise CorrelationRequestJournalStateError(
                     "correlation request has no observed proof"
                 )
+            self._require_unique_snapshot_owner(state)
             completed = _CorrelationRequestStateV1(
                 schema_version="agmind.correlation-request-state.v1",
                 operation_key=state.operation_key,
@@ -902,6 +1050,398 @@ class CorrelationRequestJournal:
             self._append(completed)
             self._states_by_operation[state.operation_key] = completed
             return completed.model_copy(deep=True)
+
+    def completed_for_snapshot(
+        self,
+        snapshot_ref: EvidenceRef,
+    ) -> _CompletedSnapshotAuthority:
+        """Issue authority only for one exact durably completed PCC snapshot."""
+        with self._lock:
+            binding = self._completed_snapshot_binding(snapshot_ref)
+            return _issue_completed_snapshot_authority(binding)
+
+    def _completed_state_for_snapshot(
+        self,
+        snapshot_ref: EvidenceRef,
+    ) -> _CorrelationRequestStateV1:
+        fingerprint = _evidence_ref_fingerprint(snapshot_ref)
+        snapshot_key = (fingerprint[5], fingerprint[7])
+        matches = tuple(
+            state
+            for state in self._states_by_operation.values()
+            if state.snapshot_event_id == snapshot_key[0]
+            and state.snapshot_content_sha256 == snapshot_key[1]
+        )
+        if len(matches) > 1:
+            self._raise_journal_corruption(
+                "correlation snapshot identity has multiple durable owners"
+            )
+        if len(matches) != 1 or matches[0].phase != "completed":
+            raise CorrelationRequestJournalAuthorityError(
+                "correlation snapshot has no unique completed journal state"
+            )
+        state = matches[0]
+        if (
+            self._operation_by_snapshot.get(snapshot_key)
+            != state.operation_key
+        ):
+            self._raise_journal_corruption(
+                "completed correlation snapshot index is not unique"
+            )
+        return state
+
+    @staticmethod
+    def _state_canonical_is_exact(
+        state: _CorrelationRequestStateV1,
+    ) -> bool:
+        try:
+            canonical = canonical_json(state)
+            reparsed = decode_strict(
+                canonical,
+                _CorrelationRequestStateV1,
+                _MAX_FRAME_PAYLOAD,
+            )
+            return (
+                type(state) is _CorrelationRequestStateV1
+                and type(reparsed) is _CorrelationRequestStateV1
+                and canonical_json(reparsed) == canonical
+                and reparsed == state
+                and reparsed.model_fields_set == state.model_fields_set
+            )
+        except (AttributeError, TypeError, UnicodeError, ValueError, ValidationError):
+            return False
+
+    def _verified_authority_anchor(
+        self,
+    ) -> tuple[os.stat_result, bytes, int, int, bytes]:
+        try:
+            current = self._verify_authenticated_content()
+        except CorrelationRequestJournalCorrupt as error:
+            if self._healthy:
+                self._healthy = False
+                self._attempt_corruption_fence(error)
+            raise
+        return (
+            current,
+            self._authenticated_digest(),
+            self._size,
+            self._record_count,
+            self._previous_hash,
+        )
+
+    @staticmethod
+    def _anchors_match(
+        first: tuple[os.stat_result, bytes, int, int, bytes],
+        second: tuple[os.stat_result, bytes, int, int, bytes],
+    ) -> bool:
+        return (
+            _same_file(first[0], second[0])
+            and first[1] == second[1]
+            and first[2:] == second[2:]
+        )
+
+    def _authenticated_pcc_for_completed_state(
+        self,
+        state: _CorrelationRequestStateV1,
+        snapshot_ref: EvidenceRef,
+    ) -> AuthenticatedPCCInput:
+        verifier = self._store._bound_verifier
+        if verifier is None or not self._store._is_bound_verifier(verifier):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation store has no exact verifier authority"
+            )
+        try:
+            authenticated = self._store._authenticated_pcc_input(
+                verifier,
+                snapshot_ref,
+                state.request,
+            )
+        except (_AckAuthorityError, EvidenceSealError) as error:
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation proof lacks exact store authority"
+            ) from error
+        except EvidenceCorrupt as error:
+            self._raise_internal_evidence_corruption(
+                "completed PCC evidence is internally corrupt",
+                error,
+            )
+        if not self._pcc_matches_completed_state(
+            authenticated,
+            state,
+            _evidence_ref_fingerprint(snapshot_ref),
+        ):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation proof changed during reauthentication"
+            )
+        return authenticated
+
+    def _pcc_matches_completed_state(
+        self,
+        authenticated: object,
+        state: _CorrelationRequestStateV1,
+        snapshot_ref: _EvidenceRefFingerprint,
+    ) -> bool:
+        if type(authenticated) is not AuthenticatedPCCInput:
+            return False
+        try:
+            request = authenticated.request
+            snapshot = authenticated.snapshot
+            trigger = snapshot.trigger
+            return (
+                authenticated_pcc_input_is_issued(authenticated)
+                and self._store._authenticated_pcc_input_is_exact(authenticated)
+                and type(request) is PCCCorrelationSnapshotRequestV1
+                and type(snapshot) is PCCCorrelationSnapshotV1
+                and _evidence_ref_fingerprint(authenticated.evidence_ref)
+                == snapshot_ref
+                and authenticated.event_id == snapshot_ref[5]
+                and authenticated.source_sequence == snapshot_ref[6]
+                and authenticated.content_sha256 == snapshot_ref[7]
+                and canonical_json(request) == canonical_json(state.request)
+                and request.model_fields_set == state.request.model_fields_set
+                and snapshot.request_sha256 == state.request_sha256
+                and snapshot.requested_ttl_seconds
+                == state.request.requested_ttl_seconds
+                and trigger.event_id == state.request.trigger_event_id
+                and trigger.content_sha256
+                == state.request.trigger_content_sha256
+                and trigger.source_sequence
+                == state.request.trigger_source_sequence
+                and state.snapshot_event_id == snapshot_ref[5]
+                and state.snapshot_content_sha256 == snapshot_ref[7]
+            )
+        except (
+            AttributeError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ):
+            return False
+
+    def _completed_snapshot_binding(
+        self,
+        snapshot_ref: EvidenceRef,
+    ) -> _CompletedSnapshotBinding:
+        self._require_usable()
+        if type(snapshot_ref) is not EvidenceRef:
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation proof must be an exact EvidenceRef"
+            )
+        anchor_before = self._verified_authority_anchor()
+        state = self._completed_state_for_snapshot(snapshot_ref)
+        if not self._state_canonical_is_exact(state):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation state is no longer canonical"
+            )
+        verifier = self._store._bound_verifier
+        if verifier is None or not self._store._is_bound_verifier(verifier):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation store lost verifier authority"
+            )
+        verifier_authority = verifier._authority
+        verifier_generation = verifier_authority.generation
+        if type(verifier_generation) is not int or verifier_generation < 0:
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation verifier generation is invalid"
+            )
+        authenticated = self._authenticated_pcc_for_completed_state(
+            state,
+            snapshot_ref,
+        )
+        anchor_after = self._verified_authority_anchor()
+        if (
+            not self._anchors_match(anchor_before, anchor_after)
+            or self._completed_state_for_snapshot(snapshot_ref) is not state
+            or not self._state_canonical_is_exact(state)
+            or not self._pcc_matches_completed_state(
+                authenticated,
+                state,
+                _evidence_ref_fingerprint(snapshot_ref),
+            )
+            or self._store._bound_verifier is not verifier
+            or not self._store._is_bound_verifier(verifier)
+            or verifier._authority is not verifier_authority
+            or verifier._authority.generation != verifier_generation
+        ):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation authority changed during issue"
+            )
+        request = state.request
+        snapshot = authenticated.snapshot
+        trigger = request
+        return _CompletedSnapshotBinding(
+            journal=self,
+            store=self._store,
+            journal_lifecycle=self._lifecycle_identity,
+            store_lifecycle=self._store._lifecycle_identity,
+            verifier=verifier,
+            verifier_authority=verifier_authority,
+            verifier_generation=verifier_generation,
+            state=state,
+            state_canonical=canonical_json(state),
+            state_fields_set=frozenset(state.model_fields_set),
+            operation_key=state.operation_key,
+            request_sha256=state.request_sha256,
+            request_canonical=canonical_json(request),
+            request_fields_set=frozenset(request.model_fields_set),
+            trigger_event_id=trigger.trigger_event_id,
+            trigger_content_sha256=trigger.trigger_content_sha256,
+            trigger_source_sequence=trigger.trigger_source_sequence,
+            snapshot_ref=_evidence_ref_fingerprint(snapshot_ref),
+            pcc=authenticated,
+            pcc_canonical=authenticated.canonical,
+            pcc_request_canonical=canonical_json(authenticated.request),
+            pcc_request_fields_set=frozenset(
+                authenticated.request.model_fields_set
+            ),
+            pcc_snapshot_canonical=canonical_json(snapshot),
+            pcc_snapshot_fields_set=frozenset(snapshot.model_fields_set),
+            journal_stat=anchor_after[0],
+            journal_digest=anchor_after[1],
+            journal_size=anchor_after[2],
+            journal_record_count=anchor_after[3],
+            journal_chain_head=anchor_after[4],
+            token=object(),
+        )
+
+    def _binding_anchor_matches(
+        self,
+        binding: _CompletedSnapshotBinding,
+        anchor: tuple[os.stat_result, bytes, int, int, bytes],
+    ) -> bool:
+        return (
+            _same_file(anchor[0], binding.journal_stat)
+            and anchor[1] == binding.journal_digest
+            and anchor[2] == binding.journal_size
+            and anchor[3] == binding.journal_record_count
+            and anchor[4] == binding.journal_chain_head
+        )
+
+    def _completed_binding_is_current(
+        self,
+        binding: _CompletedSnapshotBinding,
+    ) -> bool:
+        try:
+            snapshot_ref = cast(EvidenceRef, binding.pcc.evidence_ref)
+            state = self._completed_state_for_snapshot(snapshot_ref)
+            verifier = self._store._bound_verifier
+            request = state.request
+            snapshot = binding.pcc.snapshot
+            return (
+                binding.journal is self
+                and binding.store is self._store
+                and binding.journal_lifecycle is self._lifecycle_identity
+                and binding.store_lifecycle is self._store._lifecycle_identity
+                and verifier is binding.verifier
+                and verifier is not None
+                and self._store._is_bound_verifier(verifier)
+                and verifier._authority is binding.verifier_authority
+                and verifier._authority.generation
+                == binding.verifier_generation
+                and state is binding.state
+                and self._state_canonical_is_exact(state)
+                and canonical_json(state) == binding.state_canonical
+                and frozenset(state.model_fields_set)
+                == binding.state_fields_set
+                and state.operation_key == binding.operation_key
+                and state.request_sha256 == binding.request_sha256
+                and canonical_json(request) == binding.request_canonical
+                and frozenset(request.model_fields_set)
+                == binding.request_fields_set
+                and request.trigger_event_id == binding.trigger_event_id
+                and request.trigger_content_sha256
+                == binding.trigger_content_sha256
+                and request.trigger_source_sequence
+                == binding.trigger_source_sequence
+                and _evidence_ref_fingerprint(snapshot_ref)
+                == binding.snapshot_ref
+                and self._pcc_matches_completed_state(
+                    binding.pcc,
+                    state,
+                    binding.snapshot_ref,
+                )
+                and binding.pcc.canonical == binding.pcc_canonical
+                and canonical_json(binding.pcc.request)
+                == binding.pcc_request_canonical
+                and frozenset(binding.pcc.request.model_fields_set)
+                == binding.pcc_request_fields_set
+                and canonical_json(snapshot)
+                == binding.pcc_snapshot_canonical
+                and frozenset(snapshot.model_fields_set)
+                == binding.pcc_snapshot_fields_set
+            )
+        except CorrelationRequestJournalCorrupt:
+            raise
+        except (
+            AttributeError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ):
+            return False
+
+    def _revalidate_completed_binding(
+        self,
+        binding: _CompletedSnapshotBinding,
+    ) -> AuthenticatedPCCInput:
+        self._require_usable()
+        anchor_before = self._verified_authority_anchor()
+        if (
+            not self._binding_anchor_matches(binding, anchor_before)
+            or not self._completed_binding_is_current(binding)
+        ):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation authority was revoked"
+            )
+        snapshot_ref = cast(EvidenceRef, binding.pcc.evidence_ref)
+        current = self._authenticated_pcc_for_completed_state(
+            binding.state,
+            snapshot_ref,
+        )
+        if (
+            current.canonical != binding.pcc_canonical
+            or _evidence_ref_fingerprint(current.evidence_ref)
+            != binding.snapshot_ref
+            or canonical_json(current.request)
+            != binding.pcc_request_canonical
+            or frozenset(current.request.model_fields_set)
+            != binding.pcc_request_fields_set
+            or canonical_json(current.snapshot)
+            != binding.pcc_snapshot_canonical
+            or frozenset(current.snapshot.model_fields_set)
+            != binding.pcc_snapshot_fields_set
+        ):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation PCC changed during validation"
+            )
+        anchor_after = self._verified_authority_anchor()
+        if (
+            not self._anchors_match(anchor_before, anchor_after)
+            or not self._binding_anchor_matches(binding, anchor_after)
+            or not self._completed_binding_is_current(binding)
+        ):
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation authority changed during validation"
+            )
+        return binding.pcc
+
+    def _require_unique_snapshot_owner(
+        self,
+        state: _CorrelationRequestStateV1,
+    ) -> None:
+        snapshot_key = self._snapshot_key(state)
+        if self._operation_by_snapshot.get(snapshot_key) != state.operation_key:
+            self._raise_journal_corruption(
+                "correlation snapshot index lost its unique operation"
+            )
+
+    def _raise_journal_corruption(self, message: str) -> Never:
+        self._healthy = False
+        corrupt = CorrelationRequestJournalCorrupt(message)
+        self._attempt_corruption_fence(corrupt)
+        raise corrupt
 
     def _state_for_request(
         self,
@@ -1217,6 +1757,61 @@ class CorrelationRequestJournal:
                 raise CorrelationRequestJournalUnhealthy(
                     "correlation journal close cleanup failed"
                 ) from cleanup_errors[0]
+
+
+def _completed_snapshot_authority_protocol() -> tuple[
+    Callable[[_CompletedSnapshotBinding], _CompletedSnapshotAuthority],
+    Callable[[object], AuthenticatedPCCInput],
+]:
+    issued: weakref.WeakKeyDictionary[
+        _CompletedSnapshotAuthority,
+        _CompletedSnapshotBinding,
+    ] = weakref.WeakKeyDictionary()
+
+    def issue(
+        binding: _CompletedSnapshotBinding,
+    ) -> _CompletedSnapshotAuthority:
+        authority: _CompletedSnapshotAuthority = object.__new__(
+            _CompletedSnapshotAuthority
+        )
+        object.__setattr__(authority, "_token", binding.token)
+        issued[authority] = binding
+        return authority
+
+    def revalidate(authority: object) -> AuthenticatedPCCInput:
+        if type(authority) is not _CompletedSnapshotAuthority:
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation authority is not exact"
+            )
+        try:
+            binding = issued.get(authority)
+            token = authority._token
+        except (AttributeError, TypeError):
+            binding = None
+            token = None
+        if binding is None or token is not binding.token:
+            raise CorrelationRequestJournalAuthorityError(
+                "completed correlation authority was not issued"
+            )
+        journal = binding.journal
+        with journal._lock:
+            try:
+                return journal._revalidate_completed_binding(binding)
+            except CorrelationRequestJournalCorrupt:
+                raise
+            except CorrelationRequestJournalError as error:
+                raise CorrelationRequestJournalAuthorityError(
+                    "completed correlation authority is no longer live"
+                ) from error
+
+    return issue, revalidate
+
+
+(
+    _issue_completed_snapshot_authority,
+    _revalidate_completed_snapshot,
+) = _completed_snapshot_authority_protocol()
+del _completed_snapshot_authority_protocol
 
 
 __all__ = [
