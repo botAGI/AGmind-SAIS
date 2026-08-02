@@ -4,13 +4,43 @@ from __future__ import annotations
 
 import os
 import stat
+import weakref
+from _thread import RLock as RLockType
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol, cast
+from threading import Lock
+from typing import Never, Protocol, Self, SupportsIndex, cast, final
 
 from agmind_immune.canonicaljson import pcc_detector_bundle_sha256
+from agmind_immune.contracts import MAX_UINT64
+from agmind_immune.correlation.pcc import (
+    ActiveCandidateObservation,
+    CandidateDuplicateKey,
+    CorrelationContext,
+    CorrelationProjectionError,
+    HistoricalCoverageAssessment,
+    _duplicate_key,
+    _exact_event_id,
+    _exact_hex64,
+    _exact_uuid4,
+    _register_correlation_context,
+)
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    _canonical_registry_binding,
+    special_use_registry_is_issued,
+)
+from agmind_immune.coverage.historical import (
+    HistoricalPathAuthority,
+    derive_historical_coverage,
+)
+from agmind_immune.evidence.segments import EvidenceRef, SegmentStore
+from agmind_immune.ingest.correlation_journal import (
+    _revalidate_completed_snapshot,
+)
+from agmind_immune.ingest.envelope import AuthenticatedPCCInput
 
-__all__: tuple[()] = ()
+__all__ = ("CorrelationProjectionAuthority",)
 
 _MAX_DETECTOR_BUNDLE_BYTES = 65_536
 _DIRECTORY_COMPONENTS = ("etc", "falco", "rules.d")
@@ -299,3 +329,701 @@ def _detector_bundle_loader(filesystem: _Filesystem) -> Callable[[], str]:
 
 
 _load_pinned_detector_bundle = _detector_bundle_loader(_OSFilesystem())
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _ProjectionPredecessor:
+    generation: int
+    host_id: str | None
+    source_sequence: int
+    event_id: str | None
+    content_sha256: str | None
+    frame_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.generation) is not int
+            or not 0 <= self.generation <= MAX_UINT64
+        ):
+            raise ValueError("projection generation must be an exact uint64")
+        if type(self.source_sequence) is not int:
+            raise TypeError("projection source sequence must be an exact integer")
+        optional = (
+            self.host_id,
+            self.event_id,
+            self.content_sha256,
+            self.frame_sha256,
+        )
+        if self.source_sequence == 0:
+            if any(value is not None for value in optional):
+                raise ValueError("empty projection cursor must have no identity facts")
+            return
+        if self.source_sequence < 0 or self.source_sequence > MAX_UINT64:
+            raise ValueError("projection source sequence must be a positive uint64")
+        _exact_uuid4(self.host_id, "projection host_id")
+        _exact_event_id(self.event_id, "projection event_id")
+        _exact_hex64(self.content_sha256, "projection content_sha256")
+        _exact_hex64(self.frame_sha256, "projection frame_sha256")
+
+
+def _clone_predecessor(
+    value: _ProjectionPredecessor,
+) -> _ProjectionPredecessor:
+    if type(value) is not _ProjectionPredecessor:
+        raise TypeError("projection predecessor is not exact")
+    return _ProjectionPredecessor(
+        generation=value.generation,
+        host_id=value.host_id,
+        source_sequence=value.source_sequence,
+        event_id=value.event_id,
+        content_sha256=value.content_sha256,
+        frame_sha256=value.frame_sha256,
+    )
+
+
+@final
+class CorrelationProjectionAuthority:
+    """Opaque owner of one evidence lifecycle's correlation pin clock."""
+
+    __slots__ = ("__weakref__", "_token")
+    _token: object
+
+    def __new__(cls, *args: object, **kwargs: object) -> Self:
+        del cls, args, kwargs
+        raise TypeError("correlation projection authorities are factory-only")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("correlation projection authorities are immutable")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("CorrelationProjectionAuthority is final")
+
+    def __copy__(self) -> Never:
+        raise TypeError("correlation projection authorities cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        del memo
+        raise TypeError("correlation projection authorities cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("correlation projection authorities cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError("correlation projection authorities cannot be serialized")
+
+
+@dataclass(slots=True)
+class _ProjectionAuthorityBinding:
+    token: object
+    store: SegmentStore
+    store_lifecycle: object
+    registry: SpecialUseRegistry
+    registry_facts: object
+    detector_bundle_sha256: str
+    predecessor: _ProjectionPredecessor
+    revision: object
+    closed: bool
+    lock: RLockType
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuedContextBinding:
+    completed: object
+    public_proof: AuthenticatedPCCInput
+    trusted_proof: AuthenticatedPCCInput
+    path: HistoricalPathAuthority
+    coverage: HistoricalCoverageAssessment
+    acceptance_cursor: int
+    predecessor: _ProjectionPredecessor
+    revision: object
+    detector_bundle_sha256: str
+    registry_facts: object
+
+
+_ISSUED_AUTHORITIES: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[CorrelationProjectionAuthority],
+        _ProjectionAuthorityBinding,
+    ],
+] = {}
+_ISSUED_AUTHORITIES_LOCK = Lock()
+
+
+def _safe_detector_bundle_sha256() -> str:
+    value = _load_pinned_detector_bundle()
+    _exact_hex64(value, "detector_bundle_sha256")
+    return value
+
+
+def _healthy_store_cursor(store: SegmentStore, lifecycle: object) -> int:
+    status = store.status()
+    if (
+        store._lifecycle_identity is not lifecycle
+        or store._closed
+        or not status.healthy
+        or status.repair_pending
+        or status.retention_pending
+        or type(status.acceptance_cursor) is not int
+        or status.acceptance_cursor < 0
+    ):
+        raise CorrelationProjectionError(
+            "correlation projection evidence lifecycle is unavailable"
+        )
+    return status.acceptance_cursor
+
+
+def _registry_facts(registry: SpecialUseRegistry) -> object:
+    if (
+        type(registry) is not SpecialUseRegistry
+        or not special_use_registry_is_issued(registry)
+    ):
+        raise CorrelationProjectionError(
+            "correlation projection special-use registry is unavailable"
+        )
+    try:
+        return _canonical_registry_binding(registry)
+    except (AttributeError, RecursionError, TypeError, ValueError) as error:
+        raise CorrelationProjectionError(
+            "correlation projection special-use registry changed"
+        ) from error
+
+
+def _authority_binding(
+    authority: object,
+) -> _ProjectionAuthorityBinding:
+    if type(authority) is not CorrelationProjectionAuthority:
+        raise CorrelationProjectionError(
+            "correlation projection authority is not exact"
+        )
+    with _ISSUED_AUTHORITIES_LOCK:
+        registered = _ISSUED_AUTHORITIES.get(id(authority))
+    try:
+        token = authority._token
+    except AttributeError:
+        token = None
+    if (
+        registered is None
+        or registered[0]() is not authority
+        or token is not registered[1].token
+    ):
+        raise CorrelationProjectionError(
+            "correlation projection authority was not issued"
+        )
+    return registered[1]
+
+
+def _require_authority_locked(
+    authority: CorrelationProjectionAuthority,
+    binding: _ProjectionAuthorityBinding,
+    *,
+    allow_closed: bool = False,
+) -> None:
+    with _ISSUED_AUTHORITIES_LOCK:
+        registered = _ISSUED_AUTHORITIES.get(id(authority))
+    if (
+        registered is None
+        or registered[0]() is not authority
+        or registered[1] is not binding
+        or authority._token is not binding.token
+        or (binding.closed and not allow_closed)
+    ):
+        raise CorrelationProjectionError(
+            "correlation projection authority is no longer live"
+        )
+    try:
+        _clone_predecessor(binding.predecessor)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise CorrelationProjectionError(
+            "correlation projection predecessor facts are invalid"
+        ) from error
+
+
+def _create_correlation_projection_authority(
+    store: SegmentStore,
+    registry: SpecialUseRegistry,
+    predecessor: _ProjectionPredecessor,
+) -> CorrelationProjectionAuthority:
+    if (
+        type(store) is not SegmentStore
+        or type(registry) is not SpecialUseRegistry
+        or type(predecessor) is not _ProjectionPredecessor
+    ):
+        raise TypeError(
+            "correlation projection authority requires exact store, registry, and cursor"
+        )
+    lifecycle = store._lifecycle_identity
+    try:
+        predecessor_before = _clone_predecessor(predecessor)
+        detector_before = _safe_detector_bundle_sha256()
+        cursor_before = _healthy_store_cursor(store, lifecycle)
+        registry_before = _registry_facts(registry)
+        detector_after = _safe_detector_bundle_sha256()
+        cursor_after = _healthy_store_cursor(store, lifecycle)
+        registry_after = _registry_facts(registry)
+        predecessor_after = _clone_predecessor(predecessor)
+    except CorrelationProjectionError:
+        raise
+    except Exception as error:
+        raise CorrelationProjectionError(
+            "correlation projection pin authority is unavailable"
+        ) from error
+    if (
+        detector_before != detector_after
+        or cursor_before != cursor_after
+        or registry_before != registry_after
+        or predecessor_before != predecessor_after
+    ):
+        raise CorrelationProjectionError(
+            "correlation projection pins changed during creation"
+        )
+    authority = object.__new__(CorrelationProjectionAuthority)
+    token = object()
+    object.__setattr__(authority, "_token", token)
+    binding = _ProjectionAuthorityBinding(
+        token=token,
+        store=store,
+        store_lifecycle=lifecycle,
+        registry=registry,
+        registry_facts=registry_after,
+        detector_bundle_sha256=detector_after,
+        predecessor=predecessor_after,
+        revision=object(),
+        closed=False,
+        lock=RLockType(),
+    )
+    identity = id(authority)
+
+    def cleanup(
+        reference: weakref.ReferenceType[CorrelationProjectionAuthority],
+    ) -> None:
+        with _ISSUED_AUTHORITIES_LOCK:
+            current = _ISSUED_AUTHORITIES.get(identity)
+            if current is not None and current[0] is reference:
+                _ISSUED_AUTHORITIES.pop(identity, None)
+
+    reference = weakref.ref(authority, cleanup)
+    with _ISSUED_AUTHORITIES_LOCK:
+        _ISSUED_AUTHORITIES[identity] = (reference, binding)
+    return authority
+
+
+def _same_exact_pcc(
+    left: AuthenticatedPCCInput,
+    right: AuthenticatedPCCInput,
+) -> bool:
+    try:
+        return (
+            left is right
+            and left.canonical == right.canonical
+            and left.evidence_ref == right.evidence_ref
+            and left.request is right.request
+            and left.snapshot is right.snapshot
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _issue_hidden_pcc(
+    store: SegmentStore,
+    public_proof: AuthenticatedPCCInput,
+) -> AuthenticatedPCCInput:
+    verifier = store._bound_verifier
+    if verifier is None or not store._is_bound_verifier(verifier):
+        raise CorrelationProjectionError(
+            "correlation projection store lost verifier authority"
+        )
+    try:
+        hidden = store._authenticated_pcc_input(
+            verifier,
+            cast(EvidenceRef, public_proof.evidence_ref),
+            public_proof.request,
+        )
+    except Exception as error:
+        raise CorrelationProjectionError(
+            "correlation projection could not reissue private PCC facts"
+        ) from error
+    if (
+        hidden is public_proof
+        or hidden.canonical != public_proof.canonical
+        or hidden.evidence_ref != public_proof.evidence_ref
+    ):
+        raise CorrelationProjectionError(
+            "private PCC reissue changed authenticated facts"
+        )
+    return hidden
+
+
+def _clone_coverage(
+    value: HistoricalCoverageAssessment,
+) -> HistoricalCoverageAssessment:
+    if type(value) is not HistoricalCoverageAssessment:
+        raise TypeError("historical coverage assessment is not exact")
+    return HistoricalCoverageAssessment(
+        host_id=value.host_id,
+        boot_id=value.boot_id,
+        trigger_event_id=value.trigger_event_id,
+        trigger_source_sequence=value.trigger_source_sequence,
+        coverage_through_sequence=value.coverage_through_sequence,
+        window_start=value.window_start,
+        window_end=value.window_end,
+        complete=value.complete,
+        critical_gap=value.critical_gap,
+        coverage_snapshot_sha256=value.coverage_snapshot_sha256,
+    )
+
+
+def _clone_duplicate_key(value: CandidateDuplicateKey) -> CandidateDuplicateKey:
+    if type(value) is not CandidateDuplicateKey:
+        raise TypeError("candidate duplicate key is not exact")
+    return CandidateDuplicateKey(
+        host_id=value.host_id,
+        boot_id=value.boot_id,
+        docker_container_id=value.docker_container_id,
+        docker_started_at=value.docker_started_at,
+        detector_bundle_sha256=value.detector_bundle_sha256,
+        destination_ipv4=value.destination_ipv4,
+    )
+
+
+def _clone_active_duplicate(
+    value: ActiveCandidateObservation | None,
+) -> ActiveCandidateObservation | None:
+    if value is None:
+        return None
+    if type(value) is not ActiveCandidateObservation:
+        raise TypeError("active duplicate observation is not exact")
+    return ActiveCandidateObservation(
+        key=_clone_duplicate_key(value.key),
+        candidate_id=value.candidate_id,
+        primary_source_sequence=value.primary_source_sequence,
+        primary_event_id=value.primary_event_id,
+    )
+
+
+def _context_issue_facts(
+    binding: _ProjectionAuthorityBinding,
+    completed: object,
+    expected_predecessor: _ProjectionPredecessor,
+    active_duplicate: ActiveCandidateObservation | None,
+) -> tuple[
+    AuthenticatedPCCInput,
+    AuthenticatedPCCInput,
+    HistoricalPathAuthority,
+    HistoricalCoverageAssessment,
+    CandidateDuplicateKey,
+    ActiveCandidateObservation | None,
+    int,
+]:
+    store = binding.store
+    public_proof = _revalidate_completed_snapshot(completed)
+    if (
+        type(public_proof) is not AuthenticatedPCCInput
+        or not store._authenticated_pcc_input_is_exact(public_proof)
+        or public_proof.snapshot.outcome != "complete"
+    ):
+        raise CorrelationProjectionError(
+            "completed correlation authority is not an exact same-store complete PCC"
+        )
+    if binding.predecessor != expected_predecessor:
+        raise CorrelationProjectionError(
+            "correlation predecessor changed before context issuance"
+        )
+    cursor_before = _healthy_store_cursor(store, binding.store_lifecycle)
+    registry_before = _registry_facts(binding.registry)
+    detector_before = _safe_detector_bundle_sha256()
+    path = store._historical_path_authority(public_proof)
+    coverage = derive_historical_coverage(public_proof, path)
+    lookup_key = _duplicate_key(public_proof, public_proof.snapshot)
+    active_before = _clone_active_duplicate(active_duplicate)
+    if (
+        active_before is not None
+        and (
+            active_before.key != lookup_key
+        )
+    ):
+        raise CorrelationProjectionError(
+            "active duplicate does not bind the exact PCC lookup key"
+        )
+    trusted_proof = _issue_hidden_pcc(store, public_proof)
+
+    revalidated = _revalidate_completed_snapshot(completed)
+    coverage_after = derive_historical_coverage(public_proof, path)
+    detector_after = _safe_detector_bundle_sha256()
+    registry_after = _registry_facts(binding.registry)
+    cursor_after = _healthy_store_cursor(store, binding.store_lifecycle)
+    active_after = _clone_active_duplicate(active_duplicate)
+    if (
+        not _same_exact_pcc(revalidated, public_proof)
+        or coverage_after != coverage
+        or detector_before != detector_after
+        or detector_after != binding.detector_bundle_sha256
+        or registry_before != registry_after
+        or registry_after != binding.registry_facts
+        or cursor_before != cursor_after
+        or not store._authenticated_pcc_input_is_exact(trusted_proof)
+        or binding.predecessor != expected_predecessor
+        or active_after != active_before
+    ):
+        raise CorrelationProjectionError(
+            "correlation context authority changed during issuance"
+        )
+    return (
+        public_proof,
+        trusted_proof,
+        path,
+        coverage,
+        lookup_key,
+        active_after,
+        cursor_after,
+    )
+
+
+def _validate_issued_context_locked(
+    authority: CorrelationProjectionAuthority,
+    authority_binding: _ProjectionAuthorityBinding,
+    context_binding: _IssuedContextBinding,
+) -> None:
+    _require_authority_locked(authority, authority_binding)
+    if (
+        authority_binding.revision is not context_binding.revision
+        or authority_binding.predecessor != context_binding.predecessor
+        or authority_binding.detector_bundle_sha256
+        != context_binding.detector_bundle_sha256
+        or authority_binding.registry_facts != context_binding.registry_facts
+    ):
+        raise CorrelationProjectionError(
+            "correlation context projection clock was revoked"
+        )
+    public_proof = _revalidate_completed_snapshot(context_binding.completed)
+    if (
+        not _same_exact_pcc(public_proof, context_binding.public_proof)
+        or not authority_binding.store._authenticated_pcc_input_is_exact(
+            context_binding.public_proof
+        )
+        or not authority_binding.store._authenticated_pcc_input_is_exact(
+            context_binding.trusted_proof
+        )
+        or _healthy_store_cursor(
+            authority_binding.store,
+            authority_binding.store_lifecycle,
+        )
+        != context_binding.acceptance_cursor
+        or _registry_facts(authority_binding.registry)
+        != context_binding.registry_facts
+        or _safe_detector_bundle_sha256()
+        != context_binding.detector_bundle_sha256
+        or derive_historical_coverage(
+            context_binding.public_proof,
+            context_binding.path,
+        )
+        != context_binding.coverage
+    ):
+        raise CorrelationProjectionError(
+            "correlation context live authority was revoked"
+        )
+
+
+def _evaluate_issued_context(
+    authority: CorrelationProjectionAuthority,
+    authority_binding: _ProjectionAuthorityBinding,
+    context_binding: _IssuedContextBinding,
+    callback: Callable[[], object],
+) -> object:
+    with authority_binding.lock:
+        try:
+            _validate_issued_context_locked(
+                authority,
+                authority_binding,
+                context_binding,
+            )
+        except CorrelationProjectionError:
+            raise
+        except Exception as error:
+            raise CorrelationProjectionError(
+                "correlation context live validation failed"
+            ) from error
+        result = callback()
+        try:
+            _validate_issued_context_locked(
+                authority,
+                authority_binding,
+                context_binding,
+            )
+        except CorrelationProjectionError:
+            raise
+        except Exception as error:
+            raise CorrelationProjectionError(
+                "correlation context changed during evaluation"
+            ) from error
+        return result
+
+
+def _issue_correlation_context(
+    authority: CorrelationProjectionAuthority,
+    completed: object,
+    *,
+    expected_predecessor: _ProjectionPredecessor,
+    active_duplicate: ActiveCandidateObservation | None,
+) -> tuple[AuthenticatedPCCInput, CorrelationContext]:
+    expected_before = _clone_predecessor(expected_predecessor)
+    authority_binding = _authority_binding(authority)
+    with authority_binding.lock:
+        _require_authority_locked(authority, authority_binding)
+        if _clone_predecessor(expected_predecessor) != expected_before:
+            raise CorrelationProjectionError(
+                "expected projection predecessor changed before issuance"
+            )
+        authority_binding.revision = object()
+        revision = authority_binding.revision
+        try:
+            (
+                public_proof,
+                trusted_proof,
+                path,
+                coverage,
+                lookup_key,
+                issued_active_duplicate,
+                acceptance_cursor,
+            ) = _context_issue_facts(
+                authority_binding,
+                completed,
+                expected_before,
+                active_duplicate,
+            )
+        except CorrelationProjectionError:
+            raise
+        except Exception as error:
+            raise CorrelationProjectionError(
+                "correlation context issuance lost authority"
+            ) from error
+        if authority_binding.revision is not revision:
+            raise CorrelationProjectionError(
+                "correlation projection revision changed during issuance"
+            )
+        public_coverage = _clone_coverage(coverage)
+        context = CorrelationContext(
+            pinned_detector_bundle_sha256=(
+                authority_binding.detector_bundle_sha256
+            ),
+            special_use_registry=authority_binding.registry,
+            coverage=public_coverage,
+            lookup_key=_clone_duplicate_key(lookup_key),
+            active_duplicate=issued_active_duplicate,
+            terminal_observation=None,
+        )
+        issued_binding = _IssuedContextBinding(
+            completed=completed,
+            public_proof=public_proof,
+            trusted_proof=trusted_proof,
+            path=path,
+            coverage=_clone_coverage(coverage),
+            acceptance_cursor=acceptance_cursor,
+            predecessor=_clone_predecessor(expected_before),
+            revision=revision,
+            detector_bundle_sha256=authority_binding.detector_bundle_sha256,
+            registry_facts=authority_binding.registry_facts,
+        )
+
+        def evaluate(callback: Callable[[], object]) -> object:
+            return _evaluate_issued_context(
+                authority,
+                authority_binding,
+                issued_binding,
+                callback,
+            )
+
+        try:
+            _register_correlation_context(
+                context,
+                public_proof,
+                trusted_proof,
+                evaluate,
+            )
+        except Exception as error:
+            raise CorrelationProjectionError(
+                "correlation context registration lost exact facts"
+            ) from error
+        return public_proof, context
+
+
+def _lawful_forward(
+    current: _ProjectionPredecessor,
+    successor: _ProjectionPredecessor,
+) -> bool:
+    if current.generation != successor.generation:
+        return False
+    if successor.source_sequence == 0:
+        return False
+    if current.source_sequence == 0:
+        return True
+    return (
+        successor.host_id == current.host_id
+        and successor.source_sequence > current.source_sequence
+    )
+
+
+def _advance_correlation_projection_authority(
+    authority: CorrelationProjectionAuthority,
+    expected: _ProjectionPredecessor,
+    successor: _ProjectionPredecessor,
+) -> None:
+    expected_before = _clone_predecessor(expected)
+    successor_before = _clone_predecessor(successor)
+    binding = _authority_binding(authority)
+    with binding.lock:
+        _require_authority_locked(authority, binding)
+        if (
+            _clone_predecessor(expected) != expected_before
+            or _clone_predecessor(successor) != successor_before
+            or binding.predecessor != expected_before
+            or not _lawful_forward(
+                expected_before,
+                successor_before,
+            )
+        ):
+            raise CorrelationProjectionError(
+                "projection predecessor advance is stale or non-forward"
+            )
+        binding.predecessor = _clone_predecessor(successor_before)
+        binding.revision = object()
+
+
+def _rebuild_correlation_projection_authority(
+    authority: CorrelationProjectionAuthority,
+    successor: _ProjectionPredecessor,
+) -> None:
+    successor_before = _clone_predecessor(successor)
+    binding = _authority_binding(authority)
+    with binding.lock:
+        _require_authority_locked(authority, binding)
+        if _clone_predecessor(successor) != successor_before:
+            raise CorrelationProjectionError(
+                "projection rebuild successor changed before use"
+            )
+        current = binding.predecessor
+        if (
+            current.generation == MAX_UINT64
+            or successor_before.generation != current.generation + 1
+        ):
+            raise CorrelationProjectionError(
+                "projection rebuild generation is not fresh"
+            )
+        binding.predecessor = _clone_predecessor(successor_before)
+        binding.revision = object()
+
+
+def _close_correlation_projection_authority(
+    authority: CorrelationProjectionAuthority,
+) -> None:
+    binding = _authority_binding(authority)
+    with binding.lock:
+        _require_authority_locked(authority, binding, allow_closed=True)
+        if binding.closed:
+            return
+        binding.closed = True
+        binding.revision = object()

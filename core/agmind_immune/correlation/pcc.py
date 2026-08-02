@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, cast
+from threading import Lock
+from typing import Literal, Never, SupportsIndex, cast
 
 from agmind_immune.canonicaljson import (
     candidate_id,
@@ -19,6 +21,8 @@ from agmind_immune.contracts import (
     PCCFalcoTriggerProjectionV1,
 )
 from agmind_immune.correlation.primitives import (
+    ParsedSpecialUseRegistry,
+    SpecialUseEntry,
     SpecialUseRegistry,
     parse_rfc3339nano_utc_ns,
     special_use_registry_is_issued,
@@ -314,17 +318,19 @@ class CorrelationContext:
         object.__setattr__(context, "terminal_observation", None)
         return context
 
+    def __copy__(self) -> Never:
+        raise TypeError("correlation contexts cannot be copied")
 
-def _candidate_context_validator() -> Callable[[object], bool]:
-    def is_issued(value: object) -> bool:
-        del value
-        return False
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        del memo
+        raise TypeError("correlation contexts cannot be copied")
 
-    return is_issued
+    def __reduce__(self) -> Never:
+        raise TypeError("correlation contexts cannot be serialized")
 
-
-correlation_context_is_issued = _candidate_context_validator()
-del _candidate_context_validator
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError("correlation contexts cannot be serialized")
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +396,499 @@ class Rejected:
 type CorrelationResult = (
     CandidateCreated | InvestigationOnly | Duplicate | Rejected
 )
+
+
+type _AuthorityEvaluator = Callable[[Callable[[], object]], object]
+type _PCCFactsFingerprint = tuple[object, ...]
+type _ContextFactsFingerprint = tuple[object, ...]
+
+
+def _evidence_ref_fingerprint(value: object) -> tuple[object, ...]:
+    return (
+        type(value),
+        value.segment_id,  # type: ignore[attr-defined]
+        value.segment_relative_path,  # type: ignore[attr-defined]
+        value.frame_offset,  # type: ignore[attr-defined]
+        value.frame_size,  # type: ignore[attr-defined]
+        value.frame_sha256,  # type: ignore[attr-defined]
+        value.event_id,  # type: ignore[attr-defined]
+        value.source_sequence,  # type: ignore[attr-defined]
+        value.content_sha256,  # type: ignore[attr-defined]
+    )
+
+
+def _pcc_canonical_facts(
+    value: AuthenticatedPCCInput,
+) -> _PCCFactsFingerprint:
+    request = value.request
+    snapshot = value.snapshot
+    return (
+        value.boot_id,
+        value.canonical,
+        value.content_sha256,
+        value.event_id,
+        value.event_type,
+        value.host_id,
+        value.source_sequence,
+        _evidence_ref_fingerprint(value.evidence_ref),
+        canonical_json(request),
+        frozenset(request.model_fields_set),
+        canonical_json(snapshot),
+        frozenset(snapshot.model_fields_set),
+    )
+
+
+def _pcc_live_fingerprint(
+    value: object,
+) -> _PCCFactsFingerprint | None:
+    if type(value) is not AuthenticatedPCCInput:
+        return None
+    try:
+        request = value.request
+        snapshot = value.snapshot
+        return (
+            id(value.evidence_ref),
+            id(request),
+            id(snapshot),
+            id(snapshot.trigger),
+            *_pcc_canonical_facts(value),
+        )
+    except (
+        AttributeError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        return None
+
+
+def _key_fingerprint(value: CandidateDuplicateKey | None) -> tuple[object, ...]:
+    if value is None:
+        return (None,)
+    return (
+        id(value),
+        value.host_id,
+        value.boot_id,
+        value.docker_container_id,
+        value.docker_started_at,
+        value.detector_bundle_sha256,
+        value.destination_ipv4,
+    )
+
+
+def _coverage_fingerprint(
+    value: HistoricalCoverageAssessment | None,
+) -> tuple[object, ...]:
+    if value is None:
+        return (None,)
+    return (
+        id(value),
+        value.host_id,
+        value.boot_id,
+        value.trigger_event_id,
+        value.trigger_source_sequence,
+        value.coverage_through_sequence,
+        value.window_start,
+        value.window_end,
+        value.complete,
+        value.critical_gap,
+        value.coverage_snapshot_sha256,
+    )
+
+
+def _active_fingerprint(
+    value: ActiveCandidateObservation | None,
+) -> tuple[object, ...]:
+    if value is None:
+        return (None,)
+    return (
+        id(value),
+        *_key_fingerprint(value.key),
+        value.candidate_id,
+        value.primary_source_sequence,
+        value.primary_event_id,
+    )
+
+
+def _terminal_fingerprint(
+    value: TerminalCandidateObservation | None,
+) -> tuple[object, ...]:
+    if value is None:
+        return (None,)
+    return (
+        id(value),
+        *_key_fingerprint(value.key),
+        value.candidate_id,
+        value.state,
+        value.terminal_at,
+    )
+
+
+def _context_live_fingerprint(
+    value: object,
+) -> _ContextFactsFingerprint | None:
+    if type(value) is not CorrelationContext:
+        return None
+    try:
+        registry = value.special_use_registry
+        return (
+            value._authority_kind,
+            value.pinned_detector_bundle_sha256,
+            None if registry is None else id(registry),
+            *_coverage_fingerprint(value.coverage),
+            *_key_fingerprint(value.lookup_key),
+            *_active_fingerprint(value.active_duplicate),
+            *_terminal_fingerprint(value.terminal_observation),
+        )
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        return None
+
+
+def _key_semantic_fingerprint(
+    value: CandidateDuplicateKey | None,
+) -> tuple[object, ...]:
+    if value is None:
+        return (None,)
+    return (
+        value.host_id,
+        value.boot_id,
+        value.docker_container_id,
+        value.docker_started_at,
+        value.detector_bundle_sha256,
+        value.destination_ipv4,
+    )
+
+
+def _registry_semantic_fingerprint(
+    value: SpecialUseRegistry | None,
+) -> tuple[object, ...]:
+    if value is None:
+        return (None,)
+    if type(value.entries) is not tuple or type(value._index) is not tuple:
+        raise TypeError("correlation registry facts are not exact tuples")
+    return (
+        value.authority_sha256,
+        tuple(
+            (entry.prefix, entry.globally_reachable.value)
+            for entry in value.entries
+        ),
+        tuple(
+            (network, prefix, reachability.value)
+            for network, prefix, reachability in value._index
+        ),
+    )
+
+
+def _context_semantic_fingerprint(
+    value: CorrelationContext,
+) -> tuple[object, ...]:
+    coverage = value.coverage
+    active = value.active_duplicate
+    terminal = value.terminal_observation
+    return (
+        value._authority_kind,
+        value.pinned_detector_bundle_sha256,
+        *_registry_semantic_fingerprint(value.special_use_registry),
+        (
+            None,
+        )
+        if coverage is None
+        else (
+            coverage.host_id,
+            coverage.boot_id,
+            coverage.trigger_event_id,
+            coverage.trigger_source_sequence,
+            coverage.coverage_through_sequence,
+            coverage.window_start,
+            coverage.window_end,
+            coverage.complete,
+            coverage.critical_gap,
+            coverage.coverage_snapshot_sha256,
+        ),
+        *_key_semantic_fingerprint(value.lookup_key),
+        (
+            None,
+        )
+        if active is None
+        else (
+            *_key_semantic_fingerprint(active.key),
+            active.candidate_id,
+            active.primary_source_sequence,
+            active.primary_event_id,
+        ),
+        (
+            None,
+        )
+        if terminal is None
+        else (
+            *_key_semantic_fingerprint(terminal.key),
+            terminal.candidate_id,
+            terminal.state,
+            terminal.terminal_at,
+        ),
+    )
+
+
+def _clone_duplicate_key(value: CandidateDuplicateKey) -> CandidateDuplicateKey:
+    return CandidateDuplicateKey(
+        host_id=value.host_id,
+        boot_id=value.boot_id,
+        docker_container_id=value.docker_container_id,
+        docker_started_at=value.docker_started_at,
+        detector_bundle_sha256=value.detector_bundle_sha256,
+        destination_ipv4=value.destination_ipv4,
+    )
+
+
+def _trusted_context(value: CorrelationContext) -> CorrelationContext:
+    registry = value.special_use_registry
+    coverage = value.coverage
+    lookup_key = value.lookup_key
+    if (
+        value._authority_kind != "raw"
+        or type(registry) is not SpecialUseRegistry
+        or type(coverage) is not HistoricalCoverageAssessment
+        or type(lookup_key) is not CandidateDuplicateKey
+    ):
+        raise TypeError("issued correlation context facts are incomplete")
+    trusted_registry = object.__new__(SpecialUseRegistry)
+    ParsedSpecialUseRegistry.__init__(
+        trusted_registry,
+        tuple(
+            SpecialUseEntry(entry.prefix, entry.globally_reachable)
+            for entry in registry.entries
+        ),
+    )
+    trusted_coverage = HistoricalCoverageAssessment(
+        host_id=coverage.host_id,
+        boot_id=coverage.boot_id,
+        trigger_event_id=coverage.trigger_event_id,
+        trigger_source_sequence=coverage.trigger_source_sequence,
+        coverage_through_sequence=coverage.coverage_through_sequence,
+        window_start=coverage.window_start,
+        window_end=coverage.window_end,
+        complete=coverage.complete,
+        critical_gap=coverage.critical_gap,
+        coverage_snapshot_sha256=coverage.coverage_snapshot_sha256,
+    )
+    trusted_key = _clone_duplicate_key(lookup_key)
+    active = value.active_duplicate
+    trusted_active = (
+        None
+        if active is None
+        else ActiveCandidateObservation(
+            key=_clone_duplicate_key(active.key),
+            candidate_id=active.candidate_id,
+            primary_source_sequence=active.primary_source_sequence,
+            primary_event_id=active.primary_event_id,
+        )
+    )
+    terminal = value.terminal_observation
+    trusted_terminal = (
+        None
+        if terminal is None
+        else TerminalCandidateObservation(
+            key=_clone_duplicate_key(terminal.key),
+            candidate_id=terminal.candidate_id,
+            state=terminal.state,
+            terminal_at=terminal.terminal_at,
+        )
+    )
+    trusted = object.__new__(CorrelationContext)
+    object.__setattr__(trusted, "_authority_kind", "raw")
+    object.__setattr__(
+        trusted,
+        "pinned_detector_bundle_sha256",
+        value.pinned_detector_bundle_sha256,
+    )
+    object.__setattr__(trusted, "special_use_registry", trusted_registry)
+    object.__setattr__(trusted, "coverage", trusted_coverage)
+    object.__setattr__(trusted, "lookup_key", trusted_key)
+    object.__setattr__(trusted, "active_duplicate", trusted_active)
+    object.__setattr__(trusted, "terminal_observation", trusted_terminal)
+    return trusted
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimedCorrelationContext:
+    public_context_ref: weakref.ReferenceType[CorrelationContext]
+    public_context_identity: int
+    public_context_fingerprint: _ContextFactsFingerprint
+    public_proof: AuthenticatedPCCInput
+    public_proof_fingerprint: _PCCFactsFingerprint
+    trusted_proof: AuthenticatedPCCInput
+    trusted_context: CorrelationContext
+    evaluator: _AuthorityEvaluator
+
+
+def _correlation_context_protocol() -> tuple[
+    Callable[
+        [
+            CorrelationContext,
+            AuthenticatedPCCInput,
+            AuthenticatedPCCInput,
+            _AuthorityEvaluator,
+        ],
+        None,
+    ],
+    Callable[[object], _ClaimedCorrelationContext | None],
+]:
+    issued: dict[
+        int,
+        tuple[
+            weakref.ReferenceType[CorrelationContext],
+            _ClaimedCorrelationContext,
+        ],
+    ] = {}
+    lock = Lock()
+
+    def register(
+        context: CorrelationContext,
+        public_proof: AuthenticatedPCCInput,
+        trusted_proof: AuthenticatedPCCInput,
+        evaluator: _AuthorityEvaluator,
+    ) -> None:
+        if (
+            type(context) is not CorrelationContext
+            or type(public_proof) is not AuthenticatedPCCInput
+            or type(trusted_proof) is not AuthenticatedPCCInput
+            or public_proof is trusted_proof
+            or not authenticated_pcc_input_is_issued(public_proof)
+            or not authenticated_pcc_input_is_issued(trusted_proof)
+            or not callable(evaluator)
+        ):
+            raise TypeError("correlation context registration is not exact")
+        public_fingerprint = _pcc_live_fingerprint(public_proof)
+        trusted_fingerprint = _pcc_live_fingerprint(trusted_proof)
+        context_fingerprint = _context_live_fingerprint(context)
+        try:
+            semantic_before = _context_semantic_fingerprint(context)
+            trusted_context = _trusted_context(context)
+            semantic_after = _context_semantic_fingerprint(context)
+            trusted_semantic = _context_semantic_fingerprint(trusted_context)
+        except (AttributeError, RecursionError, TypeError, ValueError) as error:
+            raise TypeError(
+                "correlation context registration facts are not exact"
+            ) from error
+        if (
+            public_fingerprint is None
+            or trusted_fingerprint is None
+            or context_fingerprint is None
+            or _context_live_fingerprint(context) != context_fingerprint
+            or semantic_before != semantic_after
+            or semantic_before != trusted_semantic
+            or _pcc_canonical_facts(public_proof)
+            != _pcc_canonical_facts(trusted_proof)
+        ):
+            raise TypeError("correlation context registration facts changed")
+        identity = id(context)
+        reference: weakref.ReferenceType[CorrelationContext]
+        binding = _ClaimedCorrelationContext(
+            public_context_ref=weakref.ref(context),
+            public_context_identity=identity,
+            public_context_fingerprint=context_fingerprint,
+            public_proof=public_proof,
+            public_proof_fingerprint=public_fingerprint,
+            trusted_proof=trusted_proof,
+            trusted_context=trusted_context,
+            evaluator=evaluator,
+        )
+
+        def cleanup(reference: weakref.ReferenceType[CorrelationContext]) -> None:
+            with lock:
+                current = issued.get(identity)
+                if current is not None and current[0] is reference:
+                    issued.pop(identity, None)
+
+        reference = weakref.ref(context, cleanup)
+        with lock:
+            if identity in issued:
+                raise TypeError("correlation context is already registered")
+            issued[identity] = (reference, binding)
+
+    def claim(value: object) -> _ClaimedCorrelationContext | None:
+        if type(value) is not CorrelationContext:
+            return None
+        with lock:
+            registered = issued.pop(id(value), None)
+        if registered is None or registered[0]() is not value:
+            return None
+        return registered[1]
+
+    return register, claim
+
+
+(
+    _register_correlation_context,
+    _claim_correlation_context,
+) = _correlation_context_protocol()
+del _correlation_context_protocol
+
+
+_CONTEXT_MISMATCH = object()
+
+
+def _claimed_context_matches(
+    claim: _ClaimedCorrelationContext,
+    proof: object,
+    context: object,
+) -> bool:
+    return (
+        proof is claim.public_proof
+        and id(context) == claim.public_context_identity
+        and context is claim.public_context_ref()
+        and _pcc_live_fingerprint(proof)
+        == claim.public_proof_fingerprint
+        and _context_live_fingerprint(context)
+        == claim.public_context_fingerprint
+    )
+
+
+def _evaluate_claimed_context(
+    claim: _ClaimedCorrelationContext,
+    proof: AuthenticatedPCCInput,
+    context: CorrelationContext,
+) -> CorrelationResult | None:
+    if not _claimed_context_matches(claim, proof, context):
+        return None
+
+    callback_invoked = False
+
+    def evaluate_kernel() -> object:
+        nonlocal callback_invoked
+        if callback_invoked:
+            raise CorrelationProjectionError(
+                "correlation authority invoked its evaluation callback twice"
+            )
+        callback_invoked = True
+        if not _claimed_context_matches(claim, proof, context):
+            return _CONTEXT_MISMATCH
+        result = _correlate_pcc_kernel(
+            claim.trusted_proof,
+            claim.trusted_context,
+        )
+        if not _claimed_context_matches(claim, proof, context):
+            return _CONTEXT_MISMATCH
+        return result
+
+    result = claim.evaluator(evaluate_kernel)
+    if (
+        not callback_invoked
+        or result is _CONTEXT_MISMATCH
+        or not _claimed_context_matches(claim, proof, context)
+    ):
+        return None
+    if type(result) not in {
+        CandidateCreated,
+        InvestigationOnly,
+        Duplicate,
+        Rejected,
+    }:
+        raise CorrelationProjectionError(
+            "correlation authority returned an invalid evaluation result"
+        )
+    return cast(CorrelationResult, result)
 
 
 def _incident(
@@ -1003,16 +1502,22 @@ def correlate_pcc_facts(
     context: CorrelationContext,
 ) -> CorrelationResult:
     """Evaluate proof-bound facts only under issued local context authority."""
+    claimed = _claim_correlation_context(context)
     _validate_pcc_facts_binding(trigger, proof, context)
-    if (
-        proof.snapshot.outcome == "complete"
-        and not correlation_context_is_issued(context)
-    ):
+    if proof.snapshot.outcome != "complete":
+        return _correlate_pcc_kernel(proof, context)
+    if claimed is None:
         return _one_rejection(
             proof,
             "correlation_proof_mismatch",
         )
-    return _correlate_pcc_kernel(proof, context)
+    result = _evaluate_claimed_context(claimed, proof, context)
+    if result is None:
+        return _one_rejection(
+            proof,
+            "correlation_proof_mismatch",
+        )
+    return result
 
 
 def correlate_pcc(
@@ -1020,6 +1525,7 @@ def correlate_pcc(
     context: CorrelationContext,
 ) -> CorrelationResult:
     """Reduce only post-commit proof plus issued local context authority."""
+    claimed = _claim_correlation_context(context)
     if (
         type(authenticated) is not AuthenticatedPCCInput
         or not authenticated_pcc_input_is_issued(authenticated)
@@ -1028,15 +1534,24 @@ def correlate_pcc(
         raise TypeError(
             "correlate_pcc requires exact issued authenticated input and context"
         )
-    if (
-        authenticated.snapshot.outcome == "complete"
-        and not correlation_context_is_issued(context)
-    ):
+    if authenticated.snapshot.outcome != "complete":
+        return _correlate_pcc_kernel(authenticated, context)
+    if claimed is None:
         return _one_rejection(
             authenticated,
             "correlation_proof_mismatch",
         )
-    return _correlate_pcc_kernel(authenticated, context)
+    result = _evaluate_claimed_context(
+        claimed,
+        authenticated,
+        context,
+    )
+    if result is None:
+        return _one_rejection(
+            authenticated,
+            "correlation_proof_mismatch",
+        )
+    return result
 
 
 __all__ = [

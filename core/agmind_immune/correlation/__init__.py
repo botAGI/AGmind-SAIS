@@ -1,5 +1,6 @@
 """Pure, side-effect-free correlation primitives."""
 
+from .authority import CorrelationProjectionAuthority
 from .pcc import (
     ActiveCandidateObservation,
     CandidateCreated,
@@ -31,6 +32,7 @@ __all__ = [
     "CandidateCreated",
     "CandidateDuplicateKey",
     "CorrelationContext",
+    "CorrelationProjectionAuthority",
     "CorrelationProjectionError",
     "CorrelationResult",
     "Duplicate",
