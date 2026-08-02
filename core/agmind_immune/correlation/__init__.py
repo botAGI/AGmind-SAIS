@@ -1,6 +1,9 @@
 """Pure, side-effect-free correlation primitives."""
 
-from .authority import CorrelationProjectionAuthority
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from .pcc import (
     ActiveCandidateObservation,
     CandidateCreated,
@@ -27,6 +30,9 @@ from .primitives import (
     parse_rfc3339nano_utc_ns,
 )
 
+if TYPE_CHECKING:
+    from .authority import CorrelationProjectionAuthority
+
 __all__ = [
     "ActiveCandidateObservation",
     "CandidateCreated",
@@ -51,3 +57,11 @@ __all__ = [
     "load_pinned_special_use_registry",
     "parse_rfc3339nano_utc_ns",
 ]
+
+
+def __getattr__(name: str) -> type[CorrelationProjectionAuthority]:
+    if name == "CorrelationProjectionAuthority":
+        from .authority import CorrelationProjectionAuthority
+
+        return CorrelationProjectionAuthority
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
