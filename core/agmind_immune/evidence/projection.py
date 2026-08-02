@@ -34,6 +34,7 @@ from agmind_immune.contracts import (
     EventEnvelopeV1,
     FalcoConnectV1,
 )
+from agmind_immune.evidence.dedup import _logical_primary_identity_v1
 from agmind_immune.evidence.segments import (
     EvidenceCorrupt,
     EvidencePriority,
@@ -614,33 +615,12 @@ def _prepare(record: StoredEvidenceRecord) -> _PreparedRecord:
             falco = FalcoConnectV1.model_validate(envelope.normalized_fields, strict=True)
         except ValidationError as error:
             raise ProjectionValidationError("Falco reducer input is invalid") from error
-        kind = "falco_connect"
-        key: tuple[str, ...] = (
-            envelope.host_id,
-            envelope.event_type,
-            envelope.source_payload_hash,
-        )
     elif envelope.event_type == "coverage":
         try:
             coverage = CoverageEventV1.model_validate(envelope.normalized_fields, strict=True)
         except ValidationError as error:
             raise ProjectionValidationError("coverage reducer input is invalid") from error
-        kind = "coverage"
-        key = (
-            envelope.host_id,
-            envelope.event_type,
-            envelope.normalized_fields_sha256,
-            envelope.source_payload_hash,
-        )
-    else:
-        kind = "other"
-        key = (envelope.event_id,)
-    logical_hash = hashlib.sha256(
-        b"AGMIND_PROJECTION_DEDUP_V1\0"
-        + kind.encode("ascii")
-        + b"\0"
-        + canonical_json(key)
-    ).hexdigest()
+    kind, logical_hash = _logical_primary_identity_v1(envelope)
     return _PreparedRecord(record, envelope, kind, logical_hash, falco, coverage)
 
 

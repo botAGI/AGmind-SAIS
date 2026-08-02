@@ -85,6 +85,7 @@ from agmind_immune.ingest.envelope import (
 )
 
 if TYPE_CHECKING:
+    from agmind_immune.coverage.historical import HistoricalPathAuthority
     from agmind_immune.evidence.retention import (
         AcceptedRetentionBlocked,
         AcceptedRetentionTombstone,
@@ -6439,6 +6440,17 @@ class SegmentStore:
             raise EvidenceSealError(
                 "PCC correlation input lacks committed verifier authority"
             ) from error
+
+    def _historical_path_authority(
+        self,
+        authenticated: AuthenticatedPCCInput,
+    ) -> HistoricalPathAuthority:
+        """Issue one opaque exact-store path capability for a committed PCC."""
+        from agmind_immune.coverage.historical import (
+            _issue_historical_path_authority,
+        )
+
+        return _issue_historical_path_authority(self, authenticated)
 
     def _authenticated_falco_input(
         self,

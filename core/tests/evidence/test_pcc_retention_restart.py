@@ -267,3 +267,29 @@ def test_uncovered_missing_trigger_never_promotes_deferred_pcc(
         assert store.status().healthy is False
     finally:
         store.close(flush=False)
+
+
+def test_historical_path_survives_routine_trigger_retirement(
+    tmp_path: Path,
+) -> None:
+    case = _build_pcc_retention_case(
+        tmp_path,
+        finalize_retention=True,
+    )
+    verifier = _fresh_verifier()
+    store = SegmentStore(tmp_path)
+    try:
+        recovered = AcceptanceCoordinator.open_and_recover(verifier, store)
+        authenticated = recovered.authenticated_pcc_input(case.ref, case.request)
+        authority = store._historical_path_authority(authenticated)
+
+        from agmind_immune.coverage.historical import derive_historical_coverage
+
+        assessment = derive_historical_coverage(authenticated, authority)
+
+        assert assessment.complete is True
+        assert assessment.trigger_event_id == case.trigger_ref.event_id
+        assert assessment.coverage_through_sequence == case.ref.source_sequence - 1
+        assert assessment.coverage_snapshot_sha256 is not None
+    finally:
+        store.close(flush=False)
