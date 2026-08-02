@@ -1942,37 +1942,36 @@ class ProjectionStore:
                 "retention projection rebuild requires its exact factory"
             )
         with self._mutex:
-            binding = (
-                self._evidence
-                ._authenticated_retention_unlink_completion
-            )
-            if binding is None or binding.capability is not completion:
-                raise ProjectionAuthorityError(
-                    "retention projection rebuild lacks exact completion authority"
-                )
-            self._evidence._validate_authenticated_retention_completion(
-                completion,
-                binding,
-            )
             try:
+                binding = (
+                    self._evidence
+                    ._authenticated_retention_unlink_completion
+                )
+                if binding is None or binding.capability is not completion:
+                    raise ProjectionAuthorityError(
+                        "retention projection rebuild lacks exact completion authority"
+                    )
+                self._evidence._validate_authenticated_retention_completion(
+                    completion,
+                    binding,
+                )
                 report = self._rebuild(require_existing_prefix=False)
+                current = (
+                    self._evidence
+                    ._authenticated_retention_unlink_completion
+                )
+                if current is not binding:
+                    raise ProjectionAuthorityError(
+                        "retention completion changed during projection rebuild"
+                    )
+                self._evidence._validate_authenticated_retention_completion(
+                    completion,
+                    binding,
+                )
+                return report
             except BaseException:
                 self._healthy = False
                 raise
-            current = (
-                self._evidence
-                ._authenticated_retention_unlink_completion
-            )
-            if current is not binding:
-                self._healthy = False
-                raise ProjectionAuthorityError(
-                    "retention completion changed during projection rebuild"
-                )
-            self._evidence._validate_authenticated_retention_completion(
-                completion,
-                binding,
-            )
-            return report
 
     def _rebuild(
         self,

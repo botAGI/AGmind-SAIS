@@ -872,20 +872,27 @@ def _retention_case_with_surviving_falco(
     return case, capability, acknowledgements, refs
 
 
-def test_retention_rebuild_ack_conflict_latches_projection_unhealthy(
+@pytest.mark.parametrize(
+    "failure_seam",
+    ["ack_conflict", "pre_validation", "post_validation"],
+)
+def test_retention_rebuild_failure_latches_projection_unhealthy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_seam: str,
 ) -> None:
     projection = _projection()
-    raw_hash = hashlib.sha256(b"retention rebuild ACK conflict").hexdigest()
+    raw_hash = hashlib.sha256(
+        f"retention rebuild {failure_seam}".encode()
+    ).hexdigest()
     case, capability, acknowledgements, refs = (
         _retention_case_with_surviving_falco(
-            tmp_path / "retention-ack-conflict" / "evidence",
+            tmp_path / failure_seam / "evidence",
             raw_hash=raw_hash,
         )
     )
     cache = projection.ProjectionStore.open(
-        tmp_path / "retention-ack-conflict" / "projection.sqlite3",
+        tmp_path / failure_seam / "projection.sqlite3",
         evidence=case.store,
         acknowledgements=acknowledgements,
     )
@@ -909,9 +916,33 @@ def test_retention_rebuild_ack_conflict_latches_projection_unhealthy(
             if step == "apply":
                 changed = True
 
-        monkeypatch.setattr(acknowledgements, "snapshot", changed_snapshot)
-        cache._step_hook = change_ack_after_apply
-        with pytest.raises(projection.ProjectionConflict):
+        expected_error = projection.ProjectionConflict
+        if failure_seam == "ack_conflict":
+            monkeypatch.setattr(acknowledgements, "snapshot", changed_snapshot)
+            cache._step_hook = change_ack_after_apply
+        else:
+            expected_error = segments_module.EvidenceSealError
+            original_validation = (
+                case.store._validate_authenticated_retention_completion
+            )
+            validation_calls = 0
+
+            def fail_validation(candidate: object, binding: object) -> Any:
+                nonlocal validation_calls
+                validation_calls += 1
+                target_call = 1 if failure_seam == "pre_validation" else 2
+                if validation_calls == target_call:
+                    raise segments_module.EvidenceSealError(
+                        f"injected {failure_seam}"
+                    )
+                return original_validation(candidate, binding)
+
+            monkeypatch.setattr(
+                case.store,
+                "_validate_authenticated_retention_completion",
+                fail_validation,
+            )
+        with pytest.raises(expected_error):
             cache._rebuild_after_authenticated_retention(
                 completion,
                 _factory=projection._RETENTION_REBUILD_FACTORY,
