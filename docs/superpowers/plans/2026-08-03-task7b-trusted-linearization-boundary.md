@@ -419,6 +419,7 @@ git commit -m "refactor(core): freeze correlation replay facts"
 **Files:**
 - Modify: `core/agmind_immune/evidence/projection_v2.py:343-364,859-1265,2491-3740`
 - Modify: `core/agmind_immune/coverage/historical.py`
+- Modify: `core/agmind_immune/correlation/pcc.py`
 - Modify: `core/tests/evidence/test_projection_replay_boundary.py`
 - Modify: `core/tests/evidence/test_projection_pcc.py`
 
@@ -451,6 +452,29 @@ class _ReplayComputation:
 ```
 
 - Exact function signature: `_compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation`.
+
+Plan-gap resolutions approved before implementation:
+
+- `active_duplicate` and `terminal_observation` are projection-local derived
+  facts, not freeze-time external authority. Add one private values-only helper
+  in `correlation/pcc.py` that rebinds those exact optional observations onto a
+  detached `_FrozenPCCCorrelationInput`, recomputes its context canonical bytes
+  and facts digest, and performs no issuance/global-registry query. Compute
+  derives the observations from its private SQLite state before calling
+  `_correlate_frozen_pcc`.
+- Split `incident_from_verified_falco` into its unchanged issued compatibility
+  wrapper plus one private values-only body over exact decoded Falco/record
+  scalars. Pure compute calls only the values body; it does not construct or
+  consult `AuthenticatedFalcoInput` authority.
+- `prefix_sha256` is the existing logical `_v2_snapshot_hash(connection)`, not
+  a hash of SQLite file-layout bytes. `report_bytes` is domain-separated
+  canonical typed bytes that bind every computation field except itself,
+  including the database-image digest, schema/generation, transcript, leaf and
+  invalidation facts, terminal predecessor, counters, and logical prefix hash.
+  `administrative_visits` is incremented in the actual bounded processing
+  loops, never reconstructed post hoc from output lengths. Semantic visits are
+  the honest sum of independent project and validation reductions: 20 at
+  `P=4`, 72 at `P=8`.
 
 - [ ] **Step 1: Write RED pure-compute boundary tests**
 
@@ -501,10 +525,10 @@ TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
 - [ ] **Step 5: Static check and commit**
 
 ```bash
-.venv/bin/ruff check core/agmind_immune/evidence/projection_v2.py core/agmind_immune/coverage/historical.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
-.venv/bin/mypy core/agmind_immune/evidence/projection_v2.py core/agmind_immune/coverage/historical.py
+.venv/bin/ruff check core/agmind_immune/evidence/projection_v2.py core/agmind_immune/coverage/historical.py core/agmind_immune/correlation/pcc.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
+.venv/bin/mypy core/agmind_immune/evidence/projection_v2.py core/agmind_immune/coverage/historical.py core/agmind_immune/correlation/pcc.py
 git diff --check
-git add core/agmind_immune/evidence/projection_v2.py core/agmind_immune/coverage/historical.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
+git add core/agmind_immune/evidence/projection_v2.py core/agmind_immune/coverage/historical.py core/agmind_immune/correlation/pcc.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
 git commit -m "refactor(core): compute replay from frozen facts"
 ```
 
