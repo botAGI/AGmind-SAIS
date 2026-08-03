@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 import stat
@@ -10,7 +11,7 @@ from _thread import LockType
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
-from typing import BinaryIO, Literal, Protocol, cast
+from typing import BinaryIO, Literal, Protocol, TypeVar, cast
 
 from pydantic import Field, ValidationError, field_validator
 
@@ -41,6 +42,8 @@ _MAX_RECORD_BYTES = 1024
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _DELIVERY_LEASE_FACTORY = object()
+_ACK_UNPUBLISHED_ANCHOR_FACTORY = object()
+_AckCallbackResult = TypeVar("_AckCallbackResult")
 
 
 class _DigestState(Protocol):
@@ -174,6 +177,25 @@ class _ConfirmedBoundary:
     confirmed: AckIdentity | None
     prefix_size: int
     prefix_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AckUnpublishedAnchor:
+    lifecycle: object
+    store_lifecycle: object
+    descriptor: int
+    journal_stat: os.stat_result
+    authenticated_stat: os.stat_result
+    authenticated_hasher: _DigestState
+    authenticated_digest: bytes
+    size: int
+    previous_hash: bytes
+    confirmed: AckIdentity | None
+    pending: AckIdentity | None
+    generation: int
+    prefix_size: int
+    prefix_sha256: str
+    acceptance_cursor: int
 
 
 def _validate_journal_stat(info: os.stat_result) -> None:
@@ -1076,6 +1098,198 @@ class AckJournal:
             raise AckJournalStateError(
                 "ACK mutation is fenced by active retention"
             )
+
+    @staticmethod
+    def _exact_anchor_identity(identity: AckIdentity | None) -> tuple[int, str, str] | None:
+        if identity is None:
+            return None
+        if (
+            type(identity) is not AckIdentity
+            or type(identity.sequence) is not int
+            or not 1 <= identity.sequence <= MAX_UINT64
+            or type(identity.event_id) is not str
+            or _EVENT_ID.fullmatch(identity.event_id) is None
+            or type(identity.content_sha256) is not str
+            or _HEX64.fullmatch(identity.content_sha256) is None
+        ):
+            raise AckJournalAuthorityError("ACK unpublished identity is not exact")
+        return identity.sequence, identity.event_id, identity.content_sha256
+
+    def _validate_unpublished_anchor_locked(
+        self,
+        anchor: _AckUnpublishedAnchor,
+    ) -> None:
+        if (
+            type(anchor) is not _AckUnpublishedAnchor
+            or self._retention_gate_lease is not None
+            or anchor.lifecycle is not self._lifecycle_identity
+            or anchor.store_lifecycle is not self._store._lifecycle_identity
+            or self._store._lifecycle_identity is not self._lifecycle_identity
+            or self._store._ack_journal_owner is not self
+            or type(anchor.descriptor) is not int
+            or type(self._descriptor) is not int
+            or self._descriptor != anchor.descriptor
+            or self._healthy is not True
+            or self._closed is not False
+            or self._closing is not False
+            or type(anchor.size) is not int
+            or type(self._size) is not int
+            or self._size != anchor.size
+            or type(anchor.previous_hash) is not bytes
+            or type(self._previous_hash) is not bytes
+            or not hmac.compare_digest(self._previous_hash, anchor.previous_hash)
+            or type(anchor.authenticated_digest) is not bytes
+            or type(anchor.generation) is not int
+            or type(self._confirmed_generation) is not int
+            or self._confirmed_generation != anchor.generation
+            or type(anchor.prefix_size) is not int
+            or type(self._committed_prefix_size) is not int
+            or self._committed_prefix_size != anchor.prefix_size
+            or type(anchor.prefix_sha256) is not str
+            or type(self._committed_prefix_sha256) is not str
+            or not hmac.compare_digest(
+                self._committed_prefix_sha256,
+                anchor.prefix_sha256,
+            )
+            or type(anchor.acceptance_cursor) is not int
+        ):
+            raise AckJournalAuthorityError("ACK unpublished anchor changed")
+        authenticated_stat = self._authenticated_stat
+        authenticated_hasher = self._authenticated_hasher
+        if (
+            authenticated_stat is not anchor.authenticated_stat
+            or authenticated_hasher is not anchor.authenticated_hasher
+            or authenticated_stat is None
+            or authenticated_hasher is None
+        ):
+            raise AckJournalAuthorityError("ACK authenticated anchor identity changed")
+        try:
+            descriptor_stat = os.fstat(self._descriptor)
+            published_stat = self._bind_published()
+            commitment = self._store._validate_ack_commitment_binding()
+            status = self._store.status()
+            prefix_digest = self._hash_held_prefix(anchor.prefix_size)
+        except Exception as error:
+            raise AckJournalAuthorityError(
+                "ACK unpublished durable anchor is unavailable"
+            ) from error
+        if (
+            type(anchor.journal_stat) is not os.stat_result
+            or type(anchor.authenticated_stat) is not os.stat_result
+            or not _same_file(descriptor_stat, anchor.journal_stat)
+            or not _same_file(published_stat, anchor.journal_stat)
+            or not _same_file(authenticated_stat, anchor.authenticated_stat)
+            or not _same_file(anchor.journal_stat, anchor.authenticated_stat)
+            or not hmac.compare_digest(
+                authenticated_hasher.digest(),
+                anchor.authenticated_digest,
+            )
+            or not hmac.compare_digest(prefix_digest.hex(), anchor.prefix_sha256)
+            or type(status.acceptance_cursor) is not int
+            or status.acceptance_cursor != anchor.acceptance_cursor
+            or self._exact_anchor_identity(self._confirmed)
+            != self._exact_anchor_identity(anchor.confirmed)
+            or self._exact_anchor_identity(self._pending)
+            != self._exact_anchor_identity(anchor.pending)
+            or self._confirmed is not anchor.confirmed
+            or self._pending is not anchor.pending
+            or type(commitment) is not _AckCommitmentV1
+            or commitment.phase != "ready"
+            or type(commitment.generation) is not int
+            or commitment.generation != anchor.generation
+            or type(commitment.journal_prefix_size) is not int
+            or commitment.journal_prefix_size != anchor.prefix_size
+            or type(commitment.journal_prefix_sha256) is not str
+            or not hmac.compare_digest(
+                commitment.journal_prefix_sha256,
+                anchor.prefix_sha256,
+            )
+        ):
+            raise AckJournalAuthorityError("ACK unpublished anchor facts changed")
+        durable_confirmed = commitment.confirmed
+        if anchor.confirmed is None:
+            durable_matches = durable_confirmed is None
+        else:
+            durable_matches = (
+                durable_confirmed is not None
+                and type(durable_confirmed.sequence) is int
+                and durable_confirmed.sequence == anchor.confirmed.sequence
+                and type(durable_confirmed.event_id) is str
+                and hmac.compare_digest(
+                    durable_confirmed.event_id,
+                    anchor.confirmed.event_id,
+                )
+                and type(durable_confirmed.content_sha256) is str
+                and hmac.compare_digest(
+                    durable_confirmed.content_sha256,
+                    anchor.confirmed.content_sha256,
+                )
+            )
+        if not durable_matches:
+            raise AckJournalAuthorityError("ACK durable confirmed identity changed")
+
+    def _capture_unpublished_anchor(
+        self,
+        acceptance_cursor: int,
+        *,
+        _factory: object,
+    ) -> _AckUnpublishedAnchor:
+        if (
+            _factory is not _ACK_UNPUBLISHED_ANCHOR_FACTORY
+            or type(acceptance_cursor) is not int
+            or acceptance_cursor < 0
+        ):
+            raise AckJournalAuthorityError("ACK unpublished capture is inexact")
+        with self._retention_lock:
+            self._require_retention_mutation_permitted()
+            self._require_usable()
+            authenticated_stat = self._authenticated_stat
+            authenticated_hasher = self._authenticated_hasher
+            if authenticated_stat is None or authenticated_hasher is None:
+                raise AckJournalAuthorityError(
+                    "ACK unpublished capture lost its authenticated anchor"
+                )
+            anchor = _AckUnpublishedAnchor(
+                lifecycle=self._lifecycle_identity,
+                store_lifecycle=self._store._lifecycle_identity,
+                descriptor=self._descriptor,
+                journal_stat=os.fstat(self._descriptor),
+                authenticated_stat=authenticated_stat,
+                authenticated_hasher=authenticated_hasher,
+                authenticated_digest=authenticated_hasher.digest(),
+                size=self._size,
+                previous_hash=self._previous_hash,
+                confirmed=self._confirmed,
+                pending=self._pending,
+                generation=self._confirmed_generation,
+                prefix_size=self._committed_prefix_size,
+                prefix_sha256=self._committed_prefix_sha256,
+                acceptance_cursor=acceptance_cursor,
+            )
+            self._validate_unpublished_anchor_locked(anchor)
+            return anchor
+
+    def _revalidate_unpublished_anchor(
+        self,
+        anchor: _AckUnpublishedAnchor,
+    ) -> None:
+        with self._retention_lock:
+            self._validate_unpublished_anchor_locked(anchor)
+
+    def _evaluate_unpublished_anchor(
+        self,
+        anchor: _AckUnpublishedAnchor,
+        callback: Callable[[], _AckCallbackResult],
+        *,
+        _factory: object,
+    ) -> _AckCallbackResult:
+        if _factory is not _ACK_UNPUBLISHED_ANCHOR_FACTORY or not callable(callback):
+            raise AckJournalAuthorityError("ACK unpublished evaluation is inexact")
+        with self._retention_lock:
+            self._validate_unpublished_anchor_locked(anchor)
+            result = callback()
+            self._validate_unpublished_anchor_locked(anchor)
+            return result
 
     def record_pending(self, ref: EvidenceRef) -> None:
         """Durably establish the one exact observer ACK permitted in flight."""

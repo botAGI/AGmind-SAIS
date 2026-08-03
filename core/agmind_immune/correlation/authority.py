@@ -8,7 +8,6 @@ import weakref
 from _thread import RLock as RLockType
 from collections.abc import Callable
 from dataclasses import dataclass
-from threading import Lock
 from typing import Never, Protocol, Self, SupportsIndex, cast, final
 
 from agmind_immune.canonicaljson import pcc_detector_bundle_sha256
@@ -465,7 +464,7 @@ _STORE_LIFECYCLE_OWNERS: dict[
     tuple[int, int],
     _StoreLifecycleOwner,
 ] = {}
-_ISSUED_AUTHORITIES_LOCK = Lock()
+_ISSUED_AUTHORITIES_LOCK = RLockType()
 
 
 def _safe_detector_bundle_sha256() -> str:
@@ -639,6 +638,70 @@ def _validate_correlation_projection_terminal_authority(
         raise CorrelationProjectionError(
             "correlation terminal authority validation failed"
         ) from error
+
+
+def _evaluate_correlation_projection_terminal_authority[TerminalResult](
+    authority: CorrelationProjectionAuthority,
+    expected: _ProjectionPredecessor,
+    callback: Callable[[], TerminalResult],
+) -> TerminalResult:
+    if not callable(callback):
+        raise CorrelationProjectionError(
+            "correlation terminal callback is not callable"
+        )
+    try:
+        expected_before = _clone_predecessor(expected)
+        binding = _authority_binding(authority)
+    except CorrelationProjectionError:
+        raise
+    except Exception as error:
+        raise CorrelationProjectionError(
+            "correlation terminal authority evaluation failed"
+        ) from error
+    with binding.lock:
+        revision = binding.revision
+        registry = binding.registry
+        registry_facts = binding.registry_facts
+        detector_bundle_sha256 = binding.detector_bundle_sha256
+
+        def validate_locked() -> None:
+            try:
+                _require_authority_locked(authority, binding)
+                predecessor_before = _clone_predecessor(binding.predecessor)
+                current_registry_facts = _registry_facts(binding.registry)
+                current_detector = _safe_detector_bundle_sha256()
+                predecessor_after = _clone_predecessor(binding.predecessor)
+                registry_facts_after = _registry_facts(binding.registry)
+                if (
+                    _clone_predecessor(expected) != expected_before
+                    or predecessor_before != expected_before
+                    or predecessor_after != expected_before
+                    or binding.revision is not revision
+                    or binding.registry is not registry
+                    or binding.registry_facts is not registry_facts
+                    or type(current_registry_facts) is not type(registry_facts)
+                    or current_registry_facts != registry_facts
+                    or type(registry_facts_after) is not type(registry_facts)
+                    or registry_facts_after != registry_facts
+                    or binding.detector_bundle_sha256 is not detector_bundle_sha256
+                    or type(current_detector) is not str
+                    or current_detector != detector_bundle_sha256
+                    or not special_use_registry_is_issued(binding.registry)
+                ):
+                    raise CorrelationProjectionError(
+                        "correlation terminal predecessor or pins changed"
+                    )
+            except CorrelationProjectionError:
+                raise
+            except Exception as error:
+                raise CorrelationProjectionError(
+                    "correlation terminal authority validation failed"
+                ) from error
+
+        validate_locked()
+        result = callback()
+        validate_locked()
+        return result
 
 
 def _create_correlation_projection_authority(

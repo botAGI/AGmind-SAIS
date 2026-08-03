@@ -21,14 +21,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
+from functools import wraps
 from itertools import pairwise
 from pathlib import Path
-from threading import Lock
+from threading import Lock, get_ident
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
     BinaryIO,
+    Concatenate,
     Literal,
     Never,
     SupportsIndex,
@@ -160,6 +162,7 @@ _RETENTION_PROOF_FACTORY = object()
 _RETENTION_BLOCKED_CLEAR_FACTORY = object()
 _RETENTION_ACK_RECOVERY_FACTORY = object()
 _RETENTION_ACK_GATE_FACTORY = object()
+_SOURCE_TERMINAL_FACTORY = object()
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _ZERO_SHA256 = "0" * 64
 _UTC_TIMESTAMP = re.compile(
@@ -178,6 +181,54 @@ _ATOMIC_RENAME_UNAVAILABLE = frozenset(
 
 class EvidenceStoreError(RuntimeError):
     """Base class for evidence-store failures."""
+
+
+def _source_mutation_checkpoint(store: SegmentStore, stage: str) -> None:
+    del store, stage
+
+
+def _source_mutation[**SourceMutationP, SourceMutationR](
+    method: Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR],
+) -> Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR]:
+    @wraps(method)
+    def guarded(
+        store: SegmentStore,
+        *args: SourceMutationP.args,
+        **kwargs: SourceMutationP.kwargs,
+    ) -> SourceMutationR:
+        store._begin_source_mutation(allow_during_terminal=False)
+        try:
+            _source_mutation_checkpoint(store, "writer-entered")
+            return method(store, *args, **kwargs)
+        finally:
+            store._end_source_mutation()
+
+    return cast(
+        "Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR]",
+        guarded,
+    )
+
+
+def _source_health_mutation[**SourceMutationP, SourceMutationR](
+    method: Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR],
+) -> Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR]:
+    @wraps(method)
+    def guarded(
+        store: SegmentStore,
+        *args: SourceMutationP.args,
+        **kwargs: SourceMutationP.kwargs,
+    ) -> SourceMutationR:
+        store._begin_source_mutation(allow_during_terminal=True)
+        try:
+            _source_mutation_checkpoint(store, "health-writer-entered")
+            return method(store, *args, **kwargs)
+        finally:
+            store._end_source_mutation()
+
+    return cast(
+        "Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR]",
+        guarded,
+    )
 
 
 class EvidenceSealError(EvidenceStoreError):
@@ -2338,6 +2389,11 @@ class SegmentStore:
         health_step_hook: Callable[[str], None] | None = None,
         segment_create_step_hook: Callable[[str], None] | None = None,
     ) -> None:
+        self._source_gate = Lock()
+        self._source_terminal_token: object | None = None
+        self._source_active_writers = 0
+        self._source_revision = 0
+        self._source_writer_depths: dict[int, int] = {}
         self._repair_mode = bool(getattr(self, "_repair_mode", False))
         self._repair_pending = self._repair_mode
         self._repair_pretruncate = self._repair_mode
@@ -2530,6 +2586,88 @@ class SegmentStore:
             os.close(self._root_descriptor)
             self._closed = True
             raise
+
+    def _begin_source_mutation(self, *, allow_during_terminal: bool) -> None:
+        thread_id = get_ident()
+        with self._source_gate:
+            depth = self._source_writer_depths.get(thread_id, 0)
+            if type(depth) is not int or depth < 0:
+                raise EvidenceStoreError("source mutation nesting changed")
+            if depth:
+                self._source_writer_depths[thread_id] = depth + 1
+                return
+            if self._source_terminal_token is not None and not allow_during_terminal:
+                raise EvidenceStoreError("source terminal evaluation is active")
+            if (
+                type(self._source_active_writers) is not int
+                or self._source_active_writers < 0
+                or type(self._source_revision) is not int
+                or self._source_revision < 0
+            ):
+                raise EvidenceStoreError("source mutation fence state changed")
+            self._source_active_writers += 1
+            self._source_revision += 1
+            self._source_writer_depths[thread_id] = 1
+
+    def _end_source_mutation(self) -> None:
+        thread_id = get_ident()
+        with self._source_gate:
+            depth = self._source_writer_depths.get(thread_id)
+            if type(depth) is not int or depth < 1:
+                raise EvidenceStoreError("source mutation scope was lost")
+            if depth > 1:
+                self._source_writer_depths[thread_id] = depth - 1
+                return
+            self._source_writer_depths.pop(thread_id, None)
+            if type(self._source_active_writers) is not int or self._source_active_writers < 1:
+                raise EvidenceStoreError("source active-writer count changed")
+            self._source_active_writers -= 1
+
+    def _evaluate_source_terminal[SourceTerminalResult](
+        self,
+        lifecycle: object,
+        callback: Callable[[], SourceTerminalResult],
+        *,
+        _factory: object,
+    ) -> SourceTerminalResult:
+        if (
+            _factory is not _SOURCE_TERMINAL_FACTORY
+            or lifecycle is not self._lifecycle_identity
+            or not callable(callback)
+        ):
+            raise EvidenceStoreError("source terminal evaluation lacks exact authority")
+        terminal_token = object()
+        with self._source_gate:
+            if (
+                self._source_terminal_token is not None
+                or type(self._source_active_writers) is not int
+                or self._source_active_writers != 0
+                or type(self._source_revision) is not int
+                or self._source_revision < 0
+            ):
+                raise EvidenceStoreError("source terminal evaluation conflicts with a writer")
+            revision = self._source_revision
+            self._source_terminal_token = terminal_token
+        try:
+            result = callback()
+        except BaseException:
+            with self._source_gate:
+                if self._source_terminal_token is terminal_token:
+                    self._source_terminal_token = None
+            raise
+        with self._source_gate:
+            valid = (
+                self._source_terminal_token is terminal_token
+                and type(self._source_active_writers) is int
+                and self._source_active_writers == 0
+                and type(self._source_revision) is int
+                and self._source_revision == revision
+            )
+            if self._source_terminal_token is terminal_token:
+                self._source_terminal_token = None
+        if not valid:
+            raise EvidenceStoreError("source changed during terminal evaluation")
+        return result
 
     @classmethod
     def open_tail_repair(
@@ -3086,6 +3224,7 @@ class SegmentStore:
         )
         return prior
 
+    @_source_mutation
     def _freeze_retention_snapshot(
         self,
         clock: CoreClockSample,
@@ -4176,6 +4315,7 @@ class SegmentStore:
             decode_retention_state(binding.commit_uncertain_state_raw)
         )
 
+    @_source_mutation
     def _execute_authenticated_retention_unlink(
         self,
         capability: object,
@@ -4604,6 +4744,7 @@ class SegmentStore:
             ) from error
         return selected, boundary_raw
 
+    @_source_mutation
     def _finalize_authenticated_retention_completion(
         self,
         capability: object,
@@ -4851,6 +4992,7 @@ class SegmentStore:
                 "retention completion finalization is uncertain"
             ) from error
 
+    @_source_mutation
     def _clear_authenticated_retention_blocked(
         self,
         journal: object,
@@ -5371,6 +5513,7 @@ class SegmentStore:
                 "retention-state temporary requires startup recovery"
             )
 
+    @_source_mutation
     def _commit_retention_state_bytes(
         self,
         raw: bytes,
@@ -8557,6 +8700,7 @@ class SegmentStore:
                 raise EvidenceCorrupt("health intent and final marker disagree")
             self._read_only_reason = marker.reason
 
+    @_source_health_mutation
     def _trip_read_only(self, reason: str) -> None:
         if reason not in {"segment_corrupt", "evidence_conflict"}:
             raise ValueError("unsupported evidence read-only reason")
@@ -11243,6 +11387,7 @@ class SegmentStore:
                 )
         self._authenticated_retired_ranges = tuple(merged)
 
+    @_source_mutation
     def _retire_authenticated_retention_records(
         self,
         state: object,
@@ -11910,6 +12055,7 @@ class SegmentStore:
             raise
         self._authority_state = "ready"
 
+    @_source_mutation
     def append(
         self,
         envelope: VerifiedEnvelope,
@@ -12243,6 +12389,7 @@ class SegmentStore:
         self._active = active
         return active, frame
 
+    @_source_mutation
     def flush_security_boundary(self) -> None:
         if (
             self._authority_state == "retention_uncertain"
@@ -12372,6 +12519,7 @@ class SegmentStore:
                 ref=record.ref,
             )
 
+    @_source_mutation
     def close(self, *, flush: bool = True) -> None:
         if self._closed:
             return
