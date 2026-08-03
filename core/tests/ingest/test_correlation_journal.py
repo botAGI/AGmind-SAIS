@@ -716,6 +716,191 @@ def test_completed_snapshot_batch_is_ordered_and_replays_exactly_twice(
         store.close()
 
 
+def test_completed_snapshot_batch_items_use_o1_anchor_then_full_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, journal, first, second = _two_completed_snapshot_case(tmp_path)
+    real_replay = journal._authenticated_journal_replay
+    replay_count = 0
+
+    def counted_replay() -> object:
+        nonlocal replay_count
+        replay_count += 1
+        return real_replay()
+
+    monkeypatch.setattr(journal, "_authenticated_journal_replay", counted_replay)
+    try:
+        batch = correlation_module._issue_completed_snapshot_batch(
+            journal,
+            (second, first),
+        )
+        items = correlation_module._completed_snapshot_batch_items(batch)
+        assert replay_count == 2
+
+        proofs = tuple(
+            correlation_module._revalidate_completed_snapshot(item)
+            for item in items
+        )
+
+        assert tuple(proof.event_id for proof in proofs) == (
+            second.event_id,
+            first.event_id,
+        )
+        assert replay_count == 2
+        correlation_module._seal_completed_snapshot_batch(batch)
+        assert replay_count == 3
+        with pytest.raises(CorrelationRequestJournalAuthorityError):
+            correlation_module._revalidate_completed_snapshot(items[0])
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_completed_snapshot_batch_item_rejects_append_only_extension_in_o1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = private_key(11)
+    coordinator = _coordinator(tmp_path, key)
+    _accept(coordinator, boot_boundary(key))
+    journal = CorrelationRequestJournal.create_new(coordinator.segment_store)
+    trigger = _candidate_trigger(key, sequence=2)
+    trigger_ref = _accept(coordinator, trigger)
+    assert isinstance(trigger_ref, EvidenceRef)
+    request = _request(trigger_ref)
+    selected = journal.select(trigger_ref, canonical_json(request))
+    snapshot_ref = _accept_snapshot(coordinator, trigger, request, sequence=3)
+    journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+    journal.mark_completed(selected.request_sha256)
+    real_replay = journal._authenticated_journal_replay
+    replay_count = 0
+
+    def counted_replay() -> object:
+        nonlocal replay_count
+        replay_count += 1
+        return real_replay()
+
+    monkeypatch.setattr(journal, "_authenticated_journal_replay", counted_replay)
+    batch = correlation_module._issue_completed_snapshot_batch(
+        journal,
+        (snapshot_ref,),
+    )
+    item = correlation_module._completed_snapshot_batch_items(batch)[0]
+    assert replay_count == 2
+    later_trigger = _candidate_trigger(key, sequence=4)
+    later_ref = _accept(coordinator, later_trigger)
+    assert isinstance(later_ref, EvidenceRef)
+    journal.select(later_ref, canonical_json(_request(later_ref)))
+
+    try:
+        with pytest.raises(CorrelationRequestJournalAuthorityError):
+            correlation_module._revalidate_completed_snapshot(item)
+        assert replay_count == 2
+        assert journal._healthy is True
+    finally:
+        journal.close()
+        coordinator.segment_store.close()
+
+
+def test_completed_snapshot_batch_item_rejects_revoke_during_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, journal, first, _second = _two_completed_snapshot_case(tmp_path)
+    batch = correlation_module._issue_completed_snapshot_batch(
+        journal,
+        (first,),
+    )
+    item = correlation_module._completed_snapshot_batch_items(batch)[0]
+    real_exact = store._authenticated_pcc_input_is_exact
+    revoked = False
+
+    def revoke_during_exact_check(proof: object) -> bool:
+        nonlocal revoked
+        if not revoked:
+            revoked = True
+            correlation_module._revoke_completed_snapshot_batch(batch)
+        return real_exact(proof)
+
+    monkeypatch.setattr(
+        store,
+        "_authenticated_pcc_input_is_exact",
+        revoke_during_exact_check,
+    )
+    try:
+        with pytest.raises(
+            CorrelationRequestJournalAuthorityError,
+            match="batch item was revoked",
+        ):
+            correlation_module._revalidate_completed_snapshot(item)
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_completed_snapshot_batch_seal_rejects_revoke_during_final_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, journal, first, _second = _two_completed_snapshot_case(tmp_path)
+    real_replay = journal._authenticated_journal_replay
+    replay_count = 0
+    batch: object | None = None
+
+    def revoke_during_final_replay() -> object:
+        nonlocal replay_count
+        replay_count += 1
+        if replay_count == 3:
+            assert batch is not None
+            correlation_module._revoke_completed_snapshot_batch(batch)
+        return real_replay()
+
+    monkeypatch.setattr(
+        journal,
+        "_authenticated_journal_replay",
+        revoke_during_final_replay,
+    )
+    batch = correlation_module._issue_completed_snapshot_batch(
+        journal,
+        (first,),
+    )
+    correlation_module._completed_snapshot_batch_items(batch)
+    try:
+        with pytest.raises(
+            CorrelationRequestJournalAuthorityError,
+            match="batch was revoked during final seal",
+        ):
+            correlation_module._seal_completed_snapshot_batch(batch)
+    finally:
+        journal.close()
+        store.close()
+
+
+@pytest.mark.parametrize("attack", ["substitution", "reuse"])
+def test_completed_snapshot_batch_rejects_substitution_and_item_reuse(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    store, journal, first, second = _two_completed_snapshot_case(tmp_path)
+    batch = correlation_module._issue_completed_snapshot_batch(
+        journal,
+        (first, second),
+    )
+    items = correlation_module._completed_snapshot_batch_items(batch)
+    try:
+        if attack == "substitution":
+            object.__setattr__(items[0], "_token", object())
+            with pytest.raises(CorrelationRequestJournalAuthorityError):
+                correlation_module._revalidate_completed_snapshot(items[0])
+        else:
+            with pytest.raises(CorrelationRequestJournalAuthorityError):
+                correlation_module._completed_snapshot_batch_items(batch)
+    finally:
+        journal.close()
+        store.close()
+
+
 @pytest.mark.parametrize("invalid", ["duplicate", "subclass", "overflow"])
 def test_completed_snapshot_batch_rejects_invalid_ref_sets(
     tmp_path: Path,

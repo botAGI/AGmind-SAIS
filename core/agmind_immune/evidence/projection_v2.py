@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from _thread import RLock as RLockType
@@ -32,6 +33,7 @@ from agmind_immune.correlation.authority import (
     _issue_correlation_context,
     _ProjectionPredecessor,
     _same_exact_pcc,
+    _validate_correlation_projection_pins,
     _validate_correlation_projection_predecessor,
 )
 from agmind_immune.correlation.pcc import (
@@ -47,13 +49,27 @@ from agmind_immune.correlation.pcc import (
     correlate_pcc,
     incident_from_verified_falco,
 )
-from agmind_immune.correlation.primitives import SpecialUseRegistry
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    special_use_registry_is_issued,
+)
 from agmind_immune.coverage.historical import (
     HistoricalCoverageConflict,
     HistoricalCoverageUnavailable,
+    _activate_replay_historical_session,
+    _begin_replay_historical_commit,
+    _begin_replay_historical_event,
+    _begin_replay_historical_validation,
+    _close_replay_historical_session,
+    _compare_replay_historical_primary,
+    _complete_replay_historical_event,
+    _derive_replay_historical_coverage,
+    _final_seal_replay_historical_session,
+    _issue_replay_historical_path_authority,
     _late_coverage_invalidates_candidate,
     _late_coverage_may_invalidate_candidate,
-    derive_historical_coverage,
+    _revalidate_replay_historical_source,
+    _validate_replay_historical_event,
 )
 from agmind_immune.evidence.dedup import _logical_primary_identity_v2
 from agmind_immune.evidence.projection import (
@@ -80,10 +96,16 @@ from agmind_immune.ingest.ack_journal import (
     AckJournalSnapshot,
 )
 from agmind_immune.ingest.correlation_journal import (
+    _MAX_COMPLETED_BATCH,
     CorrelationRequestJournal,
     CorrelationRequestJournalError,
+    _completed_snapshot_batch_items,
+    _CompletedSnapshotBatchAuthority,
     _evaluate_completed_snapshot_batch,
+    _issue_completed_snapshot_batch,
     _revalidate_completed_snapshot,
+    _revoke_completed_snapshot_batch,
+    _seal_completed_snapshot_batch,
 )
 from agmind_immune.ingest.envelope import AuthenticatedPCCInput
 
@@ -96,6 +118,8 @@ _SCHEMA_META_V2 = {
     "snapshot_layout": "AGMIND_PROJECTION_SNAPSHOT_V2",
 }
 _SNAPSHOT_DOMAIN_V2 = b"AGMIND_PROJECTION_SNAPSHOT_V2\0"
+_UNPUBLISHED_REPLAY_FACTORY = object()
+_UNPUBLISHED_PCC_CHUNK = _MAX_COMPLETED_BATCH
 _UINT64_V2 = re.compile(r"^[0-9]{20}$")
 _EVENT_ID_V2 = re.compile(r"^evt_[0-9a-f]{64}$")
 _CANDIDATE_ID_V2 = re.compile(r"^cand_[0-9a-f]{64}$")
@@ -324,6 +348,24 @@ class _PreparedV2Record:
 class _LateCandidateV2:
     candidate: ContainmentCandidateV1
     snapshot_ref: EvidenceRef
+
+
+@dataclass(frozen=True, slots=True)
+class _UnpublishedV2ReplayReport:
+    cursor: ProjectionCursor
+    applied_count: int
+    prefix_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _UnpublishedAckAnchor:
+    boundary: _ProjectionAckBoundaryV2
+    lifecycle: object
+    descriptor: int
+    journal_stat: os.stat_result
+    authenticated_digest: bytes
+    size: int
+    previous_hash: bytes
 
 
 def _encode_uint64_v2(value: object) -> str:
@@ -1527,6 +1569,72 @@ class _V2ProjectionOwner:
             )
         return boundary
 
+    def _freeze_unpublished_ack_anchor(
+        self,
+        acceptance_cursor: int,
+    ) -> _UnpublishedAckAnchor:
+        boundary = self._freeze_ack_boundary(acceptance_cursor)
+        acknowledgements = self._acknowledgements
+        authenticated_stat = acknowledgements._authenticated_stat
+        authenticated_hasher = acknowledgements._authenticated_hasher
+        if authenticated_stat is None or authenticated_hasher is None:
+            raise ProjectionAuthorityError(
+                "Projection V2 unpublished ACK lost its authenticated anchor"
+            )
+        return _UnpublishedAckAnchor(
+            boundary=boundary,
+            lifecycle=self._ack_lifecycle,
+            descriptor=acknowledgements._descriptor,
+            journal_stat=authenticated_stat,
+            authenticated_digest=authenticated_hasher.digest(),
+            size=acknowledgements._size,
+            previous_hash=acknowledgements._previous_hash,
+        )
+
+    def _revalidate_unpublished_ack_anchor(
+        self,
+        anchor: _UnpublishedAckAnchor,
+        acceptance_cursor: int,
+    ) -> None:
+        acknowledgements = self._acknowledgements
+        authenticated_stat = acknowledgements._authenticated_stat
+        authenticated_hasher = acknowledgements._authenticated_hasher
+        try:
+            descriptor_stat = os.fstat(acknowledgements._descriptor)
+        except OSError as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 unpublished ACK descriptor is unavailable"
+            ) from error
+        if (
+            type(anchor) is not _UnpublishedAckAnchor
+            or self._healthy_acceptance_cursor() != acceptance_cursor
+            or acknowledgements._lifecycle_identity is not anchor.lifecycle
+            or acknowledgements._descriptor != anchor.descriptor
+            or acknowledgements._healthy is not True
+            or acknowledgements._closed is not False
+            or acknowledgements._closing is not False
+            or authenticated_stat is None
+            or authenticated_hasher is None
+            or descriptor_stat != anchor.journal_stat
+            or authenticated_stat != anchor.journal_stat
+            or authenticated_hasher.digest() != anchor.authenticated_digest
+            or acknowledgements._size != anchor.size
+            or acknowledgements._previous_hash != anchor.previous_hash
+            or _exact_ack_identity_v2(acknowledgements._confirmed)
+            != anchor.boundary.confirmed
+            or _exact_ack_identity_v2(acknowledgements._pending)
+            != anchor.boundary.pending
+            or acknowledgements._confirmed_generation
+            != anchor.boundary.generation
+            or acknowledgements._committed_prefix_size
+            != anchor.boundary.prefix_size
+            or acknowledgements._committed_prefix_sha256
+            != anchor.boundary.prefix_sha256
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 unpublished ACK anchor changed"
+            )
+
     def _revalidate_ack_boundary(
         self,
         frozen: _ProjectionAckBoundaryV2,
@@ -1774,11 +1882,16 @@ class _V2ProjectionOwner:
         authority: CorrelationProjectionAuthority,
         predecessor: _ProjectionPredecessor,
         prepared: _PreparedV2Record,
+        completed_authority: object | None = None,
     ) -> tuple[
         AuthenticatedPCCInput,
         CandidateCreated | Duplicate | InvestigationOnly | Rejected,
     ]:
-        completed = self._journal.completed_for_snapshot(prepared.record.ref)
+        completed = (
+            self._journal.completed_for_snapshot(prepared.record.ref)
+            if completed_authority is None
+            else completed_authority
+        )
         proof = _revalidate_completed_snapshot(completed)
         if (
             type(proof) is not AuthenticatedPCCInput
@@ -1835,6 +1948,7 @@ class _V2ProjectionOwner:
         prepared: _PreparedV2Record,
         *,
         is_primary: bool,
+        completed_authority: object | None = None,
     ) -> None:
         event_id = prepared.envelope.event_id
         self._validate_coverage_invalidation_closure(
@@ -1878,6 +1992,7 @@ class _V2ProjectionOwner:
                 authority,
                 predecessor,
                 prepared,
+                completed_authority,
             )
             if isinstance(result, CandidateCreated):
                 result_kind = "candidate"
@@ -2003,6 +2118,7 @@ class _V2ProjectionOwner:
         prepared: _PreparedV2Record,
         *,
         is_primary: bool,
+        completed_authority: object | None = None,
     ) -> None:
         self._validate_retry_base_closure(
             connection,
@@ -2015,6 +2131,7 @@ class _V2ProjectionOwner:
             predecessor,
             prepared,
             is_primary=is_primary,
+            completed_authority=completed_authority,
         )
 
     def _validate_persisted_prefix(
@@ -2023,6 +2140,7 @@ class _V2ProjectionOwner:
         authority: CorrelationProjectionAuthority,
         predecessor: _ProjectionPredecessor,
         cursor: ProjectionCursor | None,
+        completed_by_event: dict[str, object] | None = None,
     ) -> str:
         prefix_sha256 = _v2_snapshot_hash(connection)
         if cursor is None:
@@ -2142,12 +2260,27 @@ class _V2ProjectionOwner:
                     raise ProjectionConflict(
                         "Projection V2 persisted logical primary changed"
                     )
+            completed_authority: object | None = None
+            if (
+                completed_by_event is not None
+                and prepared.envelope.event_type == "pcc_correlation_snapshot"
+            ):
+                try:
+                    completed_authority = completed_by_event[
+                        prepared.envelope.event_id
+                    ]
+                except KeyError as error:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished prefix is missing completed "
+                        "PCC batch authority"
+                    ) from error
             self._validate_retry_closure(
                 connection,
                 authority,
                 predecessor,
                 prepared,
                 is_primary=is_primary,
+                completed_authority=completed_authority,
             )
             falco = prepared.falco
             if (
@@ -2353,6 +2486,239 @@ class _V2ProjectionOwner:
                 ack_boundary,
             )
 
+    def _replay_unpublished_prefix(
+        self,
+        through: EvidenceRef,
+        *,
+        _factory: object,
+    ) -> _UnpublishedV2ReplayReport:
+        with self._mutex:
+            connection, authority = self._require_usable()
+            if _factory is not _UNPUBLISHED_REPLAY_FACTORY or type(through) is not EvidenceRef:
+                raise ProjectionAuthorityError(
+                    "Projection V2 unpublished replay is factory-only"
+                )
+            _verify_v2_schema(connection)
+            if _current_v2_cursor(connection) is not None or any(
+                connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                for table, _columns, _primary_key in _TABLE_LAYOUT_V2[1:]
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 unpublished replay requires an empty database"
+                )
+            acceptance_cursor = self._healthy_acceptance_cursor()
+            ack_anchor = self._freeze_unpublished_ack_anchor(acceptance_cursor)
+            ack_boundary = ack_anchor.boundary
+            if (
+                acceptance_cursor != through.source_sequence
+                or ack_boundary.pending is not None
+                or ack_boundary.confirmed != AckIdentity.from_ref(through)
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 unpublished replay requires strict ACK equality"
+                )
+            try:
+                records = tuple(
+                    self._evidence.iter_authenticated_records(
+                        through=through.source_sequence,
+                    )
+                )
+            except Exception as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 unpublished source prefix is unavailable"
+                ) from error
+            if (
+                not records
+                or records[-1].ref != through
+                or len(records) != through.source_sequence
+                or any(
+                    record.ref.source_sequence != index
+                    for index, record in enumerate(records, start=1)
+                )
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 unpublished source prefix is not exact and contiguous"
+                )
+            prepared_records = tuple(_prepare_v2(record) for record in records)
+            snapshot_refs = tuple(
+                prepared.record.ref
+                for prepared in prepared_records
+                if prepared.envelope.event_type == "pcc_correlation_snapshot"
+            )
+
+            try:
+                historical_session, historical_token = (
+                    _activate_replay_historical_session(
+                        self._evidence,
+                        through,
+                    )
+                )
+            except HistoricalCoverageUnavailable as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 unpublished historical session is unavailable"
+                ) from error
+            batches: list[_CompletedSnapshotBatchAuthority] = []
+            completed_by_event: dict[str, object] = {}
+            try:
+                for offset in range(0, len(snapshot_refs), _UNPUBLISHED_PCC_CHUNK):
+                    refs = snapshot_refs[offset : offset + _UNPUBLISHED_PCC_CHUNK]
+                    batch = _issue_completed_snapshot_batch(self._journal, refs)
+                    items = _completed_snapshot_batch_items(batch)
+                    batches.append(batch)
+                    for ref, item in zip(refs, items, strict=True):
+                        completed_by_event[ref.event_id] = item
+                result: ProjectionApplyResult | None = None
+                for prepared in prepared_records:
+                    replay_event_token = _begin_replay_historical_event(
+                        historical_session,
+                        prepared.record.ref,
+                    )
+                    cursor = _current_v2_cursor(connection)
+                    predecessor = _predecessor_v2(self._generation, cursor)
+                    _validate_correlation_projection_predecessor(
+                        authority,
+                        predecessor,
+                    )
+                    completed = completed_by_event.get(
+                        prepared.envelope.event_id
+                    )
+                    result = self._apply_prepared(
+                        connection,
+                        authority,
+                        predecessor,
+                        prepared,
+                        acceptance_cursor,
+                        ack_boundary,
+                        completed,
+                        ack_anchor,
+                        replay_event_token,
+                    )
+                    _complete_replay_historical_event(replay_event_token)
+                if result is None or result.cursor.source_sequence != through.source_sequence:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished replay did not reach its exact boundary"
+                    )
+                current_ack = self._current_ack_boundary()
+                if (
+                    self._healthy_acceptance_cursor() != acceptance_cursor
+                    or current_ack != ack_boundary
+                    or self._evidence.resolve_authenticated_ref(through).ref != through
+                ):
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished source or ACK authority changed"
+                    )
+                cursor = _current_v2_cursor(connection)
+                predecessor = _predecessor_v2(self._generation, cursor)
+                _validate_correlation_projection_predecessor(
+                    authority,
+                    predecessor,
+                )
+                try:
+                    _begin_replay_historical_validation(historical_session)
+                except (
+                    HistoricalCoverageConflict,
+                    HistoricalCoverageUnavailable,
+                ) as error:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished final historical authority changed"
+                    ) from error
+                try:
+                    sealed_cursor = _current_v2_cursor(connection)
+                    if (
+                        not special_use_registry_is_issued(self._registry)
+                        or cursor != result.cursor
+                        or sealed_cursor != result.cursor
+                    ):
+                        raise ProjectionAuthorityError(
+                            "Projection V2 unpublished final seal changed"
+                        )
+                    self._revalidate_unpublished_ack_anchor(
+                        ack_anchor,
+                        acceptance_cursor,
+                    )
+                    if (
+                        self._healthy_acceptance_cursor() != acceptance_cursor
+                        or self._evidence.resolve_authenticated_ref(through).ref
+                        != through
+                    ):
+                        raise ProjectionAuthorityError(
+                            "Projection V2 unpublished final source changed"
+                        )
+                    _validate_correlation_projection_predecessor(
+                        authority,
+                        _predecessor_v2(self._generation, sealed_cursor),
+                    )
+                except ProjectionAuthorityError:
+                    raise
+                except Exception as error:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished final seal authority changed"
+                    ) from error
+                prefix_sha256 = self._validate_persisted_prefix(
+                    connection,
+                    authority,
+                    predecessor,
+                    cursor,
+                    completed_by_event,
+                )
+                if (
+                    cursor != result.cursor
+                    or _current_v2_cursor(connection) != cursor
+                    or _v2_snapshot_hash(connection) != prefix_sha256
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 unpublished final prefix changed"
+                    )
+                try:
+                    _revalidate_replay_historical_source(historical_session)
+                except HistoricalCoverageUnavailable as error:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished source changed after prefix seal"
+                    ) from error
+                for batch in tuple(batches):
+                    _seal_completed_snapshot_batch(batch)
+                    batches.remove(batch)
+                final_ack = self._current_ack_boundary()
+                final_cursor = _current_v2_cursor(connection)
+                if (
+                    self._healthy_acceptance_cursor() != acceptance_cursor
+                    or final_ack != ack_boundary
+                    or final_cursor != result.cursor
+                    or self._evidence.resolve_authenticated_ref(through).ref
+                    != through
+                    or _v2_snapshot_hash(connection) != prefix_sha256
+                ):
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished authority changed after final seal"
+                    )
+                _validate_correlation_projection_predecessor(
+                    authority,
+                    _predecessor_v2(self._generation, final_cursor),
+                )
+                try:
+                    _validate_correlation_projection_pins(authority)
+                    _final_seal_replay_historical_session(historical_session)
+                except (
+                    CorrelationProjectionError,
+                    HistoricalCoverageConflict,
+                    HistoricalCoverageUnavailable,
+                ) as error:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished terminal authority changed"
+                    ) from error
+                return _UnpublishedV2ReplayReport(
+                    cursor=result.cursor,
+                    applied_count=len(prepared_records),
+                    prefix_sha256=prefix_sha256,
+                )
+            finally:
+                for batch in batches:
+                    _revoke_completed_snapshot_batch(batch)
+                _close_replay_historical_session(
+                    historical_session,
+                    historical_token,
+                )
+
     def _revalidate_transaction_predecessor(
         self,
         connection: sqlite3.Connection,
@@ -2361,12 +2727,19 @@ class _V2ProjectionOwner:
         prepared: _PreparedV2Record,
         acceptance_cursor: int,
         ack_boundary: _ProjectionAckBoundaryV2,
+        unpublished_ack: _UnpublishedAckAnchor | None = None,
     ) -> None:
         if self._healthy_acceptance_cursor() != acceptance_cursor:
             raise ProjectionAuthorityError(
                 "Projection V2 acceptance cursor changed inside transaction"
             )
-        self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+        if unpublished_ack is None:
+            self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+        else:
+            self._revalidate_unpublished_ack_anchor(
+                unpublished_ack,
+                acceptance_cursor,
+            )
         current = _current_v2_cursor(connection)
         if _predecessor_v2(self._generation, current) != predecessor:
             raise ProjectionConflict(
@@ -2374,7 +2747,13 @@ class _V2ProjectionOwner:
             )
         self._validate_cursor_evidence(connection, current)
         _validate_correlation_projection_predecessor(authority, predecessor)
-        self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+        if unpublished_ack is None:
+            self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+        else:
+            self._revalidate_unpublished_ack_anchor(
+                unpublished_ack,
+                acceptance_cursor,
+            )
         if self._healthy_acceptance_cursor() != acceptance_cursor:
             raise ProjectionAuthorityError(
                 "Projection V2 acceptance cursor changed during validation"
@@ -2401,6 +2780,9 @@ class _V2ProjectionOwner:
         prepared: _PreparedV2Record,
         acceptance_cursor: int,
         ack_boundary: _ProjectionAckBoundaryV2,
+        completed_authority: object | None = None,
+        unpublished_ack: _UnpublishedAckAnchor | None = None,
+        replay_event_token: object | None = None,
     ) -> ProjectionApplyResult:
         envelope = prepared.envelope
         ref = prepared.record.ref
@@ -2409,6 +2791,11 @@ class _V2ProjectionOwner:
         transaction_started = False
         commit_attempted = False
         try:
+            if replay_event_token is not None:
+                _validate_replay_historical_event(
+                    replay_event_token,
+                    ref,
+                )
             connection.execute("BEGIN IMMEDIATE")
             transaction_started = True
             self._revalidate_transaction_predecessor(
@@ -2418,6 +2805,7 @@ class _V2ProjectionOwner:
                 prepared,
                 acceptance_cursor,
                 ack_boundary,
+                unpublished_ack,
             )
             duplicate_row = connection.execute(
                 "SELECT primary_event_id FROM projection_dedup "
@@ -2435,6 +2823,12 @@ class _V2ProjectionOwner:
                     )
                 duplicate = duplicate_value
             is_primary = duplicate is None
+            if replay_event_token is not None:
+                _compare_replay_historical_primary(
+                    replay_event_token,
+                    ref,
+                    is_primary,
+                )
             primary_event_id = envelope.event_id if is_primary else duplicate
             placeholders = ",".join("?" for _ in _TABLE_LAYOUT_V2[1][1])
             connection.execute(
@@ -2464,7 +2858,8 @@ class _V2ProjectionOwner:
                     predecessor,
                     prepared,
                     acceptance_cursor,
-            )
+                    completed_authority,
+                )
             self._step_hook(_APPLY_STEPS_V2[2])
             self._revalidate_transaction_predecessor(
                 connection,
@@ -2473,6 +2868,7 @@ class _V2ProjectionOwner:
                 prepared,
                 acceptance_cursor,
                 ack_boundary,
+                unpublished_ack,
             )
             connection.execute(
                 "INSERT INTO ingest_cursors("
@@ -2514,11 +2910,22 @@ class _V2ProjectionOwner:
                 raise ProjectionAuthorityError(
                     "Projection V2 acceptance cursor changed before commit"
                 )
-            self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+            if unpublished_ack is None:
+                self._revalidate_ack_boundary(ack_boundary, acceptance_cursor)
+            else:
+                self._revalidate_unpublished_ack_anchor(
+                    unpublished_ack,
+                    acceptance_cursor,
+                )
             _validate_correlation_projection_predecessor(
                 authority,
                 predecessor,
             )
+            if replay_event_token is not None:
+                _begin_replay_historical_commit(
+                    replay_event_token,
+                    ref,
+                )
             commit_attempted = True
             connection.execute("COMMIT")
             transaction_started = False
@@ -2619,6 +3026,7 @@ class _V2ProjectionOwner:
         predecessor: _ProjectionPredecessor,
         prepared: _PreparedV2Record,
         acceptance_cursor: int,
+        completed_authority: object | None = None,
     ) -> Callable[[], None] | None:
         self._reduce_base(connection, prepared)
         if prepared.coverage is not None:
@@ -2680,6 +3088,7 @@ class _V2ProjectionOwner:
                 predecessor,
                 prepared,
                 acceptance_cursor,
+                completed_authority,
             )
         except ProjectionConflict:
             raise
@@ -2982,17 +3391,27 @@ class _V2ProjectionOwner:
         predecessor: _ProjectionPredecessor,
         prepared: _PreparedV2Record,
         acceptance_cursor: int,
+        completed_authority: object | None = None,
     ) -> Callable[[], None]:
         if self._healthy_acceptance_cursor() != acceptance_cursor:
             raise ProjectionAuthorityError(
                 "Projection V2 acceptance changed before PCC history"
             )
         ref = prepared.record.ref
-        completed = self._journal.completed_for_snapshot(ref)
+        completed = (
+            self._journal.completed_for_snapshot(ref)
+            if completed_authority is None
+            else completed_authority
+        )
         initial = _revalidate_completed_snapshot(completed)
         if (
             type(initial) is not AuthenticatedPCCInput
             or not self._evidence._authenticated_pcc_input_is_exact(initial)
+            or type(initial.evidence_ref) is not EvidenceRef
+            or initial.evidence_ref != ref
+            or initial.event_id != ref.event_id
+            or initial.source_sequence != ref.source_sequence
+            or initial.content_sha256 != ref.content_sha256
         ):
             raise CorrelationProjectionError(
                 "completed PCC is not exact same-store authority"
@@ -3001,9 +3420,9 @@ class _V2ProjectionOwner:
         if initial.snapshot.outcome == "failed":
             result = correlate_pcc(initial, CorrelationContext.failed_snapshot())
         else:
-            path = self._evidence._historical_path_authority(initial)
-            coverage_before = derive_historical_coverage(initial, path)
-            if derive_historical_coverage(initial, path) != coverage_before:
+            path = _issue_replay_historical_path_authority(self._evidence, initial)
+            coverage_before = _derive_replay_historical_coverage(initial, path)
+            if _derive_replay_historical_coverage(initial, path) != coverage_before:
                 raise CorrelationProjectionError(
                     "historical coverage changed before duplicate lookup"
                 )
@@ -3283,6 +3702,46 @@ def _v2_projection_owner_for_test(
         registry=registry,
         step_hook=step_hook,
     )
+
+
+def _v2_unpublished_projection_from_prefix_for_test(
+    *,
+    evidence: SegmentStore,
+    acknowledgements: AckJournal,
+    journal: CorrelationRequestJournal,
+    registry: SpecialUseRegistry,
+    through: EvidenceRef,
+    step_hook: Callable[[str], None] | None = None,
+) -> tuple[_V2ProjectionOwner, sqlite3.Connection, _UnpublishedV2ReplayReport]:
+    """Build one fresh dormant V2 projection from an exact ACKed source prefix."""
+    if (
+        type(evidence) is not SegmentStore
+        or type(acknowledgements) is not AckJournal
+        or type(journal) is not CorrelationRequestJournal
+        or type(registry) is not SpecialUseRegistry
+        or type(through) is not EvidenceRef
+    ):
+        raise ProjectionAuthorityError(
+            "unpublished Projection V2 replay requires exact resources"
+        )
+    connection = _v2_connection_for_test()
+    owner = _V2ProjectionOwner._take_ownership(
+        connection,
+        evidence=evidence,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=registry,
+        step_hook=step_hook,
+    )
+    try:
+        report = owner._replay_unpublished_prefix(
+            through,
+            _factory=_UNPUBLISHED_REPLAY_FACTORY,
+        )
+        return owner, connection, report
+    except BaseException as error:
+        owner._close_after_factory_failure(error)
+        raise
 
 
 __all__: list[str] = []

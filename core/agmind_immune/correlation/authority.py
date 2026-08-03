@@ -32,7 +32,8 @@ from agmind_immune.correlation.primitives import (
 )
 from agmind_immune.coverage.historical import (
     HistoricalPathAuthority,
-    derive_historical_coverage,
+    _derive_replay_historical_coverage,
+    _issue_replay_historical_path_authority,
 )
 from agmind_immune.evidence.segments import EvidenceRef, SegmentStore
 from agmind_immune.ingest.correlation_journal import (
@@ -580,6 +581,30 @@ def _validate_correlation_projection_predecessor(
         ) from error
 
 
+def _validate_correlation_projection_pins(
+    authority: CorrelationProjectionAuthority,
+) -> None:
+    try:
+        binding = _authority_binding(authority)
+        with binding.lock:
+            _require_authority_locked(authority, binding)
+            if (
+                not special_use_registry_is_issued(binding.registry)
+                or _registry_facts(binding.registry) != binding.registry_facts
+                or _safe_detector_bundle_sha256()
+                != binding.detector_bundle_sha256
+            ):
+                raise CorrelationProjectionError(
+                    "correlation projection pins changed"
+                )
+    except CorrelationProjectionError:
+        raise
+    except Exception as error:
+        raise CorrelationProjectionError(
+            "correlation projection pin validation failed"
+        ) from error
+
+
 def _create_correlation_projection_authority(
     store: SegmentStore,
     registry: SpecialUseRegistry,
@@ -811,8 +836,8 @@ def _context_issue_facts(
     cursor_before = _healthy_store_cursor(store, binding.store_lifecycle)
     registry_before = _registry_facts(binding.registry)
     detector_before = _safe_detector_bundle_sha256()
-    path = store._historical_path_authority(public_proof)
-    coverage = derive_historical_coverage(public_proof, path)
+    path = _issue_replay_historical_path_authority(store, public_proof)
+    coverage = _derive_replay_historical_coverage(public_proof, path)
     lookup_key = _duplicate_key(public_proof, public_proof.snapshot)
     active_before = _clone_active_duplicate(active_duplicate)
     if (
@@ -827,7 +852,7 @@ def _context_issue_facts(
     trusted_proof = _issue_hidden_pcc(store, public_proof)
 
     revalidated = _revalidate_completed_snapshot(completed)
-    coverage_after = derive_historical_coverage(public_proof, path)
+    coverage_after = _derive_replay_historical_coverage(public_proof, path)
     detector_after = _safe_detector_bundle_sha256()
     registry_after = _registry_facts(binding.registry)
     cursor_after = _healthy_store_cursor(store, binding.store_lifecycle)
@@ -892,7 +917,7 @@ def _validate_issued_context_locked(
         != context_binding.registry_facts
         or _safe_detector_bundle_sha256()
         != context_binding.detector_bundle_sha256
-        or derive_historical_coverage(
+        or _derive_replay_historical_coverage(
             context_binding.public_proof,
             context_binding.path,
         )
