@@ -1,12 +1,40 @@
 from __future__ import annotations
 
+import errno
+import hashlib
+import os
+import resource
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.coverage.historical import (
     _HistoricalReductionResult,
     _reduce_historical_coverage_result,
 )
+from agmind_immune.evidence import segments as segments_module
+from agmind_immune.evidence.frames import decode_frames
+from agmind_immune.evidence.projection import ProjectionAuthorityError
+from agmind_immune.evidence.segments import (
+    MAX_EVIDENCE_RECORD_BYTES,
+    EvidencePriority,
+    EvidenceRef,
+    SegmentStore,
+)
+from agmind_immune.ingest.envelope import EnvelopeVerifier
+from agmind_immune.ingest.service import AcceptanceCoordinator
 from tests.coverage.test_historical import _self_close_records
 from tests.coverage.test_state import T0, T1, _event, _stored
-from tests.phase5b_helpers import BOOT_A, HOST_ID, private_key
+from tests.ingest.test_pcc_correlation_snapshot import _identity, _item
+from tests.phase5b_helpers import (
+    BOOT_A,
+    HOST_ID,
+    NOW,
+    boot_boundary,
+    envelope_value,
+    private_key,
+)
 
 _PCC_CONTENT_HASHES = (
     "6f0db0a71c24c3a490f886bc3537a66826722e188d0557099f3b200876544e9f",
@@ -67,6 +95,189 @@ def no_prefix_scan_pcc_fixture(count: int) -> dict[str, object]:
         "coverage_through_sequence": count,
         "window_end": T1,
     }
+
+
+def _source_envelopes() -> tuple[dict[str, object], dict[str, object]]:
+    key = private_key(11)
+    return (
+        boot_boundary(key),
+        envelope_value(
+            key,
+            sequence=2,
+            normalized_fields={"kind": "snapshot-source"},
+        ),
+    )
+
+
+def _expected_record_literals() -> tuple[bytes, bytes]:
+    protected, routine = _source_envelopes()
+    return tuple(
+        canonical_json(
+            {
+                "schema_version": "agmind.accepted-envelope.v1",
+                "evidence_priority": priority.value,
+                "accepted_at": NOW,
+                "outer": {
+                    "sequence": envelope["source_sequence"],
+                    "event_id": envelope["event_id"],
+                    "content_sha256": hashlib.sha256(
+                        canonical_json(envelope)
+                    ).hexdigest(),
+                },
+                "envelope": envelope,
+            }
+        )
+        for envelope, priority in (
+            (protected, EvidencePriority.PROTECTED),
+            (routine, EvidencePriority.ROUTINE),
+        )
+    )  # type: ignore[return-value]
+
+
+def _build_file_backed_source(
+    path: Path,
+) -> tuple[AcceptanceCoordinator, SegmentStore, EvidenceRef]:
+    key = private_key(11)
+    root, chain = _identity(key)
+    store = SegmentStore(
+        path,
+        wall_clock=lambda: datetime.fromisoformat(NOW),
+    )
+    coordinator = AcceptanceCoordinator.create_empty(
+        EnvelopeVerifier(root, chain),
+        store,
+    )
+    first, second = _source_envelopes()
+    coordinator.accept(_item(first))
+    terminal = coordinator.accept(_item(second))
+    store.flush_security_boundary()
+    store.close()
+
+    recovered = SegmentStore(path)
+    recovered_coordinator = AcceptanceCoordinator.open_and_recover(
+        EnvelopeVerifier(root, chain),
+        recovered,
+    )
+    return recovered_coordinator, recovered, terminal
+
+
+def _decode_snapshot_records(snapshot: object) -> tuple[bytes, ...]:
+    segments = snapshot.segments
+    return tuple(
+        decode_frames(
+            os.pread(
+                segments[record.segment_index].descriptor,
+                record.ref.frame_size,
+                record.ref.frame_offset,
+            ),
+            max_frame=MAX_EVIDENCE_RECORD_BYTES,
+        ).records[0].payload
+        for record in snapshot.records
+    )
+
+
+def _rename_and_unlink_source_paths(store: SegmentStore) -> None:
+    first, second = store.manifests
+    first_path = store.root / first.segment_relative_path
+    first_path.rename(first_path.with_suffix(".moved"))
+    (store.root / second.segment_relative_path).unlink()
+
+
+def _append_next_signed_record(
+    coordinator: AcceptanceCoordinator,
+) -> EvidenceRef:
+    return coordinator.accept(
+        _item(
+            envelope_value(
+                private_key(11),
+                sequence=3,
+                normalized_fields={"kind": "post-snapshot"},
+            )
+        )
+    )
+
+
+def _force_real_second_descriptor_failure(
+    path: Path,
+) -> tuple[None, tuple[int, ...]]:
+    coordinator, store, terminal = _build_file_backed_source(path)
+    del coordinator
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    sentinel = os.open(os.devnull, os.O_RDONLY)
+    expected_owned_descriptor = sentinel + 2
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_NOFILE,
+            (sentinel + 3, hard_limit),
+        )
+        with (
+            pytest.raises(OSError) as raised,
+            store._replay_source_snapshot_gate(),
+        ):
+            store._capture_replay_source_locked(terminal)
+        assert raised.value.errno == errno.EMFILE
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
+        os.close(sentinel)
+        store.close()
+    return None, (expected_owned_descriptor,)
+
+
+def _all_descriptor_fstats_fail_with_ebadf(descriptors: tuple[int, ...]) -> bool:
+    for descriptor in descriptors:
+        try:
+            os.fstat(descriptor)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                continue
+        return False
+    return True
+
+
+def test_source_snapshot_reads_held_descriptors_without_path_reopen(
+    tmp_path: Path,
+) -> None:
+    _coordinator, store, terminal = _build_file_backed_source(tmp_path / "source")
+    snapshot = None
+    try:
+        with store._replay_source_snapshot_gate():
+            snapshot = store._capture_replay_source_locked(terminal)
+        _rename_and_unlink_source_paths(store)
+        assert _decode_snapshot_records(snapshot) == _expected_record_literals()
+    finally:
+        if snapshot is not None:
+            segments_module._close_replay_source_snapshot(snapshot)
+        store.close()
+
+
+def test_source_snapshot_revalidation_rejects_revision_or_descriptor_change(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, terminal = _build_file_backed_source(tmp_path / "source")
+    snapshot = None
+    try:
+        with store._replay_source_snapshot_gate():
+            snapshot = store._capture_replay_source_locked(terminal)
+        _append_next_signed_record(coordinator)
+        with (
+            store._replay_source_snapshot_gate(),
+            pytest.raises(ProjectionAuthorityError),
+        ):
+            store._revalidate_replay_source_locked(snapshot)
+    finally:
+        if snapshot is not None:
+            segments_module._close_replay_source_snapshot(snapshot)
+        store.close()
+
+
+def test_partial_source_snapshot_failure_closes_every_owned_descriptor(
+    tmp_path: Path,
+) -> None:
+    snapshot, owned_fds = _force_real_second_descriptor_failure(
+        tmp_path / "source"
+    )
+    assert snapshot is None
+    assert _all_descriptor_fstats_fail_with_ebadf(owned_fds)
 
 
 def test_replay_reduction_returns_immutable_ordered_leaf_facts() -> None:

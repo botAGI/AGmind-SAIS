@@ -56,6 +56,7 @@ from agmind_immune.evidence.frames import (
     FrameRecord,
     JournalCorrupt,
     TornTail,
+    decode_frames,
     encode_frame,
     iter_frames,
 )
@@ -183,10 +184,6 @@ class EvidenceStoreError(RuntimeError):
     """Base class for evidence-store failures."""
 
 
-def _source_mutation_checkpoint(store: SegmentStore, stage: str) -> None:
-    del store, stage
-
-
 def _source_mutation[**SourceMutationP, SourceMutationR](
     method: Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR],
 ) -> Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR]:
@@ -198,7 +195,6 @@ def _source_mutation[**SourceMutationP, SourceMutationR](
     ) -> SourceMutationR:
         store._begin_source_mutation(allow_during_terminal=False)
         try:
-            _source_mutation_checkpoint(store, "writer-entered")
             return method(store, *args, **kwargs)
         finally:
             store._end_source_mutation()
@@ -220,7 +216,6 @@ def _source_health_mutation[**SourceMutationP, SourceMutationR](
     ) -> SourceMutationR:
         store._begin_source_mutation(allow_during_terminal=True)
         try:
-            _source_mutation_checkpoint(store, "health-writer-entered")
             return method(store, *args, **kwargs)
         finally:
             store._end_source_mutation()
@@ -489,6 +484,69 @@ class StoredEvidenceRecord:
     priority: EvidencePriority
     accepted_at: str
     ref: EvidenceRef
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplaySegmentDescriptor:
+    descriptor: int
+    device: int
+    inode: int
+    size: int
+    maximum_prefix_bytes: int
+    relative_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayRecordDescriptor:
+    ref: EvidenceRef
+    accepted_at: str
+    canonical_record: bytes
+    segment_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplaySourceSnapshot:
+    lifecycle_token: bytes
+    source_revision: int
+    terminal_ref: EvidenceRef
+    retained_ranges: tuple[tuple[int, int], ...]
+    records: tuple[_ReplayRecordDescriptor, ...]
+    segments: tuple[_ReplaySegmentDescriptor, ...]
+
+
+def _close_owned_replay_descriptors(
+    descriptors: tuple[int, ...],
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
+    close_error: BaseException | None = None
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except BaseException as error:  # noqa: BLE001
+            if primary_error is not None:
+                primary_error.add_note(
+                    "replay descriptor cleanup failure: "
+                    f"{type(error).__name__}: {error}"
+                )
+            elif close_error is None:
+                close_error = error
+            else:
+                close_error.add_note(
+                    "secondary replay descriptor close failure: "
+                    f"{type(error).__name__}: {error}"
+                )
+    if primary_error is None and close_error is not None:
+        raise close_error
+
+
+def _close_replay_source_snapshot(snapshot: _ReplaySourceSnapshot) -> None:
+    """Close every descriptor owned by one immutable replay snapshot."""
+    if type(snapshot) is not _ReplaySourceSnapshot:
+        raise TypeError("replay source close requires an exact snapshot")
+    _close_owned_replay_descriptors(
+        tuple(segment.descriptor for segment in snapshot.segments)
+    )
 
 
 def _exact_coverage_record_key(
@@ -2390,7 +2448,7 @@ class SegmentStore:
         segment_create_step_hook: Callable[[str], None] | None = None,
     ) -> None:
         self._source_gate = Lock()
-        self._source_terminal_token: object | None = None
+        self._source_lifecycle_token = os.urandom(32)
         self._source_active_writers = 0
         self._source_revision = 0
         self._source_writer_depths: dict[int, int] = {}
@@ -2588,6 +2646,8 @@ class SegmentStore:
             raise
 
     def _begin_source_mutation(self, *, allow_during_terminal: bool) -> None:
+        if type(allow_during_terminal) is not bool:
+            raise TypeError("source mutation terminal policy must be exact")
         thread_id = get_ident()
         with self._source_gate:
             depth = self._source_writer_depths.get(thread_id, 0)
@@ -2596,8 +2656,6 @@ class SegmentStore:
             if depth:
                 self._source_writer_depths[thread_id] = depth + 1
                 return
-            if self._source_terminal_token is not None and not allow_during_terminal:
-                raise EvidenceStoreError("source terminal evaluation is active")
             if (
                 type(self._source_active_writers) is not int
                 or self._source_active_writers < 0
@@ -2623,51 +2681,373 @@ class SegmentStore:
                 raise EvidenceStoreError("source active-writer count changed")
             self._source_active_writers -= 1
 
-    def _evaluate_source_terminal[SourceTerminalResult](
-        self,
-        lifecycle: object,
-        callback: Callable[[], SourceTerminalResult],
-        *,
-        _factory: object,
-    ) -> SourceTerminalResult:
-        if (
-            _factory is not _SOURCE_TERMINAL_FACTORY
-            or lifecycle is not self._lifecycle_identity
-            or not callable(callback)
-        ):
-            raise EvidenceStoreError("source terminal evaluation lacks exact authority")
-        terminal_token = object()
+    @contextmanager
+    def _replay_source_snapshot_gate(self) -> Iterator[None]:
+        """Exclude sanctioned source writers during replay freeze/revalidation."""
         with self._source_gate:
             if (
-                self._source_terminal_token is not None
-                or type(self._source_active_writers) is not int
+                type(self._source_active_writers) is not int
                 or self._source_active_writers != 0
                 or type(self._source_revision) is not int
                 or self._source_revision < 0
             ):
-                raise EvidenceStoreError("source terminal evaluation conflicts with a writer")
-            revision = self._source_revision
-            self._source_terminal_token = terminal_token
+                raise EvidenceStoreError(
+                    "replay source snapshot conflicts with a writer"
+                )
+            yield
+
+    def _replay_record_descriptors_locked(
+        self,
+        terminal_ref: EvidenceRef,
+    ) -> tuple[
+        tuple[_ReplayRecordDescriptor, ...],
+        tuple[str, ...],
+        tuple[int, ...],
+    ]:
+        verifier = self._require_authenticated_recovered()
         try:
-            result = callback()
-        except BaseException:
-            with self._source_gate:
-                if self._source_terminal_token is terminal_token:
-                    self._source_terminal_token = None
-            raise
-        with self._source_gate:
-            valid = (
-                self._source_terminal_token is terminal_token
-                and type(self._source_active_writers) is int
-                and self._source_active_writers == 0
-                and type(self._source_revision) is int
-                and self._source_revision == revision
+            _exact_coverage_ref_key(terminal_ref)
+            terminal = self.resolve_authenticated_ref(terminal_ref)
+        except (EvidenceStoreError, TypeError, ValueError) as error:
+            raise EvidenceSealError(
+                "replay terminal is not exact authenticated evidence"
+            ) from error
+        records = tuple(
+            self.iter_authenticated_records(
+                through=terminal_ref.source_sequence,
             )
-            if self._source_terminal_token is terminal_token:
-                self._source_terminal_token = None
-        if not valid:
-            raise EvidenceStoreError("source changed during terminal evaluation")
-        return result
+        )
+        if (
+            not records
+            or records[-1].ref is not terminal.ref
+            or verifier.accepted_ref(terminal_ref.source_sequence)
+            is not terminal.ref
+        ):
+            raise EvidenceSealError(
+                "replay terminal is not the final frozen source record"
+            )
+
+        paths: list[str] = []
+        path_indexes: dict[str, int] = {}
+        maximum_prefixes: list[int] = []
+        frozen_records: list[_ReplayRecordDescriptor] = []
+        for record in records:
+            try:
+                _exact_coverage_record_key(record)
+            except (TypeError, ValueError) as error:
+                raise EvidenceCorrupt(
+                    "replay source record is not exact"
+                ) from error
+            relative_path = record.ref.segment_relative_path
+            segment_index = path_indexes.get(relative_path)
+            if segment_index is None:
+                segment_index = len(paths)
+                path_indexes[relative_path] = segment_index
+                paths.append(relative_path)
+                maximum_prefixes.append(0)
+            prefix_bytes = record.ref.frame_offset + record.ref.frame_size
+            maximum_prefixes[segment_index] = max(
+                maximum_prefixes[segment_index],
+                prefix_bytes,
+            )
+            canonical_record = canonical_json(
+                {
+                    "schema_version": "agmind.accepted-envelope.v1",
+                    "evidence_priority": record.priority.value,
+                    "accepted_at": record.accepted_at,
+                    "outer": {
+                        "sequence": record.ref.source_sequence,
+                        "event_id": record.ref.event_id,
+                        "content_sha256": record.ref.content_sha256,
+                    },
+                    "envelope": record.envelope,
+                }
+            )
+            frozen_records.append(
+                _ReplayRecordDescriptor(
+                    ref=record.ref,
+                    accepted_at=record.accepted_at,
+                    canonical_record=canonical_record,
+                    segment_index=segment_index,
+                )
+            )
+        return tuple(frozen_records), tuple(paths), tuple(maximum_prefixes)
+
+    def _capture_replay_source_locked(
+        self,
+        terminal_ref: EvidenceRef,
+    ) -> _ReplaySourceSnapshot:
+        """Freeze authenticated replay facts and owned read-only descriptors."""
+        if (
+            self._closed
+            or self._read_only_reason is not None
+            or self._append_uncertain
+            or self._pending_durable_commit is not None
+            or self._repair_pending
+            or self._repair_mode
+        ):
+            raise EvidenceSealError(
+                "replay source snapshot requires a healthy recovered store"
+            )
+        if (
+            type(self._source_lifecycle_token) is not bytes
+            or len(self._source_lifecycle_token) != 32
+            or type(self._source_revision) is not int
+            or self._source_revision < 0
+        ):
+            raise EvidenceStoreError("replay source identity changed")
+        records, paths, maximum_prefixes = (
+            self._replay_record_descriptors_locked(terminal_ref)
+        )
+        retained_ranges = tuple(self._authenticated_retired_ranges)
+        if any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not int
+            or type(item[1]) is not int
+            or not 1 <= item[0] <= item[1] <= MAX_UINT64
+            for item in retained_ranges
+        ):
+            raise EvidenceCorrupt("replay retained ranges are not exact")
+
+        manifests_by_path = {
+            manifest.segment_relative_path: manifest
+            for manifest in self._manifests
+        }
+        records_by_segment: list[list[_ReplayRecordDescriptor]] = [
+            [] for _path in paths
+        ]
+        for record in records:
+            records_by_segment[record.segment_index].append(record)
+        segments: list[_ReplaySegmentDescriptor] = []
+        try:
+            for segment_index, (relative_path, maximum_prefix_bytes) in enumerate(
+                zip(paths, maximum_prefixes, strict=True)
+            ):
+                expected_records = tuple(records_by_segment[segment_index])
+                if not expected_records:
+                    raise EvidenceCorrupt("replay segment has no frozen records")
+                parts = relative_path.split("/")
+                if len(parts) != 3 or parts[0] != "segments":
+                    raise EvidenceCorrupt(
+                        "replay segment path is not canonical"
+                    )
+                _segments_name, date_name, closed_name = parts
+                active = self._active
+                if (
+                    active is not None
+                    and active.closed_relative_path == relative_path
+                ):
+                    if (
+                        active.closed_name != closed_name
+                        or active.descriptor < 0
+                    ):
+                        raise EvidenceCorrupt(
+                            "replay active segment binding changed"
+                        )
+                    name = active.open_name
+                    display_path = active.open_path
+                else:
+                    manifest = manifests_by_path.get(relative_path)
+                    if (
+                        manifest is None
+                        or manifest.segment_id
+                        != expected_records[0].ref.segment_id
+                    ):
+                        raise EvidenceCorrupt(
+                            "replay segment lacks authenticated manifest authority"
+                        )
+                    name = closed_name
+                    display_path = self.root / relative_path
+
+                opened = -1
+                duplicate = -1
+                try:
+                    opened, opened_info = _open_regular_at(
+                        self._date_descriptor(date_name),
+                        name,
+                        display_path,
+                        maximum=MAX_SEGMENT_BYTES,
+                    )
+                    if (
+                        active is not None
+                        and active.closed_relative_path == relative_path
+                    ):
+                        active_info = os.fstat(active.descriptor)
+                        if (
+                            active_info.st_dev != opened_info.st_dev
+                            or active_info.st_ino != opened_info.st_ino
+                            or active_info.st_size != opened_info.st_size
+                        ):
+                            raise EvidenceCorrupt(
+                                "replay active segment descriptor changed"
+                            )
+                    duplicate = os.dup(opened)
+                    duplicate_info = os.fstat(duplicate)
+                    if (
+                        duplicate_info.st_dev != opened_info.st_dev
+                        or duplicate_info.st_ino != opened_info.st_ino
+                        or duplicate_info.st_size != opened_info.st_size
+                        or not stat.S_ISREG(duplicate_info.st_mode)
+                        or not 0 < maximum_prefix_bytes <= duplicate_info.st_size
+                    ):
+                        raise EvidenceCorrupt(
+                            "replay duplicate descriptor binding changed"
+                        )
+
+                    prefix_parts: list[bytes] = []
+                    offset = 0
+                    while offset < maximum_prefix_bytes:
+                        chunk = os.pread(
+                            duplicate,
+                            min(1024 * 1024, maximum_prefix_bytes - offset),
+                            offset,
+                        )
+                        if not chunk:
+                            raise EvidenceCorrupt(
+                                "replay segment prefix shortened during capture"
+                            )
+                        prefix_parts.append(chunk)
+                        offset += len(chunk)
+                    decoded = decode_frames(
+                        b"".join(prefix_parts),
+                        max_frame=MAX_EVIDENCE_RECORD_BYTES,
+                    )
+                    if (
+                        decoded.torn_tail
+                        or decoded.verified_bytes != maximum_prefix_bytes
+                        or len(decoded.records) != len(expected_records)
+                    ):
+                        raise EvidenceCorrupt(
+                            "replay segment prefix does not match frozen records"
+                        )
+                    for frame, record in zip(
+                        decoded.records,
+                        expected_records,
+                        strict=True,
+                    ):
+                        if (
+                            frame.offset != record.ref.frame_offset
+                            or frame.size != record.ref.frame_size
+                            or frame.record_hash.hex()
+                            != record.ref.frame_sha256
+                            or frame.payload != record.canonical_record
+                        ):
+                            raise EvidenceCorrupt(
+                                "replay frame differs from authenticated source"
+                            )
+                    after = os.fstat(duplicate)
+                    if (
+                        after.st_dev != duplicate_info.st_dev
+                        or after.st_ino != duplicate_info.st_ino
+                        or after.st_size != duplicate_info.st_size
+                    ):
+                        raise EvidenceCorrupt(
+                            "replay descriptor changed during capture"
+                        )
+                    segments.append(
+                        _ReplaySegmentDescriptor(
+                            descriptor=duplicate,
+                            device=duplicate_info.st_dev,
+                            inode=duplicate_info.st_ino,
+                            size=duplicate_info.st_size,
+                            maximum_prefix_bytes=maximum_prefix_bytes,
+                            relative_path=relative_path,
+                        )
+                    )
+                    duplicate = -1
+                except BaseException as error:
+                    _close_owned_replay_descriptors(
+                        tuple(
+                            descriptor
+                            for descriptor in (duplicate, opened)
+                            if descriptor >= 0
+                        ),
+                        primary_error=error,
+                    )
+                    raise
+                else:
+                    _close_owned_replay_descriptors(
+                        (opened,) if opened >= 0 else ()
+                    )
+            return _ReplaySourceSnapshot(
+                lifecycle_token=self._source_lifecycle_token,
+                source_revision=self._source_revision,
+                terminal_ref=terminal_ref,
+                retained_ranges=retained_ranges,
+                records=records,
+                segments=tuple(segments),
+            )
+        except BaseException as error:
+            _close_owned_replay_descriptors(
+                tuple(
+                    segment.descriptor
+                    for segment in reversed(segments)
+                ),
+                primary_error=error,
+            )
+            raise
+
+    def _revalidate_replay_source_locked(
+        self,
+        snapshot: _ReplaySourceSnapshot,
+    ) -> None:
+        """Reject a replay result unless its frozen source remains exact."""
+        from agmind_immune.evidence.projection import ProjectionAuthorityError
+
+        try:
+            if (
+                type(snapshot) is not _ReplaySourceSnapshot
+                or type(snapshot.lifecycle_token) is not bytes
+                or snapshot.lifecycle_token != self._source_lifecycle_token
+                or type(snapshot.source_revision) is not int
+                or snapshot.source_revision != self._source_revision
+                or snapshot.retained_ranges
+                != tuple(self._authenticated_retired_ranges)
+            ):
+                raise ProjectionAuthorityError(
+                    "replay source revision or lifecycle changed"
+                )
+            records, paths, maximum_prefixes = (
+                self._replay_record_descriptors_locked(snapshot.terminal_ref)
+            )
+            if (
+                records != snapshot.records
+                or paths
+                != tuple(segment.relative_path for segment in snapshot.segments)
+                or maximum_prefixes
+                != tuple(
+                    segment.maximum_prefix_bytes
+                    for segment in snapshot.segments
+                )
+            ):
+                raise ProjectionAuthorityError(
+                    "replay source records changed"
+                )
+            for segment in snapshot.segments:
+                current = os.fstat(segment.descriptor)
+                if (
+                    type(segment.descriptor) is not int
+                    or type(segment.device) is not int
+                    or type(segment.inode) is not int
+                    or type(segment.size) is not int
+                    or type(segment.maximum_prefix_bytes) is not int
+                    or type(segment.relative_path) is not str
+                    or current.st_dev != segment.device
+                    or current.st_ino != segment.inode
+                    or current.st_size != segment.size
+                    or not stat.S_ISREG(current.st_mode)
+                    or not 0 < segment.maximum_prefix_bytes <= segment.size
+                ):
+                    raise ProjectionAuthorityError(
+                        "replay source descriptor binding changed"
+                    )
+        except ProjectionAuthorityError:
+            raise
+        except BaseException as error:
+            raise ProjectionAuthorityError(
+                "replay source authority could not be revalidated"
+            ) from error
 
     @classmethod
     def open_tail_repair(
