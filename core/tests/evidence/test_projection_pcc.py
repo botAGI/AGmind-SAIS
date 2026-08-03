@@ -5749,57 +5749,81 @@ def test_unpublished_final_rebuild_binds_complete_stored_record_identity(
     assert acknowledgements._closed is True
 
 
-def test_unpublished_final_seal_binds_authenticated_retired_ranges(
-    tmp_path: Path,
+def _assert_replay_rejects_real_public_writer(
+    path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    writer: str,
 ) -> None:
-    subject = _subject()
+    from tests.evidence.test_projection_replay_boundary import (
+        _build_replay_orchestration_case,
+        _close_replay_orchestration_case,
+        _perform_replay_writer,
+        _release_replay_barrier,
+        _start_replay_worker,
+        _wait_for_replay_phase,
+    )
+
     authority = importlib.import_module("agmind_immune.correlation.authority")
     monkeypatch.setattr(
         authority,
         "_load_pinned_detector_bundle",
         lambda: _DETECTOR_HASH,
     )
-    coordinator, proof = _accepted_complete(tmp_path / "evidence", ttl_seconds=120)
-    store, journal, acknowledgements, records = _unpublished_resources(
-        coordinator,
-        (proof,),
+    case = _build_replay_orchestration_case(path)
+    owner = case["owner"]
+    worker, reports, errors = _start_replay_worker(
+        case,
+        barrier_phase="computing",
     )
-    original_ranges = store._authenticated_retired_ranges
-    real_begin = subject._begin_replay_historical_validation
-    injected = False
-
-    def drift_after_independent_rebuild(session: Any) -> None:
-        nonlocal injected
-        real_begin(session)
-        injected = True
-        object.__setattr__(store, "_authenticated_retired_ranges", ((1, 1),))
-
-    monkeypatch.setattr(
-        subject,
-        "_begin_replay_historical_validation",
-        drift_after_independent_rebuild,
-    )
-    artifact: tuple[Any, Any, Any] | None = None
+    barrier_released = False
     try:
-        with pytest.raises(ProjectionAuthorityError):
-            artifact = subject._v2_unpublished_projection_from_prefix_for_test(
-                evidence=store,
-                acknowledgements=acknowledgements,
-                journal=journal,
-                registry=load_pinned_special_use_registry(_REGISTRY_PATH),
-                through=records[-1].ref,
-            )
+        status = _wait_for_replay_phase(case, worker, "computing", errors)
+        assert status.reservation_present is True
+        _perform_replay_writer(case, writer)
+        _release_replay_barrier(case, "computing")
+        barrier_released = True
+        worker.join(5)
+        assert worker.is_alive() is False
+        assert reports == []
+        assert len(errors) == 1
+        assert isinstance(errors[0], ProjectionAuthorityError)
+        failed = owner._replay_status_for_test()  # type: ignore[attr-defined]
+        assert failed.phase.value == "failed"
+        assert failed.reservation_present is False
     finally:
-        object.__setattr__(store, "_authenticated_retired_ranges", original_ranges)
-        if artifact is not None:
-            artifact[0].close()
+        if not barrier_released:
+            try:
+                _release_replay_barrier(case, "computing")
+            except ProjectionAuthorityError:
+                pass
+        if worker.is_alive():
+            worker.join(5)
+        _close_replay_orchestration_case(case)
+    assert case["store"]._closed is True  # type: ignore[attr-defined]
+    assert case["journal"]._closed is True  # type: ignore[attr-defined]
+    assert case["acknowledgements"]._closed is True  # type: ignore[attr-defined]
 
-    assert injected is True
-    assert artifact is None
-    assert store._closed is True
-    assert journal._closed is True
-    assert acknowledgements._closed is True
+
+def test_unpublished_final_seal_binds_authenticated_retired_ranges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_replay_rejects_real_public_writer(
+        tmp_path / "retention",
+        monkeypatch,
+        "retention",
+    )
+
+
+def test_unpublished_replay_failure_returns_no_artifact_and_closes_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_replay_rejects_real_public_writer(
+        tmp_path / "journal",
+        monkeypatch,
+        "journal",
+    )
 
 
 @pytest.mark.parametrize("drift", ["detector", "registry"])
@@ -5981,58 +6005,6 @@ def test_unpublished_post_prefix_source_authority_drift_returns_no_artifact(
     assert injected is True
     assert artifact is None
     assert store._closed is True
-
-
-@pytest.mark.parametrize("drift", ["strict_ack", "journal_cache"])
-def test_unpublished_replay_failure_returns_no_artifact_and_closes_resources(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    drift: str,
-) -> None:
-    subject = _subject()
-    authority = importlib.import_module("agmind_immune.correlation.authority")
-    monkeypatch.setattr(
-        authority,
-        "_load_pinned_detector_bundle",
-        lambda: _DETECTOR_HASH,
-    )
-    coordinator, proof = _accepted_complete(
-        tmp_path / drift,
-        ttl_seconds=120,
-    )
-    store = coordinator.segment_store
-    journal = CorrelationRequestJournal.create_new(store)
-    _complete_journal(journal, proof)
-    acknowledgements = AckJournal.create_new(store)
-    records = tuple(store.iter_authenticated_records())
-    confirmed_records = records[:-1] if drift == "strict_ack" else records
-    _confirm_ack(
-        acknowledgements,
-        *[record.ref for record in confirmed_records],
-    )
-    tampered = False
-
-    def step_hook(step: str) -> None:
-        nonlocal tampered
-        if drift == "journal_cache" and step == "candidate" and not tampered:
-            tampered = True
-            journal._states_by_operation = {}
-
-    artifact: object | None = None
-    with pytest.raises(ProjectionAuthorityError):
-        artifact = subject._v2_unpublished_projection_from_prefix_for_test(
-            evidence=store,
-            acknowledgements=acknowledgements,
-            journal=journal,
-            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
-            through=records[-1].ref,
-            step_hook=step_hook,
-        )
-
-    assert artifact is None
-    assert store._closed is True
-    assert journal._closed is True
-    assert acknowledgements._closed is True
 
 
 def test_unpublished_replay_rejects_swapped_completed_batch_items(

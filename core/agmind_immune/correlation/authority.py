@@ -864,32 +864,14 @@ def _validate_correlation_projection_terminal_authority(
     authority: CorrelationProjectionAuthority,
     expected: _ProjectionPredecessor,
 ) -> None:
-    _evaluate_correlation_projection_terminal_authority(
-        authority,
-        expected,
-        lambda: None,
-    )
-
-
-def _evaluate_correlation_projection_terminal_authority[TerminalResult](
-    authority: CorrelationProjectionAuthority,
-    expected: _ProjectionPredecessor,
-    callback: Callable[[], TerminalResult],
-) -> TerminalResult:
-    if not callable(callback):
-        raise CorrelationProjectionError(
-            "correlation terminal callback is not callable"
-        )
-    seal_predecessor = _seal_projection_predecessor
-    seal_is_current = _projection_predecessor_seal_is_current
     try:
-        expected_seal = seal_predecessor(expected)
+        expected_seal = _seal_projection_predecessor(expected)
         binding = _authority_binding(authority)
     except CorrelationProjectionError:
         raise
     except Exception as error:
         raise CorrelationProjectionError(
-            "correlation terminal authority evaluation failed"
+            "correlation terminal authority validation failed"
         ) from error
     with binding.lock:
         revision = binding.revision
@@ -898,56 +880,43 @@ def _evaluate_correlation_projection_terminal_authority[TerminalResult](
         detector_bundle_sha256 = binding.detector_bundle_sha256
         bound_predecessor = binding.predecessor
         try:
-            bound_seal = seal_predecessor(bound_predecessor)
-        except (AttributeError, TypeError, ValueError) as error:
-            raise CorrelationProjectionError(
-                "correlation terminal predecessor facts are invalid"
-            ) from error
-
-        def validate_locked() -> None:
-            try:
-                _require_authority_locked(authority, binding)
-                current_registry_facts = _registry_facts(binding.registry)
-                current_detector = _safe_detector_bundle_sha256()
-                registry_facts_after = _registry_facts(binding.registry)
-                if (
-                    not seal_is_current(
-                        expected_seal,
-                        expected,
-                    )
-                    or binding.predecessor is not bound_predecessor
-                    or not seal_is_current(
-                        bound_seal,
-                        binding.predecessor,
-                    )
-                    or bound_seal.canonical != expected_seal.canonical
-                    or binding.revision is not revision
-                    or binding.registry is not registry
-                    or binding.registry_facts is not registry_facts
-                    or type(current_registry_facts) is not type(registry_facts)
-                    or current_registry_facts != registry_facts
-                    or type(registry_facts_after) is not type(registry_facts)
-                    or registry_facts_after != registry_facts
-                    or binding.detector_bundle_sha256 is not detector_bundle_sha256
-                    or type(current_detector) is not str
-                    or current_detector != detector_bundle_sha256
-                    or not special_use_registry_is_issued(binding.registry)
-                ):
-                    raise CorrelationProjectionError(
-                        "correlation terminal predecessor or pins changed"
-                    )
-            except CorrelationProjectionError:
-                raise
-            except Exception as error:
+            bound_seal = _seal_projection_predecessor(bound_predecessor)
+            _require_authority_locked(authority, binding)
+            current_registry_facts = _registry_facts(binding.registry)
+            current_detector = _safe_detector_bundle_sha256()
+            registry_facts_after = _registry_facts(binding.registry)
+            if (
+                not _projection_predecessor_seal_is_current(
+                    expected_seal,
+                    expected,
+                )
+                or binding.predecessor is not bound_predecessor
+                or not _projection_predecessor_seal_is_current(
+                    bound_seal,
+                    binding.predecessor,
+                )
+                or bound_seal.canonical != expected_seal.canonical
+                or binding.revision is not revision
+                or binding.registry is not registry
+                or binding.registry_facts is not registry_facts
+                or type(current_registry_facts) is not type(registry_facts)
+                or current_registry_facts != registry_facts
+                or type(registry_facts_after) is not type(registry_facts)
+                or registry_facts_after != registry_facts
+                or binding.detector_bundle_sha256 is not detector_bundle_sha256
+                or type(current_detector) is not str
+                or current_detector != detector_bundle_sha256
+                or not special_use_registry_is_issued(binding.registry)
+            ):
                 raise CorrelationProjectionError(
-                    "correlation terminal authority validation failed"
-                ) from error
-
-        validate_locked()
-        result = callback()
-        validate_locked()
-        return result
-
+                    "correlation terminal predecessor or pins changed"
+                )
+        except CorrelationProjectionError:
+            raise
+        except Exception as error:
+            raise CorrelationProjectionError(
+                "correlation terminal authority validation failed"
+            ) from error
 
 def _create_correlation_projection_authority(
     store: SegmentStore,

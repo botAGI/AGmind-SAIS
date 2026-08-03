@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import stat
+import time
 from collections.abc import Callable
 from dataclasses import fields, replace
 from datetime import datetime
@@ -20,6 +21,7 @@ from agmind_immune.canonicaljson import (
     canonical_json,
     pcc_detector_bundle_sha256,
 )
+from agmind_immune.contracts import PCCCorrelationSnapshotRequestV1
 from agmind_immune.correlation.pcc import CorrelationProjectionError
 from agmind_immune.correlation.primitives import (
     ParsedSpecialUseRegistry,
@@ -31,6 +33,7 @@ from agmind_immune.coverage.historical import (
     _HistoricalReductionResult,
     _reduce_historical_coverage_result,
 )
+from agmind_immune.evidence import retention as retention_module
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.frames import decode_frames
 from agmind_immune.evidence.projection import ProjectionAuthorityError
@@ -45,6 +48,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournal,
     AckJournalCorrupt,
 )
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import EnvelopeVerifier
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from tests.correlation.test_pcc import (
@@ -54,6 +58,13 @@ from tests.correlation.test_pcc import (
 )
 from tests.coverage.test_historical import _self_close_records
 from tests.coverage.test_state import T0, T1, _event, _stored
+from tests.evidence.test_retention import (
+    REQUEST_ID as RETENTION_REQUEST_ID,
+)
+from tests.evidence.test_retention import (
+    _live_store_with_active_routine,
+    _proof_clock,
+)
 from tests.ingest.test_pcc_correlation_snapshot import _identity, _item
 from tests.phase5b_helpers import (
     BOOT_A,
@@ -267,6 +278,178 @@ def _close_complete_replay_input(resources: dict[str, object]) -> None:
     ack_journal_module._close_replay_ack_snapshot(ack_snapshot)
     acknowledgements.close()
     store.close()
+
+
+def _build_replay_orchestration_case(
+    path: Path,
+    *,
+    record_count: int = 48,
+) -> dict[str, object]:
+    subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+    key, acceptance, store, coverage = _live_store_with_active_routine(path)
+    acknowledgements = store._ack_journal_owner
+    assert type(acknowledgements) is AckJournal
+    try:
+        retention_snapshot = store._freeze_retention_snapshot(
+            _proof_clock(),
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        retention_decision = retention_module.select_retention(
+            retention_snapshot,
+            request_id=RETENTION_REQUEST_ID,
+        )
+        assert retention_decision.request is not None
+        for sequence in range(3, record_count + 1):
+            ref = acceptance.accept(
+                _item(envelope_value(key, sequence=sequence))
+            )
+            coverage._apply_live_accepted(store, ref, None)
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
+        records = tuple(store.iter_authenticated_records())
+        assert len(records) == record_count
+        journal = CorrelationRequestJournal.create_new(store)
+        connection = subject._v2_connection_for_test()
+        owner = subject._v2_projection_owner_for_test(
+            connection,
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        )
+    except BaseException:
+        coverage.close()
+        store.close(flush=False)
+        raise
+    return {
+        "subject": subject,
+        "key": key,
+        "acceptance": acceptance,
+        "store": store,
+        "coverage": coverage,
+        "acknowledgements": acknowledgements,
+        "journal": journal,
+        "retention_decision": retention_decision,
+        "connection": connection,
+        "owner": owner,
+        "records": records,
+        "through": records[-1].ref,
+    }
+
+
+def _close_replay_orchestration_case(case: dict[str, object]) -> None:
+    coverage = case["coverage"]
+    owner = case["owner"]
+    coverage.close()  # type: ignore[attr-defined]
+    owner.close()  # type: ignore[attr-defined]
+
+
+def _perform_replay_writer(case: dict[str, object], writer: str) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    key = case["key"]
+    acceptance = case["acceptance"]
+    store = case["store"]
+    coverage = case["coverage"]
+    acknowledgements = case["acknowledgements"]
+    journal = case["journal"]
+    owner = case["owner"]
+    through = case["through"]
+    assert type(store) is SegmentStore
+    assert type(acknowledgements) is AckJournal
+    assert type(journal) is CorrelationRequestJournal
+    assert type(through) is EvidenceRef
+    if writer == "append":
+        ref = acceptance.accept(  # type: ignore[attr-defined]
+            _item(envelope_value(key, sequence=through.source_sequence + 1))
+        )
+        coverage._apply_live_accepted(store, ref, None)  # type: ignore[attr-defined]
+    elif writer == "retention":
+        retention_module._open_retention_state_journal(
+            store
+        ).prepare_publication(case["retention_decision"])
+    elif writer == "ack":
+        acknowledgements.close()
+    elif writer == "correlation_authority":
+        selected = owner._authority  # type: ignore[attr-defined]
+        assert selected is not None
+        authority._close_correlation_projection_authority(selected)
+    elif writer == "journal":
+        request = PCCCorrelationSnapshotRequestV1.model_validate(
+            {
+                "schema_version": (
+                    "agmind.pcc-correlation-snapshot-request.v1"
+                ),
+                "trigger_event_id": through.event_id,
+                "trigger_content_sha256": through.content_sha256,
+                "trigger_source_sequence": through.source_sequence,
+                "requested_ttl_seconds": 120,
+            },
+            strict=True,
+        )
+        journal.select(through, canonical_json(request))
+    else:
+        raise AssertionError("unknown replay writer")
+
+
+def _start_replay_worker(
+    case: dict[str, object],
+    *,
+    barrier_phase: str | None = None,
+) -> tuple[Thread, list[object], list[BaseException]]:
+    subject = case["subject"]
+    owner = case["owner"]
+    through = case["through"]
+    reports: list[object] = []
+    errors: list[BaseException] = []
+
+    if barrier_phase is not None:
+        owner._register_replay_status_barrier_for_test(  # type: ignore[attr-defined]
+            subject._ReplayPhase(barrier_phase),  # type: ignore[attr-defined]
+        )
+
+    def replay() -> None:
+        try:
+            reports.append(
+                owner._replay_unpublished_prefix(  # type: ignore[attr-defined]
+                    through,
+                    _factory=subject._UNPUBLISHED_REPLAY_FACTORY,  # type: ignore[attr-defined]
+                )
+            )
+        except BaseException as error:  # noqa: BLE001 - asserted by caller
+            errors.append(error)
+
+    worker = Thread(target=replay)
+    worker.start()
+    return worker, reports, errors
+
+
+def _release_replay_barrier(case: dict[str, object], phase: str) -> None:
+    subject = case["subject"]
+    owner = case["owner"]
+    owner._release_replay_status_barrier_for_test(  # type: ignore[attr-defined]
+        subject._ReplayPhase(phase),  # type: ignore[attr-defined]
+    )
+
+
+def _wait_for_replay_phase(
+    case: dict[str, object],
+    worker: Thread,
+    phase: str,
+    errors: list[BaseException] | None = None,
+) -> object:
+    owner = case["owner"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        status = owner._replay_status_for_test()  # type: ignore[attr-defined]
+        if status.phase.value == phase:
+            return status
+        if not worker.is_alive():
+            break
+        time.sleep(0.001)
+    raise AssertionError(
+        f"replay never exposed {phase!r} status; "
+        f"last_status={status!r}; errors={errors!r}"
+    )
 
 
 def _drop_registered_correlation_authority(issued: object) -> None:
@@ -1024,6 +1207,194 @@ def test_compute_replay_uses_base_and_next_publish_generation(
         assert computation.terminal_predecessor.generation == 8
     finally:
         _close_complete_replay_input(resources)
+
+
+@pytest.mark.parametrize(
+    "writer",
+    (
+        "append",
+        "retention",
+        "ack",
+        "correlation_authority",
+        "journal",
+    ),
+)
+def test_snapshot_revision_change_before_validate_rejects_no_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    case = _build_replay_orchestration_case(tmp_path / writer)
+    subject = case["subject"]
+    owner = case["owner"]
+    connection = case["connection"]
+    base_generation = owner._generation  # type: ignore[attr-defined]
+    before_hash = subject._v2_snapshot_hash(connection)  # type: ignore[attr-defined]
+    worker, reports, errors = _start_replay_worker(
+        case,
+        barrier_phase="computing",
+    )
+    barrier_released = False
+    try:
+        status = _wait_for_replay_phase(case, worker, "computing", errors)
+        assert status.reservation_present is True  # type: ignore[attr-defined]
+        with pytest.raises(ProjectionAuthorityError):
+            owner.status()  # type: ignore[attr-defined]
+        _perform_replay_writer(case, writer)
+        _release_replay_barrier(case, "computing")
+        barrier_released = True
+        worker.join(5)
+        assert worker.is_alive() is False
+        assert reports == []
+        assert len(errors) == 1
+        assert isinstance(errors[0], ProjectionAuthorityError)
+        assert owner._generation == base_generation  # type: ignore[attr-defined]
+        assert owner._connection is connection  # type: ignore[attr-defined]
+        assert subject._v2_snapshot_hash(connection) == before_hash  # type: ignore[attr-defined]
+        final_status = owner._replay_status_for_test()  # type: ignore[attr-defined]
+        assert final_status.phase.value == "failed"
+        assert final_status.reservation_present is False
+    finally:
+        if not barrier_released:
+            try:
+                _release_replay_barrier(case, "computing")
+            except ProjectionAuthorityError:
+                pass
+        if worker.is_alive():
+            worker.join(5)
+        _close_replay_orchestration_case(case)
+
+
+@pytest.mark.parametrize(
+    "writer",
+    (
+        "append",
+        "retention",
+        "ack",
+        "correlation_authority",
+        "journal",
+    ),
+)
+def test_writer_started_during_validate_publish_cannot_make_mixed_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    case = _build_replay_orchestration_case(tmp_path / writer)
+    owner = case["owner"]
+    connection = case["connection"]
+    through = case["through"]
+    records = case["records"]
+    assert type(through) is EvidenceRef
+    assert type(records) is tuple
+    base_generation = owner._generation  # type: ignore[attr-defined]
+    worker, reports, errors = _start_replay_worker(
+        case,
+        barrier_phase="validating",
+    )
+    barrier_released = False
+    writer_started = Event()
+    writer_errors: list[BaseException] = []
+
+    def write() -> None:
+        writer_started.set()
+        try:
+            _perform_replay_writer(case, writer)
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            writer_errors.append(error)
+
+    writer_worker = Thread(target=write)
+    try:
+        validating = _wait_for_replay_phase(case, worker, "validating", errors)
+        assert validating.reservation_present is True  # type: ignore[attr-defined]
+        writer_worker.start()
+        assert writer_started.wait(5)
+        assert writer_worker.is_alive()
+        _release_replay_barrier(case, "validating")
+        barrier_released = True
+        worker.join(5)
+        writer_worker.join(5)
+        assert worker.is_alive() is False
+        assert writer_worker.is_alive() is False
+        assert writer_errors == []
+        assert errors == []
+        assert len(reports) == 1
+        report = reports[0]
+        assert report.cursor.source_sequence == through.source_sequence  # type: ignore[attr-defined]
+        assert report.cursor.event_id == through.event_id  # type: ignore[attr-defined]
+        assert report.cursor.content_sha256 == through.content_sha256  # type: ignore[attr-defined]
+        assert report.applied_count == len(records)  # type: ignore[attr-defined]
+        assert owner._generation == base_generation + 1  # type: ignore[attr-defined]
+        assert owner._connection is not connection  # type: ignore[attr-defined]
+        published = owner._replay_status_for_test()  # type: ignore[attr-defined]
+        assert published.phase.value == "published"
+        assert published.reservation_present is False
+    finally:
+        if not barrier_released:
+            try:
+                _release_replay_barrier(case, "validating")
+            except ProjectionAuthorityError:
+                pass
+        if worker.is_alive():
+            worker.join(5)
+        if writer_worker.is_alive():
+            writer_worker.join(5)
+        _close_replay_orchestration_case(case)
+
+
+@pytest.mark.parametrize("phase", ("freeze", "compute", "publish"))
+def test_baseexception_at_replay_phase_cleans_fds_reservation_and_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    case = _build_replay_orchestration_case(
+        tmp_path / phase,
+        record_count=8,
+    )
+    subject = case["subject"]
+    owner = case["owner"]
+    connection = case["connection"]
+    through = case["through"]
+    assert type(through) is EvidenceRef
+    base_generation = owner._generation  # type: ignore[attr-defined]
+    before_hash = subject._v2_snapshot_hash(connection)  # type: ignore[attr-defined]
+    before_fds = frozenset(os.listdir("/dev/fd"))
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            owner._replay_unpublished_prefix(  # type: ignore[attr-defined]
+                through,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,  # type: ignore[attr-defined]
+                _fault_phase=subject._ReplayFaultPhase(phase),  # type: ignore[attr-defined]
+            )
+        assert frozenset(os.listdir("/dev/fd")) == before_fds
+        assert owner._generation == base_generation  # type: ignore[attr-defined]
+        assert owner._connection is connection  # type: ignore[attr-defined]
+        assert subject._v2_snapshot_hash(connection) == before_hash  # type: ignore[attr-defined]
+        status = owner._replay_status_for_test()  # type: ignore[attr-defined]
+        assert status.generation == base_generation
+        assert status.phase.value == "failed"
+        assert status.reservation_present is False
+    finally:
+        _close_replay_orchestration_case(case)
 
 
 def test_compute_rejects_nested_evidence_ref_before_callback(

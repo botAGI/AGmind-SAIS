@@ -6234,17 +6234,21 @@ class SegmentStore:
         authority: _RetentionStateAuthority,
         raw: bytes,
     ) -> None:
-        self._require_retention_state_mutation(authority)
-        self._validate_retention_state_raw(raw)
-        self._require_clean_retention_state_temporary_namespace(authority)
-        if self._retention_state_binding is not None:
-            raise FileExistsError(_RETENTION_STATE_NAME)
-        binding = self._commit_retention_state_bytes(
-            raw,
-            replace=False,
-        )
-        if binding.raw != raw:
-            raise EvidenceCorrupt("retention state publication is uncertain")
+        self._begin_source_mutation(allow_during_terminal=False)
+        try:
+            self._require_retention_state_mutation(authority)
+            self._validate_retention_state_raw(raw)
+            self._require_clean_retention_state_temporary_namespace(authority)
+            if self._retention_state_binding is not None:
+                raise FileExistsError(_RETENTION_STATE_NAME)
+            binding = self._commit_retention_state_bytes(
+                raw,
+                replace=False,
+            )
+            if binding.raw != raw:
+                raise EvidenceCorrupt("retention state publication is uncertain")
+        finally:
+            self._end_source_mutation()
 
     def _replace_retention_state_bytes(
         self,
@@ -6254,35 +6258,39 @@ class SegmentStore:
     ) -> None:
         from agmind_immune.evidence.retention import RetentionStateConflict
 
-        self._require_retention_state_mutation(authority)
-        self._validate_retention_state_raw(expected)
-        self._validate_retention_state_raw(raw)
-        self._require_clean_retention_state_temporary_namespace(authority)
-        expected_binding = self._retention_state_binding
-        if expected_binding is None:
-            raise RetentionStateConflict(
-                "retention state CAS source is absent"
+        self._begin_source_mutation(allow_during_terminal=False)
+        try:
+            self._require_retention_state_mutation(authority)
+            self._validate_retention_state_raw(expected)
+            self._validate_retention_state_raw(raw)
+            self._require_clean_retention_state_temporary_namespace(authority)
+            expected_binding = self._retention_state_binding
+            if expected_binding is None:
+                raise RetentionStateConflict(
+                    "retention state CAS source is absent"
+                )
+            if (
+                expected_binding.raw != expected
+                or self._read_bound_retention_artifact(
+                    expected_binding,
+                    final=True,
+                )
+                != expected
+            ):
+                raise RetentionStateConflict(
+                    "retention state CAS mismatch"
+                )
+            replacement = self._commit_retention_state_bytes(
+                raw,
+                replace=True,
+                expected_binding=expected_binding,
             )
-        if (
-            expected_binding.raw != expected
-            or self._read_bound_retention_artifact(
-                expected_binding,
-                final=True,
-            )
-            != expected
-        ):
-            raise RetentionStateConflict(
-                "retention state CAS mismatch"
-            )
-        replacement = self._commit_retention_state_bytes(
-            raw,
-            replace=True,
-            expected_binding=expected_binding,
-        )
-        if replacement.raw != raw:
-            raise EvidenceCorrupt(
-                "retention state replacement did not bind exact bytes"
-            )
+            if replacement.raw != raw:
+                raise EvidenceCorrupt(
+                    "retention state replacement did not bind exact bytes"
+                )
+        finally:
+            self._end_source_mutation()
 
     @staticmethod
     def _validate_repair_state_raw(raw: bytes) -> None:
