@@ -6,9 +6,11 @@ import hashlib
 import os
 import resource
 import stat
+from collections.abc import Callable
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 from agmind_immune.canonicaljson import canonical_json
@@ -144,6 +146,8 @@ def _expected_record_literals() -> tuple[bytes, bytes]:
 
 def _build_file_backed_source(
     path: Path,
+    *,
+    health_step_hook: Callable[[str], None] | None = None,
 ) -> tuple[AcceptanceCoordinator, SegmentStore, EvidenceRef]:
     key = private_key(11)
     root, chain = _identity(key)
@@ -161,7 +165,7 @@ def _build_file_backed_source(
     store.flush_security_boundary()
     store.close()
 
-    recovered = SegmentStore(path)
+    recovered = SegmentStore(path, health_step_hook=health_step_hook)
     recovered_coordinator = AcceptanceCoordinator.open_and_recover(
         EnvelopeVerifier(root, chain),
         recovered,
@@ -244,14 +248,65 @@ def _all_descriptor_fstats_fail_with_ebadf(descriptors: tuple[int, ...]) -> bool
 
 def _build_ack_snapshot_journal(
     path: Path,
+    *,
+    health_step_hook: Callable[[str], None] | None = None,
 ) -> tuple[AckJournal, SegmentStore, tuple[EvidenceRef, ...]]:
-    _coordinator, store, _terminal = _build_file_backed_source(path)
+    _coordinator, store, _terminal = _build_file_backed_source(
+        path,
+        health_step_hook=health_step_hook,
+    )
     refs = tuple(record.ref for record in store.iter_authenticated_records())
     assert tuple(ref.source_sequence for ref in refs) == (1, 2)
     journal = AckJournal.create_new(store)
     journal.record_pending(refs[0])
     journal.record_confirmed(refs[0])
     return journal, store, refs
+
+
+def test_ack_health_fence_hook_runs_after_replay_gate_is_released(
+    tmp_path: Path,
+) -> None:
+    journal: AckJournal | None = None
+    probes: list[Thread] = []
+    gate_available_during_hook: list[bool] = []
+
+    def health_step_hook(step: str) -> None:
+        if step != "create":
+            return
+        assert journal is not None
+        acquired = Event()
+
+        def probe_gate() -> None:
+            with journal._replay_ack_snapshot_gate():
+                acquired.set()
+
+        probe = Thread(target=probe_gate)
+        probes.append(probe)
+        probe.start()
+        gate_available_during_hook.append(acquired.wait(1.0))
+
+    journal, store, _refs = _build_ack_snapshot_journal(
+        tmp_path / "health-hook",
+        health_step_hook=health_step_hook,
+    )
+    try:
+        replacement = tmp_path / "health-hook" / "ack-journal.replacement"
+        replacement.write_bytes(b"")
+        replacement.chmod(0o600)
+        os.replace(
+            replacement,
+            tmp_path / "health-hook" / "ack-journal.agf",
+        )
+        with pytest.raises(AckJournalCorrupt):
+            journal.snapshot()
+    finally:
+        for probe in probes:
+            probe.join(1.0)
+        journal.close()
+        store.close(flush=False)
+
+    assert gate_available_during_hook == [True]
+    assert all(not probe.is_alive() for probe in probes)
 
 
 @pytest.mark.parametrize(

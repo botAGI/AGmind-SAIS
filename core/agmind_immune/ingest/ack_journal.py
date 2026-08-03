@@ -296,6 +296,7 @@ class AckJournal:
     _retention_gate_lease: _AckRetentionBoundaryLease | None
     _replay_lifecycle_token: bytes
     _mutation_revision: int
+    _pending_corruption_fences: list[AckJournalCorrupt]
 
     def __init__(self) -> None:
         raise TypeError("use AckJournal.create_new() or open_and_recover()")
@@ -379,6 +380,7 @@ class AckJournal:
         journal._retention_gate_lease = None
         journal._replay_lifecycle_token = os.urandom(32)
         journal._mutation_revision = 0
+        journal._pending_corruption_fences = []
         try:
             root_descriptor, lifecycle_identity = (
                 segment_store._acquire_ack_journal(
@@ -896,6 +898,24 @@ class AckJournal:
         else:
             self._healthy = False
 
+    def _latch_corruption_locked(self, primary: AckJournalCorrupt) -> None:
+        self._mark_unhealthy_locked()
+        self._pending_corruption_fences.append(primary)
+
+    @contextmanager
+    def _retention_boundary(self) -> Iterator[None]:
+        pending_fences: tuple[AckJournalCorrupt, ...] = ()
+        try:
+            with self._retention_lock:
+                try:
+                    yield
+                finally:
+                    pending_fences = tuple(self._pending_corruption_fences)
+                    self._pending_corruption_fences.clear()
+        finally:
+            for primary in pending_fences:
+                self._attempt_corruption_fence(primary)
+
     def _bind_published_or_latch(self) -> os.stat_result:
         try:
             published = self._bind_published()
@@ -905,15 +925,13 @@ class AckJournal:
                     "ACK-journal identity changed outside its durable writer"
                 )
         except AckJournalCorrupt as primary:
-            self._mark_unhealthy_locked()
-            self._attempt_corruption_fence(primary)
+            self._latch_corruption_locked(primary)
             raise
         except OSError as error:
             retained_error = AckJournalCorrupt(
                 "ACK-journal retained inode became unavailable"
             )
-            self._mark_unhealthy_locked()
-            self._attempt_corruption_fence(retained_error)
+            self._latch_corruption_locked(retained_error)
             raise retained_error from error
         return published
 
@@ -977,8 +995,7 @@ class AckJournal:
             raise primary from error
         except _AckLifecycleCorrupt as error:
             corrupt_error = AckJournalCorrupt(str(error))
-            self._mark_unhealthy_locked()
-            self._attempt_corruption_fence(corrupt_error)
+            self._latch_corruption_locked(corrupt_error)
             raise corrupt_error from error
         except _AckLifecycleStateError as error:
             raise AckJournalStateError(str(error)) from error
@@ -1042,8 +1059,7 @@ class AckJournal:
             authenticated_hasher_after = authenticated_hasher.copy()
             authenticated_hasher_after.update(frame)
         except AckJournalCorrupt as primary:
-            self._mark_unhealthy_locked()
-            self._attempt_corruption_fence(primary)
+            self._latch_corruption_locked(primary)
             raise
         except BaseException as primary:
             self._mark_unhealthy_locked()
@@ -1088,7 +1104,7 @@ class AckJournal:
             raise AckJournalAuthorityError(
                 "retention ACK boundary request is inexact"
             )
-        with self._retention_lock:
+        with self._retention_boundary():
             if self._retention_gate_lease is not None:
                 raise AckJournalStateError(
                     "retention ACK boundary is already held"
@@ -1119,7 +1135,7 @@ class AckJournal:
         lease: _AckRetentionBoundaryLease,
         _factory: object,
     ) -> None:
-        with self._retention_lock:
+        with self._retention_boundary():
             if lease._released:
                 return
             if (
@@ -1146,7 +1162,7 @@ class AckJournal:
     @contextmanager
     def _replay_ack_snapshot_gate(self) -> Iterator[None]:
         """Exclude sanctioned ACK writers during replay freeze/revalidation."""
-        with self._retention_lock:
+        with self._retention_boundary():
             yield
 
     @staticmethod
@@ -1532,7 +1548,7 @@ class AckJournal:
             or acceptance_cursor < 0
         ):
             raise AckJournalAuthorityError("ACK unpublished capture is inexact")
-        with self._retention_lock:
+        with self._retention_boundary():
             self._require_retention_mutation_permitted()
             self._require_usable()
             authenticated_stat = self._authenticated_stat
@@ -1565,7 +1581,7 @@ class AckJournal:
         self,
         anchor: _AckUnpublishedAnchor,
     ) -> None:
-        with self._retention_lock:
+        with self._retention_boundary():
             self._validate_unpublished_anchor_locked(anchor)
 
     def _evaluate_unpublished_anchor(
@@ -1585,7 +1601,7 @@ class AckJournal:
 
     def record_pending(self, ref: EvidenceRef) -> None:
         """Durably establish the one exact observer ACK permitted in flight."""
-        with self._retention_lock:
+        with self._retention_boundary():
             self._require_retention_mutation_permitted()
             self._bump_mutation_revision_locked()
             self._record_pending_locked(ref)
@@ -1622,7 +1638,7 @@ class AckJournal:
 
     def record_confirmed(self, ref: EvidenceRef) -> None:
         """Durably confirm only the exact currently pending ACK identity."""
-        with self._retention_lock:
+        with self._retention_boundary():
             self._require_retention_mutation_permitted()
             self._bump_mutation_revision_locked()
             self._record_confirmed_locked(ref)
@@ -1678,8 +1694,7 @@ class AckJournal:
             raise primary from error
         except _AckLifecycleCorrupt as error:
             corrupt_error = AckJournalCorrupt(str(error))
-            self._mark_unhealthy_locked()
-            self._attempt_corruption_fence(corrupt_error)
+            self._latch_corruption_locked(corrupt_error)
             raise corrupt_error from error
         except BaseException as primary:
             self._mark_unhealthy_locked()
@@ -1692,7 +1707,7 @@ class AckJournal:
         self._pending = None
 
     def snapshot(self) -> AckJournalSnapshot:
-        with self._retention_lock:
+        with self._retention_boundary():
             return self._snapshot_locked()
 
     def _snapshot_locked(self) -> AckJournalSnapshot:
@@ -1707,8 +1722,7 @@ class AckJournal:
                 raise primary from error
             except _AckLifecycleCorrupt as error:
                 corrupt_error = AckJournalCorrupt(str(error))
-                self._mark_unhealthy_locked()
-                self._attempt_corruption_fence(corrupt_error)
+                self._latch_corruption_locked(corrupt_error)
                 raise corrupt_error from error
             self._bind_published_or_latch()
         return AckJournalSnapshot(
@@ -1719,7 +1733,7 @@ class AckJournal:
 
     def pending_request_body(self) -> bytes | None:
         """Return byte-stable canonical observer ACK JSON for restart retry."""
-        with self._retention_lock:
+        with self._retention_boundary():
             self._require_usable()
             pending = self._pending
             if pending is None:
@@ -1735,7 +1749,7 @@ class AckJournal:
 
     def claim_delivery(self, segment_store: SegmentStore) -> AckDeliveryLease:
         """Claim the one delivery writer bound to this exact live store."""
-        with self._retention_lock, self._delivery_lock:
+        with self._retention_boundary(), self._delivery_lock:
             self._require_usable()
             if segment_store is not self._store:
                 raise AckJournalAuthorityError(
@@ -1783,7 +1797,7 @@ class AckJournal:
     def _attempt_corruption_fence(self, primary: AckJournalCorrupt) -> None:
         try:
             self._store._trip_ack_journal_corrupt()
-        except Exception as error:  # noqa: BLE001
+        except BaseException as error:  # noqa: BLE001
             primary.add_note(
                 "secondary ACK corruption-fence failure: "
                 f"{type(error).__name__}: {error}"
@@ -1885,7 +1899,7 @@ class AckJournal:
         self.close()
 
     def close(self) -> None:
-        with self._retention_lock:
+        with self._retention_boundary():
             self._require_retention_mutation_permitted()
             if not self._closed:
                 self._bump_mutation_revision_locked()
@@ -1935,8 +1949,7 @@ class AckJournal:
                 raise primary from error
             except _AckLifecycleCorrupt as error:
                 corrupt_error = AckJournalCorrupt(str(error))
-                self._mark_unhealthy_locked()
-                self._attempt_corruption_fence(corrupt_error)
+                self._latch_corruption_locked(corrupt_error)
                 self._close_after_failed_open(corrupt_error)
                 raise corrupt_error from error
             except _AckLifecycleStateError as error:
@@ -1944,16 +1957,14 @@ class AckJournal:
                 self._close_after_failed_open(state_error)
                 raise state_error from error
             except AckJournalCorrupt as corrupt_error:
-                self._mark_unhealthy_locked()
-                self._attempt_corruption_fence(corrupt_error)
+                self._latch_corruption_locked(corrupt_error)
                 self._close_after_failed_open(corrupt_error)
                 raise
             except OSError as error:
                 retained_error = AckJournalCorrupt(
                     "ACK-journal retained inode became unavailable during close"
                 )
-                self._mark_unhealthy_locked()
-                self._attempt_corruption_fence(retained_error)
+                self._latch_corruption_locked(retained_error)
                 self._close_after_failed_open(retained_error)
                 raise retained_error from error
             except BaseException as primary_close_error:
