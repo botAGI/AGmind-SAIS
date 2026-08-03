@@ -48,13 +48,14 @@ from agmind_immune.correlation.pcc import (
     CorrelationContext,
     CorrelationProjectionError,
     Duplicate,
+    HistoricalCoverageAssessment,
     InvestigationOnly,
     Rejected,
     _correlate_frozen_pcc,
     _duplicate_key,
     _FrozenPCCCorrelationInput,
     _incident_from_frozen_falco,
-    _rebind_frozen_pcc_observations,
+    _rebind_frozen_pcc_projection_context,
     _validate_frozen_pcc_correlation_input,
     correlate_pcc,
     incident_from_verified_falco,
@@ -409,7 +410,8 @@ class _ReplayInputSnapshot:
     correlation: _CorrelationReplaySnapshot
     pcc_inputs: tuple[_FrozenPCCCorrelationInput, ...]
     schema_domain: bytes
-    projection_generation: int
+    base_projection_generation: int
+    publish_generation: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1373,6 +1375,7 @@ def _validate_replay_snapshot_shape_v2(
     tuple[_FrozenPCCCorrelationInput, ...],
     bytes,
     int,
+    int,
 ]:
     if type(snapshot) is not _ReplayInputSnapshot:
         raise TypeError("Projection V2 compute requires an exact replay snapshot")
@@ -1381,15 +1384,19 @@ def _validate_replay_snapshot_shape_v2(
     correlation = snapshot.correlation
     pcc_inputs = snapshot.pcc_inputs
     schema_domain = snapshot.schema_domain
-    generation = snapshot.projection_generation
+    base_generation = snapshot.base_projection_generation
+    publish_generation = snapshot.publish_generation
     if (
         type(source) is not _ReplaySourceSnapshot
         or type(ack) is not _AckReplaySnapshot
         or type(correlation) is not _CorrelationReplaySnapshot
         or type(pcc_inputs) is not tuple
         or type(schema_domain) is not bytes
-        or type(generation) is not int
-        or not 1 <= generation <= MAX_UINT64
+        or type(base_generation) is not int
+        or not 1 <= base_generation < MAX_UINT64
+        or type(publish_generation) is not int
+        or publish_generation != base_generation + 1
+        or not 1 <= publish_generation <= MAX_UINT64
     ):
         raise TypeError("Projection V2 replay snapshot fields are not exact")
     if any(type(item) is not _FrozenPCCCorrelationInput for item in pcc_inputs):
@@ -1458,10 +1465,18 @@ def _validate_replay_snapshot_shape_v2(
     if (
         predecessor_seal.canonical != correlation.predecessor_canonical
         or predecessor
-        != _ProjectionPredecessor(generation, None, 0, None, None, None)
+        != _ProjectionPredecessor(base_generation, None, 0, None, None, None)
     ):
         raise ProjectionConflict("Projection V2 replay predecessor is not empty")
-    return source, ack, correlation, pcc_inputs, schema_domain, generation
+    return (
+        source,
+        ack,
+        correlation,
+        pcc_inputs,
+        schema_domain,
+        base_generation,
+        publish_generation,
+    )
 
 
 def _decode_replay_records_v2(
@@ -1992,7 +2007,8 @@ def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
         correlation,
         frozen_inputs,
         schema_domain,
-        generation,
+        _base_generation,
+        publish_generation,
     ) = _validate_replay_snapshot_shape_v2(snapshot)
     counters = _ReplayComputeCounters()
     connection: sqlite3.Connection | None = None
@@ -2094,6 +2110,7 @@ def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
                             "Projection V2 replay PCC does not bind source"
                         )
                     active: ActiveCandidateObservation | None = None
+                    coverage: HistoricalCoverageAssessment | None = None
                     if proof.snapshot.outcome == "complete":
                         reduction, memo = _compute_history_reduction_v2(
                             event_frozen,
@@ -2103,8 +2120,7 @@ def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
                         context = event_frozen.context
                         expected_key = _duplicate_key(proof, proof.snapshot)
                         if (
-                            context.coverage != reduction.timeline.assessment
-                            or context.pinned_detector_bundle_sha256
+                            context.pinned_detector_bundle_sha256
                             != correlation.detector_bundle_sha256
                             or context.lookup_key != expected_key
                         ):
@@ -2120,8 +2136,10 @@ def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
                             ),
                         )
                         memo_leaves.append(memo)
-                    rebound = _rebind_frozen_pcc_observations(
+                        coverage = reduction.timeline.assessment
+                    rebound = _rebind_frozen_pcc_projection_context(
                         event_frozen,
+                        coverage,
                         active,
                         None,
                     )
@@ -2194,7 +2212,7 @@ def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
         cursor = _current_v2_cursor(connection)
         if cursor is None or cursor.source_sequence != len(records):
             raise ProjectionConflict("Projection V2 replay terminal cursor changed")
-        terminal_predecessor = _predecessor_v2(generation, cursor)
+        terminal_predecessor = _predecessor_v2(publish_generation, cursor)
         prefix_sha256 = _v2_snapshot_hash(connection)
         late_invalidations = tuple(
             tuple(row)
@@ -2211,7 +2229,7 @@ def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
         report_payload = (
             hashlib.sha256(database_image).digest(),
             hashlib.sha256(schema_domain).digest(),
-            generation,
+            publish_generation,
             len(records),
             transcript_digest,
             tuple(leaf.facts_digest for leaf in pcc_leaves),

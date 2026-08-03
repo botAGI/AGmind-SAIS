@@ -8,7 +8,8 @@ import re
 import stat
 import weakref
 from _thread import LockType
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
 from typing import (
@@ -29,6 +30,7 @@ from agmind_immune.canonicaljson import (
     pcc_correlation_request_sha256,
 )
 from agmind_immune.contracts import (
+    MAX_UINT64,
     ContractModel,
     PCCCorrelationSnapshotRequestV1,
     PCCCorrelationSnapshotV1,
@@ -204,6 +206,35 @@ class _AuthenticatedJournalReplay:
     journal_size: int
     journal_record_count: int
     journal_chain_head: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedPCCReplayFacts:
+    ref_key: _EvidenceRefFingerprint
+    state_canonical: bytes
+    state_fields_set: frozenset[str]
+    operation_key: str
+    request_sha256: str
+    proof_canonical: bytes
+    request_canonical: bytes
+    request_fields_set: frozenset[str]
+    snapshot_canonical: bytes
+    snapshot_fields_set: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _CorrelationJournalReplaySnapshot:
+    journal_lifecycle: object
+    store_lifecycle: object
+    mutation_revision: object
+    verifier_generation: int
+    journal_device: int
+    journal_inode: int
+    journal_size: int
+    journal_digest: bytes
+    journal_record_count: int
+    journal_chain_head: bytes
+    completed_facts: tuple[_CompletedPCCReplayFacts, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2033,6 +2064,249 @@ class CorrelationRequestJournal:
                 raise CorrelationRequestJournalUnhealthy(
                     "correlation journal close cleanup failed"
                 ) from cleanup_errors[0]
+
+
+@contextmanager
+def _correlation_journal_replay_gate(
+    journal: CorrelationRequestJournal,
+) -> Iterator[None]:
+    """Hold the completed-PCC journal as the deepest replay authority."""
+    if type(journal) is not CorrelationRequestJournal:
+        raise CorrelationRequestJournalAuthorityError(
+            "correlation replay requires exact journal authority"
+        )
+    with journal._lock:
+        journal._require_usable()
+        yield
+
+
+def _completed_replay_facts_locked(
+    journal: CorrelationRequestJournal,
+    replay: _AuthenticatedJournalReplay,
+    *,
+    through_sequence: int,
+) -> tuple[tuple[_CompletedPCCReplayFacts, ...], tuple[AuthenticatedPCCInput, ...]]:
+    records = tuple(
+        journal._store.iter_authenticated_records(through=through_sequence)
+    )
+    if (
+        not records
+        or records[-1].ref.source_sequence != through_sequence
+        or any(
+            record.ref.source_sequence != ordinal
+            for ordinal, record in enumerate(records, start=1)
+        )
+    ):
+        raise CorrelationRequestJournalAuthorityError(
+            "correlation replay terminal is not exact and contiguous"
+        )
+    facts: list[_CompletedPCCReplayFacts] = []
+    proofs: list[AuthenticatedPCCInput] = []
+    for record in records:
+        ref = record.ref
+        ref_key = _evidence_ref_fingerprint(ref)
+        operation = replay.operation_by_snapshot.get((ref_key[5], ref_key[7]))
+        if operation is None:
+            continue
+        state = replay.states_by_operation.get(operation)
+        if state is None:
+            journal._raise_journal_corruption(
+                "correlation replay snapshot index lost its state"
+            )
+        if state.phase != "completed":
+            continue
+        if (
+            replay.operation_by_request.get(state.request_sha256) != operation
+            or state.snapshot_event_id != ref_key[5]
+            or state.snapshot_content_sha256 != ref_key[7]
+            or not journal._state_canonical_is_exact(state)
+        ):
+            journal._raise_journal_corruption(
+                "correlation replay completed indexes changed"
+            )
+        proof = journal._authenticated_pcc_for_completed_state(state, ref)
+        facts.append(
+            _CompletedPCCReplayFacts(
+                ref_key=ref_key,
+                state_canonical=canonical_json(state),
+                state_fields_set=frozenset(state.model_fields_set),
+                operation_key=state.operation_key,
+                request_sha256=state.request_sha256,
+                proof_canonical=proof.canonical,
+                request_canonical=canonical_json(proof.request),
+                request_fields_set=frozenset(proof.request.model_fields_set),
+                snapshot_canonical=canonical_json(proof.snapshot),
+                snapshot_fields_set=frozenset(proof.snapshot.model_fields_set),
+            )
+        )
+        proofs.append(proof)
+    return tuple(facts), tuple(proofs)
+
+
+def _capture_correlation_journal_replay_locked(
+    journal: CorrelationRequestJournal,
+    *,
+    through_sequence: int,
+) -> tuple[_CorrelationJournalReplaySnapshot, tuple[AuthenticatedPCCInput, ...]]:
+    """Capture immutable durable journal facts and ephemeral issued PCC proofs."""
+    if (
+        type(journal) is not CorrelationRequestJournal
+        or type(through_sequence) is not int
+        or not 1 <= through_sequence <= MAX_UINT64
+    ):
+        raise CorrelationRequestJournalAuthorityError(
+            "correlation replay capture fields are not exact"
+        )
+    journal._require_usable()
+    journal_lifecycle = journal._lifecycle_identity
+    mutation_revision = journal._mutation_revision
+    store = journal._store
+    store_lifecycle = store._lifecycle_identity
+    verifier = store._bound_verifier
+    if verifier is None or not store._is_bound_verifier(verifier):
+        raise CorrelationRequestJournalAuthorityError(
+            "correlation replay lost verifier authority"
+        )
+    verifier_generation = verifier._authority.generation
+    if type(verifier_generation) is not int or verifier_generation < 0:
+        raise CorrelationRequestJournalAuthorityError(
+            "correlation replay verifier generation is invalid"
+        )
+    replay = journal._authenticated_journal_replay()
+    facts, proofs = _completed_replay_facts_locked(
+        journal,
+        replay,
+        through_sequence=through_sequence,
+    )
+    replay_after = journal._authenticated_journal_replay()
+    if (
+        not journal._replays_match(replay, replay_after)
+        or journal._lifecycle_identity is not journal_lifecycle
+        or journal._mutation_revision is not mutation_revision
+        or journal._store is not store
+        or store._lifecycle_identity is not store_lifecycle
+        or store._bound_verifier is not verifier
+        or not store._is_bound_verifier(verifier)
+        or verifier._authority.generation != verifier_generation
+    ):
+        raise CorrelationRequestJournalAuthorityError(
+            "correlation replay authority changed during capture"
+        )
+    info = replay_after.journal_stat
+    snapshot = _CorrelationJournalReplaySnapshot(
+        journal_lifecycle=journal_lifecycle,
+        store_lifecycle=store_lifecycle,
+        mutation_revision=mutation_revision,
+        verifier_generation=verifier_generation,
+        journal_device=info.st_dev,
+        journal_inode=info.st_ino,
+        journal_size=replay_after.journal_size,
+        journal_digest=replay_after.journal_digest,
+        journal_record_count=replay_after.journal_record_count,
+        journal_chain_head=replay_after.journal_chain_head,
+        completed_facts=facts,
+    )
+    return snapshot, proofs
+
+
+def _revalidate_correlation_journal_replay_locked(
+    journal: CorrelationRequestJournal,
+    snapshot: _CorrelationJournalReplaySnapshot,
+) -> None:
+    """Reject publication unless every frozen journal fact remains exact."""
+    if (
+        type(journal) is not CorrelationRequestJournal
+        or type(snapshot) is not _CorrelationJournalReplaySnapshot
+        or type(snapshot.verifier_generation) is not int
+        or snapshot.verifier_generation < 0
+        or type(snapshot.journal_device) is not int
+        or type(snapshot.journal_inode) is not int
+        or type(snapshot.journal_size) is not int
+        or snapshot.journal_size < 0
+        or type(snapshot.journal_digest) is not bytes
+        or len(snapshot.journal_digest) != 32
+        or type(snapshot.journal_record_count) is not int
+        or snapshot.journal_record_count < 0
+        or type(snapshot.journal_chain_head) is not bytes
+        or len(snapshot.journal_chain_head) != 32
+        or type(snapshot.completed_facts) is not tuple
+        or any(
+            type(fact) is not _CompletedPCCReplayFacts
+            for fact in snapshot.completed_facts
+        )
+    ):
+        raise CorrelationRequestJournalAuthorityError(
+            "correlation replay snapshot is not exact"
+        )
+    journal._require_usable()
+    store = journal._store
+    verifier = store._bound_verifier
+    replay = journal._authenticated_journal_replay()
+    info = replay.journal_stat
+    if (
+        journal._lifecycle_identity is not snapshot.journal_lifecycle
+        or journal._mutation_revision is not snapshot.mutation_revision
+        or store._lifecycle_identity is not snapshot.store_lifecycle
+        or verifier is None
+        or not store._is_bound_verifier(verifier)
+        or verifier._authority.generation != snapshot.verifier_generation
+        or info.st_dev != snapshot.journal_device
+        or info.st_ino != snapshot.journal_inode
+        or replay.journal_size != snapshot.journal_size
+        or replay.journal_digest != snapshot.journal_digest
+        or replay.journal_record_count != snapshot.journal_record_count
+        or replay.journal_chain_head != snapshot.journal_chain_head
+    ):
+        raise CorrelationRequestJournalAuthorityError(
+            "correlation replay journal revision or durable facts changed"
+        )
+    for fact in snapshot.completed_facts:
+        try:
+            ref = EvidenceRef(
+                segment_id=fact.ref_key[0],
+                segment_relative_path=fact.ref_key[1],
+                frame_offset=fact.ref_key[2],
+                frame_size=fact.ref_key[3],
+                frame_sha256=fact.ref_key[4],
+                event_id=fact.ref_key[5],
+                source_sequence=fact.ref_key[6],
+                content_sha256=fact.ref_key[7],
+            )
+            state = replay.states_by_operation.get(fact.operation_key)
+            if state is None:
+                raise ValueError("completed replay state disappeared")
+            proof = journal._authenticated_pcc_for_completed_state(state, ref)
+            if (
+                canonical_json(state) != fact.state_canonical
+                or frozenset(state.model_fields_set) != fact.state_fields_set
+                or state.operation_key != fact.operation_key
+                or state.request_sha256 != fact.request_sha256
+                or replay.operation_by_request.get(fact.request_sha256)
+                != fact.operation_key
+                or replay.operation_by_snapshot.get(
+                    (fact.ref_key[5], fact.ref_key[7])
+                )
+                != fact.operation_key
+                or proof.canonical != fact.proof_canonical
+                or canonical_json(proof.request) != fact.request_canonical
+                or frozenset(proof.request.model_fields_set)
+                != fact.request_fields_set
+                or canonical_json(proof.snapshot) != fact.snapshot_canonical
+                or frozenset(proof.snapshot.model_fields_set)
+                != fact.snapshot_fields_set
+                or not journal._pcc_matches_completed_state(
+                    proof,
+                    state,
+                    fact.ref_key,
+                )
+            ):
+                raise ValueError("completed replay facts changed")
+        except CorrelationRequestJournalError:
+            raise
+        except (AttributeError, IndexError, TypeError, ValueError) as error:
+            raise CorrelationRequestJournalAuthorityError(
+                "correlation replay completed PCC facts changed"
+            ) from error
 
 
 def _evaluate_completed_snapshot_batch[T](

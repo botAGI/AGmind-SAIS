@@ -719,7 +719,7 @@ def _correlation_projection_snapshot_gate(
     authority: CorrelationProjectionAuthority,
 ) -> Iterator[_ProjectionAuthorityBinding]:
     binding = _authority_binding(authority)
-    with binding.lock:
+    with binding.lock, _ISSUED_AUTHORITIES_LOCK:
         _require_authority_locked(authority, binding)
         yield binding
 

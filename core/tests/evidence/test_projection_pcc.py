@@ -38,7 +38,6 @@ from agmind_immune.ingest.envelope import AuthenticatedPCCInput
 from tests.correlation.test_pcc import (
     _accepted_complete,
     _accepted_direct_falco,
-    _context,
 )
 from tests.correlation.test_pcc import (
     _resign as _resign_pcc_envelope,
@@ -664,53 +663,17 @@ def _frozen_compute_pcc_input(
     foreign_active: bool = False,
 ) -> object:
     pcc = importlib.import_module("agmind_immune.correlation.pcc")
-    historical = importlib.import_module("agmind_immune.coverage.historical")
-    if proof.snapshot.outcome == "failed":
-        return pcc._freeze_pcc_correlation_input(
-            proof,
-            pcc.CorrelationContext.failed_snapshot(),
-        )
-    entries = historical._build_frozen_replay_entries(
-        records,
-        tuple(historical._prepare_historical_record(record) for record in records),
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    del records, foreign_active
+    registry = load_pinned_special_use_registry(_REGISTRY_PATH)
+    return pcc._freeze_replay_pcc_seed(
+        proof,
+        detector_bundle_sha256=_DETECTOR_HASH,
+        registry=registry,
+        registry_facts_canonical=authority._registry_facts_canonical(
+            authority._registry_facts(registry)
+        ),
     )
-    compact = tuple(
-        entry.record
-        for entry in entries
-        if entry.compact_member
-        and entry.record.ref.source_sequence
-        <= proof.snapshot.coverage_through_sequence
-    )
-    trigger = proof.snapshot.trigger
-    reduction = historical._reduce_historical_coverage_result(
-        compact,
-        host_id=proof.host_id,
-        boot_id=proof.boot_id,
-        trigger_event_id=trigger.event_id,
-        trigger_source_sequence=trigger.source_sequence,
-        trigger_event_time=trigger.event_time,
-        clock_uncertainty_ms=trigger.clock_uncertainty_ms,
-        coverage_through_sequence=proof.snapshot.coverage_through_sequence,
-        window_end=proof.snapshot.decision_time,
-    )
-    lookup_key = pcc._duplicate_key(proof, proof.snapshot)
-    active = None
-    if foreign_active:
-        foreign_key = replace(lookup_key, host_id=OTHER_HOST)
-        active = pcc.ActiveCandidateObservation(
-            key=foreign_key,
-            candidate_id="cand_" + "d" * 64,
-            primary_source_sequence=1,
-            primary_event_id="evt_" + "d" * 64,
-        )
-    context = pcc.CorrelationContext(
-        pinned_detector_bundle_sha256=_DETECTOR_HASH,
-        special_use_registry=load_pinned_special_use_registry(_REGISTRY_PATH),
-        coverage=reduction.timeline.assessment,
-        lookup_key=lookup_key,
-        active_duplicate=active,
-    )
-    return pcc._freeze_pcc_correlation_input(proof, context)
 
 
 def _capture_compute_input(
@@ -767,7 +730,8 @@ def _capture_compute_input(
                 b"AGMIND_PROJECTION_SCHEMA_V2\0"
                 + Path("core/agmind_immune/evidence/schema_v2.sql").read_bytes()
             ),
-            projection_generation=1,
+            base_projection_generation=1,
+            publish_generation=2,
         )
     except BaseException:
         if source_snapshot is not None:
@@ -1091,9 +1055,8 @@ def test_compute_projection_parity_scenarios(
     if proof is None:
         frozen_inputs: tuple[object, ...] = ()
     elif case.startswith("compact-"):
-        pcc = importlib.import_module("agmind_immune.correlation.pcc")
         frozen_inputs = (
-            pcc._freeze_pcc_correlation_input(proof, _context(proof)),
+            _frozen_compute_pcc_input(proof, records),
         )
     else:
         frozen_inputs = (

@@ -410,6 +410,9 @@ type CorrelationResult = (
 _FROZEN_PCC_PROOF_DOMAIN = b"AGMIND_FROZEN_PCC_PROOF_V1\0"
 _FROZEN_PCC_CONTEXT_DOMAIN = b"AGMIND_FROZEN_PCC_CONTEXT_V1\0"
 _FROZEN_PCC_FACTS_DOMAIN = b"AGMIND_FROZEN_PCC_CORRELATION_FACTS_V1\0"
+_REPLAY_REGISTRY_FACTS_DOMAIN = (
+    b"AGMIND_CORRELATION_REPLAY_REGISTRY_FACTS_V1\0"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,6 +746,128 @@ def _freeze_pcc_correlation_input(
         context_canonical=expected_context,
         facts_sha256=hashlib.sha256(
             _FROZEN_PCC_FACTS_DOMAIN + expected_proof + expected_context
+        ).digest(),
+    )
+
+
+def _replay_registry_facts_canonical(registry: SpecialUseRegistry) -> bytes:
+    facts = _canonical_registry_binding(registry)
+    if (
+        type(facts) is not tuple
+        or len(facts) != 2
+        or type(facts[0]) is not tuple
+        or type(facts[1]) is not tuple
+    ):
+        raise TypeError("replay registry facts are not exact")
+    entries, index = facts
+    if any(
+        type(entry) is not tuple
+        or len(entry) != 2
+        or any(type(value) is not str for value in entry)
+        for entry in entries
+    ) or any(
+        type(item) is not tuple
+        or len(item) != 3
+        or type(item[0]) is not int
+        or type(item[1]) is not int
+        or type(item[2]) is not str
+        for item in index
+    ):
+        raise TypeError("replay registry scalar facts are not exact")
+    return _REPLAY_REGISTRY_FACTS_DOMAIN + canonical_json(
+        (
+            (
+                "entries",
+                tuple(
+                    (("str", prefix), ("str", reachability))
+                    for prefix, reachability in entries
+                ),
+            ),
+            (
+                "index",
+                tuple(
+                    (
+                        ("int", str(network)),
+                        ("int", str(prefix_length)),
+                        ("str", reachability),
+                    )
+                    for network, prefix_length, reachability in index
+                ),
+            ),
+        )
+    )
+
+
+def _freeze_replay_pcc_seed(
+    proof: AuthenticatedPCCInput,
+    *,
+    detector_bundle_sha256: str,
+    registry: SpecialUseRegistry,
+    registry_facts_canonical: bytes,
+) -> _FrozenPCCCorrelationInput:
+    """Detach one issued PCC without precomputing historical coverage."""
+    if (
+        type(proof) is not AuthenticatedPCCInput
+        or not authenticated_pcc_input_is_issued(proof)
+        or type(registry) is not SpecialUseRegistry
+        or not special_use_registry_is_issued(registry)
+        or type(registry_facts_canonical) is not bytes
+    ):
+        raise TypeError("replay PCC seed requires exact issued facts")
+    _exact_hex64(detector_bundle_sha256, "detector_bundle_sha256")
+    if (
+        registry.authority_sha256 != PCC_SPECIAL_USE_REGISTRY_SHA256
+        or _replay_registry_facts_canonical(registry)
+        != registry_facts_canonical
+    ):
+        raise TypeError("replay PCC seed registry facts changed")
+    detached_proof = _detached_pcc_proof(proof)
+    snapshot = detached_proof.snapshot
+    if snapshot.outcome == "failed":
+        detached_context = CorrelationContext.failed_snapshot()
+    elif snapshot.outcome == "complete":
+        if snapshot.detector_bundle_sha256 != detector_bundle_sha256:
+            raise ValueError("replay PCC detector pin changed")
+        detached_registry = ParsedSpecialUseRegistry(
+            tuple(
+                SpecialUseEntry(entry.prefix, entry.globally_reachable)
+                for entry in registry.entries
+            )
+        )
+        detached_context = object.__new__(CorrelationContext)
+        object.__setattr__(detached_context, "_authority_kind", "raw")
+        object.__setattr__(
+            detached_context,
+            "pinned_detector_bundle_sha256",
+            detector_bundle_sha256,
+        )
+        object.__setattr__(
+            detached_context,
+            "special_use_registry",
+            detached_registry,
+        )
+        object.__setattr__(detached_context, "coverage", None)
+        object.__setattr__(
+            detached_context,
+            "lookup_key",
+            _clone_duplicate_key(_duplicate_key(detached_proof, snapshot)),
+        )
+        object.__setattr__(detached_context, "active_duplicate", None)
+        object.__setattr__(detached_context, "terminal_observation", None)
+    else:
+        raise TypeError("replay PCC outcome is not exact")
+    proof_canonical = _proof_facts_canonical(detached_proof)
+    context_canonical = _context_facts_canonical(
+        detached_context,
+        frozen=True,
+    )
+    return _FrozenPCCCorrelationInput(
+        proof=detached_proof,
+        context=detached_context,
+        proof_canonical=proof_canonical,
+        context_canonical=context_canonical,
+        facts_sha256=hashlib.sha256(
+            _FROZEN_PCC_FACTS_DOMAIN + proof_canonical + context_canonical
         ).digest(),
     )
 
@@ -1780,6 +1905,78 @@ def _validate_frozen_pcc_correlation_input(
     ):
         raise ValueError("frozen PCC correlation canonical facts changed")
     return proof, context
+
+
+def _rebind_frozen_pcc_projection_context(
+    input: _FrozenPCCCorrelationInput,
+    coverage: HistoricalCoverageAssessment | None,
+    active_duplicate: ActiveCandidateObservation | None,
+    terminal_observation: TerminalCandidateObservation | None,
+) -> _FrozenPCCCorrelationInput:
+    """Bind compute-owned historical and projection-local observations."""
+    if (
+        type(input) is not _FrozenPCCCorrelationInput
+        or (
+            coverage is not None
+            and type(coverage) is not HistoricalCoverageAssessment
+        )
+        or (
+            active_duplicate is not None
+            and type(active_duplicate) is not ActiveCandidateObservation
+        )
+        or (
+            terminal_observation is not None
+            and type(terminal_observation) is not TerminalCandidateObservation
+        )
+    ):
+        raise TypeError("replay PCC projection context is not exact")
+    proof, context = _validate_frozen_pcc_correlation_input(input)
+    if proof.snapshot.outcome == "failed":
+        if (
+            context._authority_kind != "failed_only"
+            or coverage is not None
+            or active_duplicate is not None
+            or terminal_observation is not None
+        ):
+            raise TypeError("failed replay PCC cannot carry projection context")
+        return input
+    if (
+        proof.snapshot.outcome != "complete"
+        or context._authority_kind != "raw"
+        or context.coverage is not None
+        or type(coverage) is not HistoricalCoverageAssessment
+        or type(context.special_use_registry) is not ParsedSpecialUseRegistry
+        or type(context.lookup_key) is not CandidateDuplicateKey
+    ):
+        raise TypeError("complete replay PCC requires compute-owned coverage")
+    rebound = object.__new__(CorrelationContext)
+    object.__setattr__(rebound, "_authority_kind", "raw")
+    object.__setattr__(
+        rebound,
+        "pinned_detector_bundle_sha256",
+        context.pinned_detector_bundle_sha256,
+    )
+    object.__setattr__(
+        rebound,
+        "special_use_registry",
+        context.special_use_registry,
+    )
+    object.__setattr__(rebound, "coverage", coverage)
+    object.__setattr__(rebound, "lookup_key", context.lookup_key)
+    object.__setattr__(rebound, "active_duplicate", active_duplicate)
+    object.__setattr__(rebound, "terminal_observation", terminal_observation)
+    context_canonical = _context_facts_canonical(rebound, frozen=True)
+    return _FrozenPCCCorrelationInput(
+        proof=proof,
+        context=rebound,
+        proof_canonical=input.proof_canonical,
+        context_canonical=context_canonical,
+        facts_sha256=hashlib.sha256(
+            _FROZEN_PCC_FACTS_DOMAIN
+            + input.proof_canonical
+            + context_canonical
+        ).digest(),
+    )
 
 
 def _rebind_frozen_pcc_observations(

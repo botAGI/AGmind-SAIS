@@ -172,6 +172,65 @@ def _two_completed_snapshot_case(
     return coordinator.segment_store, journal, refs[0], refs[1]
 
 
+def test_correlation_journal_replay_snapshot_rejects_real_completed_writer(
+    tmp_path: Path,
+) -> None:
+    key = private_key(11)
+    coordinator = _coordinator(tmp_path, key)
+    _accept(coordinator, boot_boundary(key))
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    completed_refs: list[EvidenceRef] = []
+    try:
+        for trigger_sequence in (2, 4):
+            trigger = _candidate_trigger(key, sequence=trigger_sequence)
+            trigger_ref = _accept(coordinator, trigger)
+            assert isinstance(trigger_ref, EvidenceRef)
+            request = _request(trigger_ref)
+            selected = journal.select(trigger_ref, canonical_json(request))
+            snapshot_ref = _accept_snapshot(
+                coordinator,
+                trigger,
+                request,
+                sequence=trigger_sequence + 1,
+            )
+            journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+            journal.mark_completed(selected.request_sha256)
+            completed_refs.append(snapshot_ref)
+
+        with correlation_module._correlation_journal_replay_gate(journal):
+            snapshot, proofs = (
+                correlation_module._capture_correlation_journal_replay_locked(
+                    journal,
+                    through_sequence=completed_refs[-1].source_sequence,
+                )
+            )
+
+        trigger = _candidate_trigger(key, sequence=6)
+        trigger_ref = _accept(coordinator, trigger)
+        assert isinstance(trigger_ref, EvidenceRef)
+        request = _request(trigger_ref)
+        selected = journal.select(trigger_ref, canonical_json(request))
+        snapshot_ref = _accept_snapshot(coordinator, trigger, request, sequence=7)
+        journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+        journal.mark_completed(selected.request_sha256)
+
+        with (
+            correlation_module._correlation_journal_replay_gate(journal),
+            pytest.raises(CorrelationRequestJournalAuthorityError),
+        ):
+            correlation_module._revalidate_correlation_journal_replay_locked(
+                journal,
+                snapshot,
+            )
+        assert tuple(proof.event_id for proof in proofs) == tuple(
+            ref.event_id for ref in completed_refs
+        )
+    finally:
+        journal.close()
+        store.close()
+
+
 def test_correlation_journal_selected_record_has_exact_schema_and_ttl_120(
     tmp_path: Path,
 ) -> None:

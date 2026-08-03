@@ -184,6 +184,9 @@ def _build_registered_correlation_authority(
 
 def _build_complete_replay_input_snapshot(
     path: Path,
+    *,
+    base_projection_generation: int = 1,
+    publish_generation: int | None = None,
 ) -> tuple[object, dict[str, object]]:
     subject = importlib.import_module("agmind_immune.evidence.projection_v2")
     authority_module, _pcc_module = _correlation_modules()
@@ -206,7 +209,7 @@ def _build_complete_replay_input_snapshot(
             )
         issued, binding, predecessor = _build_registered_correlation_authority(
             store,
-            generation=1,
+            generation=base_projection_generation,
         )
         with authority_module._correlation_projection_snapshot_gate(
             issued
@@ -228,7 +231,12 @@ def _build_complete_replay_input_snapshot(
                 b"AGMIND_PROJECTION_SCHEMA_V2\0"
                 + Path("core/agmind_immune/evidence/schema_v2.sql").read_bytes()
             ),
-            projection_generation=1,
+            base_projection_generation=base_projection_generation,
+            publish_generation=(
+                base_projection_generation + 1
+                if publish_generation is None
+                else publish_generation
+            ),
         )
     except BaseException:
         if source_snapshot is not None:
@@ -873,6 +881,37 @@ def test_frozen_pcc_kernel_accepts_values_only_and_matches_live_result(
         failed_coordinator.segment_store.close()
 
 
+def test_replay_pcc_seed_binds_only_compute_owned_coverage(
+    tmp_path: Path,
+) -> None:
+    authority_module, pcc_module = _correlation_modules()
+    coordinator, proof = _accepted_complete(tmp_path / "replay-seed")
+    context = _context(proof)
+    registry = context.special_use_registry
+    assert type(registry) is SpecialUseRegistry
+    try:
+        seed = pcc_module._freeze_replay_pcc_seed(
+            proof,
+            detector_bundle_sha256=context.pinned_detector_bundle_sha256,
+            registry=registry,
+            registry_facts_canonical=authority_module._registry_facts_canonical(
+                authority_module._registry_facts(registry)
+            ),
+        )
+        assert seed.context.coverage is None
+        rebound = pcc_module._rebind_frozen_pcc_projection_context(
+            seed,
+            context.coverage,
+            None,
+            None,
+        )
+        assert pcc_module._correlate_frozen_pcc(rebound) == (
+            pcc_module._correlate_pcc_kernel(proof, context)
+        )
+    finally:
+        coordinator.segment_store.close()
+
+
 def test_correlation_snapshot_rechecks_typed_predecessor_revision_and_pins(
     tmp_path: Path,
 ) -> None:
@@ -966,6 +1005,23 @@ def test_compute_accepts_only_frozen_value_snapshot(
             subject._compute_replay(
                 replace(snapshot, source=_WrongSource())
             )
+    finally:
+        _close_complete_replay_input(resources)
+
+
+def test_compute_replay_uses_base_and_next_publish_generation(
+    tmp_path: Path,
+) -> None:
+    subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+    snapshot, resources = _build_complete_replay_input_snapshot(
+        tmp_path / "split-generation",
+        base_projection_generation=7,
+        publish_generation=8,
+    )
+    try:
+        computation = subject._compute_replay(snapshot)
+        assert snapshot.correlation.predecessor.generation == 7
+        assert computation.terminal_predecessor.generation == 8
     finally:
         _close_complete_replay_input(resources)
 
