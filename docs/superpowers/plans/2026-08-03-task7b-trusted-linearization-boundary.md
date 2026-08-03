@@ -390,7 +390,7 @@ Expected: facts-only kernel and snapshot API absent; current claimed-context eva
 
 - [ ] **Step 3: Implement frozen facts and snapshot validation**
 
-Split `_correlate_pcc_kernel` into a values-only body that does not call `authenticated_pcc_input_is_issued`; issuance is checked exactly once while freezing. Encode predecessor, proof, context, detector pin, and registry facts with exact types and domain-separated canonical bytes. Gate order inside correlation is `binding.lock` then `_ISSUED_AUTHORITIES_LOCK`. Delete `_evaluate_correlation_projection_terminal_authority`, `_evaluate_issued_context`, evaluator registration, and evaluator-bearing `_IssuedContextBinding` after Task 6 has no callers.
+Split `_correlate_pcc_kernel` into a values-only body that does not call `authenticated_pcc_input_is_issued`; issuance is checked exactly once while freezing. Encode predecessor, proof, context, detector pin, and registry facts with exact types and domain-separated canonical bytes. Gate order inside correlation is `binding.lock` then `_ISSUED_AUTHORITIES_LOCK`. Task 6 deletes `_evaluate_correlation_projection_terminal_authority` and every terminal replay caller. Preserve `_evaluate_issued_context`, evaluator registration, and `_IssuedContextBinding` for the dormant ordinary V2 `apply` compatibility path; Task 8 migrates that path when V2 activates.
 
 - [ ] **Step 4: Run focused GREEN and result parity**
 
@@ -537,10 +537,13 @@ git commit -m "refactor(core): compute replay from frozen facts"
 ### Task 6: Freeze → compute → validate/publish orchestration
 
 **Files:**
-- Modify: `core/agmind_immune/evidence/projection_v2.py:1268-1684,2491-2828,3837-3894`
+- Modify: `core/agmind_immune/evidence/projection_v2.py:380-430,1268-2250,2254-3905,4800-4900`
 - Modify: `core/agmind_immune/evidence/segments.py`
 - Modify: `core/agmind_immune/ingest/ack_journal.py`
+- Modify: `core/agmind_immune/ingest/correlation_journal.py`
 - Modify: `core/agmind_immune/correlation/authority.py`
+- Modify: `core/agmind_immune/correlation/pcc.py`
+- Modify: `core/tests/ingest/test_correlation_journal.py`
 - Modify: `core/tests/evidence/test_projection_replay_boundary.py`
 - Modify: `core/tests/evidence/test_projection_pcc.py`
 
@@ -556,63 +559,222 @@ class _ReplayPhase(StrEnum):
     FAILED = "failed"
 
 
+class _ReplayFaultPhase(StrEnum):
+    FREEZE = "freeze"
+    COMPUTE = "compute"
+    PUBLISH = "publish"
+
+
 @dataclass(frozen=True, slots=True)
 class _ReplayStatus:
     generation: int
     phase: _ReplayPhase
     reservation_present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayReservation:
+    token: object
+    base_generation: int
+    publish_generation: int
+    through_key: tuple[str, str, int, int, str, str, int, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedPCCReplayFacts:
+    ref_key: tuple[str, str, int, int, str, str, int, str]
+    state_canonical: bytes
+    state_fields_set: frozenset[str]
+    operation_key: str
+    request_sha256: str
+    proof_canonical: bytes
+    request_canonical: bytes
+    request_fields_set: frozenset[str]
+    snapshot_canonical: bytes
+    snapshot_fields_set: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _CorrelationJournalReplaySnapshot:
+    journal_lifecycle: object
+    store_lifecycle: object
+    mutation_revision: object
+    verifier_generation: int
+    journal_device: int
+    journal_inode: int
+    journal_size: int
+    journal_digest: bytes
+    journal_record_count: int
+    journal_chain_head: bytes
+    completed_facts: tuple[_CompletedPCCReplayFacts, ...]
 ```
 
-- Exact status signature: `_ProjectionV2Owner._replay_status_for_test() -> _ReplayStatus`.
+- Exact owner status signature: `_V2ProjectionOwner._replay_status_for_test() -> _ReplayStatus`.
+- Exact journal signatures: `_correlation_journal_replay_gate(journal: CorrelationRequestJournal) -> Iterator[None]`, `_capture_correlation_journal_replay_locked(journal: CorrelationRequestJournal, *, through_sequence: int) -> tuple[_CorrelationJournalReplaySnapshot, tuple[AuthenticatedPCCInput, ...]]`, and `_revalidate_correlation_journal_replay_locked(journal: CorrelationRequestJournal, snapshot: _CorrelationJournalReplaySnapshot) -> None`.
+- Replace `_ReplayInputSnapshot.projection_generation` with exact `base_projection_generation: int` and `publish_generation: int`. Require `publish_generation == base_projection_generation + 1`; validate the frozen correlation predecessor at the base generation and build the computation/report terminal predecessor at the publish generation.
+- Exact pure PCC signatures: `_freeze_replay_pcc_seed(proof: AuthenticatedPCCInput, *, detector_bundle_sha256: str, registry: SpecialUseRegistry, registry_facts_canonical: bytes) -> _FrozenPCCCorrelationInput` and `_rebind_frozen_pcc_projection_context(input: _FrozenPCCCorrelationInput, coverage: HistoricalCoverageAssessment | None, active_duplicate: ActiveCandidateObservation | None, terminal_observation: TerminalCandidateObservation | None) -> _FrozenPCCCorrelationInput`.
+- Exact hydration signature: `_validate_and_hydrate_replay(snapshot: _ReplayInputSnapshot, computation: _ReplayComputation) -> tuple[sqlite3.Connection, _UnpublishedV2ReplayReport]`.
 
-Production uses the status internally; tests only poll immutable status and never inject a callback. A finite `_ReplayFaultPhase | None` is accepted only by `_v2_unpublished_projection_from_prefix_for_test`; it raises `KeyboardInterrupt` at the freeze/compute/publish boundary by data selection, never by calling injected code.
+The journal snapshot is validation-only and never enters `_compute_replay`; only its immediately detached PCC seeds enter `_ReplayInputSnapshot`. Capture all completed PCC proofs through the strict terminal in deterministic source order. Final revalidation compares the exact mutation revision, lifecycle/store/verifier generation, durable inode/size/digest/chain/count, completed indexes and every canonical PCC fact while the journal lock remains held through publication.
 
-- [ ] **Step 1: Write RED sanctioned-writer and cleanup tests**
+Production uses replay status internally; tests only poll immutable status under `_replay_state_lock` and never inject a callback. `_ReplayFaultPhase | None` is finite data accepted by the private replay entry and supplied only from its test wrapper/tests; it raises `KeyboardInterrupt` after complete freeze, at compute entry, or after final revalidation before live mutation, never by calling injected code. The status lock is separate from `_mutex`, so lock-held `VALIDATING` remains observable.
+
+- [ ] **Step 1: Write RED journal-snapshot, PCC-seed and generation tests**
 
 ```python
-@pytest.mark.parametrize("writer", ["append", "retention", "ack", "correlation"])
+def test_correlation_journal_replay_snapshot_rejects_real_completed_writer() -> None:
+    journal, terminal = completed_journal_fixture()
+    with _correlation_journal_replay_gate(journal):
+        snapshot, proofs = _capture_correlation_journal_replay_locked(
+            journal,
+            through_sequence=terminal.source_sequence,
+        )
+    complete_another_request_through_public_journal_api(journal)
+    with _correlation_journal_replay_gate(journal), pytest.raises(
+        CorrelationRequestJournalAuthorityError
+    ):
+        _revalidate_correlation_journal_replay_locked(journal, snapshot)
+    assert proofs
+
+
+def test_replay_pcc_seed_binds_only_compute_owned_coverage() -> None:
+    seed, reduction, expected = replay_seed_fixture()
+    assert seed.context.coverage is None
+    rebound = _rebind_frozen_pcc_projection_context(
+        seed,
+        reduction.timeline.assessment,
+        None,
+        None,
+    )
+    assert _correlate_frozen_pcc(rebound) == expected
+
+
+def test_compute_replay_uses_base_and_next_publish_generation() -> None:
+    snapshot = build_complete_replay_input_snapshot(
+        base_projection_generation=7,
+        publish_generation=8,
+    )
+    computation = _compute_replay(snapshot)
+    assert snapshot.correlation.predecessor.generation == 7
+    assert computation.terminal_predecessor.generation == 8
+```
+
+- [ ] **Step 2: Run the three RED nodes**
+
+```bash
+TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
+  .venv/bin/python -m pytest -q \
+  core/tests/ingest/test_correlation_journal.py::test_correlation_journal_replay_snapshot_rejects_real_completed_writer \
+  core/tests/evidence/test_projection_replay_boundary.py::test_replay_pcc_seed_binds_only_compute_owned_coverage \
+  core/tests/evidence/test_projection_replay_boundary.py::test_compute_replay_uses_base_and_next_publish_generation
+```
+
+Expected: missing journal gate/snapshot, seed rebind and split-generation contracts.
+
+- [ ] **Step 3: Implement values-only completed-PCC freeze and pure coverage rebind**
+
+The fixed nesting is:
+
+```text
+owner._mutex
+  -> SegmentStore._source_gate
+  -> AckJournal._retention_lock
+  -> correlation binding.lock
+  -> _ISSUED_AUTHORITIES_LOCK
+  -> CorrelationRequestJournal._lock
+```
+
+Make `_correlation_projection_snapshot_gate` hold the reentrant issued-authority lock across its yield. The journal is deepest; never acquire journal then correlation binding. Journal capture authenticates exact completed states/proofs without any supplied callable and returns issued proofs only as an ephemeral second return value. Freeze those proofs immediately with the live registry/pins held by the correlation binding, retain only detached seeds, and discard every issued proof reference before releasing locks. Do not construct a completed-batch authority or register a correlation context.
+
+For a complete proof `_freeze_replay_pcc_seed` builds a detached raw context with exact detector, parsed registry and duplicate key but `coverage=None`; failed proofs use `CorrelationContext.failed_snapshot()`. `_rebind_frozen_pcc_projection_context` requires exact computed coverage for complete proofs and `None` for failed proofs, rebinds projection-local observations, and recomputes canonical context/facts without issuance or global-registry lookup. Remove the pre-rebind `context.coverage != reduction.timeline.assessment` rejection from `_compute_replay`; keep exact detector and lookup-key checks.
+
+- [ ] **Step 4: Run focused primitive GREEN and commit**
+
+```bash
+TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
+  .venv/bin/python -m pytest -q \
+  core/tests/ingest/test_correlation_journal.py::test_correlation_journal_replay_snapshot_rejects_real_completed_writer \
+  core/tests/evidence/test_projection_replay_boundary.py::test_replay_pcc_seed_binds_only_compute_owned_coverage \
+  core/tests/evidence/test_projection_replay_boundary.py::test_compute_replay_uses_base_and_next_publish_generation \
+  core/tests/evidence/test_projection_pcc.py::test_compute_projection_parity_scenarios
+.venv/bin/ruff check core/agmind_immune/ingest/correlation_journal.py core/agmind_immune/correlation/authority.py core/agmind_immune/correlation/pcc.py core/agmind_immune/evidence/projection_v2.py core/tests/ingest/test_correlation_journal.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
+.venv/bin/mypy core/agmind_immune/ingest/correlation_journal.py core/agmind_immune/correlation/authority.py core/agmind_immune/correlation/pcc.py core/agmind_immune/evidence/projection_v2.py
+git diff --check
+git add core/agmind_immune/ingest/correlation_journal.py core/agmind_immune/correlation/authority.py core/agmind_immune/correlation/pcc.py core/agmind_immune/evidence/projection_v2.py core/tests/ingest/test_correlation_journal.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
+git commit -m "feat(core): freeze completed PCC replay facts"
+```
+
+- [ ] **Step 5: Write RED sanctioned-writer, reservation and cleanup tests**
+
+```python
+@pytest.mark.parametrize(
+    "writer",
+    ["append", "retention", "ack", "correlation_authority", "journal"],
+)
 def test_snapshot_revision_change_before_validate_rejects_no_report(writer: str) -> None:
-    owner = start_replay_with_real_fixture()
+    owner, worker = start_existing_owner_replay_with_real_fixture()
     wait_until_status(owner, _ReplayPhase.COMPUTING)
     perform_real_public_writer(writer)
-    assert finish_replay(owner) is None
-    assert owner.generation == original_generation()
+    with pytest.raises(ProjectionAuthorityError):
+        finish_replay(worker)
+    assert owner._generation == original_generation()
     assert no_projection_artifact_was_published(owner)
 
 
-@pytest.mark.parametrize("writer", ["append", "retention", "ack", "correlation"])
+@pytest.mark.parametrize(
+    "writer",
+    ["append", "retention", "ack", "correlation_authority", "journal"],
+)
 def test_writer_started_during_validate_publish_cannot_make_mixed_report(writer: str) -> None:
-    owner = start_replay_with_real_fixture()
-    blocked_writer = start_writer_before_public_mutation(writer)
+    owner, worker = start_existing_owner_replay_with_real_fixture()
     wait_until_status(owner, _ReplayPhase.VALIDATING)
-    release_writer(blocked_writer)
-    report = finish_replay(owner)
+    blocked_writer = start_real_public_writer(writer)
+    assert_writer_is_blocked(blocked_writer)
+    report = finish_replay(worker)
     assert report == literal_pre_snapshot_report()
     assert_writer_completed_after_publish(blocked_writer)
 
 
 @pytest.mark.parametrize("phase", ["freeze", "compute", "publish"])
 def test_baseexception_at_replay_phase_cleans_fds_reservation_and_generation(phase: str) -> None:
-    owner = build_owner_with_fault_phase(phase)
+    owner, through = build_owner_with_fault_phase(phase)
     with pytest.raises(KeyboardInterrupt):
-        owner.replay()
+        owner._replay_unpublished_prefix(
+            through,
+            _factory=_UNPUBLISHED_REPLAY_FACTORY,
+            _fault_phase=_ReplayFaultPhase(phase),
+        )
     assert owner._replay_status_for_test().reservation_present is False
-    assert owner.generation == original_generation()
+    assert owner._generation == original_generation()
     assert all_snapshot_fds_closed(owner)
     assert no_projection_artifact_was_published(owner)
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [ ] **Step 6: Run and verify orchestration RED**
+
+```bash
+TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
+  .venv/bin/python -m pytest -q \
+  core/tests/evidence/test_projection_replay_boundary.py::test_snapshot_revision_change_before_validate_rejects_no_report \
+  core/tests/evidence/test_projection_replay_boundary.py::test_writer_started_during_validate_publish_cannot_make_mixed_report \
+  core/tests/evidence/test_projection_replay_boundary.py::test_baseexception_at_replay_phase_cleans_fds_reservation_and_generation
+```
 
 Expected: current nested source/ACK/correlation callback protocol cannot expose immutable status, cannot perform out-of-lock compute, and leaks the old replay private model into orchestration.
 
-- [ ] **Step 3: Rewrite `_replay_unpublished_prefix` into three phases**
+- [ ] **Step 7: Rewrite `_replay_unpublished_prefix` into three phases**
 
-Freeze under the fixed locks, install one exact reservation, capture source/ACK/correlation/PCC snapshots, and release all locks. Set phase `COMPUTING`, call `_compute_replay(snapshot)`, then reacquire the same locks, revalidate every snapshot, deserialize/apply the computation into the unpublished owner transaction, construct the report, clear the reservation, advance generation, and return without any intervening callback. One outer `finally` closes source/ACK descriptors and clears partial reservation/status on every `BaseException`.
+Add `_replay_state_lock`, `_replay_reservation` and `_replay_status` to `_V2ProjectionOwner`. Install the exact reservation under `_mutex -> _replay_state_lock`, capture the source/ACK/correlation/journal snapshots and detached seeds under the fixed lock order, then release every authority lock and `_mutex`. All other owner operations acquire `_mutex -> _replay_state_lock` and reject the reservation while compute is active.
 
-Delete replay handle/access/event/state-seal imports and plumbing, nested `under_ack_guard`/`under_correlation_guard`, source terminal callback, `terminal_external_authority_check`, returned `final_authority_check`, and replay-path `_step_hook` calls. Preserve active V1 and dormant V2 entry points.
+Set `COMPUTING` only after freeze locks release. Call `_compute_replay(snapshot)`, then call `_validate_and_hydrate_replay` before final locks. Hydration reconstructs `report_bytes`, deserializes into a fresh private SQLite connection, verifies exact schema/integrity/cursor/terminal predecessor/logical hash/transcript count/invalidation rows/source terminal, and preconstructs `_UnpublishedV2ReplayReport`. It calls no live owner, historical session, batch evaluator, `_issue_correlation_context`, `_apply_prepared`, or replay hook.
 
-- [ ] **Step 4: Run focused concurrency/cleanup GREEN**
+Reacquire the full lock order and set `VALIDATING` only after the journal lock is held. Revalidate every snapshot and exact reservation. Raise the finite publish fault before live mutation. Close source/ACK descriptors and the original empty connection, call `_rebuild_correlation_projection_authority(authority, computation.terminal_predecessor)`, then perform only non-throwing assignments of the hydrated connection, publish generation and `PUBLISHED` status. A max-generation owner fails before reservation installation.
+
+One outer `finally` preserves the primary `BaseException`, closes an unpublished hydrated connection, closes any still-owned ACK/source descriptors, then clears the exact reservation last and records `FAILED(base_generation, False)` if publication did not complete. Attach cleanup failures as notes. Capture helpers retain their own partial-construction cleanup.
+
+Delete replay handle/access/event/state-seal imports and plumbing, nested `under_ack_guard`/`under_correlation_guard`, source terminal callback, `terminal_external_authority_check`, returned `final_authority_check`, the replay-only `_issue_completed_snapshot_batch`/item/seal/revoke authority family and replay-path `_step_hook` calls. Remove their journal unit tests. Preserve ordinary V2 `_evaluate_completed_snapshot_batch`, `_issue_correlation_context`/`_IssuedContextBinding` compatibility, active V1 and dormant V2 entry points.
+
+- [ ] **Step 8: Run focused concurrency/cleanup GREEN**
 
 ```bash
 TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
@@ -624,7 +786,9 @@ TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
   core/tests/evidence/test_projection_pcc.py::test_unpublished_final_seal_binds_authenticated_retired_ranges
 ```
 
-- [ ] **Step 5: Run post-orchestration semantic/crash slice**
+Rewrite the two legacy nodes in this command to use a real public journal/retention writer and status barrier; do not retain `_step_hook`, private-range mutation or terminal callback injection.
+
+- [ ] **Step 9: Run post-orchestration semantic/crash slice**
 
 ```bash
 TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
@@ -638,13 +802,13 @@ TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
   core/tests/evidence/test_projection_pcc.py::test_candidate_write_crash_points_roll_back_and_retry_exactly
 ```
 
-- [ ] **Step 6: Static check and commit**
+- [ ] **Step 10: Static check and commit**
 
 ```bash
-.venv/bin/ruff check core/agmind_immune/evidence/projection_v2.py core/agmind_immune/evidence/segments.py core/agmind_immune/ingest/ack_journal.py core/agmind_immune/correlation/authority.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
-.venv/bin/mypy core/agmind_immune/evidence/projection_v2.py core/agmind_immune/evidence/segments.py core/agmind_immune/ingest/ack_journal.py core/agmind_immune/correlation/authority.py
+.venv/bin/ruff check core/agmind_immune/evidence/projection_v2.py core/agmind_immune/evidence/segments.py core/agmind_immune/ingest/ack_journal.py core/agmind_immune/ingest/correlation_journal.py core/agmind_immune/correlation/authority.py core/agmind_immune/correlation/pcc.py core/tests/ingest/test_correlation_journal.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
+.venv/bin/mypy core/agmind_immune/evidence/projection_v2.py core/agmind_immune/evidence/segments.py core/agmind_immune/ingest/ack_journal.py core/agmind_immune/ingest/correlation_journal.py core/agmind_immune/correlation/authority.py core/agmind_immune/correlation/pcc.py
 git diff --check
-git add core/agmind_immune/evidence/projection_v2.py core/agmind_immune/evidence/segments.py core/agmind_immune/ingest/ack_journal.py core/agmind_immune/correlation/authority.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
+git add core/agmind_immune/evidence/projection_v2.py core/agmind_immune/evidence/segments.py core/agmind_immune/ingest/ack_journal.py core/agmind_immune/ingest/correlation_journal.py core/agmind_immune/correlation/authority.py core/agmind_immune/correlation/pcc.py core/tests/ingest/test_correlation_journal.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
 git commit -m "refactor(core): publish replay after exact revalidation"
 ```
 

@@ -113,6 +113,7 @@ projection mutex
   -> ACK retention lock
   -> correlation binding lock
   -> issued-authority lock
+  -> completed-PCC journal lock
 ```
 
 core captures an immutable `_ReplayInputSnapshot` containing:
@@ -125,7 +126,24 @@ core captures an immutable `_ReplayInputSnapshot` containing:
 - ACK generation, confirmed descriptor and retention state;
 - exact correlation predecessor revision and typed canonical facts;
 - detector pin and issued-registry facts;
-- projection generation and expected schema domain.
+- completed-PCC journal lifecycle/revision, durable file identity and digest,
+  canonical completed-state/index facts, and detached PCC proof seeds;
+- base projection generation, next publish generation and expected schema
+  domain.
+
+The correlation binding gate holds the reentrant issued-authority lock across
+the completed-PCC journal gate. The journal is deepest because the ordinary
+V2 compatibility path already acquires correlation binding before journal;
+the inverse order is forbidden. Bounded authentication needed to copy exact
+journal/PCC facts is snapshot construction, not historical or projection
+replay. It invokes no supplied callable and performs no historical reduction.
+
+Complete PCC seeds intentionally contain no historical coverage assessment.
+They contain only a detached authenticated proof, detached pinned-registry
+facts, detector pin and deterministic duplicate key. Failed PCC seeds contain
+the detached proof and failed-only context. No batch authority, evaluator,
+registered context, live registry or verifier object escapes the freeze
+section into deterministic compute.
 
 No replay, hashing hook, test hook, network call, model call, policy call or
 user callback runs while these locks are held. Locks are released after the
@@ -150,20 +168,38 @@ The reducer has no access to live store/ACK/correlation objects. It accepts no
 callable parameters. Any decode, hash, range, identity or limit failure returns
 no artifact.
 
+For each complete PCC the reducer derives the historical assessment from its
+own frozen source facts, then purely rebinds that assessment plus its
+projection-local duplicate/terminal observations onto the seed before calling
+the facts-only correlation kernel. Freeze never precomputes coverage and
+compute never queries issuance tables or a global registry.
+
 ### 5.3 Validate and publish
 
 Core reacquires the same locks in the same order and compares every captured
-revision, lifecycle, descriptor, typed fact and pin against live authority.
+revision, lifecycle, descriptor, completed-journal fact, typed fact and pin
+against live authority.
 If any value changed, it discards the computation and returns a retryable or
 fail-closed result according to the existing state machine.
 
 If unchanged, the same critical section:
 
 1. verifies the computation's typed seal;
-2. constructs the unpublished report;
-3. closes replay snapshot resources and clears the exact reservation;
-4. publishes/returns the already constructed report;
-5. records the projection generation transition.
+2. verifies a separately hydrated private SQLite image and constructs the
+   unpublished report before any live mutation;
+3. closes replay snapshot descriptors and the original unpublished empty
+   connection;
+4. rebuilds the correlation predecessor from the frozen base generation to
+   exactly `base + 1`;
+5. atomically adopts the already validated private connection, records the
+   publish generation, clears the exact reservation and returns the already
+   constructed report.
+
+The computation is sealed for the publish generation while validation checks
+the frozen correlation predecessor at the base generation. Generation
+arithmetic is exact uint64 and a maximum-generation replay fails before any
+artifact. Once the fallible predecessor rebuild succeeds, remaining owner
+assignments are non-throwing.
 
 There is no external callback between the last validation and publication.
 Sanctioned writers either complete before the validation snapshot, change a
@@ -217,6 +253,10 @@ is not a supported interleaving; arbitrary replacement is TCB compromise.
 - Validation mismatch returns no artifact and advances no projection state.
 - Every reservation and owned replay descriptor is cleared/closed in `finally`
   on any `BaseException`.
+- Replay status is guarded by a small lock separate from the projection mutex,
+  so tests can observe `COMPUTING` and lock-held `VALIDATING` without injecting
+  executable hooks. Other owner operations reject the exact reservation while
+  compute runs with the projection mutex released.
 - A crash before publish leaves the prior durable projection authoritative.
 - A crash during a later Task 8 atomic replace follows the existing
   checkpoint/fsync/replace/parent-fsync/reopen protocol.
@@ -272,6 +312,11 @@ Replace:
 - post-hoc `_fold_replay_timeline` traversal with reducer-emitted leaf facts;
 - same-process monkeypatch threat tests with process-boundary and sanctioned
   concurrency tests.
+
+Task 6 removes the terminal replay evaluators, completed-batch replay
+authorities and replay session/broker plumbing. It does not yet remove the
+ordinary V2 live-context issuance/registration compatibility path used by
+`apply`; that path remains dormant and is migrated with Task 8 activation.
 
 The exhausted `_ReplayHandle`, `_ReplayAccess`, `_ReplayEventToken`, replay
 path and broker-dispatch surfaces are removed; pure replay has no live
