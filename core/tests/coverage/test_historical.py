@@ -1052,7 +1052,6 @@ def _bounded_reduce(records: Any, *, trigger: int, through: int) -> Any:
         clock_uncertainty_ms=0,
         coverage_through_sequence=through,
         window_end=T1,
-        _prefix_records=lambda _sequence: (),
     )
 
 

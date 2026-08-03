@@ -308,35 +308,59 @@ def _prepare_historical_record(record: StoredEvidenceRecord) -> _PreparedHistori
     )
 
 
-def _is_primary(
-    prefix: Iterable[StoredEvidenceRecord],
-    prepared: _PreparedHistoricalRecord,
-) -> bool:
-    for earlier in prefix:
-        candidate = _prepare_historical_record(earlier)
-        if (
-            candidate.fact.dedup_kind == prepared.fact.dedup_kind
-            and candidate.fact.logical_key_sha256
-            == prepared.fact.logical_key_sha256
-        ):
-            return False
-    return True
+@dataclass(frozen=True, slots=True)
+class _HistoricalPreparedPrefix:
+    prepared: tuple[_PreparedHistoricalRecord, ...]
+    primary: tuple[bool, ...]
+
+    def before(self, source_sequence: int) -> tuple[_PreparedHistoricalRecord, ...]:
+        return tuple(
+            item
+            for item in self.prepared
+            if item.envelope.source_sequence < source_sequence
+        )
 
 
 @dataclass(frozen=True, slots=True)
-class _HistoricalPrefixOracle:
-    prepared_before: Callable[[int], Iterable[_PreparedHistoricalRecord]]
-    is_primary: Callable[[_PreparedHistoricalRecord], bool]
+class _HistoricalReductionDiagnostics:
+    prepared_records: int
+    primary_checks: int
+    interval_materializations: int
+    event_materializations: int
+    leaf_materializations: int
+    semantic_prefix_visits: int
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalReductionResult:
+    timeline: HistoricalCoverageTimeline
+    assessment_digest: bytes
+    interval_count: int
+    interval_digest: bytes
+    event_count: int
+    event_digest: bytes
+    semantic_digest: bytes
+    diagnostics: _HistoricalReductionDiagnostics
+
+
+def _prepared_prefix_primary(
+    prefix: _HistoricalPreparedPrefix,
+    candidate: _PreparedHistoricalRecord,
+) -> bool:
+    for prepared, primary in zip(prefix.prepared, prefix.primary, strict=True):
+        if prepared is candidate:
+            return primary
+    raise HistoricalCoverageConflict("historical record is outside the prepared prefix")
 
 
 def _episode_was_closed(
-    prefix: _HistoricalPrefixOracle,
+    prefix: _HistoricalPreparedPrefix,
     before_sequence: int,
     key: tuple[str | None, str, str, str],
 ) -> bool:
     closed = False
-    for candidate in prefix.prepared_before(before_sequence):
-        if not prefix.is_primary(candidate):
+    for candidate in prefix.before(before_sequence):
+        if not _prepared_prefix_primary(prefix, candidate):
             continue
         if (
             candidate.coverage is None
@@ -353,17 +377,17 @@ def _episode_was_closed(
 
 
 def _sequence_range_was_seen(
-    prefix: _HistoricalPrefixOracle,
+    prefix: _HistoricalPreparedPrefix,
     before_sequence: int,
     start: int,
     end: int,
 ) -> bool:
-    for candidate in prefix.prepared_before(before_sequence):
+    for candidate in prefix.before(before_sequence):
         coverage = candidate.coverage
         if (
             coverage is None
             or candidate.fact.classification.action != "sequence_open"
-            or not prefix.is_primary(candidate)
+            or not _prepared_prefix_primary(prefix, candidate)
         ):
             continue
         prior_start = coverage.affected_source_sequence_start
@@ -378,19 +402,19 @@ def _sequence_range_was_seen(
 
 
 def _docker_episode_was_seen(
-    prefix: _HistoricalPrefixOracle,
+    prefix: _HistoricalPreparedPrefix,
     before_sequence: int,
     opened_at: str,
     generation: int,
 ) -> bool:
-    for candidate in prefix.prepared_before(before_sequence):
+    for candidate in prefix.before(before_sequence):
         coverage = candidate.coverage
         if (
             coverage is not None
             and candidate.fact.classification.action == "docker_open"
             and coverage.opened_at == opened_at
             and coverage.reconcile_generation == generation
-            and prefix.is_primary(candidate)
+            and _prepared_prefix_primary(prefix, candidate)
         ):
             return True
     return False
@@ -466,8 +490,8 @@ def _coverage_snapshot_sha256(
     ).hexdigest()
 
 
-def _reduce_historical_coverage(
-    records: Iterable[StoredEvidenceRecord],
+def _reduce_historical_coverage_result(
+    records: tuple[StoredEvidenceRecord, ...],
     *,
     host_id: str,
     boot_id: str,
@@ -477,43 +501,26 @@ def _reduce_historical_coverage(
     clock_uncertainty_ms: int,
     coverage_through_sequence: int,
     window_end: str,
-    _prefix_records: Callable[[int], Iterable[StoredEvidenceRecord]] | None = None,
-    _prepared_records: Iterable[_PreparedHistoricalRecord] | None = None,
-    _prefix_oracle: _HistoricalPrefixOracle | None = None,
-    _replay_timeline_sink: Callable[[HistoricalCoverageTimeline], None] | None = None,
-) -> HistoricalCoverageTimeline:
-    if _prefix_records is None and _prefix_oracle is None:
-        if type(records) is not tuple:
-            raise HistoricalCoverageUnavailable(
-                "historical reduction requires a transaction-bound prefix oracle"
-            )
-        test_records = records
-        _prefix_records = lambda sequence: (
-            item
-            for item in test_records
-            if item.ref.source_sequence < sequence
+) -> _HistoricalReductionResult:
+    if type(records) is not tuple or any(
+        type(record) is not StoredEvidenceRecord for record in records
+    ):
+        raise HistoricalCoverageUnavailable(
+            "historical reduction requires exact ordered evidence records"
         )
-    if _prefix_oracle is None:
-        if _prefix_records is None:
-            raise HistoricalCoverageUnavailable(
-                "historical reduction lost its prefix oracle"
-            )
-        prefix_records = _prefix_records
-        _prefix_oracle = _HistoricalPrefixOracle(
-            prepared_before=lambda sequence: (
-                _prepare_historical_record(item)
-                for item in prefix_records(sequence)
-            ),
-            is_primary=lambda prepared: _is_primary(
-                prefix_records(prepared.envelope.source_sequence),
-                prepared,
-            ),
+    selected_prepared = tuple(_prepare_historical_record(stored) for stored in records)
+    seen_primary_keys: set[tuple[str, str]] = set()
+    primary_mask: list[bool] = []
+    for prepared in selected_prepared:
+        primary_key = (
+            prepared.fact.dedup_kind,
+            prepared.fact.logical_key_sha256,
         )
-    selected_prepared = (
-        tuple(_prepare_historical_record(stored) for stored in records)
-        if _prepared_records is None
-        else _prepared_records
-    )
+        primary = primary_key not in seen_primary_keys
+        primary_mask.append(primary)
+        if primary:
+            seen_primary_keys.add(primary_key)
+    prefix = _HistoricalPreparedPrefix(selected_prepared, tuple(primary_mask))
     window = _historical_coverage_window(
         trigger_event_time,
         clock_uncertainty_ms,
@@ -536,7 +543,7 @@ def _reduce_historical_coverage(
         last_sequence = envelope.source_sequence
         if envelope.source_sequence > coverage_through_sequence:
             continue
-        if not _prefix_oracle.is_primary(prepared):
+        if not _prepared_prefix_primary(prefix, prepared):
             continue
         if current_boot is not None and envelope.boot_id != current_boot:
             active = {
@@ -564,7 +571,7 @@ def _reduce_historical_coverage(
                 raise HistoricalCoverageConflict("Docker open lost generation")
             docker_key = (coverage.opened_at, generation)
             if docker_key in docker_active or _docker_episode_was_seen(
-                _prefix_oracle,
+                prefix,
                 envelope.source_sequence,
                 coverage.opened_at,
                 generation,
@@ -633,7 +640,7 @@ def _reduce_historical_coverage(
                 raise HistoricalCoverageConflict("sequence open lost range")
             sequence_key = (start, end, coverage.opened_at)
             if sequence_key in sequence_active or _sequence_range_was_seen(
-                _prefix_oracle,
+                prefix,
                 envelope.source_sequence,
                 start,
                 end,
@@ -718,7 +725,7 @@ def _reduce_historical_coverage(
             if action == "generic_open":
                 if active_opened is None:
                     if _episode_was_closed(
-                        _prefix_oracle,
+                        prefix,
                         envelope.source_sequence,
                         episode_key,
                     ):
@@ -804,11 +811,11 @@ def _reduce_historical_coverage(
                     )
             else:
                 # A self-contained close is legal only when no earlier primary used the key.
-                for prior in _prefix_oracle.prepared_before(
+                for prior in prefix.before(
                     envelope.source_sequence
                 ):
                     if (
-                        _prefix_oracle.is_primary(prior)
+                        _prepared_prefix_primary(prefix, prior)
                         and prior.coverage is not None
                         and prior.fact.classification.action
                         in {"generic_open", "generic_close"}
@@ -888,20 +895,44 @@ def _reduce_historical_coverage(
             or open_sequence.affected_start > coverage_through_sequence
         ):
             structural_incomplete = True
-    sorted_intervals = tuple(
-        sorted(
-            intervals,
-            key=lambda item: (
-                item.opened_at,
-                item.component,
-                item.kind,
-                item.open_event_id,
-                item.close_event_id or "",
-            ),
-        )
-    )
+    ordered_intervals: list[HistoricalCriticalEpisode] = []
+    interval_hasher = hashlib.sha256()
+    interval_hasher.update(_REPLAY_MEMO_INTERVAL_HASH_DOMAIN + b"[")
+    for interval in sorted(
+        intervals,
+        key=lambda item: (
+            item.opened_at,
+            item.component,
+            item.kind,
+            item.open_event_id,
+            item.close_event_id or "",
+        ),
+    ):
+        if type(interval) is not HistoricalCriticalEpisode:
+            raise HistoricalCoverageUnavailable(
+                "historical replay memo interval type changed"
+            )
+        if ordered_intervals:
+            interval_hasher.update(b",")
+        ordered_intervals.append(interval)
+        interval_hasher.update(canonical_json(_replay_exact_fact(interval)))
+    sorted_intervals = tuple(ordered_intervals)
+    interval_hasher.update(b"]")
     _bounded_for_test("final intervals", sorted_intervals)
-    coverage_ids = tuple(sorted(set(final_ids)))
+    ordered_event_ids: list[str] = []
+    event_hasher = hashlib.sha256()
+    event_hasher.update(_REPLAY_MEMO_EVENT_HASH_DOMAIN + b"[")
+    for event_id in sorted(set(final_ids)):
+        if type(event_id) is not str:
+            raise HistoricalCoverageUnavailable(
+                "historical replay memo event type changed"
+            )
+        if ordered_event_ids:
+            event_hasher.update(b",")
+        ordered_event_ids.append(event_id)
+        event_hasher.update(canonical_json(_replay_exact_fact(event_id)))
+    coverage_ids = tuple(ordered_event_ids)
+    event_hasher.update(b"]")
     _bounded_for_test("final coverage IDs", coverage_ids)
     complete = window.complete and not structural_incomplete
     digest = None
@@ -931,10 +962,65 @@ def _reduce_historical_coverage(
         critical_gap=bool(sorted_intervals) if complete else False,
         coverage_snapshot_sha256=digest,
     )
+    assessment_digest = _replay_fact_digest(
+        _REPLAY_MEMO_ASSESSMENT_HASH_DOMAIN,
+        assessment,
+    )
+    interval_digest = interval_hasher.digest()
+    event_digest = event_hasher.digest()
+    semantic_digest = _replay_fact_digest(
+        _REPLAY_MEMO_SEMANTIC_HASH_DOMAIN,
+        (
+            assessment_digest,
+            len(sorted_intervals),
+            interval_digest,
+            len(coverage_ids),
+            event_digest,
+        ),
+    )
     timeline = HistoricalCoverageTimeline(assessment, sorted_intervals, coverage_ids)
-    if _replay_timeline_sink is not None:
-        _replay_timeline_sink(timeline)
-    return timeline
+    return _HistoricalReductionResult(
+        timeline=timeline,
+        assessment_digest=assessment_digest,
+        interval_count=len(sorted_intervals),
+        interval_digest=interval_digest,
+        event_count=len(coverage_ids),
+        event_digest=event_digest,
+        semantic_digest=semantic_digest,
+        diagnostics=_HistoricalReductionDiagnostics(
+            prepared_records=len(selected_prepared),
+            primary_checks=len(selected_prepared),
+            interval_materializations=len(sorted_intervals),
+            event_materializations=len(coverage_ids),
+            leaf_materializations=len(sorted_intervals) + len(coverage_ids),
+            semantic_prefix_visits=len(selected_prepared) * (len(selected_prepared) + 1),
+        ),
+    )
+
+
+def _reduce_historical_coverage(
+    records: Iterable[StoredEvidenceRecord],
+    *,
+    host_id: str,
+    boot_id: str,
+    trigger_event_id: str,
+    trigger_source_sequence: int,
+    trigger_event_time: str,
+    clock_uncertainty_ms: int,
+    coverage_through_sequence: int,
+    window_end: str,
+) -> HistoricalCoverageTimeline:
+    return _reduce_historical_coverage_result(
+        tuple(records),
+        host_id=host_id,
+        boot_id=boot_id,
+        trigger_event_id=trigger_event_id,
+        trigger_source_sequence=trigger_source_sequence,
+        trigger_event_time=trigger_event_time,
+        clock_uncertainty_ms=clock_uncertainty_ms,
+        coverage_through_sequence=coverage_through_sequence,
+        window_end=window_end,
+    ).timeline
 
 
 type _RefFingerprint = tuple[object, ...]
@@ -1160,17 +1246,6 @@ class _ReplayMemoLeaf:
     event_digest: bytes
     semantic_digest: bytes
     facts_digest: bytes
-
-
-@dataclass(frozen=True, slots=True)
-class _ReplayTimelineFold:
-    assessment: HistoricalCoverageAssessment
-    assessment_digest: bytes
-    interval_count: int
-    interval_digest: bytes
-    event_count: int
-    event_digest: bytes
-    semantic_digest: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -1454,78 +1529,8 @@ _REPLAY_MEMO_SEMANTIC_HASH_DOMAIN = b"AGMIND_HISTORICAL_REPLAY_MEMO_SEMANTIC_V1\
 _REPLAY_MEMO_LEAF_HASH_DOMAIN = b"AGMIND_HISTORICAL_REPLAY_MEMO_LEAF_V1\0"
 
 
-def _replay_leaf_fold_visit(kind: str) -> None:
-    del kind
-
-
-def _replay_seal_visit(kind: str) -> None:
-    del kind
-
-
-def _replay_validation_compact_visit(kind: str) -> None:
-    del kind
-
-
 def _replay_fact_digest(domain: bytes, value: object) -> bytes:
     return hashlib.sha256(domain + canonical_json(_replay_exact_fact(value))).digest()
-
-
-def _fold_replay_timeline(
-    assessment: HistoricalCoverageAssessment,
-    intervals: tuple[HistoricalCriticalEpisode, ...],
-    event_ids: tuple[str, ...],
-) -> _ReplayTimelineFold:
-    if (
-        type(assessment) is not HistoricalCoverageAssessment
-        or type(intervals) is not tuple
-        or type(event_ids) is not tuple
-    ):
-        raise HistoricalCoverageUnavailable(
-            "historical replay timeline fold facts are not exact"
-        )
-    interval_facts: list[object] = []
-    for interval in intervals:
-        if type(interval) is not HistoricalCriticalEpisode:
-            raise HistoricalCoverageUnavailable(
-                "historical replay memo interval type changed"
-            )
-        interval_facts.append(_replay_exact_fact(interval))
-    event_facts: list[object] = []
-    for event_id in event_ids:
-        if type(event_id) is not str:
-            raise HistoricalCoverageUnavailable(
-                "historical replay memo event type changed"
-            )
-        event_facts.append(_replay_exact_fact(event_id))
-    assessment_digest = _replay_fact_digest(
-        _REPLAY_MEMO_ASSESSMENT_HASH_DOMAIN,
-        assessment,
-    )
-    interval_digest = hashlib.sha256(
-        _REPLAY_MEMO_INTERVAL_HASH_DOMAIN + canonical_json(interval_facts)
-    ).digest()
-    event_digest = hashlib.sha256(
-        _REPLAY_MEMO_EVENT_HASH_DOMAIN + canonical_json(event_facts)
-    ).digest()
-    semantic_digest = _replay_fact_digest(
-        _REPLAY_MEMO_SEMANTIC_HASH_DOMAIN,
-        (
-            assessment_digest,
-            len(interval_facts),
-            interval_digest,
-            len(event_facts),
-            event_digest,
-        ),
-    )
-    return _ReplayTimelineFold(
-        assessment=assessment,
-        assessment_digest=assessment_digest,
-        interval_count=len(interval_facts),
-        interval_digest=interval_digest,
-        event_count=len(event_facts),
-        event_digest=event_digest,
-        semantic_digest=semantic_digest,
-    )
 
 
 def _build_replay_pcc_leaf(
@@ -1585,7 +1590,7 @@ def _replay_pcc_leaf_is_current(leaf: _ReplayPCCLeaf) -> bool:
 
 def _build_replay_memo_leaf(
     key: tuple[str, str],
-    timeline: HistoricalCoverageTimeline,
+    reduction: _HistoricalReductionResult,
     compact_count: int,
     compact_digest: str,
 ) -> _ReplayMemoLeaf:
@@ -1593,10 +1598,9 @@ def _build_replay_memo_leaf(
         type(key) is not tuple
         or len(key) != 2
         or any(type(part) is not str for part in key)
-        or type(timeline) is not HistoricalCoverageTimeline
-        or type(timeline.assessment) is not HistoricalCoverageAssessment
-        or type(timeline.intersecting_intervals) is not tuple
-        or type(timeline.coverage_event_ids) is not tuple
+        or type(reduction) is not _HistoricalReductionResult
+        or type(reduction.timeline) is not HistoricalCoverageTimeline
+        or type(reduction.timeline.assessment) is not HistoricalCoverageAssessment
         or type(compact_count) is not int
         or compact_count < 0
         or type(compact_digest) is not str
@@ -1605,36 +1609,31 @@ def _build_replay_memo_leaf(
         raise HistoricalCoverageUnavailable(
             "historical replay memo leaf facts are not exact"
         )
-    fold = _fold_replay_timeline(
-        timeline.assessment,
-        timeline.intersecting_intervals,
-        timeline.coverage_event_ids,
-    )
     facts_digest = _replay_fact_digest(
         _REPLAY_MEMO_LEAF_HASH_DOMAIN,
         (
             key,
             compact_count,
             compact_digest,
-            fold.assessment_digest,
-            fold.interval_count,
-            fold.interval_digest,
-            fold.event_count,
-            fold.event_digest,
-            fold.semantic_digest,
+            reduction.assessment_digest,
+            reduction.interval_count,
+            reduction.interval_digest,
+            reduction.event_count,
+            reduction.event_digest,
+            reduction.semantic_digest,
         ),
     )
     return _ReplayMemoLeaf(
         key=key,
-        assessment=timeline.assessment,
+        assessment=reduction.timeline.assessment,
         compact_count=compact_count,
         compact_digest=compact_digest,
-        assessment_digest=fold.assessment_digest,
-        interval_count=fold.interval_count,
-        interval_digest=fold.interval_digest,
-        event_count=fold.event_count,
-        event_digest=fold.event_digest,
-        semantic_digest=fold.semantic_digest,
+        assessment_digest=reduction.assessment_digest,
+        interval_count=reduction.interval_count,
+        interval_digest=reduction.interval_digest,
+        event_count=reduction.event_count,
+        event_digest=reduction.event_digest,
+        semantic_digest=reduction.semantic_digest,
         facts_digest=facts_digest,
     )
 
@@ -1761,7 +1760,6 @@ def _capture_replay_broker_seal(
     entry_records: list[StoredEvidenceRecord] = []
     entry_prepared: list[_PreparedHistoricalRecord] = []
     for entry in entries:
-        _replay_seal_visit("entry")
         if (
             type(entry) is not _FrozenReplayEntry
             or type(entry.record) is not StoredEvidenceRecord
@@ -1793,7 +1791,6 @@ def _capture_replay_broker_seal(
         )
     running_digest = _initial_replay_compact_digest()
     for record, prepared in zip(records, prepared_records, strict=True):
-        _replay_seal_visit("compact")
         if (
             type(record) is not StoredEvidenceRecord
             or type(record.ref) is not EvidenceRef
@@ -1821,7 +1818,6 @@ def _capture_replay_broker_seal(
         ]
     ] = []
     for key, leaf in used_pcc.items():
-        _replay_seal_visit("pcc")
         if key is not leaf.key or not pcc_leaf_is_current(leaf):
             raise HistoricalCoverageUnavailable(
                 "historical replay PCC leaf changed"
@@ -1841,7 +1837,6 @@ def _capture_replay_broker_seal(
         tuple[_ReplayMemoLeaf, HistoricalCoverageAssessment]
     ] = []
     for key, memo_leaf in memo.items():
-        _replay_seal_visit("memo")
         if (
             key is not memo_leaf.key
             or not 0 <= memo_leaf.compact_count <= compact_count
@@ -2488,47 +2483,8 @@ def _replay_historical_session(
                 )
             trigger = authenticated.snapshot.trigger
             selected_records = binding.compact_records
-            selected_prepared = binding.compact_prepared
-
-            def exact_primary(candidate: _PreparedHistoricalRecord) -> bool:
-                sequence = candidate.envelope.source_sequence
-                if not 1 <= sequence <= len(entries):
-                    raise HistoricalCoverageConflict(
-                        "compact primary lies outside the frozen transcript"
-                    )
-                entry = entries[sequence - 1]
-                if (
-                    entry.prepared is not candidate
-                    or not entry.expected_primary
-                    or not entry.compact_member
-                ):
-                    raise HistoricalCoverageConflict(
-                        "compact primary differs from the frozen transcript"
-                    )
-                return True
-
-            prefix_oracle = _HistoricalPrefixOracle(
-                prepared_before=lambda sequence: (
-                    item
-                    for item in selected_prepared
-                    if item.envelope.source_sequence < sequence
-                ),
-                is_primary=exact_primary,
-            )
-            built_leaves: list[_ReplayMemoLeaf] = []
-
-            def build_timeline_leaf(timeline: HistoricalCoverageTimeline) -> None:
-                built_leaves.append(
-                    build_memo_leaf(
-                        key,
-                        timeline,
-                        binding.compact_count,
-                        binding.compact_digest,
-                    )
-                )
-
-            timeline = _reduce_historical_coverage(
-                selected_records,
+            reduction = _reduce_historical_coverage_result(
+                tuple(selected_records),
                 host_id=authenticated.host_id,
                 boot_id=authenticated.boot_id,
                 trigger_event_id=trigger.event_id,
@@ -2539,16 +2495,14 @@ def _replay_historical_session(
                     authenticated.snapshot.coverage_through_sequence
                 ),
                 window_end=authenticated.snapshot.decision_time,
-                _prepared_records=selected_prepared,
-                _prefix_oracle=prefix_oracle,
-                _replay_timeline_sink=build_timeline_leaf,
             )
-            if len(built_leaves) != 1:
-                raise HistoricalCoverageUnavailable(
-                    "historical replay reducer did not produce one exact leaf"
-                )
-            leaf = built_leaves[0]
-            if leaf.assessment is not timeline.assessment:
+            leaf = build_memo_leaf(
+                key,
+                reduction,
+                binding.compact_count,
+                binding.compact_digest,
+            )
+            if leaf.assessment is not reduction.timeline.assessment:
                 raise HistoricalCoverageUnavailable(
                     "historical replay reducer leaf assessment changed"
                 )
@@ -2618,9 +2572,7 @@ def _replay_historical_session(
                 if not entry.compact_member:
                     continue
                 rebuilt_compact_records.append(entry.record)
-                _replay_validation_compact_visit("record")
                 rebuilt_compact_prepared.append(entry.prepared)
-                _replay_validation_compact_visit("prepared")
                 rebuilt_prefix_digests.append(
                     _update_replay_compact_digest(
                         rebuilt_prefix_digests[-1],
@@ -2680,67 +2632,9 @@ def _replay_historical_session(
                     rebuilt_compact_records,
                     selected_count,
                 )
-                selected_prepared = _BoundedView(
-                    rebuilt_compact_prepared,
-                    selected_count,
-                )
-
-                def exact_rebuilt_primary(
-                    candidate: _PreparedHistoricalRecord,
-                ) -> bool:
-                    sequence = candidate.envelope.source_sequence
-                    if not 1 <= sequence <= len(rebuilt_entries):
-                        raise HistoricalCoverageConflict(
-                            "rebuilt compact primary is outside the transcript"
-                        )
-                    entry = rebuilt_entries[sequence - 1]
-                    if (
-                        entry.prepared is not candidate
-                        or not entry.expected_primary
-                        or not entry.compact_member
-                    ):
-                        raise HistoricalCoverageConflict(
-                            "rebuilt compact primary differs from the transcript"
-                        )
-                    return True
-
-                def rebuilt_prepared_before(
-                    sequence: int,
-                    prepared: _BoundedView[_PreparedHistoricalRecord] = (
-                        selected_prepared
-                    ),
-                ) -> Iterable[_PreparedHistoricalRecord]:
-                    return (
-                        item
-                        for item in prepared
-                        if item.envelope.source_sequence < sequence
-                    )
-
-                prefix_oracle = _HistoricalPrefixOracle(
-                    prepared_before=rebuilt_prepared_before,
-                    is_primary=exact_rebuilt_primary,
-                )
                 trigger = fresh.snapshot.trigger
-                rebuilt_leaves: list[_ReplayMemoLeaf] = []
-
-                def build_rebuilt_leaf(
-                    timeline: HistoricalCoverageTimeline,
-                    leaves: list[_ReplayMemoLeaf] = rebuilt_leaves,
-                    key: tuple[str, str] = cached.key,
-                    count: int = selected_count,
-                    digest: str = cached.compact_digest,
-                ) -> None:
-                    leaves.append(
-                        build_memo_leaf(
-                            key,
-                            timeline,
-                            count,
-                            digest,
-                        )
-                    )
-
-                rebuilt_timeline = _reduce_historical_coverage(
-                    selected_records,
+                reduction = _reduce_historical_coverage_result(
+                    tuple(selected_records),
                     host_id=fresh.host_id,
                     boot_id=fresh.boot_id,
                     trigger_event_id=trigger.event_id,
@@ -2749,16 +2643,14 @@ def _replay_historical_session(
                     clock_uncertainty_ms=trigger.clock_uncertainty_ms,
                     coverage_through_sequence=coverage_through,
                     window_end=fresh.snapshot.decision_time,
-                    _prepared_records=selected_prepared,
-                    _prefix_oracle=prefix_oracle,
-                    _replay_timeline_sink=build_rebuilt_leaf,
                 )
-                if len(rebuilt_leaves) != 1:
-                    raise HistoricalCoverageUnavailable(
-                        "historical replay validation did not produce one exact leaf"
-                    )
-                rebuilt_leaf = rebuilt_leaves[0]
-                if rebuilt_leaf.assessment is not rebuilt_timeline.assessment:
+                rebuilt_leaf = build_memo_leaf(
+                    cached.key,
+                    reduction,
+                    selected_count,
+                    cached.compact_digest,
+                )
+                if rebuilt_leaf.assessment is not reduction.timeline.assessment:
                     raise HistoricalCoverageUnavailable(
                         "historical replay validation leaf assessment changed"
                     )
@@ -3716,10 +3608,6 @@ def _derive_historical_coverage_with_access(
                 clock_uncertainty_ms=trigger.clock_uncertainty_ms,
                 coverage_through_sequence=binding.coverage_through_sequence,
                 window_end=authenticated.snapshot.decision_time,
-                _prefix_records=lambda sequence: store.iter_authenticated_records(
-                    after=0,
-                    through=sequence - 1,
-                ),
             )
             _revalidate_authority(authenticated, authority)
             return timeline.assessment
