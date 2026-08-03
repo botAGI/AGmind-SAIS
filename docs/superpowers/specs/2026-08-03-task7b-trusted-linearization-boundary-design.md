@@ -138,6 +138,16 @@ the inverse order is forbidden. Bounded authentication needed to copy exact
 journal/PCC facts is snapshot construction, not historical or projection
 replay. It invokes no supplied callable and performs no historical reduction.
 
+Corruption/conflict discovered while any replay lock is held only latches a
+finite pending health-fence value. ACK and correlation-journal gates never call
+back into the store health/source gate while nested. After the entire journal
+→ issued-authority → correlation → ACK → source stack unwinds, orchestration
+drains the pending fences before returning the primary result. Ordinary public
+correlation-journal operations likewise release the journal lock before
+entering store read-only state. Fence failures are attached to the primary
+error; changing the source lock to reentrant or reversing the lock order is
+forbidden because neither solves the cross-thread inversion.
+
 Complete PCC seeds intentionally contain no historical coverage assessment.
 They contain only a detached authenticated proof, detached pinned-registry
 facts, detector pin and deterministic duplicate key. Failed PCC seeds contain
@@ -255,8 +265,15 @@ is not a supported interleaving; arbitrary replacement is TCB compromise.
   on any `BaseException`.
 - Replay status is guarded by a small lock separate from the projection mutex,
   so tests can observe `COMPUTING` and lock-held `VALIDATING` without injecting
-  executable hooks. Other owner operations reject the exact reservation while
-  compute runs with the projection mutex released.
+  executable hooks. A test may pre-register one exact enum phase through a
+  bounded data-only `Condition` handshake; production waits only for that
+  registered phase, for at most five seconds, and invokes no supplied
+  callable. Other owner operations reject the exact reservation while compute
+  runs with the projection mutex released.
+- Cleanup transfers each ACK/source snapshot out of live ownership before the
+  first close attempt. A partial close failure is never retried against the
+  same numeric descriptor, which may already have been reused by another
+  thread.
 - A crash before publish leaves the prior durable projection authoritative.
 - A crash during a later Task 8 atomic replace follows the existing
   checkpoint/fsync/replace/parent-fsync/reopen protocol.

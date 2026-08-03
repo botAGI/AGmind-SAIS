@@ -543,6 +543,7 @@ git commit -m "refactor(core): compute replay from frozen facts"
 - Modify: `core/agmind_immune/ingest/correlation_journal.py`
 - Modify: `core/agmind_immune/correlation/authority.py`
 - Modify: `core/agmind_immune/correlation/pcc.py`
+- Modify: `core/agmind_immune/coverage/historical.py`
 - Modify: `core/tests/ingest/test_correlation_journal.py`
 - Modify: `core/tests/evidence/test_projection_replay_boundary.py`
 - Modify: `core/tests/evidence/test_projection_pcc.py`
@@ -811,6 +812,112 @@ git diff --check
 git add core/agmind_immune/evidence/projection_v2.py core/agmind_immune/evidence/segments.py core/agmind_immune/ingest/ack_journal.py core/agmind_immune/ingest/correlation_journal.py core/agmind_immune/correlation/authority.py core/agmind_immune/correlation/pcc.py core/tests/ingest/test_correlation_journal.py core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py
 git commit -m "refactor(core): publish replay after exact revalidation"
 ```
+
+#### Task 6 review fix round
+
+The independent review found three Important issues: nested health fencing can
+invert/re-enter the source gate, the historical replay broker remains in
+production, and partial snapshot close can retry already-reused FD numbers.
+
+- [ ] **Fix 1: Add RED lock-unwind and one-shot ownership regressions**
+
+```python
+@pytest.mark.parametrize("authority", ["ack", "correlation_journal"])
+def test_replay_corruption_fence_drains_after_full_lock_unwind(authority: str) -> None:
+    case = build_real_corrupt_replay_case(authority)
+    worker = start_replay(case)
+    worker.join(timeout=5.0)
+    assert worker.is_alive() is False
+    assert case.store.status().healthy is False
+    assert case.owner._replay_status_for_test().reservation_present is False
+
+
+def test_public_correlation_conflict_fences_after_journal_unlock() -> None:
+    case = build_real_conflicting_journal_writer_case()
+    replay, writer = start_source_then_journal_inversion_case(case)
+    writer.join(timeout=5.0)
+    replay.join(timeout=5.0)
+    assert writer.is_alive() is False
+    assert replay.is_alive() is False
+    assert case.store.status().healthy is False
+
+
+def test_snapshot_cleanup_consumes_fd_ownership_before_close() -> None:
+    case = build_partial_source_snapshot_close_failure()
+    with pytest.raises(BaseException):
+        case.replay()
+    assert case.every_owned_fd_close_attempts == 1
+    assert case.reused_unrelated_fd_is_open()
+```
+
+- [ ] **Fix 2: Defer health fences until the complete replay stack unwinds**
+
+`AckJournal._replay_ack_snapshot_gate` and
+`_correlation_journal_replay_gate` queue finite corruption values and do not
+drain them. Add exact methods
+`AckJournal._drain_replay_corruption_fences(primary: BaseException | None) -> None`
+and
+`CorrelationRequestJournal._drain_replay_corruption_fences(primary: BaseException | None) -> None`.
+Call both after every freeze/validate lock stack has fully unwound and before
+the phase returns. Preserve the primary error and attach drain failures as
+notes. Refactor ordinary correlation-journal public operation boundaries so
+`_raise_conflict`, corruption fencing and `store.enter_read_only()` drain only
+after `journal._lock` is released. Do not use an `RLock` source gate and do not
+reverse the documented order.
+
+- [ ] **Fix 3: Consume descriptor ownership before close**
+
+Move each snapshot into a local `owned_*` variable, set the orchestration
+owner variable to `None`, and only then call `_close_replay_ack_snapshot` or
+`_close_replay_source_snapshot`. Apply this on publication and outer cleanup;
+each numeric FD receives at most one close attempt even if a later close in the
+same source snapshot raises.
+
+- [ ] **Fix 4: Remove the exhausted historical broker without breaking ordinary V2**
+
+Delete `_ReplayHandle`, `_ReplayAccess`, `_ReplayEventToken`, session/broker
+registries, replay event/path dispatch, and callback final-seal helpers from
+`coverage/historical.py`. Replace `_issue_replay_historical_path_authority`
+with one ordinary exact-store issuer taking only `(store, proof)`, and make
+ordinary coverage derivation take no replay access. Remove `historical_access`
+from `correlation/authority.py` bindings/signatures/validation and update the
+ordinary V2 caller in `projection_v2.py`. Preserve `_issue_correlation_context`,
+its ordinary context registration/evaluator, and
+`_evaluate_completed_snapshot_batch` until Task 8.
+
+- [ ] **Fix 5: Run only the new regressions and prior exact Task 6 gates**
+
+```bash
+TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
+  .venv/bin/python -m pytest -q \
+  core/tests/evidence/test_projection_replay_boundary.py::test_replay_corruption_fence_drains_after_full_lock_unwind \
+  core/tests/ingest/test_correlation_journal.py::test_public_correlation_conflict_fences_after_journal_unlock \
+  core/tests/evidence/test_projection_replay_boundary.py::test_snapshot_cleanup_consumes_fd_ownership_before_close
+
+TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
+  .venv/bin/python -m pytest -q \
+  core/tests/evidence/test_projection_replay_boundary.py::test_snapshot_revision_change_before_validate_rejects_no_report \
+  core/tests/evidence/test_projection_replay_boundary.py::test_writer_started_during_validate_publish_cannot_make_mixed_report \
+  core/tests/evidence/test_projection_replay_boundary.py::test_baseexception_at_replay_phase_cleans_fds_reservation_and_generation \
+  core/tests/evidence/test_projection_pcc.py::test_unpublished_replay_failure_returns_no_artifact_and_closes_resources \
+  core/tests/evidence/test_projection_pcc.py::test_unpublished_final_seal_binds_authenticated_retired_ranges
+
+TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
+  .venv/bin/python -m pytest -q \
+  core/tests/evidence/test_projection_pcc.py::test_late_sequence_range_invalidates_despite_later_report_timestamp \
+  core/tests/evidence/test_projection_pcc.py::test_nonintersecting_late_window_and_range_do_not_invalidate \
+  core/tests/evidence/test_projection_pcc.py::test_late_invalidation_survives_close_event_and_exact_retry \
+  core/tests/evidence/test_projection_pcc.py::test_transport_duplicate_late_coverage_is_idempotent \
+  core/tests/evidence/test_projection_pcc.py::test_complete_pcc_without_completed_journal_rolls_back_event_and_cursor \
+  core/tests/evidence/test_projection_pcc.py::test_invalidation_write_crash_rolls_back_coverage_event_and_cursor \
+  core/tests/evidence/test_projection_pcc.py::test_candidate_write_crash_points_roll_back_and_retry_exactly
+```
+
+- [ ] **Fix 6: Static check, report exact range, and commit**
+
+Run the Task 6 Ruff/mypy/diff-check commands, replace the report's moving
+`HEAD` range with immutable full SHAs, append the review findings/fix evidence,
+and commit `fix(core): drain replay fences after lock unwind`.
 
 ---
 
