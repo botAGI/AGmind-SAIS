@@ -161,7 +161,7 @@ If unchanged, the same critical section:
 
 1. verifies the computation's typed seal;
 2. constructs the unpublished report;
-3. revokes replay-local capabilities and clears the exact reservation;
+3. closes replay snapshot resources and clears the exact reservation;
 4. publishes/returns the already constructed report;
 5. records the projection generation transition.
 
@@ -215,8 +215,8 @@ is not a supported interleaving; arbitrary replacement is TCB compromise.
 - Snapshot construction either returns a complete immutable value or nothing.
 - Computation owns no live lock or authority.
 - Validation mismatch returns no artifact and advances no projection state.
-- Every reservation and replay-local bearer is revoked in `finally` on any
-  `BaseException`.
+- Every reservation and owned replay descriptor is cleared/closed in `finally`
+  on any `BaseException`.
 - A crash before publish leaves the prior durable projection authoritative.
 - A crash during a later Task 8 atomic replace follows the existing
   checkpoint/fsync/replace/parent-fsync/reopen protocol.
@@ -256,7 +256,7 @@ boundary instead.
 
 Keep the useful round-5 work:
 
-- closure-owned access/path lifecycle;
+- exact replay reservation/generation cleanup and one-shot lifecycle;
 - explicit probing states and one-shot versioned tickets;
 - strict typed predecessor facts;
 - immutable PCC/memo leaf shapes;
@@ -272,6 +272,10 @@ Replace:
 - post-hoc `_fold_replay_timeline` traversal with reducer-emitted leaf facts;
 - same-process monkeypatch threat tests with process-boundary and sanctioned
   concurrency tests.
+
+The exhausted `_ReplayHandle`, `_ReplayAccess`, `_ReplayEventToken`, replay
+path and broker-dispatch surfaces are removed; pure replay has no live
+capability object to preserve.
 
 No compatibility shim preserves the exhausted private session/factory model.
 
