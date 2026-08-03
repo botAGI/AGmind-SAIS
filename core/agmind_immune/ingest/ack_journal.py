@@ -297,6 +297,8 @@ class AckJournal:
     _replay_lifecycle_token: bytes
     _mutation_revision: int
     _pending_corruption_fences: list[AckJournalCorrupt]
+    _pending_replay_corruption_fences: list[AckJournalCorrupt]
+    _replay_snapshot_gate_active: bool
 
     def __init__(self) -> None:
         raise TypeError("use AckJournal.create_new() or open_and_recover()")
@@ -381,6 +383,8 @@ class AckJournal:
         journal._replay_lifecycle_token = os.urandom(32)
         journal._mutation_revision = 0
         journal._pending_corruption_fences = []
+        journal._pending_replay_corruption_fences = []
+        journal._replay_snapshot_gate_active = False
         try:
             root_descriptor, lifecycle_identity = (
                 segment_store._acquire_ack_journal(
@@ -900,21 +904,58 @@ class AckJournal:
 
     def _latch_corruption_locked(self, primary: AckJournalCorrupt) -> None:
         self._mark_unhealthy_locked()
-        self._pending_corruption_fences.append(primary)
+        pending = (
+            self._pending_replay_corruption_fences
+            if self._replay_snapshot_gate_active
+            else self._pending_corruption_fences
+        )
+        pending.append(primary)
 
     @contextmanager
     def _retention_boundary(self) -> Iterator[None]:
-        pending_fences: tuple[AckJournalCorrupt, ...] = ()
+        primary: BaseException | None = None
         try:
             with self._retention_lock:
-                try:
-                    yield
-                finally:
-                    pending_fences = tuple(self._pending_corruption_fences)
-                    self._pending_corruption_fences.clear()
+                yield
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            for primary in pending_fences:
-                self._attempt_corruption_fence(primary)
+            self._drain_corruption_fences(primary)
+
+    def _drain_corruption_fences(
+        self,
+        primary: BaseException | None,
+    ) -> None:
+        with self._retention_lock:
+            pending = tuple(self._pending_corruption_fences)
+            self._pending_corruption_fences.clear()
+        self._persist_corruption_fences(pending, primary)
+
+    def _drain_replay_corruption_fences(
+        self,
+        primary: BaseException | None,
+    ) -> None:
+        """Persist queued corruption fences outside the replay lock stack."""
+        with self._retention_lock:
+            pending = tuple(self._pending_replay_corruption_fences)
+            self._pending_replay_corruption_fences.clear()
+        self._persist_corruption_fences(pending, primary)
+
+    def _persist_corruption_fences(
+        self,
+        pending: tuple[AckJournalCorrupt, ...],
+        primary: BaseException | None,
+    ) -> None:
+        for corruption in pending:
+            try:
+                self._store._trip_ack_journal_corrupt()
+            except BaseException as error:  # noqa: BLE001
+                target = corruption if primary is None else primary
+                target.add_note(
+                    "secondary ACK corruption-fence failure: "
+                    f"{type(error).__name__}: {error}"
+                )
 
     def _bind_published_or_latch(self) -> os.stat_result:
         try:
@@ -1162,8 +1203,14 @@ class AckJournal:
     @contextmanager
     def _replay_ack_snapshot_gate(self) -> Iterator[None]:
         """Exclude sanctioned ACK writers during replay freeze/revalidation."""
-        with self._retention_boundary():
-            yield
+        with self._retention_lock:
+            if self._replay_snapshot_gate_active:
+                raise AckJournalStateError("replay ACK snapshot gate is nested")
+            self._replay_snapshot_gate_active = True
+            try:
+                yield
+            finally:
+                self._replay_snapshot_gate_active = False
 
     @staticmethod
     def _hash_replay_ack_prefix(descriptor: int, size: int) -> bytes:

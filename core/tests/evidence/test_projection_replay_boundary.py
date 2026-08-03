@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import resource
+import signal
 import stat
 import time
 from collections.abc import Callable
@@ -1207,6 +1208,169 @@ def test_compute_replay_uses_base_and_next_publish_generation(
         assert computation.terminal_predecessor.generation == 8
     finally:
         _close_complete_replay_input(resources)
+
+
+@pytest.mark.parametrize("authority", ("ack", "correlation_journal"))
+def test_replay_corruption_fence_drains_after_full_lock_unwind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority: str,
+) -> None:
+    correlation_authority = importlib.import_module(
+        "agmind_immune.correlation.authority"
+    )
+    monkeypatch.setattr(
+        correlation_authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    child = os.fork()
+    if child == 0:
+        exit_code = 2
+        try:
+            case = _build_replay_orchestration_case(
+                tmp_path / authority,
+                record_count=8,
+            )
+            subject = case["subject"]
+            owner = case["owner"]
+            store = case["store"]
+            through = case["through"]
+            assert type(store) is SegmentStore
+            assert type(through) is EvidenceRef
+            artifact_name = (
+                "ack-journal.agf"
+                if authority == "ack"
+                else "correlation-requests.agf"
+            )
+            replacement = store.root / f"{artifact_name}.replacement"
+            replacement.write_bytes(b"")
+            replacement.chmod(0o600)
+            os.replace(replacement, store.root / artifact_name)
+            replay_error: BaseException | None = None
+            try:
+                owner._replay_unpublished_prefix(  # type: ignore[attr-defined]
+                    through,
+                    _factory=subject._UNPUBLISHED_REPLAY_FACTORY,  # type: ignore[attr-defined]
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                replay_error = error
+            assert isinstance(replay_error, ProjectionAuthorityError)
+            assert store.status().healthy is False
+            assert (
+                owner._replay_status_for_test().reservation_present  # type: ignore[attr-defined]
+                is False
+            )
+            exit_code = 0
+        finally:
+            os._exit(exit_code)
+
+    deadline = time.monotonic() + 5
+    status: int | None = None
+    while time.monotonic() < deadline:
+        waited, child_status = os.waitpid(child, os.WNOHANG)
+        if waited == child:
+            status = child_status
+            break
+        time.sleep(0.001)
+    if status is None:
+        os.kill(child, signal.SIGKILL)
+        os.waitpid(child, 0)
+        pytest.fail("replay corruption fence did not unwind before persistence")
+    assert os.waitstatus_to_exitcode(status) == 0
+
+
+def test_snapshot_cleanup_consumes_fd_ownership_before_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    correlation_authority = importlib.import_module(
+        "agmind_immune.correlation.authority"
+    )
+    monkeypatch.setattr(
+        correlation_authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    case = _build_replay_orchestration_case(
+        tmp_path / "one-shot-close",
+        record_count=8,
+    )
+    subject = case["subject"]
+    owner = case["owner"]
+    through = case["through"]
+    assert type(through) is EvidenceRef
+    real_close_snapshot = subject._close_replay_source_snapshot  # type: ignore[attr-defined]
+    real_close = os.close
+    close_attempts: dict[int, int] = {}
+    owned_descriptors: tuple[int, ...] = ()
+    unrelated_descriptor = -1
+    call_count = 0
+
+    def fail_after_partial_close(snapshot: object) -> None:
+        nonlocal call_count, owned_descriptors, unrelated_descriptor
+        call_count += 1
+        owned_descriptors = tuple(
+            segment.descriptor  # type: ignore[attr-defined]
+            for segment in snapshot.segments  # type: ignore[attr-defined]
+        )
+        assert len(owned_descriptors) >= 2
+        if call_count == 1:
+            first, failing, *remaining = owned_descriptors
+            close_attempts[first] = close_attempts.get(first, 0) + 1
+            real_close(first)
+            opened = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(opened, first)
+            if opened != first:
+                real_close(opened)
+            unrelated_descriptor = first
+            close_attempts[failing] = close_attempts.get(failing, 0) + 1
+            for descriptor in remaining:
+                close_attempts[descriptor] = close_attempts.get(descriptor, 0) + 1
+                real_close(descriptor)
+            raise OSError("injected source snapshot close failure")
+        for descriptor in owned_descriptors:
+            close_attempts[descriptor] = close_attempts.get(descriptor, 0) + 1
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass
+
+    monkeypatch.setattr(
+        subject,
+        "_close_replay_source_snapshot",
+        fail_after_partial_close,
+    )
+    try:
+        with pytest.raises(OSError, match="injected source snapshot close failure"):
+            owner._replay_unpublished_prefix(  # type: ignore[attr-defined]
+                through,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,  # type: ignore[attr-defined]
+            )
+        assert close_attempts
+        assert set(close_attempts.values()) == {1}
+        assert unrelated_descriptor >= 0
+        os.fstat(unrelated_descriptor)
+    finally:
+        monkeypatch.setattr(
+            subject,
+            "_close_replay_source_snapshot",
+            real_close_snapshot,
+        )
+        if unrelated_descriptor >= 0:
+            try:
+                os.fstat(unrelated_descriptor)
+            except OSError:
+                pass
+            else:
+                real_close(unrelated_descriptor)
+        for descriptor in owned_descriptors:
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                continue
+            real_close(descriptor)
+        _close_replay_orchestration_case(case)
 
 
 @pytest.mark.parametrize(

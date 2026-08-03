@@ -32,9 +32,8 @@ from agmind_immune.correlation.primitives import (
 )
 from agmind_immune.coverage.historical import (
     HistoricalPathAuthority,
-    _derive_replay_historical_coverage,
-    _issue_replay_historical_path_authority,
-    _ReplayAccess,
+    _issue_historical_path_authority,
+    derive_historical_coverage,
 )
 from agmind_immune.evidence.segments import EvidenceRef, SegmentStore
 from agmind_immune.ingest.correlation_journal import (
@@ -553,7 +552,6 @@ class _IssuedContextBinding:
     revision: object
     detector_bundle_sha256: str
     registry_facts: object
-    historical_access: _ReplayAccess | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1169,7 +1167,6 @@ def _context_issue_facts(
     completed: object,
     expected_predecessor: _ProjectionPredecessor,
     active_duplicate: ActiveCandidateObservation | None,
-    historical_access: _ReplayAccess | None,
 ) -> tuple[
     AuthenticatedPCCInput,
     AuthenticatedPCCInput,
@@ -1196,15 +1193,13 @@ def _context_issue_facts(
     cursor_before = _healthy_store_cursor(store, binding.store_lifecycle)
     registry_before = _registry_facts(binding.registry)
     detector_before = _safe_detector_bundle_sha256()
-    path = _issue_replay_historical_path_authority(
+    path = _issue_historical_path_authority(
         store,
         public_proof,
-        historical_access,
     )
-    coverage = _derive_replay_historical_coverage(
+    coverage = derive_historical_coverage(
         public_proof,
         path,
-        historical_access,
     )
     lookup_key = _duplicate_key(public_proof, public_proof.snapshot)
     active_before = _clone_active_duplicate(active_duplicate)
@@ -1220,10 +1215,9 @@ def _context_issue_facts(
     trusted_proof = _issue_hidden_pcc(store, public_proof)
 
     revalidated = _revalidate_completed_snapshot(completed)
-    coverage_after = _derive_replay_historical_coverage(
+    coverage_after = derive_historical_coverage(
         public_proof,
         path,
-        historical_access,
     )
     detector_after = _safe_detector_bundle_sha256()
     registry_after = _registry_facts(binding.registry)
@@ -1289,10 +1283,9 @@ def _validate_issued_context_locked(
         != context_binding.registry_facts
         or _safe_detector_bundle_sha256()
         != context_binding.detector_bundle_sha256
-        or _derive_replay_historical_coverage(
+        or derive_historical_coverage(
             context_binding.public_proof,
             context_binding.path,
-            context_binding.historical_access,
         )
         != context_binding.coverage
     ):
@@ -1342,7 +1335,6 @@ def _issue_correlation_context(
     *,
     expected_predecessor: _ProjectionPredecessor,
     active_duplicate: ActiveCandidateObservation | None,
-    historical_access: _ReplayAccess | None = None,
 ) -> tuple[AuthenticatedPCCInput, CorrelationContext]:
     expected_before = _clone_predecessor(expected_predecessor)
     authority_binding = _authority_binding(authority)
@@ -1368,7 +1360,6 @@ def _issue_correlation_context(
                 completed,
                 expected_before,
                 active_duplicate,
-                historical_access,
             )
         except CorrelationProjectionError:
             raise
@@ -1402,7 +1393,6 @@ def _issue_correlation_context(
             revision=revision,
             detector_bundle_sha256=authority_binding.detector_bundle_sha256,
             registry_facts=authority_binding.registry_facts,
-            historical_access=historical_access,
         )
 
         def evaluate(callback: Callable[[], object]) -> object:

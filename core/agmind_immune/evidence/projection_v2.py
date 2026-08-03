@@ -72,10 +72,9 @@ from agmind_immune.coverage.historical import (
     _build_frozen_replay_entries,
     _build_replay_memo_leaf,
     _build_replay_pcc_leaf,
-    _derive_replay_historical_coverage,
     _FrozenReplayEntry,
     _HistoricalReductionResult,
-    _issue_replay_historical_path_authority,
+    _issue_historical_path_authority,
     _late_coverage_invalidates_candidate,
     _late_coverage_invalidates_candidate_values,
     _late_coverage_may_invalidate_candidate,
@@ -85,6 +84,7 @@ from agmind_immune.coverage.historical import (
     _replay_exact_fact,
     _ReplayMemoLeaf,
     _ReplayPCCLeaf,
+    derive_historical_coverage,
 )
 from agmind_immune.evidence.dedup import _logical_primary_identity_v2
 from agmind_immune.evidence.frames import JournalCorrupt, decode_frames
@@ -3115,7 +3115,6 @@ class _V2ProjectionOwner:
                 completed,
                 expected_predecessor=predecessor,
                 active_duplicate=active,
-                historical_access=None,
             )
             if not _same_exact_pcc(proof, issued_proof):
                 raise ProjectionAuthorityError(
@@ -3920,10 +3919,12 @@ class _V2ProjectionOwner:
                             "injected replay publish failure"
                         )
 
-                    _close_replay_ack_snapshot(ack_snapshot)
+                    owned_ack_snapshot = ack_snapshot
                     ack_snapshot = None
-                    _close_replay_source_snapshot(source_snapshot)
+                    _close_replay_ack_snapshot(owned_ack_snapshot)
+                    owned_source_snapshot = source_snapshot
                     source_snapshot = None
+                    _close_replay_source_snapshot(owned_source_snapshot)
                     connection.close()
                     _rebuild_correlation_projection_authority(
                         authority,
@@ -3959,19 +3960,33 @@ class _V2ProjectionOwner:
             raise
         finally:
             cleanup_errors: list[BaseException] = []
+            try:
+                self._acknowledgements._drain_replay_corruption_fences(
+                    primary_error
+                )
+            except BaseException as error:  # noqa: BLE001
+                cleanup_errors.append(error)
+            try:
+                self._journal._drain_replay_corruption_fences(primary_error)
+            except BaseException as error:  # noqa: BLE001
+                cleanup_errors.append(error)
             if hydrated_connection is not None:
                 try:
                     hydrated_connection.close()
                 except BaseException as error:  # noqa: BLE001
                     cleanup_errors.append(error)
             if ack_snapshot is not None:
+                owned_ack_snapshot = ack_snapshot
+                ack_snapshot = None
                 try:
-                    _close_replay_ack_snapshot(ack_snapshot)
+                    _close_replay_ack_snapshot(owned_ack_snapshot)
                 except BaseException as error:  # noqa: BLE001
                     cleanup_errors.append(error)
             if source_snapshot is not None:
+                owned_source_snapshot = source_snapshot
+                source_snapshot = None
                 try:
-                    _close_replay_source_snapshot(source_snapshot)
+                    _close_replay_source_snapshot(owned_source_snapshot)
                 except BaseException as error:  # noqa: BLE001
                     cleanup_errors.append(error)
             if not published:
@@ -4677,21 +4692,18 @@ class _V2ProjectionOwner:
         if initial.snapshot.outcome == "failed":
             result = correlate_pcc(initial, CorrelationContext.failed_snapshot())
         else:
-            path = _issue_replay_historical_path_authority(
+            path = _issue_historical_path_authority(
                 self._evidence,
                 initial,
-                None,
             )
-            coverage_before = _derive_replay_historical_coverage(
+            coverage_before = derive_historical_coverage(
                 initial,
                 path,
-                None,
             )
             if (
-                _derive_replay_historical_coverage(
+                derive_historical_coverage(
                     initial,
                     path,
-                    None,
                 )
                 != coverage_before
             ):
@@ -4726,7 +4738,6 @@ class _V2ProjectionOwner:
                 completed,
                 expected_predecessor=predecessor,
                 active_duplicate=active,
-                historical_access=None,
             )
             if not _same_exact_pcc(initial, proof):
                 raise CorrelationProjectionError(
@@ -4760,7 +4771,6 @@ class _V2ProjectionOwner:
                         completed,
                         expected_predecessor=predecessor,
                         active_duplicate=active,
-                        historical_access=None,
                     )
                     if not _same_exact_pcc(initial, fresh_proof):
                         raise CorrelationProjectionError(

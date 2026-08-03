@@ -8,10 +8,11 @@ import re
 import stat
 import weakref
 from _thread import LockType
+from _thread import RLock as RLockType
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock
+from threading import Lock, RLock
 from typing import (
     BinaryIO,
     Literal,
@@ -342,6 +343,11 @@ class CorrelationRequestJournal:
     _authenticated_hasher: _DigestState | None
     _mutation_revision: object
     _lock: LockType
+    _operation_lock: RLockType
+    _pending_corruption_fences: list[CorrelationRequestJournalCorrupt]
+    _pending_replay_corruption_fences: list[CorrelationRequestJournalCorrupt]
+    _pending_conflict_fences: list[CorrelationRequestJournalStateError]
+    _replay_snapshot_gate_active: bool
 
     def __init__(self) -> None:
         raise TypeError(
@@ -383,6 +389,11 @@ class CorrelationRequestJournal:
         journal._authenticated_hasher = None
         journal._mutation_revision = object()
         journal._lock = Lock()
+        journal._operation_lock = RLock()
+        journal._pending_corruption_fences = []
+        journal._pending_replay_corruption_fences = []
+        journal._pending_conflict_fences = []
+        journal._replay_snapshot_gate_active = False
         try:
             root_descriptor, lifecycle_identity = (
                 store._acquire_correlation_journal(
@@ -725,9 +736,75 @@ class CorrelationRequestJournal:
                 )
             return published
         except CorrelationRequestJournalCorrupt as error:
-            self._healthy = False
-            self._attempt_corruption_fence(error)
+            self._latch_corruption_fence_locked(error)
             raise
+
+    @contextmanager
+    def _operation_boundary(self) -> Iterator[None]:
+        """Serialize one public operation through its post-lock fence drain."""
+        primary: BaseException | None = None
+        with self._operation_lock:
+            try:
+                with self._lock:
+                    yield
+            except BaseException as error:
+                primary = error
+                raise
+            finally:
+                self._drain_operation_fences(primary)
+
+    def _latch_corruption_fence_locked(
+        self,
+        primary: CorrelationRequestJournalCorrupt,
+    ) -> None:
+        self._healthy = False
+        pending_fences = (
+            self._pending_replay_corruption_fences
+            if self._replay_snapshot_gate_active
+            else self._pending_corruption_fences
+        )
+        if not any(pending is primary for pending in pending_fences):
+            pending_fences.append(primary)
+
+    def _drain_operation_fences(
+        self,
+        primary: BaseException | None,
+    ) -> None:
+        with self._operation_lock:
+            with self._lock:
+                corruptions = tuple(self._pending_corruption_fences)
+                conflicts = tuple(self._pending_conflict_fences)
+                self._pending_corruption_fences.clear()
+                self._pending_conflict_fences.clear()
+            self._persist_corruption_fences(corruptions, primary)
+            for conflict in conflicts:
+                self._drain_conflict_fence(conflict)
+
+    def _drain_replay_corruption_fences(
+        self,
+        primary: BaseException | None,
+    ) -> None:
+        """Persist queued conflict/corruption fences after journal unlock."""
+        with self._operation_lock:
+            with self._lock:
+                corruptions = tuple(self._pending_replay_corruption_fences)
+                self._pending_replay_corruption_fences.clear()
+            self._persist_corruption_fences(corruptions, primary)
+
+    def _persist_corruption_fences(
+        self,
+        corruptions: tuple[CorrelationRequestJournalCorrupt, ...],
+        primary: BaseException | None,
+    ) -> None:
+        for corruption in corruptions:
+            try:
+                self._store._trip_correlation_journal_corrupt()
+            except BaseException as error:  # noqa: BLE001
+                target = corruption if primary is None else primary
+                target.add_note(
+                    "secondary correlation corruption-fence failure: "
+                    f"{type(error).__name__}: {error}"
+                )
 
     def _authenticated_digest_or_none(self) -> bytes | None:
         hasher = self._authenticated_hasher
@@ -789,8 +866,7 @@ class CorrelationRequestJournal:
             )
         except _CorrelationJournalLifecycleCorrupt as error:
             corrupt = CorrelationRequestJournalCorrupt(str(error))
-            self._healthy = False
-            self._attempt_corruption_fence(corrupt)
+            self._latch_corruption_fence_locked(corrupt)
             raise corrupt from error
         except _CorrelationJournalLifecycleStateError as error:
             raise CorrelationRequestJournalStateError(str(error)) from error
@@ -855,8 +931,7 @@ class CorrelationRequestJournal:
             hasher_after = hasher.copy()
             hasher_after.update(frame)
         except CorrelationRequestJournalCorrupt as error:
-            self._healthy = False
-            self._attempt_corruption_fence(error)
+            self._latch_corruption_fence_locked(error)
             raise
         except BaseException as error:
             self._healthy = False
@@ -882,7 +957,7 @@ class CorrelationRequestJournal:
         canonical_request: bytes,
     ) -> _CorrelationRequestStateV1:
         """Durably select one exact narrow request for an authenticated trigger."""
-        with self._lock:
+        with self._operation_boundary():
             self._require_usable()
             if type(canonical_request) is not bytes:
                 raise CorrelationRequestJournalStateError(
@@ -979,7 +1054,7 @@ class CorrelationRequestJournal:
         snapshot_ref: EvidenceRef,
     ) -> _CorrelationRequestStateV1:
         """Durably bind one protected PCC proof to its selected request."""
-        with self._lock:
+        with self._operation_boundary():
             self._require_usable()
             state = self._state_for_request(request_sha256)
             if type(snapshot_ref) is not EvidenceRef:
@@ -1076,7 +1151,7 @@ class CorrelationRequestJournal:
         request_sha256: str,
     ) -> _CorrelationRequestStateV1:
         """Durably complete only one request whose exact proof was observed."""
-        with self._lock:
+        with self._operation_boundary():
             self._require_usable()
             state = self._state_for_request(request_sha256)
             if state.phase == "completed":
@@ -1105,7 +1180,7 @@ class CorrelationRequestJournal:
         snapshot_ref: EvidenceRef,
     ) -> _CompletedSnapshotAuthority:
         """Issue authority only for one exact durably completed PCC snapshot."""
-        with self._lock:
+        with self._operation_boundary():
             binding = self._completed_snapshot_binding(snapshot_ref)
             return _issue_completed_snapshot_authority(binding)
 
@@ -1295,8 +1370,7 @@ class CorrelationRequestJournal:
             return replay
         except CorrelationRequestJournalCorrupt as error:
             if self._healthy:
-                self._healthy = False
-                self._attempt_corruption_fence(error)
+                self._latch_corruption_fence_locked(error)
             raise
 
     def _completed_state_from_replay(
@@ -1675,9 +1749,8 @@ class CorrelationRequestJournal:
             )
 
     def _raise_journal_corruption(self, message: str) -> Never:
-        self._healthy = False
         corrupt = CorrelationRequestJournalCorrupt(message)
-        self._attempt_corruption_fence(corrupt)
+        self._latch_corruption_fence_locked(corrupt)
         raise corrupt
 
     def _state_for_request(
@@ -1701,6 +1774,14 @@ class CorrelationRequestJournal:
         return state
 
     def _raise_conflict(self, message: str) -> None:
+        conflict = CorrelationRequestJournalStateError(message)
+        self._pending_conflict_fences.append(conflict)
+        raise conflict
+
+    def _drain_conflict_fence(
+        self,
+        conflict: CorrelationRequestJournalStateError,
+    ) -> None:
         failures: list[Exception] = []
         for _attempt in range(2):
             try:
@@ -1716,7 +1797,7 @@ class CorrelationRequestJournal:
                 failures.append(error)
                 continue
             self._latch_verifier_after_conflict_fence()
-            raise CorrelationRequestJournalStateError(message)
+            return
 
         self._healthy = False
         unhealthy = CorrelationRequestJournalUnhealthy(
@@ -1798,14 +1879,13 @@ class CorrelationRequestJournal:
         message: str,
         cause: EvidenceCorrupt,
     ) -> Never:
-        self._healthy = False
         corrupt = CorrelationRequestJournalCorrupt(message)
-        self._attempt_corruption_fence(corrupt)
+        self._latch_corruption_fence_locked(corrupt)
         raise corrupt from cause
 
     def pending(self) -> tuple[_CorrelationRequestStateV1, ...]:
         """Return selected/observed requests in stable selection order."""
-        with self._lock:
+        with self._operation_boundary():
             self._require_usable()
             return tuple(
                 state.model_copy(deep=True)
@@ -1815,7 +1895,7 @@ class CorrelationRequestJournal:
 
     def _is_bound_to(self, store: SegmentStore) -> bool:
         """Report whether this live journal owns the exact supplied store."""
-        with self._lock:
+        with self._operation_boundary():
             if (
                 store is not self._store
                 or self._closed
@@ -1935,7 +2015,7 @@ class CorrelationRequestJournal:
 
     def close(self) -> None:
         """Seal the authenticated journal identity and release its root lease."""
-        with self._lock:
+        with self._operation_boundary():
             if self._closed:
                 return
             if self._closing:
@@ -1959,8 +2039,7 @@ class CorrelationRequestJournal:
                     )
                 except _CorrelationJournalLifecycleCorrupt as error:
                     corrupt = CorrelationRequestJournalCorrupt(str(error))
-                    self._healthy = False
-                    self._attempt_corruption_fence(corrupt)
+                    self._latch_corruption_fence_locked(corrupt)
                     primary = corrupt
                 except _CorrelationJournalLifecycleIoUncertain as error:
                     self._healthy = False
@@ -1971,8 +2050,7 @@ class CorrelationRequestJournal:
                     )
                     primary = error
                 except CorrelationRequestJournalCorrupt as error:
-                    self._healthy = False
-                    self._attempt_corruption_fence(error)
+                    self._latch_corruption_fence_locked(error)
                     primary = error
                 except BaseException as error:  # noqa: BLE001
                     self._healthy = False
@@ -2006,8 +2084,16 @@ def _correlation_journal_replay_gate(
             "correlation replay requires exact journal authority"
         )
     with journal._lock:
-        journal._require_usable()
-        yield
+        if journal._replay_snapshot_gate_active:
+            raise CorrelationRequestJournalStateError(
+                "correlation replay snapshot gate is nested"
+            )
+        journal._replay_snapshot_gate_active = True
+        try:
+            journal._require_usable()
+            yield
+        finally:
+            journal._replay_snapshot_gate_active = False
 
 
 def _completed_replay_facts_locked(
@@ -2263,7 +2349,7 @@ def _evaluate_completed_snapshot_batch[T](
         raise CorrelationRequestJournalAuthorityError(
             "completed correlation batch refs are not unique"
         )
-    with journal._lock:
+    with journal._operation_boundary():
         journal._require_usable()
         journal_lifecycle = journal._lifecycle_identity
         store = journal._store
@@ -2448,7 +2534,7 @@ def _completed_snapshot_authority_protocol() -> tuple[
                 "completed correlation authority was not issued"
             )
         journal = binding.journal
-        with journal._lock:
+        with journal._operation_boundary():
             if (
                 issued.get(authority) is not binding
                 or authority._token is not binding.token

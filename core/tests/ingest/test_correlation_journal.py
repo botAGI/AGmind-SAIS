@@ -374,6 +374,69 @@ def test_correlation_journal_rejects_conflicting_request_or_proof(
     store.close(flush=False)
 
 
+def test_public_correlation_conflict_fences_after_journal_unlock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, store, trigger_ref, trigger = seeded_correlation_store(
+        tmp_path
+    )
+    journal = CorrelationRequestJournal.create_new(store)
+    request = _request(trigger_ref)
+    selected = journal.select(trigger_ref, canonical_json(request))
+    first = _accept_snapshot(coordinator, trigger, request, sequence=3)
+    journal.mark_proof_observed(selected.request_sha256, first)
+    second = _accept_snapshot(coordinator, trigger, request, sequence=4)
+    source_locked = Event()
+    conflict_entered = Event()
+    replay_errors: list[BaseException] = []
+    writer_errors: list[BaseException] = []
+    real_raise_conflict = journal._raise_conflict
+
+    def signal_conflict(message: str) -> None:
+        conflict_entered.set()
+        real_raise_conflict(message)
+
+    monkeypatch.setattr(journal, "_raise_conflict", signal_conflict)
+
+    def replay_side() -> None:
+        try:
+            with store._replay_source_snapshot_gate():
+                source_locked.set()
+                if not conflict_entered.wait(5):
+                    raise AssertionError("conflicting writer never held journal lock")
+                with correlation_module._correlation_journal_replay_gate(journal):
+                    pass
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            replay_errors.append(error)
+
+    def writer_side() -> None:
+        try:
+            if not source_locked.wait(5):
+                raise AssertionError("replay never held source lock")
+            journal.mark_proof_observed(selected.request_sha256, second)
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            writer_errors.append(error)
+
+    replay = Thread(target=replay_side, daemon=True)
+    writer = Thread(target=writer_side, daemon=True)
+    replay.start()
+    writer.start()
+    writer.join(5)
+    replay.join(5)
+    try:
+        assert writer.is_alive() is False
+        assert replay.is_alive() is False
+        assert replay_errors == []
+        assert len(writer_errors) == 1
+        assert isinstance(writer_errors[0], CorrelationRequestJournalStateError)
+        assert store.status().healthy is False
+    finally:
+        if not writer.is_alive() and not replay.is_alive():
+            journal.close()
+            store.close(flush=False)
+
+
 def test_correlation_conflict_never_returns_state_error_without_durable_fence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
