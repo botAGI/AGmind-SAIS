@@ -84,10 +84,13 @@ def test_replay_reduction_returns_immutable_ordered_leaf_facts() -> None:
 def test_replay_reduction_reports_exact_admin_and_semantic_work_at_four_and_eight() -> None:
     four = _reduce_historical_coverage_result(**four_pcc_fixture())
     eight = _reduce_historical_coverage_result(**eight_pcc_fixture())
-    assert four.diagnostics.semantic_prefix_visits == 20
-    assert eight.diagnostics.semantic_prefix_visits == 72
+    # One reduction performs P main visits plus P(P-1)/2 prefix visits.
+    # Task 5 sums the projecting and validation reductions to 20 / 72.
+    assert four.diagnostics.semantic_prefix_visits == 10
+    assert eight.diagnostics.semantic_prefix_visits == 36
+    assert four.diagnostics.primary_checks == 10
+    assert eight.diagnostics.primary_checks == 36
     assert eight.diagnostics.prepared_records == 2 * four.diagnostics.prepared_records
-    assert eight.diagnostics.primary_checks == 2 * four.diagnostics.primary_checks
     assert eight.diagnostics.leaf_materializations == 2 * four.diagnostics.leaf_materializations
 ```
 
@@ -122,7 +125,7 @@ class _HistoricalPreparedPrefix:
         )
 ```
 
-Precompute the primary mask once from exact `(dedup_kind, logical_key_sha256)` keys. While materializing the final ordered interval and event tuples, create their canonical bytes and update the leaf digests in the same loops. Delete `_fold_replay_timeline`, `_replay_timeline_sink`, `_replay_leaf_fold_visit`, `_replay_seal_visit`, and `_replay_validation_compact_visit`. Change `_build_replay_memo_leaf` to consume `_HistoricalReductionResult` rather than a completed timeline.
+Precompute the primary mask once from exact `(dedup_kind, logical_key_sha256)` keys and bind it to an immutable exact source-sequence/ordinal index, so each primary lookup is `O(1)`. A reducer-local counter increments on every main record visit, yielded prefix record, and primary lookup; diagnostics snapshot those observed values instead of deriving a formula from `N`. While materializing the final ordered interval and event tuples, create their canonical bytes and update the leaf digests in the same loops. Delete `_fold_replay_timeline`, `_replay_timeline_sink`, `_replay_leaf_fold_visit`, `_replay_seal_visit`, and `_replay_validation_compact_visit`. Change `_build_replay_memo_leaf` to consume `_HistoricalReductionResult` rather than a completed timeline.
 
 - [ ] **Step 4: Run focused GREEN and ordinary reducer parity**
 
