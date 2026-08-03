@@ -8,8 +8,8 @@ import weakref
 from collections.abc import Callable, Iterable, Iterator
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
-from threading import RLock, get_ident, local
-from typing import Never, SupportsIndex, cast, final
+from threading import RLock, get_ident
+from typing import Never, SupportsIndex, cast, final, overload
 
 from pydantic import ValidationError
 
@@ -972,6 +972,55 @@ class _ReplayPathBinding:
     compact_digest: str
     event_token: _ReplayEventToken | None
     phase: str
+    access: _ReplayAccess
+
+
+@final
+class _ReplayHandle:
+    __slots__ = ("__weakref__",)
+
+    def __copy__(self) -> Never:
+        raise TypeError("historical replay handles cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        del memo
+        raise TypeError("historical replay handles cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("historical replay handles cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError("historical replay handles cannot be serialized")
+
+
+@final
+class _ReplayAccess:
+    __slots__ = ("__weakref__",)
+
+    def __copy__(self) -> Never:
+        raise TypeError("historical replay accesses cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        del memo
+        raise TypeError("historical replay accesses cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("historical replay accesses cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        del protocol
+        raise TypeError("historical replay accesses cannot be serialized")
+
+
+@dataclass(slots=True)
+class _ReplayAccessBinding:
+    session: _ReplayHistoricalSession
+    pcc: AuthenticatedPCCInput
+    phase: str
+    event_token: _ReplayEventToken | None
+    epoch: int
+    open: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -993,6 +1042,45 @@ class _BoundedView[T]:
     def __iter__(self) -> Iterator[T]:
         for index in range(self.count):
             yield self.ledger[index]
+
+
+class _ReplayLedger[T](list[T]):
+    version: int
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.version = 0
+
+    def append(self, value: T) -> None:
+        super().append(value)
+        self.version += 1
+
+    @overload
+    def __setitem__(self, index: SupportsIndex, value: T) -> None: ...
+
+    @overload
+    def __setitem__(self, index: slice, value: Iterable[T]) -> None: ...
+
+    def __setitem__(
+        self,
+        index: SupportsIndex | slice,
+        value: T | Iterable[T],
+    ) -> None:
+        if isinstance(index, slice):
+            super().__setitem__(index, cast(Iterable[T], value))
+        else:
+            super().__setitem__(index, cast(T, value))
+        self.version += 1
+
+    def pop(self, index: SupportsIndex = -1) -> T:
+        value = super().pop(index)
+        self.version += 1
+        return value
+
+    def clear(self) -> None:
+        if self:
+            super().clear()
+            self.version += 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -1128,7 +1216,8 @@ def _replay_compact_digest(
 class _ReplayHistoricalSession:
     __slots__ = (
         "__weakref__",
-        "_access_secret",
+        "access_epoch",
+        "active_accesses",
         "compact_count",
         "compact_digest",
         "compact_prepared",
@@ -1146,6 +1235,8 @@ class _ReplayHistoricalSession:
         "store",
         "terminal_ref",
         "used_pcc",
+        "validated_memo_keys",
+        "validated_state",
         "verifier",
         "verifier_authority",
         "verifier_generation",
@@ -1225,15 +1316,20 @@ class _ReplayHistoricalSession:
         self.frozen_retired_ranges = tuple(store._authenticated_retired_ranges)
         self.entries = entries
         self.projected_head = 0
-        self.compact_records: list[StoredEvidenceRecord] = []
-        self.compact_prepared: list[_PreparedHistoricalRecord] = []
+        self.compact_records: _ReplayLedger[StoredEvidenceRecord] = _ReplayLedger()
+        self.compact_prepared: _ReplayLedger[_PreparedHistoricalRecord] = (
+            _ReplayLedger()
+        )
         self.compact_count = 0
         self.compact_digest = _initial_replay_compact_digest()
         self.memo: dict[tuple[str, str], _ReplayMemo] = {}
         self.pending_event: _ReplayEventToken | None = None
         self.phase = "projecting"
         self.used_pcc: dict[tuple[str, str], AuthenticatedPCCInput] = {}
-        self._access_secret = object()
+        self.access_epoch = 0
+        self.active_accesses: set[_ReplayAccess] = set()
+        self.validated_memo_keys: set[tuple[str, str]] = set()
+        self.validated_state: tuple[object, ...] | None = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         del kwargs
@@ -1279,6 +1375,104 @@ class _ReplayHistoricalSession:
             raise HistoricalCoverageUnavailable(
                 "historical replay frozen source authority changed"
             )
+
+    def open_access(
+        self,
+        handle: _ReplayHandle,
+        authenticated: AuthenticatedPCCInput,
+    ) -> _ReplayAccess:
+        self._require_active()
+        handle_binding = _REPLAY_HANDLE_BINDINGS.get(handle)
+        if handle_binding is not self:
+            raise HistoricalCoverageUnavailable(
+                "historical replay handle is not exact and live"
+            )
+        if (
+            type(authenticated) is not AuthenticatedPCCInput
+            or not self.store._authenticated_pcc_input_is_exact(authenticated)
+        ):
+            raise HistoricalCoverageUnavailable(
+                "historical replay access requires an exact PCC"
+            )
+        key = (authenticated.event_id, authenticated.content_sha256)
+        event_token: _ReplayEventToken | None
+        if self.phase == "projecting":
+            event_token = self.pending_event
+            if (
+                event_token is None
+                or event_token._state not in {"issued", "observed"}
+                or authenticated.source_sequence != self.projected_head + 1
+            ):
+                raise HistoricalCoverageUnavailable(
+                    "projecting replay access is outside its exact event"
+                )
+            used = self.used_pcc.get(key)
+            if used is not None and used is not authenticated:
+                raise HistoricalCoverageUnavailable(
+                    "projecting replay rejects a value-equal PCC substitute"
+                )
+        elif self.phase == "validating":
+            event_token = None
+            if key not in self.validated_memo_keys or key not in self.memo:
+                raise HistoricalCoverageUnavailable(
+                    "validation replay access lacks an independently sealed memo"
+                )
+            self._revoke_accesses()
+        else:
+            raise HistoricalCoverageUnavailable(
+                "historical replay access is out of phase"
+            )
+        self.access_epoch += 1
+        access = _ReplayAccess()
+        _REPLAY_ACCESS_BINDINGS[access] = _ReplayAccessBinding(
+            session=self,
+            pcc=authenticated,
+            phase=self.phase,
+            event_token=event_token,
+            epoch=self.access_epoch,
+        )
+        self.active_accesses.add(access)
+        return access
+
+    def validate_access(
+        self,
+        access: _ReplayAccess,
+        authenticated: AuthenticatedPCCInput,
+    ) -> _ReplayAccessBinding:
+        binding = _REPLAY_ACCESS_BINDINGS.get(access)
+        if (
+            type(access) is not _ReplayAccess
+            or binding is None
+            or not binding.open
+            or binding.session is not self
+            or binding.pcc is not authenticated
+            or access not in self.active_accesses
+            or binding.epoch != self.access_epoch
+            or binding.phase != self.phase
+            or (
+                binding.phase == "projecting"
+                and (
+                    binding.event_token is not self.pending_event
+                    or binding.event_token is None
+                    or binding.event_token._state not in {"issued", "observed"}
+                )
+            )
+        ):
+            raise HistoricalCoverageUnavailable(
+                "historical replay access was revoked or substituted"
+            )
+        return binding
+
+    def close_access(self, access: _ReplayAccess) -> None:
+        binding = _REPLAY_ACCESS_BINDINGS.get(access)
+        if binding is not None and binding.session is self:
+            binding.open = False
+            _REPLAY_ACCESS_BINDINGS.pop(access, None)
+        self.active_accesses.discard(access)
+
+    def _revoke_accesses(self) -> None:
+        for access in tuple(self.active_accesses):
+            self.close_access(access)
 
     def begin_event(self, ref: EvidenceRef) -> _ReplayEventToken:
         self._require_active()
@@ -1339,6 +1533,7 @@ class _ReplayHistoricalSession:
             raise HistoricalCoverageUnavailable(
                 "historical replay event lacks observed primary equality"
             )
+        self._revoke_accesses()
         object.__setattr__(token, "_state", "committing")
         self.phase = "committing"
 
@@ -1377,12 +1572,13 @@ class _ReplayHistoricalSession:
         self.pending_event = None
         self.phase = "projecting"
 
-    def issue(self, authenticated: AuthenticatedPCCInput) -> _ReplayPathBinding:
+    def issue(
+        self,
+        authenticated: AuthenticatedPCCInput,
+        access: _ReplayAccess,
+    ) -> _ReplayPathBinding:
         self._require_active()
-        if not _replay_access_is_open(self):
-            raise HistoricalCoverageUnavailable(
-                "historical replay requires private lexical access"
-            )
+        self.validate_access(access, authenticated)
         if not self.store._authenticated_pcc_input_is_exact(authenticated):
             raise HistoricalCoverageUnavailable(
                 "historical replay PCC is not exact at the projected head"
@@ -1431,9 +1627,19 @@ class _ReplayHistoricalSession:
             compact_digest=compact_digest,
             event_token=self.pending_event,
             phase=self.phase,
+            access=access,
         )
 
-    def reduce(self, binding: _ReplayPathBinding) -> HistoricalCoverageAssessment:
+    def reduce(
+        self,
+        binding: _ReplayPathBinding,
+        access: _ReplayAccess,
+    ) -> HistoricalCoverageAssessment:
+        self.validate_access(access, binding.pcc)
+        if binding.access is not access:
+            raise HistoricalCoverageUnavailable(
+                "historical replay path belongs to another lexical access"
+            )
         authenticated = binding.pcc
         key = (authenticated.event_id, authenticated.content_sha256)
         cached = self.memo.get(key)
@@ -1495,8 +1701,13 @@ class _ReplayHistoricalSession:
             timeline = cached.timeline
         return timeline.assessment
 
-    def validate_binding(self, binding: _ReplayPathBinding) -> None:
+    def validate_binding(
+        self,
+        binding: _ReplayPathBinding,
+        access: _ReplayAccess,
+    ) -> None:
         self._require_active()
+        self.validate_access(access, binding.pcc)
         authenticated = binding.pcc
         key = (authenticated.event_id, authenticated.content_sha256)
         used = self.used_pcc.get(key)
@@ -1533,7 +1744,7 @@ class _ReplayHistoricalSession:
             or not self.store._authenticated_pcc_input_is_exact(authenticated)
             or not exact_compact
             or not exact_phase
-            or not _replay_access_is_open(self)
+            or binding.access is not access
         ):
             raise HistoricalCoverageUnavailable(
                 "historical replay path binding changed"
@@ -1549,6 +1760,8 @@ class _ReplayHistoricalSession:
                 "historical replay did not reach its frozen terminal"
             )
         self.phase = "validating"
+        self._revoke_accesses()
+        self.validated_memo_keys.clear()
         try:
             rebuilt_records = tuple(
                 self.store.iter_authenticated_records(
@@ -1585,35 +1798,31 @@ class _ReplayHistoricalSession:
                 raise HistoricalCoverageUnavailable(
                     "historical replay independent source rebuild changed"
                 )
-            rebuilt_compact = tuple(
-                entry.record for entry in rebuilt_entries if entry.compact_member
-            )
-            rebuilt_compact_prepared = [
-                entry.prepared for entry in rebuilt_entries if entry.compact_member
-            ]
-            rebuilt_compact_records = list(rebuilt_compact)
+            rebuilt_compact_records: list[StoredEvidenceRecord] = []
+            rebuilt_compact_prepared: list[_PreparedHistoricalRecord] = []
             rebuilt_prefix_digests = [_initial_replay_compact_digest()]
-            for rebuilt_record in rebuilt_compact_records:
+            for entry in rebuilt_entries:
+                if not entry.compact_member:
+                    continue
+                rebuilt_compact_records.append(entry.record)
+                rebuilt_compact_prepared.append(entry.prepared)
                 rebuilt_prefix_digests.append(
                     _update_replay_compact_digest(
                         rebuilt_prefix_digests[-1],
-                        rebuilt_record,
+                        entry.record,
                     )
                 )
-            rebuilt_compact_count, rebuilt_compact_digest = (
-                _replay_compact_digest(rebuilt_compact)
-            )
             if (
                 self.compact_count != len(self.compact_records)
                 or self.compact_count != len(self.compact_prepared)
-                or rebuilt_compact_count != self.compact_count
-                or rebuilt_compact_digest != self.compact_digest
+                or len(rebuilt_compact_records) != self.compact_count
+                or rebuilt_prefix_digests[-1] != self.compact_digest
                 or any(
                     rebuilt.ref != accumulated.ref
                     or rebuilt.canonical_envelope
                     != accumulated.canonical_envelope
                     for rebuilt, accumulated in zip(
-                        rebuilt_compact,
+                        rebuilt_compact_records,
                         self.compact_records,
                         strict=True,
                     )
@@ -1622,10 +1831,7 @@ class _ReplayHistoricalSession:
                 raise HistoricalCoverageUnavailable(
                     "historical replay accumulated compact transcript changed"
                 )
-            for key, authenticated in sorted(
-                self.used_pcc.items(),
-                key=lambda item: item[1].source_sequence,
-            ):
+            for key, authenticated in self.used_pcc.items():
                 cached = self.memo.get(key)
                 if cached is None:
                     raise HistoricalCoverageUnavailable(
@@ -1738,20 +1944,34 @@ class _ReplayHistoricalSession:
                     raise HistoricalCoverageUnavailable(
                         "historical replay assessment changed in final rebuild"
                     )
+                self.validated_memo_keys.add(key)
+            if (
+                self.validated_memo_keys != set(self.used_pcc)
+                or self.validated_memo_keys != set(self.memo)
+            ):
+                raise HistoricalCoverageUnavailable(
+                    "historical replay memo validation closure changed"
+                )
+            self.validated_state = (
+                self.projected_head,
+                self.compact_count,
+                self.compact_digest,
+                tuple(self.used_pcc),
+                frozenset(self.memo),
+                self.compact_records.version,
+                self.compact_prepared.version,
+            )
         except BaseException:
             self.phase = "revoked"
             raise
 
-    def final_seal(self) -> None:
+    def final_seal(self, authority_check: Callable[[], None]) -> None:
         self._require_active()
         if self.phase != "validating":
             raise HistoricalCoverageUnavailable(
                 "historical replay final seal is out of phase"
             )
         try:
-            resident_keys = tuple(
-                _exact_coverage_record_key(record) for record in self.store._records
-            )
             record_keys = tuple(
                 _exact_coverage_record_key(record)
                 for record in self.store.iter_authenticated_records(
@@ -1765,6 +1985,10 @@ class _ReplayHistoricalSession:
                 )
                 for entry in self.entries
             )
+            resident_keys = tuple(
+                _exact_coverage_record_key(record) for record in self.store._records
+            )
+            retired_ranges = tuple(self.store._authenticated_retired_ranges)
         except (EvidenceStoreError, TypeError, ValueError) as error:
             self.phase = "revoked"
             raise HistoricalCoverageUnavailable(
@@ -1775,13 +1999,35 @@ class _ReplayHistoricalSession:
             record_keys != self.frozen_record_keys
             or resolved_keys != self.frozen_record_keys
             or resident_keys != self.frozen_record_keys
-            or tuple(self.store._authenticated_retired_ranges)
-            != self.frozen_retired_ranges
+            or retired_ranges != self.frozen_retired_ranges
         ):
             self.phase = "revoked"
             raise HistoricalCoverageUnavailable(
                 "historical replay final transcript changed"
             )
+        current_state = (
+            self.projected_head,
+            self.compact_count,
+            self.compact_digest,
+            tuple(self.used_pcc),
+            frozenset(self.memo),
+            self.compact_records.version,
+            self.compact_prepared.version,
+        )
+        if (
+            self.validated_state is None
+            or current_state != self.validated_state
+            or self.validated_memo_keys != set(self.used_pcc)
+            or self.validated_memo_keys != set(self.memo)
+            or self.projected_head != self.terminal_ref.source_sequence
+        ):
+            self.phase = "revoked"
+            raise HistoricalCoverageUnavailable(
+                "historical replay terminal session state changed"
+            )
+        self._revoke_accesses()
+        authority_check()
+        self._require_active()
         self.phase = "sealed"
 
     def revalidate_resident_source(self) -> None:
@@ -1802,6 +2048,15 @@ class _ReplayHistoricalSession:
             )
 
     def revoke(self) -> None:
+        self._revoke_accesses()
+        self.memo.clear()
+        self.used_pcc.clear()
+        self.validated_memo_keys.clear()
+        self.validated_state = None
+        self.compact_records.clear()
+        self.compact_prepared.clear()
+        self.compact_count = 0
+        self.compact_digest = _initial_replay_compact_digest()
         self.phase = "revoked"
 
 
@@ -1810,7 +2065,6 @@ _ACTIVE_REPLAY_SESSION: ContextVar[_ReplayHistoricalSession | None] = ContextVar
     default=None,
 )
 _REPLAY_SESSION_REGISTRY_LOCK = RLock()
-_REPLAY_ACCESS = local()
 _REPLAY_SESSION_BY_STORE: weakref.WeakKeyDictionary[
     SegmentStore,
     weakref.ReferenceType[_ReplayHistoricalSession],
@@ -1818,6 +2072,18 @@ _REPLAY_SESSION_BY_STORE: weakref.WeakKeyDictionary[
 _REPLAY_STORE_GATES: weakref.WeakKeyDictionary[SegmentStore, RLock] = (
     weakref.WeakKeyDictionary()
 )
+_REPLAY_HANDLE_BINDINGS: weakref.WeakKeyDictionary[
+    _ReplayHandle,
+    _ReplayHistoricalSession,
+] = weakref.WeakKeyDictionary()
+_PENDING_REPLAY_HANDLES: weakref.WeakKeyDictionary[
+    _ReplayHistoricalSession,
+    _ReplayHandle,
+] = weakref.WeakKeyDictionary()
+_REPLAY_ACCESS_BINDINGS: weakref.WeakKeyDictionary[
+    _ReplayAccess,
+    _ReplayAccessBinding,
+] = weakref.WeakKeyDictionary()
 
 
 def _store_replay_gate(store: SegmentStore) -> RLock:
@@ -1827,22 +2093,6 @@ def _store_replay_gate(store: SegmentStore) -> RLock:
             gate = RLock()
             _REPLAY_STORE_GATES[store] = gate
         return gate
-
-
-def _replay_access_is_open(session: _ReplayHistoricalSession) -> bool:
-    return getattr(_REPLAY_ACCESS, "value", None) == (
-        session,
-        session._access_secret,
-    )
-
-
-def _with_replay_access[T](session: _ReplayHistoricalSession, call: Callable[[], T]) -> T:
-    prior = getattr(_REPLAY_ACCESS, "value", None)
-    _REPLAY_ACCESS.value = (session, session._access_secret)
-    try:
-        return call()
-    finally:
-        _REPLAY_ACCESS.value = prior
 
 
 def _activate_replay_historical_session(
@@ -1871,6 +2121,9 @@ def _activate_replay_historical_session(
                     "historical replay store already has an active session"
                 )
             _REPLAY_SESSION_BY_STORE[store] = weakref.ref(session)
+            handle = _ReplayHandle()
+            _REPLAY_HANDLE_BINDINGS[handle] = session
+            _PENDING_REPLAY_HANDLES[session] = handle
     try:
         token = _ACTIVE_REPLAY_SESSION.set(session)
     except BaseException:
@@ -1880,6 +2133,37 @@ def _activate_replay_historical_session(
                 _REPLAY_SESSION_BY_STORE.pop(store, None)
         raise
     return session, token
+
+
+def _take_replay_historical_handle(
+    session: _ReplayHistoricalSession,
+) -> _ReplayHandle:
+    handle = _PENDING_REPLAY_HANDLES.pop(session, None)
+    if handle is None or _REPLAY_HANDLE_BINDINGS.get(handle) is not session:
+        raise HistoricalCoverageUnavailable(
+            "historical replay handle is unavailable or already taken"
+        )
+    return handle
+
+
+def _open_replay_historical_access(
+    handle: _ReplayHandle,
+    authenticated: AuthenticatedPCCInput,
+) -> _ReplayAccess:
+    session = _REPLAY_HANDLE_BINDINGS.get(handle)
+    if session is None:
+        raise HistoricalCoverageUnavailable(
+            "historical replay handle is not issued and live"
+        )
+    return session.open_access(handle, authenticated)
+
+
+def _close_replay_historical_access(access: _ReplayAccess | None) -> None:
+    if access is None:
+        return
+    binding = _REPLAY_ACCESS_BINDINGS.get(access)
+    if binding is not None:
+        binding.session.close_access(access)
 
 
 def _begin_replay_historical_event(
@@ -1939,8 +2223,9 @@ def _begin_replay_historical_validation(
 
 def _final_seal_replay_historical_session(
     session: _ReplayHistoricalSession,
+    authority_check: Callable[[], None],
 ) -> None:
-    session.final_seal()
+    session.final_seal(authority_check)
 
 
 def _revalidate_replay_historical_source(
@@ -1954,6 +2239,12 @@ def _close_replay_historical_session(
     token: Token[_ReplayHistoricalSession | None],
 ) -> None:
     session.revoke()
+    pending = _PENDING_REPLAY_HANDLES.pop(session, None)
+    if pending is not None:
+        _REPLAY_HANDLE_BINDINGS.pop(pending, None)
+    for handle, bound_session in tuple(_REPLAY_HANDLE_BINDINGS.items()):
+        if bound_session is session:
+            _REPLAY_HANDLE_BINDINGS.pop(handle, None)
     _ACTIVE_REPLAY_SESSION.reset(token)
     with _store_replay_gate(session.store), _REPLAY_SESSION_REGISTRY_LOCK:
         current_ref = _REPLAY_SESSION_BY_STORE.get(session.store)
@@ -2173,15 +2464,9 @@ def _issue_historical_path_authority(
 ) -> HistoricalPathAuthority:
     session = _ACTIVE_REPLAY_SESSION.get()
     if session is not None:
-        if session.store is not store:
-            raise HistoricalCoverageUnavailable(
-                "active historical replay belongs to another store"
-            )
-        if not _replay_access_is_open(session):
-            raise HistoricalCoverageUnavailable(
-                "historical replay requires private lexical access"
-            )
-        binding: _PathBinding | _ReplayPathBinding = session.issue(authenticated)
+        raise HistoricalCoverageUnavailable(
+            "historical replay requires an explicit lexical access"
+        )
     else:
         with _store_replay_gate(store):
             with _REPLAY_SESSION_REGISTRY_LOCK:
@@ -2202,19 +2487,32 @@ def _issue_historical_path_authority(
 def _issue_replay_historical_path_authority(
     store: SegmentStore,
     authenticated: AuthenticatedPCCInput,
+    access: _ReplayAccess | None,
 ) -> HistoricalPathAuthority:
     session = _ACTIVE_REPLAY_SESSION.get()
     if session is None:
+        if access is not None:
+            raise HistoricalCoverageUnavailable(
+                "ordinary historical issue rejects replay access"
+            )
         return _issue_historical_path_authority(store, authenticated)
-    return _with_replay_access(
-        session,
-        lambda: _issue_historical_path_authority(store, authenticated),
+    if session.store is not store or access is None:
+        raise HistoricalCoverageUnavailable(
+            "historical replay issue lacks its explicit lexical access"
+        )
+    binding: _PathBinding | _ReplayPathBinding = session.issue(
+        authenticated,
+        access,
     )
+    authority = HistoricalPathAuthority(store, binding, _factory=_PATH_FACTORY)
+    _ISSUED_PATHS[authority] = binding
+    return authority
 
 
 def _revalidate_authority(
     authenticated: AuthenticatedPCCInput,
     authority: HistoricalPathAuthority,
+    access: _ReplayAccess | None = None,
 ) -> tuple[SegmentStore, _PathBinding | _ReplayPathBinding]:
     if type(authority) is not HistoricalPathAuthority:
         raise TypeError("historical coverage requires an exact path authority")
@@ -2225,11 +2523,12 @@ def _revalidate_authority(
             _ISSUED_PATHS.get(authority) is not binding
             or store is not binding.session.store
             or authenticated is not binding.pcc
+            or access is None
         ):
             raise HistoricalCoverageUnavailable(
                 "historical replay path belongs to another PCC or store"
             )
-        binding.session.validate_binding(binding)
+        binding.session.validate_binding(binding, access)
         return store, binding
     if (
         type(binding) is not _PathBinding
@@ -2248,15 +2547,27 @@ def derive_historical_coverage(
     authenticated: AuthenticatedPCCInput,
     authority: HistoricalPathAuthority,
 ) -> HistoricalCoverageAssessment:
+    return _derive_historical_coverage_with_access(
+        authenticated,
+        authority,
+        None,
+    )
+
+
+def _derive_historical_coverage_with_access(
+    authenticated: AuthenticatedPCCInput,
+    authority: HistoricalPathAuthority,
+    access: _ReplayAccess | None,
+) -> HistoricalCoverageAssessment:
     store_ref = authority._store_ref() if type(authority) is HistoricalPathAuthority else None
     if store_ref is None:
         raise HistoricalCoverageUnavailable("historical path lost its store")
     with _store_replay_gate(store_ref):
         binding_value = authority._binding
         if type(binding_value) is _ReplayPathBinding:
-            if not _replay_access_is_open(binding_value.session):
+            if access is None:
                 raise HistoricalCoverageUnavailable(
-                    "historical replay requires private lexical access"
+                    "historical replay requires explicit lexical access"
                 )
         else:
             with _REPLAY_SESSION_REGISTRY_LOCK:
@@ -2264,10 +2575,18 @@ def derive_historical_coverage(
                     raise HistoricalCoverageUnavailable(
                         "historical replay revoked ordinary path authority"
                     )
-        store, replay_binding = _revalidate_authority(authenticated, authority)
+        store, replay_binding = _revalidate_authority(
+            authenticated,
+            authority,
+            access,
+        )
         if type(replay_binding) is _ReplayPathBinding:
-            assessment = replay_binding.session.reduce(replay_binding)
-            _revalidate_authority(authenticated, authority)
+            if access is None:
+                raise HistoricalCoverageUnavailable(
+                    "historical replay derive lacks explicit access"
+                )
+            assessment = replay_binding.session.reduce(replay_binding, access)
+            _revalidate_authority(authenticated, authority, access)
             return assessment
         if type(replay_binding) is not _PathBinding:
             raise HistoricalCoverageUnavailable(
@@ -2308,13 +2627,23 @@ def derive_historical_coverage(
 def _derive_replay_historical_coverage(
     authenticated: AuthenticatedPCCInput,
     authority: HistoricalPathAuthority,
+    access: _ReplayAccess | None,
 ) -> HistoricalCoverageAssessment:
     binding = authority._binding if type(authority) is HistoricalPathAuthority else None
     if type(binding) is not _ReplayPathBinding:
+        if access is not None:
+            raise HistoricalCoverageUnavailable(
+                "ordinary historical derive rejects replay access"
+            )
         return derive_historical_coverage(authenticated, authority)
-    return _with_replay_access(
-        binding.session,
-        lambda: derive_historical_coverage(authenticated, authority),
+    if access is None:
+        raise HistoricalCoverageUnavailable(
+            "historical replay derive lacks explicit lexical access"
+        )
+    return _derive_historical_coverage_with_access(
+        authenticated,
+        authority,
+        access,
     )
 
 

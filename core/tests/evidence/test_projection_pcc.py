@@ -218,6 +218,39 @@ def _accepted_two_complete(
     return coordinator, first, second
 
 
+def _accepted_many_complete(
+    path: Path,
+    count: int,
+) -> tuple[Any, tuple[AuthenticatedPCCInput, ...]]:
+    key = private_key(11)
+    coordinator = _coordinator(path, key)
+    _accept(coordinator, boot_boundary(key))
+    proofs: list[AuthenticatedPCCInput] = []
+    sequence = 2
+    for index in range(count):
+        proofs.append(
+            _append_unpublished_complete(
+                coordinator,
+                key,
+                trigger_sequence=sequence,
+                boot_id=BOOT_A,
+                destination_ipv4=f"9.9.9.{index + 1}",
+            )
+        )
+        sequence += 2
+        if index + 1 < count:
+            _accept(
+                coordinator,
+                _counted_critical(
+                    sequence,
+                    index + 1,
+                    source_hash_digit=f"{index + 1:x}",
+                ).envelope,
+            )
+            sequence += 1
+    return coordinator, tuple(proofs)
+
+
 def _accepted_two_complete_around_late_coverage(
     path: Path,
 ) -> tuple[Any, AuthenticatedPCCInput, EvidenceRef, AuthenticatedPCCInput]:
@@ -1082,7 +1115,7 @@ def test_unpublished_historical_replay_is_linear_and_reduces_each_pcc_twice(
     )
     real_prepare = historical._prepare_historical_record
     real_reduce = historical._reduce_historical_coverage
-    real_derive = historical.derive_historical_coverage
+    real_derive = historical._derive_replay_historical_coverage
     real_revalidate = historical._revalidate_authority
     prepare_calls = 0
     reduction_calls = 0
@@ -1112,7 +1145,21 @@ def test_unpublished_historical_replay_is_linear_and_reduces_each_pcc_twice(
     monkeypatch.setattr(historical, "_prepare_historical_record", counted_prepare)
     monkeypatch.setattr(historical, "_reduce_historical_coverage", counted_reduce)
     monkeypatch.setattr(historical, "_revalidate_authority", counted_revalidate)
-    monkeypatch.setattr(historical, "derive_historical_coverage", counted_derive)
+    monkeypatch.setattr(
+        historical,
+        "_derive_replay_historical_coverage",
+        counted_derive,
+    )
+    monkeypatch.setattr(
+        authority,
+        "_derive_replay_historical_coverage",
+        counted_derive,
+    )
+    monkeypatch.setattr(
+        subject,
+        "_derive_replay_historical_coverage",
+        counted_derive,
+    )
     owner, _connection, report = (
         subject._v2_unpublished_projection_from_prefix_for_test(
             evidence=store,
@@ -1153,9 +1200,11 @@ def test_unpublished_historical_replay_retains_one_compact_ledger_without_prefix
     captured_sessions: list[Any] = []
     digest_visits: list[int] = []
     reducer_visits: list[int] = []
+    final_snapshot: list[tuple[int, tuple[tuple[bool, bool, type, type], ...]]] = []
     real_activate = subject._activate_replay_historical_session
     real_digest = historical._replay_compact_digest
     real_reduce = historical._reduce_historical_coverage
+    real_final = subject._final_seal_replay_historical_session
 
     def capture_session(*args: object, **kwargs: object) -> object:
         session, token = real_activate(*args, **kwargs)
@@ -1172,9 +1221,27 @@ def test_unpublished_historical_replay_retains_one_compact_ledger_without_prefix
         reducer_visits.append(len(selected))
         return real_reduce(selected, *args, **kwargs)
 
+    def capture_final(session: Any, callback: Any) -> None:
+        final_snapshot.append(
+            (
+                session.compact_count,
+                tuple(
+                    (
+                        hasattr(memo, "compact_records"),
+                        hasattr(memo, "compact_prepared"),
+                        type(memo.compact_count),
+                        type(memo.compact_digest),
+                    )
+                    for memo in session.memo.values()
+                ),
+            )
+        )
+        real_final(session, callback)
+
     monkeypatch.setattr(subject, "_activate_replay_historical_session", capture_session)
     monkeypatch.setattr(historical, "_replay_compact_digest", count_digest)
     monkeypatch.setattr(historical, "_reduce_historical_coverage", count_reduce)
+    monkeypatch.setattr(subject, "_final_seal_replay_historical_session", capture_final)
     owner, _connection, report = (
         subject._v2_unpublished_projection_from_prefix_for_test(
             evidence=store,
@@ -1187,18 +1254,99 @@ def test_unpublished_historical_replay_retains_one_compact_ledger_without_prefix
     try:
         assert report.cursor.source_sequence == records[-1].ref.source_sequence
         assert len(captured_sessions) == 1
-        session = captured_sessions[0]
-        compact_count = session.compact_count
+        compact_count, memo_shapes = final_snapshot[0]
         assert len(reducer_visits) == 2 * len(stale_proofs)
         assert sum(reducer_visits) > compact_count
-        assert digest_visits == [compact_count]
-        for memo in session.memo.values():
-            assert not hasattr(memo, "compact_records")
-            assert not hasattr(memo, "compact_prepared")
-            assert type(memo.compact_count) is int
-            assert type(memo.compact_digest) is str
+        assert digest_visits == []
+        assert memo_shapes == ((False, False, int, str),) * len(stale_proofs)
     finally:
         owner.close()
+
+
+@pytest.mark.parametrize("pcc_count", [4, 8])
+def test_unpublished_historical_admin_work_scales_linearly_on_alternating_trace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pcc_count: int,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proofs = _accepted_many_complete(tmp_path / str(pcc_count), pcc_count)
+    store, journal, acknowledgements, records = _unpublished_resources(coordinator, proofs)
+    prepare_calls = 0
+    digest_updates = 0
+    reduction_calls = 0
+    final_counts: list[tuple[int, int]] = []
+    real_prepare = historical._prepare_historical_record
+    real_update = historical._update_replay_compact_digest
+    real_reduce = historical._reduce_historical_coverage
+    real_final = subject._final_seal_replay_historical_session
+    real_init = historical._ReplayHistoricalSession.__init__
+    real_begin_validation = historical._ReplayHistoricalSession.begin_validation
+    counting_source = False
+
+    def count_prepare(record: object) -> object:
+        nonlocal prepare_calls
+        if counting_source:
+            prepare_calls += 1
+        return real_prepare(record)
+
+    def count_initial_source(session: Any, *args: object, **kwargs: object) -> None:
+        nonlocal counting_source
+        counting_source = True
+        try:
+            real_init(session, *args, **kwargs)
+        finally:
+            counting_source = False
+
+    def count_validation_source(session: Any) -> None:
+        nonlocal counting_source
+        counting_source = True
+        try:
+            real_begin_validation(session)
+        finally:
+            counting_source = False
+
+    def count_update(previous: str, record: object) -> str:
+        nonlocal digest_updates
+        digest_updates += 1
+        return real_update(previous, record)
+
+    def count_reduce(*args: object, **kwargs: object) -> object:
+        nonlocal reduction_calls
+        reduction_calls += 1
+        return real_reduce(*args, **kwargs)
+
+    def capture_final(session: Any, callback: Any) -> None:
+        final_counts.append((session.compact_count, len(session.memo)))
+        real_final(session, callback)
+
+    monkeypatch.setattr(historical, "_prepare_historical_record", count_prepare)
+    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", count_initial_source)
+    monkeypatch.setattr(
+        historical._ReplayHistoricalSession,
+        "begin_validation",
+        count_validation_source,
+    )
+    monkeypatch.setattr(historical, "_update_replay_compact_digest", count_update)
+    monkeypatch.setattr(historical, "_reduce_historical_coverage", count_reduce)
+    monkeypatch.setattr(subject, "_final_seal_replay_historical_session", capture_final)
+    owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[-1].ref,
+    )
+    owner.close()
+    compact_count, memo_count = final_counts[0]
+    assert report.applied_count == len(records)
+    assert prepare_calls == 2 * len(records)
+    assert reduction_calls == 2 * pcc_count
+    assert memo_count == pcc_count
+    assert digest_updates == 2 * compact_count
 
 
 def test_unpublished_historical_memo_revalidation_drift_returns_no_artifact(
@@ -1639,13 +1787,14 @@ def test_projecting_path_is_event_scoped_and_rejects_copied_context_use(
         (first, second),
     )
     captured: list[tuple[AuthenticatedPCCInput, object]] = []
-    real_issue = historical._issue_historical_path_authority
+    real_issue = historical._issue_replay_historical_path_authority
 
     def capture_production_path(
         candidate_store: Any,
         authenticated: AuthenticatedPCCInput,
+        access: object,
     ) -> object:
-        path = real_issue(candidate_store, authenticated)
+        path = real_issue(candidate_store, authenticated, access)
         if (
             candidate_store is store
             and authenticated.event_id == first.event_id
@@ -1656,15 +1805,24 @@ def test_projecting_path_is_event_scoped_and_rejects_copied_context_use(
 
     monkeypatch.setattr(
         historical,
-        "_issue_historical_path_authority",
+        "_issue_replay_historical_path_authority",
+        capture_production_path,
+    )
+    monkeypatch.setattr(
+        subject,
+        "_issue_replay_historical_path_authority",
         capture_production_path,
     )
     copied_context_denied = False
+    copied_helper_issue_denied = False
+    copied_helper_derive_denied = False
     stale_event_denied = False
     first_candidate_seen = False
 
     def probe_path_epoch(step: str) -> None:
-        nonlocal copied_context_denied, stale_event_denied, first_candidate_seen
+        nonlocal copied_context_denied, copied_helper_derive_denied
+        nonlocal copied_helper_issue_denied, stale_event_denied
+        nonlocal first_candidate_seen
         if step == "candidate" and not first_candidate_seen:
             first_candidate_seen = True
             assert captured
@@ -1678,6 +1836,24 @@ def test_projecting_path_is_event_scoped_and_rejects_copied_context_use(
                 )
             except historical.HistoricalCoverageUnavailable:
                 copied_context_denied = True
+            try:
+                copied.run(
+                    historical._issue_replay_historical_path_authority,
+                    store,
+                    proof,
+                    None,
+                )
+            except historical.HistoricalCoverageUnavailable:
+                copied_helper_issue_denied = True
+            try:
+                copied.run(
+                    historical._derive_replay_historical_coverage,
+                    proof,
+                    path,
+                    None,
+                )
+            except historical.HistoricalCoverageUnavailable:
+                copied_helper_derive_denied = True
             return
         if step == "event" and first_candidate_seen and not stale_event_denied:
             proof, path = captured[0]
@@ -1699,6 +1875,8 @@ def test_projecting_path_is_event_scoped_and_rejects_copied_context_use(
     try:
         assert report.cursor.source_sequence == records[-1].ref.source_sequence
         assert copied_context_denied is True
+        assert copied_helper_issue_denied is True
+        assert copied_helper_derive_denied is True
         assert stale_event_denied is True
     finally:
         owner.close()
@@ -1767,6 +1945,236 @@ def test_replay_session_runtime_capability_cannot_be_copied_pickled_or_subclasse
         assert subclass_denied is True
     finally:
         owner.close()
+
+
+def test_validation_replay_path_is_bound_to_one_exact_memo_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, first, second = _accepted_two_complete(tmp_path / "evidence")
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (first, second),
+    )
+    validation_paths: list[tuple[AuthenticatedPCCInput, object, object]] = []
+    previous_denied = False
+    real_issue = subject._issue_replay_historical_path_authority
+
+    def capture_validation_path(
+        candidate_store: Any,
+        proof: AuthenticatedPCCInput,
+        access: object,
+    ) -> object:
+        nonlocal previous_denied
+        path = real_issue(candidate_store, proof, access)
+        binding = cast(Any, path)._binding
+        if binding.phase == "validating":
+            if validation_paths:
+                old_proof, old_path, old_access = validation_paths[0]
+                try:
+                    historical._derive_replay_historical_coverage(
+                        old_proof,
+                        old_path,
+                        old_access,
+                    )
+                except historical.HistoricalCoverageUnavailable:
+                    previous_denied = True
+            validation_paths.append((proof, path, access))
+        return path
+
+    monkeypatch.setattr(
+        subject,
+        "_issue_replay_historical_path_authority",
+        capture_validation_path,
+    )
+    monkeypatch.setattr(
+        authority,
+        "_issue_replay_historical_path_authority",
+        capture_validation_path,
+    )
+    owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[-1].ref,
+    )
+    owner.close()
+    assert report.cursor.source_sequence == records[-1].ref.source_sequence
+    assert len(validation_paths) >= 2
+    assert previous_denied is True
+    proof, path, access = validation_paths[-1]
+    with pytest.raises(historical.HistoricalCoverageUnavailable):
+        historical._derive_replay_historical_coverage(proof, path, access)
+
+
+def test_projecting_replay_access_rejects_value_equal_pcc_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, stale = _accepted_complete(tmp_path / "evidence", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (stale,),
+    )
+    verifier = store._bound_verifier
+    assert verifier is not None
+    substitute = store._authenticated_pcc_input(
+        verifier,
+        cast(EvidenceRef, stale.evidence_ref),
+        stale.request,
+    )
+    captured_access: list[object] = []
+    real_issue = subject._issue_replay_historical_path_authority
+
+    def capture_access(store_value: Any, proof: Any, access: object) -> object:
+        path = real_issue(store_value, proof, access)
+        if not captured_access and cast(Any, path)._binding.phase == "projecting":
+            captured_access.append(access)
+        return path
+
+    monkeypatch.setattr(subject, "_issue_replay_historical_path_authority", capture_access)
+    denied = False
+
+    def probe(step: str) -> None:
+        nonlocal denied
+        if step != "candidate" or denied:
+            return
+        assert captured_access
+        try:
+            historical._issue_replay_historical_path_authority(
+                store,
+                substitute,
+                captured_access[0],
+            )
+        except historical.HistoricalCoverageUnavailable:
+            denied = True
+
+    owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[-1].ref,
+        step_hook=probe,
+    )
+    owner.close()
+    assert report.cursor.source_sequence == records[-1].ref.source_sequence
+    assert denied is True
+
+
+def test_projecting_replay_access_rejects_mutated_session_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, stale = _accepted_complete(tmp_path / "evidence", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (stale,),
+    )
+    captured_path: list[tuple[Any, Any, Any]] = []
+    real_issue = subject._issue_replay_historical_path_authority
+
+    def capture_path(store_value: Any, proof: Any, access: Any) -> Any:
+        path = real_issue(store_value, proof, access)
+        if not captured_path and cast(Any, path)._binding.phase == "projecting":
+            captured_path.append((proof, path, access))
+        return path
+
+    monkeypatch.setattr(subject, "_issue_replay_historical_path_authority", capture_path)
+    denied = False
+
+    def probe(step: str) -> None:
+        nonlocal denied
+        if step != "candidate" or denied:
+            return
+        proof, path, access = captured_path[0]
+        session = cast(Any, path)._binding.session
+        original_epoch = session.access_epoch
+        session.access_epoch += 1
+        try:
+            historical._derive_replay_historical_coverage(proof, path, access)
+        except historical.HistoricalCoverageUnavailable:
+            denied = True
+        finally:
+            session.access_epoch = original_epoch
+
+    owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[-1].ref,
+        step_hook=probe,
+    )
+    owner.close()
+    assert report.cursor.source_sequence == records[-1].ref.source_sequence
+    assert denied is True
+
+
+def test_replay_session_cleanup_clears_state_and_revokes_captured_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, stale = _accepted_complete(tmp_path / "evidence", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (stale,),
+    )
+    captured_session: list[Any] = []
+    captured_path: list[tuple[Any, Any, Any]] = []
+    real_activate = subject._activate_replay_historical_session
+    real_issue = subject._issue_replay_historical_path_authority
+
+    def capture_session(*args: object, **kwargs: object) -> Any:
+        result = real_activate(*args, **kwargs)
+        captured_session.append(result[0])
+        return result
+
+    def capture_path(store_value: Any, proof: Any, access: Any) -> Any:
+        path = real_issue(store_value, proof, access)
+        if not captured_path:
+            captured_path.append((proof, path, access))
+        return path
+
+    monkeypatch.setattr(subject, "_activate_replay_historical_session", capture_session)
+    monkeypatch.setattr(subject, "_issue_replay_historical_path_authority", capture_path)
+    owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[-1].ref,
+    )
+    owner.close()
+    assert report.cursor.source_sequence == records[-1].ref.source_sequence
+    session = captured_session[0]
+    assert session.memo == {}
+    assert session.used_pcc == {}
+    assert session.validated_memo_keys == set()
+    assert session.compact_records == []
+    assert session.compact_prepared == []
+    assert session.compact_count == 0
+    assert session.active_accesses == set()
+    proof, path, access = captured_path[0]
+    with pytest.raises(historical.HistoricalCoverageUnavailable):
+        historical._derive_replay_historical_coverage(proof, path, access)
 
 
 def test_unpublished_rollback_restores_projected_head_before_path_dispatch(
@@ -2346,6 +2754,68 @@ def test_unpublished_post_prefix_source_record_drift_returns_no_artifact(
     assert store._closed is True
     assert journal._closed is True
     assert acknowledgements._closed is True
+
+
+@pytest.mark.parametrize("drift", ["lifecycle", "verifier", "repair", "retention"])
+def test_unpublished_post_prefix_source_authority_drift_returns_no_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / drift, ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    original_lifecycle = store._lifecycle_identity
+    original_verifier = store._bound_verifier
+    original_repair = store._repair_pending
+    original_retention = store._retention_pending_latched
+    real_validate = subject._V2ProjectionOwner._validate_persisted_prefix
+    injected = False
+
+    def drift_after_persisted_prefix(owner: Any, *args: object, **kwargs: object) -> str:
+        nonlocal injected
+        digest = real_validate(owner, *args, **kwargs)
+        if historical._ACTIVE_REPLAY_SESSION.get() is not None:
+            injected = True
+            if drift == "lifecycle":
+                object.__setattr__(store, "_lifecycle_identity", object())
+            elif drift == "verifier":
+                object.__setattr__(store, "_bound_verifier", None)
+            elif drift == "repair":
+                object.__setattr__(store, "_repair_pending", True)
+            else:
+                object.__setattr__(store, "_retention_pending_latched", True)
+        return digest
+
+    monkeypatch.setattr(
+        subject._V2ProjectionOwner,
+        "_validate_persisted_prefix",
+        drift_after_persisted_prefix,
+    )
+    artifact: object | None = None
+    try:
+        with pytest.raises(ProjectionAuthorityError):
+            artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+                evidence=store,
+                acknowledgements=acknowledgements,
+                journal=journal,
+                registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+                through=records[-1].ref,
+            )
+    finally:
+        object.__setattr__(store, "_lifecycle_identity", original_lifecycle)
+        object.__setattr__(store, "_bound_verifier", original_verifier)
+        object.__setattr__(store, "_repair_pending", original_repair)
+        object.__setattr__(store, "_retention_pending_latched", original_retention)
+    assert injected is True
+    assert artifact is None
+    assert store._closed is True
 
 
 @pytest.mark.parametrize("drift", ["strict_ack", "journal_cache"])
@@ -3349,6 +3819,273 @@ def test_owner_factory_rejects_closed_journal_lifecycle(
             acknowledgements.close()
         if not getattr(store, "_closed", True):
             store.close()
+
+
+@pytest.mark.parametrize("drift", ["detector", "registry"])
+def test_terminal_source_iteration_rechecks_external_pins_before_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / drift, ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    registry = load_pinned_special_use_registry(_REGISTRY_PATH)
+    original_entries = registry.entries
+    batches_sealed = False
+    injected = False
+    real_batch_seal = subject._seal_completed_snapshot_batch
+    real_iter = type(store).iter_authenticated_records
+
+    def mark_batch_sealed(batch: object) -> None:
+        nonlocal batches_sealed
+        real_batch_seal(batch)
+        batches_sealed = True
+
+    def drift_during_terminal_iteration(
+        candidate_store: Any,
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> Any:
+        nonlocal injected
+        selected = tuple(real_iter(candidate_store, after=after, through=through))
+        if candidate_store is store and batches_sealed and not injected:
+            injected = True
+            if drift == "detector":
+                monkeypatch.setattr(
+                    authority,
+                    "_load_pinned_detector_bundle",
+                    lambda: "2" * 64,
+                )
+            else:
+                object.__setattr__(registry, "entries", ())
+        return iter(selected)
+
+    monkeypatch.setattr(subject, "_seal_completed_snapshot_batch", mark_batch_sealed)
+    monkeypatch.setattr(type(store), "iter_authenticated_records", drift_during_terminal_iteration)
+    artifact: object | None = None
+    try:
+        with pytest.raises(ProjectionAuthorityError):
+            artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+                evidence=store,
+                acknowledgements=acknowledgements,
+                journal=journal,
+                registry=registry,
+                through=records[-1].ref,
+            )
+    finally:
+        object.__setattr__(registry, "entries", original_entries)
+    assert injected is True
+    assert artifact is None
+    assert store._closed is True
+
+
+def test_terminal_source_iteration_rechecks_resident_append_before_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / "evidence", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    batches_sealed = False
+    injected = False
+    real_batch_seal = subject._seal_completed_snapshot_batch
+    real_iter = type(store).iter_authenticated_records
+
+    def mark_batch_sealed(batch: object) -> None:
+        nonlocal batches_sealed
+        real_batch_seal(batch)
+        batches_sealed = True
+
+    def append_during_terminal_iteration(
+        candidate_store: Any,
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> Any:
+        nonlocal injected
+        selected = tuple(real_iter(candidate_store, after=after, through=through))
+        if candidate_store is store and batches_sealed and not injected:
+            injected = True
+            store._records.append(store._records[-1])
+        return iter(selected)
+
+    monkeypatch.setattr(subject, "_seal_completed_snapshot_batch", mark_batch_sealed)
+    monkeypatch.setattr(type(store), "iter_authenticated_records", append_during_terminal_iteration)
+    artifact: object | None = None
+    try:
+        with pytest.raises(ProjectionAuthorityError):
+            artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+                evidence=store,
+                acknowledgements=acknowledgements,
+                journal=journal,
+                registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+                through=records[-1].ref,
+            )
+    finally:
+        if len(store._records) > len(records):
+            store._records.pop()
+    assert injected is True
+    assert artifact is None
+    assert store._closed is True
+
+
+@pytest.mark.parametrize("drift", ["ack", "cursor", "hash", "predecessor", "status"])
+def test_terminal_source_iteration_rechecks_external_authority_before_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / drift, ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    connections: list[sqlite3.Connection] = []
+    batches_sealed = False
+    injected = False
+    original_ack_generation = acknowledgements._confirmed_generation
+    original_repair = store._repair_pending
+    real_connection_factory = subject._v2_connection_for_test
+    real_batch_seal = subject._seal_completed_snapshot_batch
+    real_iter = type(store).iter_authenticated_records
+    real_hash = subject._v2_snapshot_hash
+    real_predecessor = subject._validate_correlation_projection_predecessor
+
+    def capture_connection() -> sqlite3.Connection:
+        connection = real_connection_factory()
+        connections.append(connection)
+        return connection
+
+    def mark_batch_sealed(batch: object) -> None:
+        nonlocal batches_sealed
+        real_batch_seal(batch)
+        batches_sealed = True
+
+    def observed_hash(connection: sqlite3.Connection) -> str:
+        if injected and drift == "hash":
+            return "0" * 64
+        return real_hash(connection)
+
+    def validate_predecessor(*args: object, **kwargs: object) -> None:
+        if injected and drift == "predecessor":
+            raise ProjectionAuthorityError("injected predecessor drift")
+        real_predecessor(*args, **kwargs)
+
+    def drift_during_terminal_iteration(
+        candidate_store: Any,
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> Any:
+        nonlocal injected
+        selected = tuple(real_iter(candidate_store, after=after, through=through))
+        if candidate_store is store and batches_sealed and not injected:
+            injected = True
+            if drift == "ack":
+                acknowledgements._confirmed_generation += 1
+            elif drift == "cursor":
+                connections[0].execute(
+                    "UPDATE ingest_cursors SET source_sequence=?",
+                    (f"{records[-2].ref.source_sequence:020d}",),
+                )
+            elif drift == "status":
+                object.__setattr__(store, "_repair_pending", True)
+        return iter(selected)
+
+    monkeypatch.setattr(subject, "_v2_connection_for_test", capture_connection)
+    monkeypatch.setattr(subject, "_seal_completed_snapshot_batch", mark_batch_sealed)
+    monkeypatch.setattr(subject, "_v2_snapshot_hash", observed_hash)
+    monkeypatch.setattr(
+        subject,
+        "_validate_correlation_projection_predecessor",
+        validate_predecessor,
+    )
+    monkeypatch.setattr(type(store), "iter_authenticated_records", drift_during_terminal_iteration)
+    artifact: object | None = None
+    try:
+        with pytest.raises(ProjectionAuthorityError):
+            artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+                evidence=store,
+                acknowledgements=acknowledgements,
+                journal=journal,
+                registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+                through=records[-1].ref,
+            )
+    finally:
+        acknowledgements._confirmed_generation = original_ack_generation
+        object.__setattr__(store, "_repair_pending", original_repair)
+    assert injected is True
+    assert artifact is None
+    assert store._closed is True
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["projected_head", "compact_order", "compact_count", "compact_digest", "memo_closure"],
+)
+def test_terminal_seal_rechecks_complete_session_state_after_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proofs = _accepted_unpublished_compact_history(tmp_path / drift)
+    store, journal, acknowledgements, records = _unpublished_resources(coordinator, proofs)
+    captured: list[Any] = []
+    real_activate = subject._activate_replay_historical_session
+    real_seal = subject._seal_completed_snapshot_batch
+
+    def capture(*args: object, **kwargs: object) -> Any:
+        result = real_activate(*args, **kwargs)
+        captured.append(result[0])
+        return result
+
+    def mutate_after_batch(batch: object) -> None:
+        real_seal(batch)
+        session = captured[0]
+        if drift == "projected_head":
+            session.projected_head -= 1
+        elif drift == "compact_order":
+            session.compact_records[0], session.compact_records[1] = (
+                session.compact_records[1],
+                session.compact_records[0],
+            )
+        elif drift == "compact_count":
+            session.compact_count -= 1
+        elif drift == "compact_digest":
+            session.compact_digest = "0" * 64
+        else:
+            session.memo.pop(next(iter(session.memo)))
+
+    monkeypatch.setattr(subject, "_activate_replay_historical_session", capture)
+    monkeypatch.setattr(subject, "_seal_completed_snapshot_batch", mutate_after_batch)
+    artifact: object | None = None
+    with pytest.raises(ProjectionAuthorityError):
+        artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=records[-1].ref,
+        )
+    assert artifact is None
 
 
 def test_apply_rejects_equality_laundered_ref_before_source_selection(

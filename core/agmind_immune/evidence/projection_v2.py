@@ -68,7 +68,11 @@ from agmind_immune.coverage.historical import (
     _issue_replay_historical_path_authority,
     _late_coverage_invalidates_candidate,
     _late_coverage_may_invalidate_candidate,
+    _open_replay_historical_access,
+    _ReplayAccess,
+    _ReplayHandle,
     _revalidate_replay_historical_source,
+    _take_replay_historical_handle,
     _validate_replay_historical_event,
 )
 from agmind_immune.evidence.dedup import _logical_primary_identity_v2
@@ -1286,6 +1290,7 @@ class _V2ProjectionOwner:
     _mutex: RLockType
     _healthy: bool
     _closed: bool
+    _historical_replay_handle: _ReplayHandle | None
 
     def __init__(self) -> None:
         raise TypeError("use the module-private Projection V2 owner factory")
@@ -1339,6 +1344,7 @@ class _V2ProjectionOwner:
         owner._mutex = RLock()
         owner._healthy = True
         owner._closed = False
+        owner._historical_replay_handle = None
         try:
             if connection.in_transaction:
                 raise ProjectionConflict(
@@ -1435,6 +1441,15 @@ class _V2ProjectionOwner:
             self._evidence,
             self._evidence_lifecycle,
         )
+
+    def _open_historical_replay_access(
+        self,
+        proof: AuthenticatedPCCInput,
+    ) -> _ReplayAccess | None:
+        handle = self._historical_replay_handle
+        if handle is None:
+            return None
+        return _open_replay_historical_access(handle, proof)
 
     def _current_ack_boundary(self) -> _ProjectionAckBoundaryV2:
         acknowledgements = self._acknowledgements
@@ -1905,6 +1920,7 @@ class _V2ProjectionOwner:
         if proof.snapshot.outcome == "failed":
             result = correlate_pcc(proof, CorrelationContext.failed_snapshot())
         else:
+            historical_access = self._open_historical_replay_access(proof)
             key = _duplicate_key(proof, proof.snapshot)
             trigger = proof.snapshot.trigger
             active = _historical_active_duplicate_v2(
@@ -1920,6 +1936,7 @@ class _V2ProjectionOwner:
                 completed,
                 expected_predecessor=predecessor,
                 active_duplicate=active,
+                historical_access=historical_access,
             )
             if not _same_exact_pcc(proof, issued_proof):
                 raise ProjectionAuthorityError(
@@ -2553,6 +2570,9 @@ class _V2ProjectionOwner:
                         through,
                     )
                 )
+                self._historical_replay_handle = _take_replay_historical_handle(
+                    historical_session
+                )
             except HistoricalCoverageUnavailable as error:
                 raise ProjectionAuthorityError(
                     "Projection V2 unpublished historical session is unavailable"
@@ -2695,9 +2715,31 @@ class _V2ProjectionOwner:
                     authority,
                     _predecessor_v2(self._generation, final_cursor),
                 )
-                try:
+
+                def terminal_external_authority_check() -> None:
+                    terminal_cursor = _current_v2_cursor(connection)
+                    if (
+                        self._healthy_acceptance_cursor() != acceptance_cursor
+                        or self._current_ack_boundary() != ack_boundary
+                        or terminal_cursor != result.cursor
+                        or self._evidence.resolve_authenticated_ref(through).ref
+                        != through
+                        or _v2_snapshot_hash(connection) != prefix_sha256
+                    ):
+                        raise ProjectionAuthorityError(
+                            "Projection V2 terminal external authority changed"
+                        )
+                    _validate_correlation_projection_predecessor(
+                        authority,
+                        _predecessor_v2(self._generation, terminal_cursor),
+                    )
                     _validate_correlation_projection_pins(authority)
-                    _final_seal_replay_historical_session(historical_session)
+
+                try:
+                    _final_seal_replay_historical_session(
+                        historical_session,
+                        terminal_external_authority_check,
+                    )
                 except (
                     CorrelationProjectionError,
                     HistoricalCoverageConflict,
@@ -2712,6 +2754,7 @@ class _V2ProjectionOwner:
                     prefix_sha256=prefix_sha256,
                 )
             finally:
+                self._historical_replay_handle = None
                 for batch in batches:
                     _revoke_completed_snapshot_batch(batch)
                 _close_replay_historical_session(
@@ -3417,12 +3460,29 @@ class _V2ProjectionOwner:
                 "completed PCC is not exact same-store authority"
             )
         active: ActiveCandidateObservation | None = None
+        historical_access: _ReplayAccess | None = None
         if initial.snapshot.outcome == "failed":
             result = correlate_pcc(initial, CorrelationContext.failed_snapshot())
         else:
-            path = _issue_replay_historical_path_authority(self._evidence, initial)
-            coverage_before = _derive_replay_historical_coverage(initial, path)
-            if _derive_replay_historical_coverage(initial, path) != coverage_before:
+            historical_access = self._open_historical_replay_access(initial)
+            path = _issue_replay_historical_path_authority(
+                self._evidence,
+                initial,
+                historical_access,
+            )
+            coverage_before = _derive_replay_historical_coverage(
+                initial,
+                path,
+                historical_access,
+            )
+            if (
+                _derive_replay_historical_coverage(
+                    initial,
+                    path,
+                    historical_access,
+                )
+                != coverage_before
+            ):
                 raise CorrelationProjectionError(
                     "historical coverage changed before duplicate lookup"
                 )
@@ -3454,6 +3514,7 @@ class _V2ProjectionOwner:
                 completed,
                 expected_predecessor=predecessor,
                 active_duplicate=active,
+                historical_access=historical_access,
             )
             if not _same_exact_pcc(initial, proof):
                 raise CorrelationProjectionError(
@@ -3487,6 +3548,7 @@ class _V2ProjectionOwner:
                         completed,
                         expected_predecessor=predecessor,
                         active_duplicate=active,
+                        historical_access=historical_access,
                     )
                     if not _same_exact_pcc(initial, fresh_proof):
                         raise CorrelationProjectionError(
