@@ -38,6 +38,7 @@ from agmind_immune.ingest.envelope import AuthenticatedPCCInput
 from tests.correlation.test_pcc import (
     _accepted_complete,
     _accepted_direct_falco,
+    _context,
 )
 from tests.correlation.test_pcc import (
     _resign as _resign_pcc_envelope,
@@ -641,6 +642,397 @@ def _unpublished_resources(
 def _apply_all(owner: Any, coordinator: Any) -> None:
     for record in coordinator.segment_store.iter_authenticated_records():
         owner.apply(record.ref)
+
+
+def _frozen_compute_pcc_input(
+    proof: AuthenticatedPCCInput,
+    records: tuple[Any, ...],
+    *,
+    foreign_active: bool = False,
+) -> object:
+    pcc = importlib.import_module("agmind_immune.correlation.pcc")
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    if proof.snapshot.outcome == "failed":
+        return pcc._freeze_pcc_correlation_input(
+            proof,
+            pcc.CorrelationContext.failed_snapshot(),
+        )
+    entries = historical._build_frozen_replay_entries(
+        records,
+        tuple(historical._prepare_historical_record(record) for record in records),
+    )
+    compact = tuple(
+        entry.record
+        for entry in entries
+        if entry.compact_member
+        and entry.record.ref.source_sequence
+        <= proof.snapshot.coverage_through_sequence
+    )
+    trigger = proof.snapshot.trigger
+    reduction = historical._reduce_historical_coverage_result(
+        compact,
+        host_id=proof.host_id,
+        boot_id=proof.boot_id,
+        trigger_event_id=trigger.event_id,
+        trigger_source_sequence=trigger.source_sequence,
+        trigger_event_time=trigger.event_time,
+        clock_uncertainty_ms=trigger.clock_uncertainty_ms,
+        coverage_through_sequence=proof.snapshot.coverage_through_sequence,
+        window_end=proof.snapshot.decision_time,
+    )
+    lookup_key = pcc._duplicate_key(proof, proof.snapshot)
+    active = None
+    if foreign_active:
+        foreign_key = replace(lookup_key, host_id=OTHER_HOST)
+        active = pcc.ActiveCandidateObservation(
+            key=foreign_key,
+            candidate_id="cand_" + "d" * 64,
+            primary_source_sequence=1,
+            primary_event_id="evt_" + "d" * 64,
+        )
+    context = pcc.CorrelationContext(
+        pinned_detector_bundle_sha256=_DETECTOR_HASH,
+        special_use_registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        coverage=reduction.timeline.assessment,
+        lookup_key=lookup_key,
+        active_duplicate=active,
+    )
+    return pcc._freeze_pcc_correlation_input(proof, context)
+
+
+def _capture_compute_input(
+    subject: Any,
+    coordinator: Any,
+    frozen_inputs: tuple[object, ...],
+) -> tuple[object, dict[str, object]]:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    store = coordinator.segment_store
+    records = tuple(store.iter_authenticated_records())
+    terminal = records[-1].ref
+    acknowledgements = AckJournal.create_new(store)
+    _confirm_ack(acknowledgements, *[record.ref for record in records])
+    source_snapshot = None
+    ack_snapshot = None
+    issued = None
+    try:
+        with store._replay_source_snapshot_gate():
+            source_snapshot = store._capture_replay_source_locked(terminal)
+        with acknowledgements._replay_ack_snapshot_gate():
+            ack_snapshot = acknowledgements._capture_replay_ack_locked(
+                terminal.source_sequence
+            )
+        predecessor = authority._ProjectionPredecessor(
+            generation=1,
+            host_id=None,
+            source_sequence=0,
+            event_id=None,
+            content_sha256=None,
+            frame_sha256=None,
+        )
+        registry = load_pinned_special_use_registry(_REGISTRY_PATH)
+        issued = authority._issue_correlation_projection_authority(
+            store,
+            registry,
+            predecessor,
+            _DETECTOR_HASH,
+            authority._registry_facts(registry),
+        )
+        binding = authority._authority_binding(issued)
+        with authority._correlation_projection_snapshot_gate(issued) as held:
+            assert held is binding
+            correlation_snapshot = authority._capture_correlation_replay_locked(
+                issued,
+                held,
+                predecessor,
+            )
+        snapshot = subject._ReplayInputSnapshot(
+            source=source_snapshot,
+            ack=ack_snapshot,
+            correlation=correlation_snapshot,
+            pcc_inputs=frozen_inputs,
+            schema_domain=(
+                b"AGMIND_PROJECTION_SCHEMA_V2\0"
+                + Path("core/agmind_immune/evidence/schema_v2.sql").read_bytes()
+            ),
+            projection_generation=1,
+        )
+    except BaseException:
+        if source_snapshot is not None:
+            segments_module._close_replay_source_snapshot(source_snapshot)
+        if ack_snapshot is not None:
+            importlib.import_module(
+                "agmind_immune.ingest.ack_journal"
+            )._close_replay_ack_snapshot(ack_snapshot)
+        if issued is not None:
+            authority._close_correlation_projection_authority(issued)
+        acknowledgements.close()
+        store.close()
+        raise
+    authority._close_correlation_projection_authority(issued)
+    return snapshot, {
+        "source_snapshot": source_snapshot,
+        "ack_snapshot": ack_snapshot,
+        "acknowledgements": acknowledgements,
+        "store": store,
+    }
+
+
+def _close_compute_input(resources: dict[str, object]) -> None:
+    segments_module._close_replay_source_snapshot(resources["source_snapshot"])
+    importlib.import_module(
+        "agmind_immune.ingest.ack_journal"
+    )._close_replay_ack_snapshot(resources["ack_snapshot"])
+    resources["acknowledgements"].close()
+    resources["store"].close()
+
+
+def _with_conservative_sequence_gap(
+    subject: Any,
+    snapshot: object,
+    resources: dict[str, object],
+    path: Path,
+    proof: AuthenticatedPCCInput,
+) -> object:
+    frames = importlib.import_module("agmind_immune.evidence.frames")
+    gap = _gap_open(
+        private_key(11),
+        4,
+        start=proof.snapshot.trigger.source_sequence,
+        end=proof.snapshot.trigger.source_sequence,
+        opened_at=T5,
+    )
+    payload = canonical_json(
+        {
+            "schema_version": "agmind.accepted-envelope.v1",
+            "evidence_priority": gap.priority.value,
+            "accepted_at": gap.accepted_at,
+            "outer": {
+                "sequence": gap.ref.source_sequence,
+                "event_id": gap.ref.event_id,
+                "content_sha256": gap.ref.content_sha256,
+            },
+            "envelope": gap.envelope,
+        }
+    )
+    frame = frames.encode_frame(
+        payload,
+        previous_hash=bytes(32),
+        max_frame=segments_module.MAX_EVIDENCE_RECORD_BYTES,
+    )
+    framed = frames.decode_frames(
+        frame,
+        max_frame=segments_module.MAX_EVIDENCE_RECORD_BYTES,
+    ).records[0]
+    ref = replace(
+        gap.ref,
+        frame_offset=0,
+        frame_size=len(frame),
+        frame_sha256=framed.record_hash.hex(),
+    )
+    path.write_bytes(frame)
+    descriptor = os.open(path, os.O_RDONLY)
+    info = os.fstat(descriptor)
+    source = snapshot.source
+    source = replace(
+        source,
+        terminal_ref=ref,
+        records=(
+            *source.records,
+            segments_module._ReplayRecordDescriptor(
+                ref=ref,
+                accepted_at=gap.accepted_at,
+                canonical_record=payload,
+                segment_index=len(source.segments),
+            ),
+        ),
+        segments=(
+            *source.segments,
+            segments_module._ReplaySegmentDescriptor(
+                descriptor=descriptor,
+                device=info.st_dev,
+                inode=info.st_ino,
+                size=info.st_size,
+                maximum_prefix_bytes=info.st_size,
+                relative_path=ref.segment_relative_path,
+            ),
+        ),
+    )
+    ack = replace(
+        snapshot.ack,
+        confirmed=(ref.source_sequence, ref.event_id, ref.content_sha256),
+    )
+    resources["source_snapshot"] = source
+    resources["ack_snapshot"] = ack
+    return replace(snapshot, source=source, ack=ack)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "direct-investigation",
+        "safe-candidate",
+        "failed-pcc",
+        "compact-second-close",
+        "compact-reopen",
+        "late-critical",
+        "different-host-observation",
+        "sequence-range",
+        "nonintersecting-window",
+        "retry",
+        "transport-duplicate",
+    ),
+)
+def test_compute_projection_parity_scenarios(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    subject = _subject()
+    proof: AuthenticatedPCCInput | None = None
+    foreign_active = False
+    if case == "direct-investigation":
+        coordinator, _authenticated = _accepted_direct_falco(
+            tmp_path / case,
+            investigation_only=True,
+        )
+    elif case == "failed-pcc":
+        coordinator, proof = _accepted_failed_120(tmp_path / case)
+    elif case.startswith("compact-"):
+        conflict = case.removeprefix("compact-")
+        coordinator, proof = _accepted_unpublished_historical_conflict(
+            tmp_path / case,
+            conflict=conflict,
+        )
+    else:
+        coordinator, proof = _accepted_complete(
+            tmp_path / case,
+            ttl_seconds=120,
+        )
+        if case == "late-critical":
+            _accept(
+                coordinator,
+                _generic_critical(
+                    private_key(11),
+                    4,
+                    component="falco-adapter",
+                    kind="falco_heartbeat_gap",
+                    opened_at=NOW,
+                    closed_at=NOW,
+                ).envelope,
+            )
+        elif case == "different-host-observation":
+            foreign_active = True
+        elif case == "nonintersecting-window":
+            _accept(
+                coordinator,
+                _generic_critical(
+                    private_key(11),
+                    4,
+                    component="falco-adapter",
+                    kind="falco_heartbeat_gap",
+                    opened_at=T5,
+                    closed_at=T5,
+                ).envelope,
+            )
+        elif case == "transport-duplicate":
+            for sequence in (4, 5):
+                _accept(
+                    coordinator,
+                    _generic_critical(
+                        private_key(11),
+                        sequence,
+                        component="falco-adapter",
+                        kind="falco_heartbeat_gap",
+                        opened_at=NOW,
+                        closed_at=NOW,
+                    ).envelope,
+                )
+
+    records = tuple(coordinator.segment_store.iter_authenticated_records())
+    if proof is None:
+        frozen_inputs: tuple[object, ...] = ()
+    elif case.startswith("compact-"):
+        pcc = importlib.import_module("agmind_immune.correlation.pcc")
+        frozen_inputs = (
+            pcc._freeze_pcc_correlation_input(proof, _context(proof)),
+        )
+    else:
+        frozen_inputs = (
+            _frozen_compute_pcc_input(
+                proof,
+                records,
+                foreign_active=foreign_active,
+            ),
+        )
+    snapshot, resources = _capture_compute_input(
+        subject,
+        coordinator,
+        frozen_inputs,
+    )
+    if case == "sequence-range":
+        assert proof is not None
+        snapshot = _with_conservative_sequence_gap(
+            subject,
+            snapshot,
+            resources,
+            tmp_path / case / "conservative-gap.agf",
+            proof,
+        )
+    try:
+        if case.startswith("compact-"):
+            with pytest.raises(subject.ProjectionConflict):
+                subject._compute_replay(snapshot)
+            return
+
+        computation = subject._compute_replay(snapshot)
+        if case == "retry":
+            assert subject._compute_replay(snapshot) == computation
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.deserialize(computation.database_image)
+            incident_kinds = tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT result_kind FROM incidents ORDER BY incident_id"
+                )
+            )
+            candidate_count = connection.execute(
+                "SELECT count(*) FROM candidates"
+            ).fetchone()[0]
+            invalidation_count = connection.execute(
+                "SELECT count(*) FROM candidate_invalidations"
+            ).fetchone()[0]
+            if case == "direct-investigation":
+                assert (incident_kinds, candidate_count, invalidation_count) == (
+                    ("investigation",),
+                    0,
+                    0,
+                )
+            elif case == "failed-pcc":
+                assert (incident_kinds, candidate_count, invalidation_count) == (
+                    ("rejected",),
+                    0,
+                    0,
+                )
+            else:
+                assert incident_kinds == ("candidate",)
+                assert candidate_count == 1
+                expected_invalidations = (
+                    1
+                    if case
+                    in {"late-critical", "sequence-range", "transport-duplicate"}
+                    else 0
+                )
+                assert invalidation_count == expected_invalidations
+                if case == "transport-duplicate":
+                    duplicate_rows = connection.execute(
+                        "SELECT count(*) FROM events "
+                        "WHERE duplicate_of_event_id IS NOT NULL"
+                    ).fetchone()[0]
+                    assert duplicate_rows == 1
+        finally:
+            connection.close()
+    finally:
+        _close_compute_input(resources)
 
 
 def _forge_later_logical_primary(

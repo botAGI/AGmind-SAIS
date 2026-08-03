@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import stat
 import sys
 from _thread import RLock as RLockType
 from collections.abc import Callable, Sequence
@@ -29,11 +32,13 @@ from agmind_immune.correlation.authority import (
     CorrelationProjectionAuthority,
     _advance_correlation_projection_authority,
     _close_correlation_projection_authority,
+    _CorrelationReplaySnapshot,
     _create_correlation_projection_authority,
     _evaluate_correlation_projection_terminal_authority,
     _issue_correlation_context,
     _ProjectionPredecessor,
     _same_exact_pcc,
+    _seal_projection_predecessor,
     _validate_correlation_projection_predecessor,
 )
 from agmind_immune.correlation.pcc import (
@@ -45,7 +50,11 @@ from agmind_immune.correlation.pcc import (
     Duplicate,
     InvestigationOnly,
     Rejected,
+    _correlate_frozen_pcc,
     _duplicate_key,
+    _FrozenPCCCorrelationInput,
+    _incident_from_frozen_falco,
+    _rebind_frozen_pcc_observations,
     correlate_pcc,
     incident_from_verified_falco,
 )
@@ -59,21 +68,34 @@ from agmind_immune.coverage.historical import (
     _begin_replay_historical_commit,
     _begin_replay_historical_event,
     _begin_replay_historical_validation,
+    _build_frozen_replay_entries,
+    _build_replay_memo_leaf,
+    _build_replay_pcc_leaf,
     _compare_replay_historical_primary,
     _complete_replay_historical_event,
     _complete_replay_historical_session,
     _derive_replay_historical_coverage,
     _final_seal_replay_historical_session,
+    _FrozenReplayEntry,
+    _HistoricalReductionResult,
     _issue_replay_historical_path_authority,
     _late_coverage_invalidates_candidate,
+    _late_coverage_invalidates_candidate_values,
     _late_coverage_may_invalidate_candidate,
     _open_replay_historical_access,
+    _prepare_historical_record,
+    _reduce_historical_coverage_result,
+    _replay_compact_digest,
+    _replay_exact_fact,
     _replay_historical_session,
     _ReplayAccess,
     _ReplayHandle,
+    _ReplayMemoLeaf,
+    _ReplayPCCLeaf,
     _validate_replay_historical_event,
 )
 from agmind_immune.evidence.dedup import _logical_primary_identity_v2
+from agmind_immune.evidence.frames import JournalCorrupt, decode_frames
 from agmind_immune.evidence.projection import (
     ProjectionApplyResult,
     ProjectionAuthorityError,
@@ -85,12 +107,19 @@ from agmind_immune.evidence.projection import (
 )
 from agmind_immune.evidence.segments import (
     _SOURCE_TERMINAL_FACTORY,
+    MAX_EVIDENCE_RECORD_BYTES,
+    MAX_SEGMENT_BYTES,
+    EvidencePriority,
     EvidenceRef,
     EvidenceStatus,
     EvidenceStoreError,
     SegmentStore,
     StoredEvidenceRecord,
+    _AcceptedEnvelopeRecordV1,
     _exact_coverage_record_key,
+    _ReplayRecordDescriptor,
+    _ReplaySegmentDescriptor,
+    _ReplaySourceSnapshot,
 )
 from agmind_immune.incidents.models import ContainmentCandidateV1, IncidentV1
 from agmind_immune.ingest.ack_journal import (
@@ -99,6 +128,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournal,
     AckJournalError,
     AckJournalSnapshot,
+    _AckReplaySnapshot,
     _AckUnpublishedAnchor,
 )
 from agmind_immune.ingest.correlation_journal import (
@@ -124,6 +154,9 @@ _SCHEMA_META_V2 = {
     "snapshot_layout": "AGMIND_PROJECTION_SNAPSHOT_V2",
 }
 _SNAPSHOT_DOMAIN_V2 = b"AGMIND_PROJECTION_SNAPSHOT_V2\0"
+_REPLAY_SCHEMA_DOMAIN_V2 = b"AGMIND_PROJECTION_SCHEMA_V2\0"
+_REPLAY_TRANSCRIPT_DOMAIN_V2 = b"AGMIND_PROJECTION_REPLAY_TRANSCRIPT_V2\0"
+_REPLAY_REPORT_DOMAIN_V2 = b"AGMIND_PROJECTION_REPLAY_REPORT_V2\0"
 _UNPUBLISHED_REPLAY_FACTORY = object()
 _UNPUBLISHED_PCC_CHUNK = _MAX_COMPLETED_BATCH
 _UINT64_V2 = re.compile(r"^[0-9]{20}$")
@@ -361,6 +394,37 @@ class _UnpublishedV2ReplayReport:
     cursor: ProjectionCursor
     applied_count: int
     prefix_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayInputSnapshot:
+    source: _ReplaySourceSnapshot
+    ack: _AckReplaySnapshot
+    correlation: _CorrelationReplaySnapshot
+    pcc_inputs: tuple[_FrozenPCCCorrelationInput, ...]
+    schema_domain: bytes
+    projection_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayComputation:
+    database_image: bytes
+    transcript_count: int
+    transcript_digest: bytes
+    pcc_leaves: tuple[_ReplayPCCLeaf, ...]
+    memo_leaves: tuple[_ReplayMemoLeaf, ...]
+    late_invalidations: tuple[object, ...]
+    terminal_predecessor: _ProjectionPredecessor
+    administrative_visits: int
+    semantic_prefix_visits: int
+    report_bytes: bytes
+    prefix_sha256: str
+
+
+@dataclass(slots=True)
+class _ReplayComputeCounters:
+    administrative_visits: int = 0
+    semantic_prefix_visits: int = 0
 
 
 def _encode_uint64_v2(value: object) -> str:
@@ -1263,6 +1327,834 @@ def _historical_active_duplicate_v2(
         primary_source_sequence=candidate.primary_source_sequence,
         primary_event_id=candidate.primary_event_id,
     )
+
+
+def _replay_pread_v2(
+    descriptor: int,
+    size: int,
+    *,
+    maximum: int,
+    counters: _ReplayComputeCounters,
+) -> bytes:
+    if (
+        type(descriptor) is not int
+        or descriptor < 0
+        or type(size) is not int
+        or not 0 <= size <= maximum
+        or type(maximum) is not int
+        or maximum < 0
+        or type(counters) is not _ReplayComputeCounters
+    ):
+        raise TypeError("Projection V2 replay descriptor bounds are not exact")
+    parts: list[bytes] = []
+    offset = 0
+    while offset < size:
+        counters.administrative_visits += 1
+        chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise ProjectionConflict("Projection V2 replay descriptor shortened")
+        parts.append(chunk)
+        offset += len(chunk)
+    return b"".join(parts)
+
+
+def _validate_replay_snapshot_shape_v2(
+    snapshot: _ReplayInputSnapshot,
+) -> tuple[
+    _ReplaySourceSnapshot,
+    _AckReplaySnapshot,
+    _CorrelationReplaySnapshot,
+    tuple[_FrozenPCCCorrelationInput, ...],
+    bytes,
+    int,
+]:
+    if type(snapshot) is not _ReplayInputSnapshot:
+        raise TypeError("Projection V2 compute requires an exact replay snapshot")
+    source = snapshot.source
+    ack = snapshot.ack
+    correlation = snapshot.correlation
+    pcc_inputs = snapshot.pcc_inputs
+    schema_domain = snapshot.schema_domain
+    generation = snapshot.projection_generation
+    if (
+        type(source) is not _ReplaySourceSnapshot
+        or type(ack) is not _AckReplaySnapshot
+        or type(correlation) is not _CorrelationReplaySnapshot
+        or type(pcc_inputs) is not tuple
+        or type(schema_domain) is not bytes
+        or type(generation) is not int
+        or not 1 <= generation <= MAX_UINT64
+    ):
+        raise TypeError("Projection V2 replay snapshot fields are not exact")
+    if any(type(item) is not _FrozenPCCCorrelationInput for item in pcc_inputs):
+        raise TypeError("Projection V2 replay PCC inputs are not exact")
+    if (
+        type(source.lifecycle_token) is not bytes
+        or len(source.lifecycle_token) != 32
+        or type(source.source_revision) is not int
+        or source.source_revision < 0
+        or type(source.terminal_ref) is not EvidenceRef
+        or type(source.retained_ranges) is not tuple
+        or type(source.records) is not tuple
+        or type(source.segments) is not tuple
+        or any(type(item) is not _ReplayRecordDescriptor for item in source.records)
+        or any(type(item) is not _ReplaySegmentDescriptor for item in source.segments)
+    ):
+        raise TypeError("Projection V2 replay source facts are not exact")
+    if any(
+        type(item) is not tuple
+        or len(item) != 2
+        or type(item[0]) is not int
+        or type(item[1]) is not int
+        or not 1 <= item[0] <= item[1] <= MAX_UINT64
+        for item in source.retained_ranges
+    ):
+        raise TypeError("Projection V2 replay retained ranges are not exact")
+    if (
+        type(ack.lifecycle_token) is not bytes
+        or len(ack.lifecycle_token) != 32
+        or type(ack.mutation_revision) is not int
+        or ack.mutation_revision < 0
+        or type(ack.generation) is not int
+        or not 0 <= ack.generation <= MAX_UINT64
+        or (ack.confirmed is not None and type(ack.confirmed) is not tuple)
+        or (ack.pending is not None and type(ack.pending) is not tuple)
+        or type(ack.committed_prefix_size) is not int
+        or type(ack.committed_prefix_sha256) is not bytes
+        or len(ack.committed_prefix_sha256) != 32
+        or type(ack.retention_pending) is not bool
+        or type(ack.descriptor) is not int
+        or type(ack.device) is not int
+        or type(ack.inode) is not int
+        or type(ack.size) is not int
+    ):
+        raise TypeError("Projection V2 replay ACK facts are not exact")
+    predecessor = correlation.predecessor
+    if (
+        type(correlation.lifecycle_token) is not bytes
+        or len(correlation.lifecycle_token) != 32
+        or callable(correlation.revision)
+        or type(predecessor) is not _ProjectionPredecessor
+        or type(correlation.predecessor_canonical) is not bytes
+        or type(correlation.detector_bundle_sha256) is not str
+        or _HEX64_V2.fullmatch(correlation.detector_bundle_sha256) is None
+        or type(correlation.registry_facts_canonical) is not bytes
+    ):
+        raise TypeError("Projection V2 replay correlation facts are not exact")
+    try:
+        predecessor_seal = _seal_projection_predecessor(predecessor)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError("Projection V2 replay predecessor is malformed") from error
+    if (
+        predecessor_seal.canonical != correlation.predecessor_canonical
+        or predecessor
+        != _ProjectionPredecessor(generation, None, 0, None, None, None)
+    ):
+        raise ProjectionConflict("Projection V2 replay predecessor is not empty")
+    return source, ack, correlation, pcc_inputs, schema_domain, generation
+
+
+def _decode_replay_records_v2(
+    source: _ReplaySourceSnapshot,
+    counters: _ReplayComputeCounters,
+) -> tuple[StoredEvidenceRecord, ...]:
+    records_by_segment: list[list[_ReplayRecordDescriptor]] = [
+        [] for _segment in source.segments
+    ]
+    for ordinal, record in enumerate(source.records, start=1):
+        counters.administrative_visits += 1
+        if (
+            type(record.ref) is not EvidenceRef
+            or type(record.accepted_at) is not str
+            or type(record.canonical_record) is not bytes
+            or type(record.segment_index) is not int
+            or not 0 <= record.segment_index < len(source.segments)
+            or record.ref.source_sequence != ordinal
+        ):
+            raise TypeError("Projection V2 replay record descriptor is not exact")
+        records_by_segment[record.segment_index].append(record)
+    for segment_index, segment in enumerate(source.segments):
+        counters.administrative_visits += 1
+        if (
+            type(segment.descriptor) is not int
+            or segment.descriptor < 0
+            or type(segment.device) is not int
+            or type(segment.inode) is not int
+            or type(segment.size) is not int
+            or not 0 < segment.size <= MAX_SEGMENT_BYTES
+            or type(segment.maximum_prefix_bytes) is not int
+            or not 0 < segment.maximum_prefix_bytes <= segment.size
+            or type(segment.relative_path) is not str
+        ):
+            raise TypeError("Projection V2 replay segment descriptor is not exact")
+        info = os.fstat(segment.descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or (info.st_dev, info.st_ino, info.st_size)
+            != (segment.device, segment.inode, segment.size)
+            or fcntl.fcntl(segment.descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+            != os.O_RDONLY
+        ):
+            raise ProjectionConflict("Projection V2 replay segment binding changed")
+        prefix = _replay_pread_v2(
+            segment.descriptor,
+            segment.maximum_prefix_bytes,
+            maximum=MAX_SEGMENT_BYTES,
+            counters=counters,
+        )
+        try:
+            decoded = decode_frames(prefix, max_frame=MAX_EVIDENCE_RECORD_BYTES)
+        except (JournalCorrupt, ValueError) as error:
+            raise ProjectionConflict("Projection V2 replay segment is corrupt") from error
+        expected = records_by_segment[segment_index]
+        if (
+            decoded.torn_tail
+            or decoded.verified_bytes != segment.maximum_prefix_bytes
+            or len(decoded.records) != len(expected)
+        ):
+            raise ProjectionConflict("Projection V2 replay frames differ from snapshot")
+        for frame, descriptor in zip(decoded.records, expected, strict=True):
+            counters.administrative_visits += 1
+            if (
+                frame.offset != descriptor.ref.frame_offset
+                or frame.size != descriptor.ref.frame_size
+                or frame.record_hash.hex() != descriptor.ref.frame_sha256
+                or frame.payload != descriptor.canonical_record
+            ):
+                raise ProjectionConflict("Projection V2 replay frame binding changed")
+
+    records: list[StoredEvidenceRecord] = []
+    for descriptor in source.records:
+        counters.administrative_visits += 1
+        try:
+            accepted = decode_strict(
+                descriptor.canonical_record,
+                _AcceptedEnvelopeRecordV1,
+                MAX_EVIDENCE_RECORD_BYTES,
+            )
+            envelope = accepted.envelope
+            canonical_envelope = canonical_json(envelope)
+            priority = EvidencePriority(accepted.evidence_priority)
+        except (TypeError, ValueError, ValidationError) as error:
+            raise ProjectionValidationError(
+                "Projection V2 replay accepted record is invalid"
+            ) from error
+        ref = descriptor.ref
+        if (
+            accepted.accepted_at != descriptor.accepted_at
+            or accepted.outer.sequence != ref.source_sequence
+            or accepted.outer.event_id != ref.event_id
+            or accepted.outer.content_sha256 != ref.content_sha256
+        ):
+            raise ProjectionValidationError(
+                "Projection V2 replay accepted outer facts changed"
+            )
+        records.append(
+            StoredEvidenceRecord(
+                envelope=envelope,
+                canonical_envelope=canonical_envelope,
+                priority=priority,
+                accepted_at=descriptor.accepted_at,
+                ref=ref,
+            )
+        )
+    if (
+        not records
+        or records[-1].ref != source.terminal_ref
+        or len(records) != source.terminal_ref.source_sequence
+    ):
+        raise ProjectionConflict("Projection V2 replay source is not contiguous")
+    return tuple(records)
+
+
+def _verify_replay_ack_v2(
+    ack: _AckReplaySnapshot,
+    terminal: EvidenceRef,
+    counters: _ReplayComputeCounters,
+) -> None:
+    confirmed = ack.confirmed
+    if (
+        type(confirmed) is not tuple
+        or len(confirmed) != 3
+        or type(confirmed[0]) is not int
+        or type(confirmed[1]) is not str
+        or type(confirmed[2]) is not str
+        or confirmed
+        != (terminal.source_sequence, terminal.event_id, terminal.content_sha256)
+        or ack.pending is not None
+        or ack.retention_pending
+        or not 0 <= ack.committed_prefix_size <= ack.size
+    ):
+        raise ProjectionAuthorityError("Projection V2 replay ACK boundary is not strict")
+    info = os.fstat(ack.descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or (info.st_dev, info.st_ino, info.st_size)
+        != (ack.device, ack.inode, ack.size)
+        or fcntl.fcntl(ack.descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+        != os.O_RDONLY
+    ):
+        raise ProjectionAuthorityError("Projection V2 replay ACK descriptor changed")
+    prefix = _replay_pread_v2(
+        ack.descriptor,
+        ack.committed_prefix_size,
+        maximum=ack.size,
+        counters=counters,
+    )
+    if hashlib.sha256(prefix).digest() != ack.committed_prefix_sha256:
+        raise ProjectionAuthorityError("Projection V2 replay ACK prefix changed")
+
+
+def _replay_connection_v2(schema_domain: bytes) -> sqlite3.Connection:
+    if (
+        type(schema_domain) is not bytes
+        or not schema_domain.startswith(_REPLAY_SCHEMA_DOMAIN_V2)
+    ):
+        raise TypeError("Projection V2 replay schema domain is not exact")
+    raw = schema_domain[len(_REPLAY_SCHEMA_DOMAIN_V2) :]
+    if hashlib.sha256(raw).hexdigest() != _SCHEMA_V2_SHA256:
+        raise ProjectionConflict("Projection V2 frozen schema bytes changed")
+    try:
+        script = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ProjectionConflict("Projection V2 frozen schema is not UTF-8") from error
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        _configure_v2_connection(connection, file_backed=False)
+        connection.executescript(script)
+        actual_tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        metadata = dict(
+            connection.execute("SELECT key,value FROM schema_meta ORDER BY key")
+        )
+        if actual_tables != _TABLE_NAMES_V2 or metadata != _SCHEMA_META_V2:
+            raise ProjectionConflict("Projection V2 frozen schema is not exact")
+        if [
+            str(row[0])
+            for row in connection.execute("PRAGMA integrity_check").fetchall()
+        ] != ["ok"]:
+            raise ProjectionConflict("Projection V2 frozen schema integrity failed")
+        _verify_v2_pragmas(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _compute_reduce_base_v2(
+    connection: sqlite3.Connection,
+    prepared: _PreparedV2Record,
+) -> None:
+    envelope = prepared.envelope
+    ref = prepared.record.ref
+    sequence = _encode_uint64_v2(ref.source_sequence)
+    coverage = prepared.coverage
+    if coverage is not None:
+        connection.execute(
+            "INSERT INTO coverage_intervals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                envelope.event_id,
+                envelope.host_id,
+                coverage.component,
+                coverage.kind,
+                coverage.severity,
+                coverage.opened_at,
+                coverage.closed_at,
+                _optional_uint64_v2(coverage.affected_source_sequence_start),
+                _optional_uint64_v2(coverage.affected_source_sequence_end),
+                _optional_uint64_v2(coverage.dropped_count),
+                coverage.reason_code,
+                _optional_uint64_v2(coverage.reconcile_generation),
+                sequence,
+                ref.content_sha256,
+            ),
+        )
+        return
+    falco = prepared.falco
+    if falco is None:
+        return
+    if falco.docker_container_id is not None and falco.docker_started_at is not None:
+        connection.execute(
+            "INSERT INTO containers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(host_id,container_id,container_started_at) DO UPDATE SET "
+            "image_id=excluded.image_id,repo_digests_json=excluded.repo_digests_json,"
+            "immutable_spec_sha256=excluded.immutable_spec_sha256,"
+            "inventory_revision=excluded.inventory_revision,"
+            "last_event_id=excluded.last_event_id,"
+            "last_source_sequence=excluded.last_source_sequence,"
+            "last_content_sha256=excluded.last_content_sha256 "
+            "WHERE excluded.last_source_sequence > containers.last_source_sequence",
+            (
+                envelope.host_id,
+                falco.docker_container_id,
+                falco.docker_started_at,
+                falco.image_id,
+                canonical_json(falco.repo_digests).decode("utf-8"),
+                falco.immutable_spec_sha256,
+                _optional_uint64_v2(falco.inventory_revision),
+                envelope.event_id,
+                sequence,
+                ref.content_sha256,
+                envelope.event_id,
+                sequence,
+                ref.content_sha256,
+            ),
+        )
+    connection.execute(
+        "INSERT INTO process_observations VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            envelope.event_id,
+            envelope.host_id,
+            falco.docker_container_id,
+            falco.docker_started_at,
+            falco.proc_name,
+            falco.proc_exe_path,
+            falco.proc_parent_name,
+            sequence,
+            ref.content_sha256,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO network_observations VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            envelope.event_id,
+            envelope.host_id,
+            falco.docker_container_id,
+            falco.docker_started_at,
+            int(falco.successful_connect),
+            falco.destination_ipv4,
+            falco.destination_port,
+            falco.l4_protocol,
+            int(falco.investigation_only),
+            sequence,
+            ref.content_sha256,
+        ),
+    )
+    if (
+        not falco.successful_connect
+        or falco.missing_required_fields
+        or falco.investigation_only
+    ):
+        incident = _incident_from_frozen_falco(
+            falco,
+            event_id=envelope.event_id,
+            source_sequence=envelope.source_sequence,
+            host_id=envelope.host_id,
+            boot_id=envelope.boot_id,
+            event_time=envelope.event_time,
+            ingest_time=envelope.ingest_time,
+            coverage_flags=tuple(envelope.coverage_flags),
+        )
+        _insert_v2_incident(connection, incident, "investigation")
+
+
+def _persist_compute_pcc_result_v2(
+    connection: sqlite3.Connection,
+    result: object,
+    proof: AuthenticatedPCCInput,
+    active: ActiveCandidateObservation | None,
+) -> None:
+    if isinstance(result, CandidateCreated):
+        candidate = result.candidate
+        _insert_v2_incident(connection, result.incident, "candidate")
+        _insert_v2_candidate(connection, candidate)
+        roles = (
+            ("primary_trigger", proof.snapshot.trigger),
+            ("correlation_snapshot", proof),
+        )
+        for role, evidence in roles:
+            connection.execute(
+                "INSERT INTO candidate_evidence VALUES(?,?,?,?,?,?)",
+                _encode_candidate_evidence(
+                    candidate.candidate_id,
+                    evidence.event_id,
+                    evidence.source_sequence,
+                    evidence.content_sha256,
+                    role,
+                    proof.event_id,
+                ),
+            )
+        return
+    if isinstance(result, Duplicate):
+        if active is None or result.existing_candidate_id != active.candidate_id:
+            raise ProjectionConflict(
+                "Projection V2 replay duplicate changed its active candidate"
+            )
+        _insert_v2_incident(connection, result.incident, "duplicate")
+        roles = (
+            ("supporting_trigger", proof.snapshot.trigger),
+            ("supporting_snapshot", proof),
+        )
+        for role, evidence in roles:
+            connection.execute(
+                "INSERT INTO candidate_evidence VALUES(?,?,?,?,?,?)",
+                _encode_candidate_evidence(
+                    result.existing_candidate_id,
+                    evidence.event_id,
+                    evidence.source_sequence,
+                    evidence.content_sha256,
+                    role,
+                    proof.event_id,
+                ),
+            )
+        return
+    if isinstance(result, InvestigationOnly):
+        _insert_v2_incident(connection, result.incident, "investigation")
+        return
+    if isinstance(result, Rejected):
+        _insert_v2_incident(connection, result.incident, "rejected")
+        return
+    raise ProjectionConflict("Projection V2 replay correlation result is not exact")
+
+
+def _compute_history_reduction_v2(
+    frozen: _FrozenPCCCorrelationInput,
+    entries: tuple[_FrozenReplayEntry, ...],
+    counters: _ReplayComputeCounters,
+) -> tuple[_HistoricalReductionResult, _ReplayMemoLeaf]:
+    proof = frozen.proof
+    if type(proof) is not AuthenticatedPCCInput:
+        raise TypeError("Projection V2 replay PCC proof is not exact")
+    snapshot = proof.snapshot
+    trigger = snapshot.trigger
+    compact_records: list[StoredEvidenceRecord] = []
+    for entry in entries:
+        counters.administrative_visits += 1
+        if (
+            entry.compact_member
+            and entry.record.ref.source_sequence
+            <= snapshot.coverage_through_sequence
+        ):
+            compact_records.append(entry.record)
+    compact = tuple(compact_records)
+    compact_count, compact_digest = _replay_compact_digest(compact)
+    reduction = _reduce_historical_coverage_result(
+        compact,
+        host_id=proof.host_id,
+        boot_id=proof.boot_id,
+        trigger_event_id=trigger.event_id,
+        trigger_source_sequence=trigger.source_sequence,
+        trigger_event_time=trigger.event_time,
+        clock_uncertainty_ms=trigger.clock_uncertainty_ms,
+        coverage_through_sequence=snapshot.coverage_through_sequence,
+        window_end=snapshot.decision_time,
+    )
+    counters.semantic_prefix_visits += (
+        reduction.diagnostics.semantic_prefix_visits
+    )
+    key = (proof.event_id, proof.content_sha256)
+    return reduction, _build_replay_memo_leaf(
+        key,
+        reduction,
+        compact_count,
+        compact_digest,
+    )
+
+
+def _compute_late_invalidations_v2(
+    connection: sqlite3.Connection,
+    prepared: _PreparedV2Record,
+    proofs_by_event: dict[str, AuthenticatedPCCInput],
+    counters: _ReplayComputeCounters,
+) -> None:
+    if prepared.coverage is None or not _late_coverage_may_invalidate_candidate(
+        prepared.record
+    ):
+        return
+    rows = connection.execute(
+        f"SELECT {','.join(_CANDIDATE_COLUMNS)} FROM candidates "
+        "WHERE host_id=? ORDER BY candidate_id COLLATE BINARY LIMIT ?",
+        (prepared.envelope.host_id, _INVALIDATION_CANDIDATE_CAP_V2 + 1),
+    ).fetchall()
+    if len(rows) > _INVALIDATION_CANDIDATE_CAP_V2:
+        raise ProjectionConflict("Projection V2 replay invalidation cap exceeded")
+    for row in rows:
+        counters.administrative_visits += 1
+        candidate = _decode_candidate(row)
+        proof = proofs_by_event.get(candidate.correlation_snapshot_event_id)
+        if type(proof) is not AuthenticatedPCCInput:
+            raise ProjectionConflict("Projection V2 replay candidate lost PCC leaf")
+        if _late_coverage_invalidates_candidate_values(proof, prepared.record):
+            connection.execute(
+                "INSERT INTO candidate_invalidations VALUES(?,?,?,?,?)",
+                _encode_candidate_invalidation(
+                    candidate.candidate_id,
+                    prepared.envelope.event_id,
+                    prepared.record.ref.source_sequence,
+                    prepared.record.ref.content_sha256,
+                    _INVALIDATION_REASON_V2,
+                ),
+            )
+
+
+def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
+    """Project one immutable replay snapshot without consulting live authority."""
+    (
+        source,
+        ack,
+        correlation,
+        frozen_inputs,
+        schema_domain,
+        generation,
+    ) = _validate_replay_snapshot_shape_v2(snapshot)
+    counters = _ReplayComputeCounters()
+    connection: sqlite3.Connection | None = None
+    try:
+        records = _decode_replay_records_v2(source, counters)
+        _verify_replay_ack_v2(ack, source.terminal_ref, counters)
+        prepared_records = tuple(_prepare_v2(record) for record in records)
+        historical_prepared = tuple(
+            _prepare_historical_record(record) for record in records
+        )
+        entries = _build_frozen_replay_entries(records, historical_prepared)
+
+        frozen_by_event: dict[str, _FrozenPCCCorrelationInput] = {}
+        pcc_leaves: list[_ReplayPCCLeaf] = []
+        proofs_by_event: dict[str, AuthenticatedPCCInput] = {}
+        for frozen_input in frozen_inputs:
+            counters.administrative_visits += 1
+            proof = frozen_input.proof
+            if type(proof) is not AuthenticatedPCCInput:
+                raise TypeError("Projection V2 replay PCC proof is not exact")
+            evidence_ref = proof.evidence_ref
+            if type(evidence_ref) is not EvidenceRef:
+                raise TypeError("Projection V2 replay PCC ref is not exact")
+            key = (proof.event_id, proof.content_sha256)
+            if proof.event_id in frozen_by_event:
+                raise ProjectionConflict("Projection V2 replay PCC input is duplicated")
+            frozen_by_event[proof.event_id] = frozen_input
+            proofs_by_event[proof.event_id] = proof
+            pcc_leaves.append(_build_replay_pcc_leaf(key, proof))
+
+        connection = _replay_connection_v2(schema_domain)
+        transcript = hashlib.sha256(_REPLAY_TRANSCRIPT_DOMAIN_V2)
+        memo_leaves: list[_ReplayMemoLeaf] = []
+        consumed_pcc: set[str] = set()
+        connection.execute("BEGIN IMMEDIATE")
+        for prepared in prepared_records:
+            counters.administrative_visits += 1
+            envelope = prepared.envelope
+            ref = prepared.record.ref
+            duplicate_row = connection.execute(
+                "SELECT primary_event_id FROM projection_dedup "
+                "WHERE dedup_kind=? AND logical_key_sha256=? AND is_primary=1",
+                (prepared.dedup_kind, prepared.logical_key_sha256),
+            ).fetchone()
+            duplicate = None if duplicate_row is None else duplicate_row[0]
+            if duplicate is not None and (
+                type(duplicate) is not str
+                or _EVENT_ID_V2.fullmatch(duplicate) is None
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 replay logical primary is invalid"
+                )
+            primary_event_id = envelope.event_id if duplicate is None else duplicate
+            placeholders = ",".join("?" for _ in _TABLE_LAYOUT_V2[1][1])
+            connection.execute(
+                f"INSERT INTO events({','.join(_TABLE_LAYOUT_V2[1][1])}) "
+                f"VALUES({placeholders})",
+                _event_values_v2(prepared, duplicate),
+            )
+            connection.execute(
+                "INSERT INTO projection_dedup("
+                "event_id,dedup_kind,logical_key_sha256,primary_event_id,is_primary"
+                ") VALUES(?,?,?,?,?)",
+                (
+                    envelope.event_id,
+                    prepared.dedup_kind,
+                    prepared.logical_key_sha256,
+                    primary_event_id,
+                    int(duplicate is None),
+                ),
+            )
+            if duplicate is None:
+                _compute_reduce_base_v2(connection, prepared)
+                if prepared.coverage is not None:
+                    _compute_late_invalidations_v2(
+                        connection,
+                        prepared,
+                        proofs_by_event,
+                        counters,
+                    )
+                elif envelope.event_type == "pcc_correlation_snapshot":
+                    event_frozen = frozen_by_event.get(envelope.event_id)
+                    if event_frozen is None:
+                        raise ProjectionConflict(
+                            "Projection V2 replay lacks frozen PCC facts"
+                        )
+                    proof = event_frozen.proof
+                    if (
+                        type(proof) is not AuthenticatedPCCInput
+                        or type(proof.evidence_ref) is not EvidenceRef
+                        or proof.evidence_ref != ref
+                        or proof.source_sequence != ref.source_sequence
+                        or proof.event_id != ref.event_id
+                        or proof.content_sha256 != ref.content_sha256
+                    ):
+                        raise ProjectionConflict(
+                            "Projection V2 replay PCC does not bind source"
+                        )
+                    active: ActiveCandidateObservation | None = None
+                    if proof.snapshot.outcome == "complete":
+                        reduction, memo = _compute_history_reduction_v2(
+                            event_frozen,
+                            entries,
+                            counters,
+                        )
+                        context = event_frozen.context
+                        expected_key = _duplicate_key(proof, proof.snapshot)
+                        if (
+                            context.coverage != reduction.timeline.assessment
+                            or context.pinned_detector_bundle_sha256
+                            != correlation.detector_bundle_sha256
+                            or context.lookup_key != expected_key
+                        ):
+                            raise ProjectionConflict(
+                                "Projection V2 replay frozen PCC context changed"
+                            )
+                        active = _active_duplicate_v2(
+                            connection,
+                            expected_key,
+                            current_trigger_order=(
+                                proof.snapshot.trigger.source_sequence,
+                                proof.snapshot.trigger.event_id,
+                            ),
+                        )
+                        memo_leaves.append(memo)
+                    rebound = _rebind_frozen_pcc_observations(
+                        event_frozen,
+                        active,
+                        None,
+                    )
+                    result = _correlate_frozen_pcc(rebound)
+                    _persist_compute_pcc_result_v2(
+                        connection,
+                        result,
+                        proof,
+                        active,
+                    )
+                    consumed_pcc.add(envelope.event_id)
+            connection.execute(
+                "INSERT INTO ingest_cursors("
+                "host_id,source_sequence,event_id,content_sha256,segment_id,"
+                "segment_relative_path,frame_offset,frame_size,frame_sha256"
+                ") VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(host_id) DO UPDATE SET "
+                "source_sequence=excluded.source_sequence,event_id=excluded.event_id,"
+                "content_sha256=excluded.content_sha256,segment_id=excluded.segment_id,"
+                "segment_relative_path=excluded.segment_relative_path,"
+                "frame_offset=excluded.frame_offset,frame_size=excluded.frame_size,"
+                "frame_sha256=excluded.frame_sha256",
+                (
+                    envelope.host_id,
+                    _encode_uint64_v2(ref.source_sequence),
+                    ref.event_id,
+                    ref.content_sha256,
+                    ref.segment_id,
+                    ref.segment_relative_path,
+                    _encode_uint64_v2(ref.frame_offset),
+                    _encode_uint64_v2(ref.frame_size),
+                    ref.frame_sha256,
+                ),
+            )
+            transcript.update(
+                canonical_json(
+                    _replay_exact_fact(
+                        (
+                            ref,
+                            prepared.record.canonical_envelope,
+                            duplicate,
+                            duplicate is None,
+                        )
+                    )
+                )
+            )
+        if consumed_pcc != set(frozen_by_event):
+            raise ProjectionConflict("Projection V2 replay has unused PCC facts")
+        connection.execute("COMMIT")
+
+        for validation_frozen, expected_memo in zip(
+            (
+                frozen_by_event[leaf.key[0]]
+                for leaf in pcc_leaves
+                if frozen_by_event[leaf.key[0]].proof.snapshot.outcome == "complete"
+            ),
+            memo_leaves,
+            strict=True,
+        ):
+            counters.administrative_visits += 1
+            _reduction, rebuilt = _compute_history_reduction_v2(
+                validation_frozen,
+                entries,
+                counters,
+            )
+            if rebuilt != expected_memo:
+                raise ProjectionConflict(
+                    "Projection V2 replay independent history validation changed"
+                )
+
+        cursor = _current_v2_cursor(connection)
+        if cursor is None or cursor.source_sequence != len(records):
+            raise ProjectionConflict("Projection V2 replay terminal cursor changed")
+        terminal_predecessor = _predecessor_v2(generation, cursor)
+        prefix_sha256 = _v2_snapshot_hash(connection)
+        late_invalidations = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT candidate_id,coverage_event_id,coverage_source_sequence,"
+                "coverage_content_sha256,reason_code FROM candidate_invalidations "
+                "ORDER BY candidate_id,coverage_event_id"
+            ).fetchall()
+        )
+        for _row in late_invalidations:
+            counters.administrative_visits += 1
+        database_image = connection.serialize()
+        transcript_digest = transcript.digest()
+        report_payload = (
+            hashlib.sha256(database_image).digest(),
+            hashlib.sha256(schema_domain).digest(),
+            generation,
+            len(records),
+            transcript_digest,
+            tuple(leaf.facts_digest for leaf in pcc_leaves),
+            tuple(leaf.facts_digest for leaf in memo_leaves),
+            hashlib.sha256(
+                canonical_json(_replay_exact_fact(late_invalidations))
+            ).digest(),
+            _seal_projection_predecessor(terminal_predecessor).canonical,
+            counters.administrative_visits,
+            counters.semantic_prefix_visits,
+            prefix_sha256,
+        )
+        report_bytes = _REPLAY_REPORT_DOMAIN_V2 + canonical_json(
+            _replay_exact_fact(report_payload)
+        )
+        return _ReplayComputation(
+            database_image=database_image,
+            transcript_count=len(records),
+            transcript_digest=transcript_digest,
+            pcc_leaves=tuple(pcc_leaves),
+            memo_leaves=tuple(memo_leaves),
+            late_invalidations=late_invalidations,
+            terminal_predecessor=terminal_predecessor,
+            administrative_visits=counters.administrative_visits,
+            semantic_prefix_visits=counters.semantic_prefix_visits,
+            report_bytes=report_bytes,
+            prefix_sha256=prefix_sha256,
+        )
+    except (HistoricalCoverageConflict, HistoricalCoverageUnavailable) as error:
+        raise ProjectionConflict(
+            "Projection V2 replay historical facts conflict"
+        ) from error
+    except sqlite3.IntegrityError as error:
+        raise ProjectionConflict("Projection V2 replay facts conflict") from error
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class _V2ProjectionOwner:

@@ -22,6 +22,7 @@ from agmind_immune.canonicaljson import (
 from agmind_immune.contracts import (
     MAX_UINT64,
     PCC_SPECIAL_USE_REGISTRY_SHA256,
+    FalcoConnectV1,
     PCCCorrelationSnapshotRequestV1,
     PCCCorrelationSnapshotV1,
     PCCFalcoTriggerProjectionV1,
@@ -1341,18 +1342,32 @@ def _incident(
     )
 
 
-def incident_from_verified_falco(
-    authenticated: AuthenticatedFalcoInput,
+def _incident_from_frozen_falco(
+    falco: FalcoConnectV1,
+    *,
+    event_id: str,
+    source_sequence: int,
+    host_id: str,
+    boot_id: str,
+    event_time: str,
+    ingest_time: str,
+    coverage_flags: tuple[str, ...],
 ) -> IncidentV1:
-    """Build one trigger-only investigation incident after durable acceptance."""
+    """Build a direct incident from exact decoded, authority-free values."""
     if (
-        type(authenticated) is not AuthenticatedFalcoInput
-        or not authenticated_falco_input_is_issued(authenticated)
+        type(falco) is not FalcoConnectV1
+        or type(event_id) is not str
+        or type(source_sequence) is not int
+        or type(host_id) is not str
+        or type(boot_id) is not str
+        or type(event_time) is not str
+        or type(ingest_time) is not str
+        or type(coverage_flags) is not tuple
+        or any(type(flag) is not str for flag in coverage_flags)
     ):
         raise TypeError(
-            "direct incident requires exact issued Falco authority"
+            "direct incident requires exact frozen Falco values"
         )
-    falco = authenticated.falco
     if not falco.successful_connect:
         reasons: tuple[CorrelationReasonCode, ...] = (
             "connect_not_successful",
@@ -1367,22 +1382,22 @@ def incident_from_verified_falco(
         )
     fields: dict[str, object] = {
         "schema_version": "agmind.incident.v1",
-        "incident_id": incident_id(authenticated.event_id),
-        "primary_event_id": authenticated.event_id,
-        "primary_source_sequence": authenticated.source_sequence,
-        "host_id": authenticated.host_id,
-        "boot_id": authenticated.boot_id,
+        "incident_id": incident_id(event_id),
+        "primary_event_id": event_id,
+        "primary_source_sequence": source_sequence,
+        "host_id": host_id,
+        "boot_id": boot_id,
         "detector_rule": falco.detector_rule,
         "detector_rule_version": falco.detector_rule_version,
-        "event_time": authenticated.event_time,
-        "ingest_time": authenticated.ingest_time,
+        "event_time": event_time,
+        "ingest_time": ingest_time,
         "successful_connect": falco.successful_connect,
         "investigation_only": falco.investigation_only,
         "missing_required_fields": tuple(falco.missing_required_fields),
-        "coverage_flags": authenticated.coverage_flags,
-        "evidence_ids": (authenticated.event_id,),
+        "coverage_flags": coverage_flags,
+        "evidence_ids": (event_id,),
         "reason_codes": reasons,
-        "authority_event_id": authenticated.event_id,
+        "authority_event_id": event_id,
     }
     optional = {
         "docker_container_id": falco.docker_container_id,
@@ -1402,6 +1417,29 @@ def incident_from_verified_falco(
         }
     )
     return IncidentV1.model_validate(fields, strict=True)
+
+
+def incident_from_verified_falco(
+    authenticated: AuthenticatedFalcoInput,
+) -> IncidentV1:
+    """Build one trigger-only investigation incident after durable acceptance."""
+    if (
+        type(authenticated) is not AuthenticatedFalcoInput
+        or not authenticated_falco_input_is_issued(authenticated)
+    ):
+        raise TypeError(
+            "direct incident requires exact issued Falco authority"
+        )
+    return _incident_from_frozen_falco(
+        authenticated.falco,
+        event_id=authenticated.event_id,
+        source_sequence=authenticated.source_sequence,
+        host_id=authenticated.host_id,
+        boot_id=authenticated.boot_id,
+        event_time=authenticated.event_time,
+        ingest_time=authenticated.ingest_time,
+        coverage_flags=authenticated.coverage_flags,
+    )
 
 
 def incident_from_retained_trigger(
@@ -1695,6 +1733,18 @@ def _correlate_frozen_pcc(
     input: _FrozenPCCCorrelationInput,
 ) -> CorrelationResult:
     """Correlate only detached, canonical, authority-free values."""
+    proof, context = _validate_frozen_pcc_correlation_input(input)
+    return _correlate_pcc_values(
+        proof,
+        context,
+        registry_authority_sha256=PCC_SPECIAL_USE_REGISTRY_SHA256,
+    )
+
+
+def _validate_frozen_pcc_correlation_input(
+    input: _FrozenPCCCorrelationInput,
+) -> tuple[AuthenticatedPCCInput, CorrelationContext]:
+    """Return canonical detached values without consulting issuance tables."""
     if type(input) is not _FrozenPCCCorrelationInput:
         raise TypeError("frozen PCC correlation input is not exact")
     proof = input.proof
@@ -1729,10 +1779,59 @@ def _correlate_frozen_pcc(
         or facts_sha256 != input.facts_sha256
     ):
         raise ValueError("frozen PCC correlation canonical facts changed")
-    return _correlate_pcc_values(
-        proof,
-        context,
-        registry_authority_sha256=PCC_SPECIAL_USE_REGISTRY_SHA256,
+    return proof, context
+
+
+def _rebind_frozen_pcc_observations(
+    input: _FrozenPCCCorrelationInput,
+    active_duplicate: ActiveCandidateObservation | None,
+    terminal_observation: TerminalCandidateObservation | None,
+) -> _FrozenPCCCorrelationInput:
+    """Bind projection-local observations to detached frozen PCC facts."""
+    if (
+        type(input) is not _FrozenPCCCorrelationInput
+        or (
+            active_duplicate is not None
+            and type(active_duplicate) is not ActiveCandidateObservation
+        )
+        or (
+            terminal_observation is not None
+            and type(terminal_observation) is not TerminalCandidateObservation
+        )
+    ):
+        raise TypeError("frozen PCC observation rebind requires exact values")
+    proof, context = _validate_frozen_pcc_correlation_input(input)
+    if context._authority_kind == "failed_only":
+        if active_duplicate is not None or terminal_observation is not None:
+            raise TypeError("failed PCC cannot carry projection observations")
+        return input
+    rebound = object.__new__(CorrelationContext)
+    object.__setattr__(rebound, "_authority_kind", context._authority_kind)
+    object.__setattr__(
+        rebound,
+        "pinned_detector_bundle_sha256",
+        context.pinned_detector_bundle_sha256,
+    )
+    object.__setattr__(
+        rebound,
+        "special_use_registry",
+        context.special_use_registry,
+    )
+    object.__setattr__(rebound, "coverage", context.coverage)
+    object.__setattr__(rebound, "lookup_key", context.lookup_key)
+    object.__setattr__(rebound, "active_duplicate", active_duplicate)
+    object.__setattr__(rebound, "terminal_observation", terminal_observation)
+    context_canonical = _context_facts_canonical(rebound, frozen=True)
+    return _FrozenPCCCorrelationInput(
+        proof=proof,
+        context=rebound,
+        proof_canonical=input.proof_canonical,
+        context_canonical=context_canonical,
+        facts_sha256=hashlib.sha256(
+            _FROZEN_PCC_FACTS_DOMAIN
+            + input.proof_canonical
+            + context_canonical
+        ).digest(),
     )
 
 

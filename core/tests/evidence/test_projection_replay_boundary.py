@@ -9,7 +9,7 @@ import os
 import resource
 import stat
 from collections.abc import Callable
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Thread
@@ -142,11 +142,13 @@ def _mutated_canonical(
 
 def _build_registered_correlation_authority(
     store: SegmentStore,
+    *,
+    generation: int = 0,
 ) -> tuple[Any, Any, Any]:
     authority_module, _pcc_module = _correlation_modules()
     registry = load_pinned_special_use_registry(_REGISTRY_PATH)
     predecessor = authority_module._ProjectionPredecessor(
-        generation=0,
+        generation=generation,
         host_id=None,
         source_sequence=0,
         event_id=None,
@@ -165,6 +167,85 @@ def _build_registered_correlation_authority(
     )
     binding = authority_module._authority_binding(issued)
     return issued, binding, predecessor
+
+
+def _build_complete_replay_input_snapshot(
+    path: Path,
+) -> tuple[object, dict[str, object]]:
+    subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+    authority_module, _pcc_module = _correlation_modules()
+    coordinator, store, terminal = _build_file_backed_source(path)
+    del coordinator
+    records = tuple(store.iter_authenticated_records())
+    acknowledgements = AckJournal.create_new(store)
+    for record in records:
+        acknowledgements.record_pending(record.ref)
+        acknowledgements.record_confirmed(record.ref)
+    source_snapshot = None
+    ack_snapshot = None
+    issued = None
+    try:
+        with store._replay_source_snapshot_gate():
+            source_snapshot = store._capture_replay_source_locked(terminal)
+        with acknowledgements._replay_ack_snapshot_gate():
+            ack_snapshot = acknowledgements._capture_replay_ack_locked(
+                terminal.source_sequence
+            )
+        issued, binding, predecessor = _build_registered_correlation_authority(
+            store,
+            generation=1,
+        )
+        with authority_module._correlation_projection_snapshot_gate(
+            issued
+        ) as held:
+            assert held is binding
+            correlation_snapshot = (
+                authority_module._capture_correlation_replay_locked(
+                    issued,
+                    held,
+                    predecessor,
+                )
+            )
+        snapshot = subject._ReplayInputSnapshot(
+            source=source_snapshot,
+            ack=ack_snapshot,
+            correlation=correlation_snapshot,
+            pcc_inputs=(),
+            schema_domain=(
+                b"AGMIND_PROJECTION_SCHEMA_V2\0"
+                + Path("core/agmind_immune/evidence/schema_v2.sql").read_bytes()
+            ),
+            projection_generation=1,
+        )
+    except BaseException:
+        if source_snapshot is not None:
+            segments_module._close_replay_source_snapshot(source_snapshot)
+        if ack_snapshot is not None:
+            ack_journal_module._close_replay_ack_snapshot(ack_snapshot)
+        if issued is not None:
+            _drop_registered_correlation_authority(issued)
+        acknowledgements.close()
+        store.close()
+        raise
+    assert issued is not None
+    _drop_registered_correlation_authority(issued)
+    return snapshot, {
+        "store": store,
+        "acknowledgements": acknowledgements,
+        "source_snapshot": source_snapshot,
+        "ack_snapshot": ack_snapshot,
+    }
+
+
+def _close_complete_replay_input(resources: dict[str, object]) -> None:
+    source_snapshot = resources["source_snapshot"]
+    ack_snapshot = resources["ack_snapshot"]
+    acknowledgements = resources["acknowledgements"]
+    store = resources["store"]
+    segments_module._close_replay_source_snapshot(source_snapshot)
+    ack_journal_module._close_replay_ack_snapshot(ack_snapshot)
+    acknowledgements.close()
+    store.close()
 
 
 def _drop_registered_correlation_authority(issued: object) -> None:
@@ -838,3 +919,58 @@ def test_correlation_snapshot_rechecks_typed_predecessor_revision_and_pins(
         if issued is not None:
             _drop_registered_correlation_authority(issued)
         store.close()
+
+
+def test_compute_accepts_only_frozen_value_snapshot(
+    tmp_path: Path,
+) -> None:
+    subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+    snapshot, resources = _build_complete_replay_input_snapshot(
+        tmp_path / "compute-boundary"
+    )
+
+    class _WrongSource:
+        def __getattribute__(self, name: str) -> object:
+            raise AssertionError(f"wrong source attribute executed: {name}")
+
+    try:
+        computation = subject._compute_replay(snapshot)
+        assert type(computation) is subject._ReplayComputation
+        assert tuple(
+            field.name
+            for field in fields(snapshot)
+            if callable(getattr(snapshot, field.name))
+        ) == ()
+        assert not any(
+            isinstance(getattr(snapshot, field.name), (SegmentStore, AckJournal))
+            for field in fields(snapshot)
+        )
+        with pytest.raises(TypeError):
+            subject._compute_replay(
+                replace(snapshot, source=resources["store"])
+            )
+        with pytest.raises(TypeError):
+            subject._compute_replay(
+                replace(snapshot, source=_WrongSource())
+            )
+    finally:
+        _close_complete_replay_input(resources)
+
+
+def test_compute_is_deterministic_and_does_not_mutate_live_projection(
+    tmp_path: Path,
+) -> None:
+    subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+    snapshot, resources = _build_complete_replay_input_snapshot(
+        tmp_path / "compute-determinism"
+    )
+    owner_connection = subject._v2_connection_for_test()
+    try:
+        before = subject._v2_snapshot_hash(owner_connection)
+        first = subject._compute_replay(snapshot)
+        second = subject._compute_replay(snapshot)
+        assert first == second
+        assert subject._v2_snapshot_hash(owner_connection) == before
+    finally:
+        owner_connection.close()
+        _close_complete_replay_input(resources)

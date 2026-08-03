@@ -178,6 +178,21 @@ def _late_coverage_invalidates_candidate(
         raise HistoricalCoverageUnavailable(
             "late coverage requires exact issued evidence authority"
         )
+    return _late_coverage_invalidates_candidate_values(authenticated, record)
+
+
+def _late_coverage_invalidates_candidate_values(
+    authenticated: AuthenticatedPCCInput,
+    record: StoredEvidenceRecord,
+) -> bool:
+    """Derive late coverage impact from exact detached proof values."""
+    if (
+        type(authenticated) is not AuthenticatedPCCInput
+        or type(record) is not StoredEvidenceRecord
+    ):
+        raise HistoricalCoverageUnavailable(
+            "late coverage requires exact detached evidence values"
+        )
     prepared = _prepare_historical_record(record)
     coverage = prepared.coverage
     if coverage is None:
@@ -2208,6 +2223,24 @@ def _replay_historical_session(
             raise HistoricalCoverageUnavailable(
                 "historical replay broker requires exact source authority"
             )
+        supplied_terminal_ref = terminal_ref
+        try:
+            terminal_record = store.resolve_authenticated_ref(
+                supplied_terminal_ref
+            )
+        except EvidenceStoreError as error:
+            raise HistoricalCoverageUnavailable(
+                "historical replay terminal is not authenticated"
+            ) from error
+        if (
+            type(terminal_record) is not StoredEvidenceRecord
+            or type(terminal_record.ref) is not EvidenceRef
+            or terminal_record.ref != supplied_terminal_ref
+        ):
+            raise HistoricalCoverageUnavailable(
+                "historical replay terminal binding changed"
+            )
+        terminal_ref = terminal_record.ref
         status_before = store.status()
         verifier = store._bound_verifier
         lifecycle = store._lifecycle_identity
