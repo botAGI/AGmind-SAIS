@@ -33,8 +33,8 @@ from agmind_immune.correlation.authority import (
     _issue_correlation_context,
     _ProjectionPredecessor,
     _same_exact_pcc,
-    _validate_correlation_projection_pins,
     _validate_correlation_projection_predecessor,
+    _validate_correlation_projection_terminal_authority,
 )
 from agmind_immune.correlation.pcc import (
     ActiveCandidateObservation,
@@ -2570,16 +2570,22 @@ class _V2ProjectionOwner:
                         through,
                     )
                 )
-                self._historical_replay_handle = _take_replay_historical_handle(
-                    historical_session
-                )
             except HistoricalCoverageUnavailable as error:
                 raise ProjectionAuthorityError(
                     "Projection V2 unpublished historical session is unavailable"
                 ) from error
             batches: list[_CompletedSnapshotBatchAuthority] = []
+            sealed_batch_count = 0
             completed_by_event: dict[str, object] = {}
             try:
+                try:
+                    self._historical_replay_handle = (
+                        _take_replay_historical_handle(historical_session)
+                    )
+                except HistoricalCoverageUnavailable as error:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 unpublished historical handle is unavailable"
+                    ) from error
                 for offset in range(0, len(snapshot_refs), _UNPUBLISHED_PCC_CHUNK):
                     refs = snapshot_refs[offset : offset + _UNPUBLISHED_PCC_CHUNK]
                     batch = _issue_completed_snapshot_batch(self._journal, refs)
@@ -2695,9 +2701,9 @@ class _V2ProjectionOwner:
                     raise ProjectionAuthorityError(
                         "Projection V2 unpublished source changed after prefix seal"
                     ) from error
-                for batch in tuple(batches):
+                for batch in batches:
                     _seal_completed_snapshot_batch(batch)
-                    batches.remove(batch)
+                    sealed_batch_count += 1
                 final_ack = self._current_ack_boundary()
                 final_cursor = _current_v2_cursor(connection)
                 if (
@@ -2718,9 +2724,12 @@ class _V2ProjectionOwner:
 
                 def terminal_external_authority_check() -> None:
                     terminal_cursor = _current_v2_cursor(connection)
+                    self._revalidate_unpublished_ack_anchor(
+                        ack_anchor,
+                        acceptance_cursor,
+                    )
                     if (
                         self._healthy_acceptance_cursor() != acceptance_cursor
-                        or self._current_ack_boundary() != ack_boundary
                         or terminal_cursor != result.cursor
                         or self._evidence.resolve_authenticated_ref(through).ref
                         != through
@@ -2729,11 +2738,10 @@ class _V2ProjectionOwner:
                         raise ProjectionAuthorityError(
                             "Projection V2 terminal external authority changed"
                         )
-                    _validate_correlation_projection_predecessor(
+                    _validate_correlation_projection_terminal_authority(
                         authority,
                         _predecessor_v2(self._generation, terminal_cursor),
                     )
-                    _validate_correlation_projection_pins(authority)
 
                 try:
                     _final_seal_replay_historical_session(
@@ -2755,7 +2763,7 @@ class _V2ProjectionOwner:
                 )
             finally:
                 self._historical_replay_handle = None
-                for batch in batches:
+                for batch in batches[sealed_batch_count:]:
                     _revoke_completed_snapshot_batch(batch)
                 _close_replay_historical_session(
                     historical_session,

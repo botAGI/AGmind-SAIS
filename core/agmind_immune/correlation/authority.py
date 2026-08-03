@@ -607,6 +607,40 @@ def _validate_correlation_projection_pins(
         ) from error
 
 
+def _validate_correlation_projection_terminal_authority(
+    authority: CorrelationProjectionAuthority,
+    expected: _ProjectionPredecessor,
+) -> None:
+    try:
+        expected_before = _clone_predecessor(expected)
+        binding = _authority_binding(authority)
+        with binding.lock:
+            _require_authority_locked(authority, binding)
+            revision = binding.revision
+            predecessor_before = _clone_predecessor(binding.predecessor)
+            registry_facts = _registry_facts(binding.registry)
+            detector_bundle_sha256 = _safe_detector_bundle_sha256()
+            predecessor_after = _clone_predecessor(binding.predecessor)
+            if (
+                _clone_predecessor(expected) != expected_before
+                or predecessor_before != expected_before
+                or predecessor_after != expected_before
+                or binding.revision is not revision
+                or not special_use_registry_is_issued(binding.registry)
+                or registry_facts != binding.registry_facts
+                or detector_bundle_sha256 != binding.detector_bundle_sha256
+            ):
+                raise CorrelationProjectionError(
+                    "correlation terminal predecessor or pins changed"
+                )
+    except CorrelationProjectionError:
+        raise
+    except Exception as error:
+        raise CorrelationProjectionError(
+            "correlation terminal authority validation failed"
+        ) from error
+
+
 def _create_correlation_projection_authority(
     store: SegmentStore,
     registry: SpecialUseRegistry,
