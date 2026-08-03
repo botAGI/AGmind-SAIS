@@ -3,9 +3,9 @@
 ## Commit range
 
 - Base: `91b33e4fb8664a9cb6e360f7fc4657251006d4cd`
-- Task range: `91b33e4..HEAD` (two focused commits)
+- Initial implementation range: `91b33e4fb8664a9cb6e360f7fc4657251006d4cd..cbe3a38e3d74070461f23083d86d86cc83587204` (two focused commits)
 - `10ef65f feat(core): freeze completed PCC replay facts`
-- `refactor(core): publish replay after exact revalidation`
+- `cbe3a38e3d74070461f23083d86d86cc83587204 refactor(core): publish replay after exact revalidation`
 
 ## RED evidence
 
