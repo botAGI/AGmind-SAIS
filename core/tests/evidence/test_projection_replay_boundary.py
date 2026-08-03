@@ -3,6 +3,8 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
+import importlib
+import json
 import os
 import resource
 import stat
@@ -11,9 +13,20 @@ from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Thread
+from typing import Any
 
 import pytest
-from agmind_immune.canonicaljson import canonical_json
+from agmind_immune.canonicaljson import (
+    canonical_json,
+    pcc_detector_bundle_sha256,
+)
+from agmind_immune.correlation.pcc import CorrelationProjectionError
+from agmind_immune.correlation.primitives import (
+    ParsedSpecialUseRegistry,
+    SpecialUseRegistry,
+    load_pinned_special_use_registry,
+    special_use_registry_is_issued,
+)
 from agmind_immune.coverage.historical import (
     _HistoricalReductionResult,
     _reduce_historical_coverage_result,
@@ -34,6 +47,11 @@ from agmind_immune.ingest.ack_journal import (
 )
 from agmind_immune.ingest.envelope import EnvelopeVerifier
 from agmind_immune.ingest.service import AcceptanceCoordinator
+from tests.correlation.test_pcc import (
+    _accepted_complete,
+    _accepted_failed,
+    _context,
+)
 from tests.coverage.test_historical import _self_close_records
 from tests.coverage.test_state import T0, T1, _event, _stored
 from tests.ingest.test_pcc_correlation_snapshot import _identity, _item
@@ -56,6 +74,104 @@ _PCC_CONTENT_HASHES = (
     "6764d6251e5c2d314a9f768e3a97b4aa96087505e42990620971f3ee97604005",
     "58986446964c7f26eb5c2b44ef6a89a30c1c0836bea70a4c55bd1b9a5755e2f2",
 )
+_REGISTRY_PATH = Path("contracts/v1/ipv4-special-use.csv")
+_DETECTOR_HASH = "1" * 64
+
+
+def _correlation_modules() -> tuple[Any, Any]:
+    return (
+        importlib.import_module("agmind_immune.correlation.authority"),
+        importlib.import_module("agmind_immune.correlation.pcc"),
+    )
+
+
+def _replace_first_serialized_fact(
+    value: object,
+    predicate: Callable[[object], bool],
+    replacement: object,
+) -> tuple[object, bool]:
+    if predicate(value):
+        return replacement, True
+    if type(value) is list:
+        changed: list[object] = []
+        replaced = False
+        for item in value:
+            if replaced:
+                changed.append(item)
+                continue
+            rewritten, replaced = _replace_first_serialized_fact(
+                item,
+                predicate,
+                replacement,
+            )
+            changed.append(rewritten)
+        return changed, replaced
+    if type(value) is dict:
+        changed_dict: dict[str, object] = {}
+        replaced = False
+        for key, item in value.items():
+            if replaced:
+                changed_dict[key] = item
+                continue
+            rewritten, replaced = _replace_first_serialized_fact(
+                item,
+                predicate,
+                replacement,
+            )
+            changed_dict[key] = rewritten
+        return changed_dict, replaced
+    return value, False
+
+
+def _mutated_canonical(
+    canonical: bytes,
+    predicate: Callable[[object], bool],
+    replacement: object,
+) -> bytes:
+    domain, separator, payload = canonical.partition(b"\0")
+    assert separator == b"\0"
+    decoded = json.loads(payload)
+    changed, replaced = _replace_first_serialized_fact(
+        decoded,
+        predicate,
+        replacement,
+    )
+    assert replaced
+    return domain + separator + canonical_json(changed)
+
+
+def _build_registered_correlation_authority(
+    store: SegmentStore,
+) -> tuple[Any, Any, Any]:
+    authority_module, _pcc_module = _correlation_modules()
+    registry = load_pinned_special_use_registry(_REGISTRY_PATH)
+    predecessor = authority_module._ProjectionPredecessor(
+        generation=0,
+        host_id=None,
+        source_sequence=0,
+        event_id=None,
+        content_sha256=None,
+        frame_sha256=None,
+    )
+    detector_digest = pcc_detector_bundle_sha256(
+        Path("deploy/falco/rules.d/agmind-pcc.yaml").read_bytes()
+    )
+    issued = authority_module._issue_correlation_projection_authority(
+        store,
+        registry,
+        predecessor,
+        detector_digest,
+        authority_module._registry_facts(registry),
+    )
+    binding = authority_module._authority_binding(issued)
+    return issued, binding, predecessor
+
+
+def _drop_registered_correlation_authority(issued: object) -> None:
+    authority_module, _pcc_module = _correlation_modules()
+    authority_module._close_correlation_projection_authority(issued)
+    with authority_module._ISSUED_AUTHORITIES_LOCK:
+        authority_module._ISSUED_AUTHORITIES.pop(id(issued), None)
 
 
 def _pcc_fixture(count: int) -> dict[str, object]:
@@ -522,3 +638,179 @@ def test_replay_reduction_reports_exact_admin_and_semantic_work_at_four_and_eigh
     assert eight.diagnostics.primary_checks == 36
     assert eight.diagnostics.prepared_records == 2 * four.diagnostics.prepared_records
     assert eight.diagnostics.leaf_materializations == 2 * four.diagnostics.leaf_materializations
+
+
+def test_frozen_pcc_kernel_accepts_values_only_and_matches_live_result(
+    tmp_path: Path,
+) -> None:
+    _authority_module, pcc_module = _correlation_modules()
+    coordinator, proof = _accepted_complete(tmp_path / "frozen")
+    context = _context(proof)
+    try:
+        expected = pcc_module._correlate_pcc_kernel(proof, context)
+        frozen = pcc_module._freeze_pcc_correlation_input(proof, context)
+
+        assert pcc_module._correlate_frozen_pcc(frozen) == expected
+        assert tuple(
+            field.name
+            for field in fields(frozen)
+            if callable(getattr(frozen, field.name))
+        ) == ()
+        assert pcc_module.authenticated_pcc_input_is_issued(frozen.proof) is False
+        registry = frozen.context.special_use_registry
+        assert type(registry) is ParsedSpecialUseRegistry
+        assert not isinstance(registry, SpecialUseRegistry)
+        assert special_use_registry_is_issued(registry) is False
+
+        proof_value = frozen.proof_canonical.partition(b"\0")[2]
+        context_value = frozen.context_canonical.partition(b"\0")[2]
+        malformed = (
+            (
+                "proof_canonical",
+                _mutated_canonical(
+                    frozen.proof_canonical,
+                    lambda value: value
+                    == ["int", str(proof.source_sequence)],
+                    ["bool", True],
+                ),
+            ),
+            (
+                "proof_canonical",
+                _mutated_canonical(
+                    frozen.proof_canonical,
+                    lambda value: value
+                    == ["int", str(proof.source_sequence)],
+                    ["scalar-subclass", str(proof.source_sequence)],
+                ),
+            ),
+            (
+                "context_canonical",
+                _mutated_canonical(
+                    frozen.context_canonical,
+                    lambda value: value == ["none"],
+                    ["optional", "none"],
+                ),
+            ),
+            (
+                "context_canonical",
+                _mutated_canonical(
+                    frozen.context_canonical,
+                    lambda value: value == ["str", _DETECTOR_HASH],
+                    ["str", "3" * 64],
+                ),
+            ),
+            (
+                "context_canonical",
+                _mutated_canonical(
+                    frozen.context_canonical,
+                    lambda value: value
+                    == ["str", context.special_use_registry.entries[0].prefix],
+                    ["str", "198.18.0.0/15"],
+                ),
+            ),
+        )
+        assert proof_value != context_value
+        for field_name, canonical in malformed:
+            arguments = {
+                "proof_canonical": frozen.proof_canonical,
+                "context_canonical": frozen.context_canonical,
+            }
+            arguments[field_name] = canonical
+            with pytest.raises((TypeError, ValueError)):
+                pcc_module._freeze_pcc_correlation_input(
+                    proof,
+                    context,
+                    **arguments,
+                )
+
+        with pytest.raises(TypeError):
+            pcc_module._freeze_pcc_correlation_input(
+                frozen.proof,
+                context,
+            )
+        with pytest.raises(TypeError):
+            pcc_module._freeze_pcc_correlation_input(
+                proof,
+                frozen.context,
+            )
+    finally:
+        coordinator.segment_store.close()
+
+    failed_coordinator, failed_proof = _accepted_failed(
+        tmp_path / "frozen-failed"
+    )
+    failed_context = pcc_module.CorrelationContext.failed_snapshot()
+    try:
+        expected_failed = pcc_module._correlate_pcc_kernel(
+            failed_proof,
+            failed_context,
+        )
+        frozen_failed = pcc_module._freeze_pcc_correlation_input(
+            failed_proof,
+            failed_context,
+        )
+        assert pcc_module._correlate_frozen_pcc(frozen_failed) == expected_failed
+        assert frozen_failed.context.special_use_registry is None
+    finally:
+        failed_coordinator.segment_store.close()
+
+
+def test_correlation_snapshot_rechecks_typed_predecessor_revision_and_pins(
+    tmp_path: Path,
+) -> None:
+    authority_module, _pcc_module = _correlation_modules()
+    _coordinator, store, terminal = _build_file_backed_source(
+        tmp_path / "correlation"
+    )
+    issued = None
+    try:
+        issued, binding, expected = _build_registered_correlation_authority(
+            store
+        )
+        with authority_module._correlation_projection_snapshot_gate(
+            issued
+        ) as held:
+            assert held is binding
+            snapshot = authority_module._capture_correlation_replay_locked(
+                issued,
+                held,
+                expected,
+            )
+        assert type(snapshot.lifecycle_token) is bytes
+        assert len(snapshot.lifecycle_token) == 32
+        assert type(snapshot.predecessor_canonical) is bytes
+        assert type(snapshot.registry_facts_canonical) is bytes
+        assert tuple(
+            field.name
+            for field in fields(snapshot)
+            if callable(getattr(snapshot, field.name))
+        ) == ()
+
+        successor = authority_module._ProjectionPredecessor(
+            generation=0,
+            host_id=HOST_ID,
+            source_sequence=terminal.source_sequence,
+            event_id=terminal.event_id,
+            content_sha256=terminal.content_sha256,
+            frame_sha256=terminal.frame_sha256,
+        )
+        authority_module._advance_correlation_projection_authority(
+            issued,
+            expected,
+            successor,
+        )
+        with (
+            authority_module._correlation_projection_snapshot_gate(
+                issued
+            ) as held,
+            pytest.raises(CorrelationProjectionError),
+        ):
+            authority_module._revalidate_correlation_replay_locked(
+                issued,
+                held,
+                snapshot,
+            )
+    finally:
+        if issued is not None:
+            _drop_registered_correlation_authority(issued)
+        store.close()

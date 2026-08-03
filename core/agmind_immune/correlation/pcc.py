@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
+from enum import Enum
 from threading import Lock
 from typing import Literal, Never, SupportsIndex, cast
+
+from pydantic import BaseModel
 
 from agmind_immune.canonicaljson import (
     candidate_id,
@@ -17,6 +21,7 @@ from agmind_immune.canonicaljson import (
 )
 from agmind_immune.contracts import (
     MAX_UINT64,
+    PCC_SPECIAL_USE_REGISTRY_SHA256,
     PCCCorrelationSnapshotRequestV1,
     PCCCorrelationSnapshotV1,
     PCCFalcoTriggerProjectionV1,
@@ -25,9 +30,11 @@ from agmind_immune.correlation.primitives import (
     ParsedSpecialUseRegistry,
     SpecialUseEntry,
     SpecialUseRegistry,
+    _canonical_registry_binding,
     parse_rfc3339nano_utc_ns,
     special_use_registry_is_issued,
 )
+from agmind_immune.evidence.segments import EvidenceRef
 from agmind_immune.incidents.models import (
     ContainmentCandidateV1,
     CorrelationReasonCode,
@@ -397,6 +404,347 @@ class Rejected:
 type CorrelationResult = (
     CandidateCreated | InvestigationOnly | Duplicate | Rejected
 )
+
+
+_FROZEN_PCC_PROOF_DOMAIN = b"AGMIND_FROZEN_PCC_PROOF_V1\0"
+_FROZEN_PCC_CONTEXT_DOMAIN = b"AGMIND_FROZEN_PCC_CONTEXT_V1\0"
+_FROZEN_PCC_FACTS_DOMAIN = b"AGMIND_FROZEN_PCC_CORRELATION_FACTS_V1\0"
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenPCCCorrelationInput:
+    proof: AuthenticatedPCCInput
+    context: CorrelationContext
+    proof_canonical: bytes
+    context_canonical: bytes
+    facts_sha256: bytes
+
+
+def _exact_correlation_fact(value: object) -> object:
+    """Encode exact runtime scalar/container types for frozen correlation."""
+    value_type = type(value)
+    type_name = f"{value_type.__module__}.{value_type.__qualname__}"
+    if value is None:
+        return ["none"]
+    if value_type is bool:
+        return ["bool", value]
+    if value_type is int:
+        return ["int", str(value)]
+    if value_type is str:
+        return ["str", value]
+    if value_type is bytes:
+        return ["bytes", cast(bytes, value).hex()]
+    if value_type is tuple:
+        return [
+            "tuple",
+            [_exact_correlation_fact(item) for item in cast(tuple[object, ...], value)],
+        ]
+    if value_type is list:
+        return [
+            "list",
+            [_exact_correlation_fact(item) for item in cast(list[object], value)],
+        ]
+    if value_type is set:
+        rendered = [
+            _exact_correlation_fact(item)
+            for item in cast(set[object], value)
+        ]
+        rendered.sort(key=canonical_json)
+        return ["set", rendered]
+    if value_type is frozenset:
+        rendered = [
+            _exact_correlation_fact(item)
+            for item in cast(frozenset[object], value)
+        ]
+        rendered.sort(key=canonical_json)
+        return ["frozenset", rendered]
+    if isinstance(value, Enum):
+        return ["enum", type_name, _exact_correlation_fact(value.value)]
+    if value_type is AuthenticatedPCCInput:
+        proof = cast(AuthenticatedPCCInput, value)
+        return [
+            "authenticated_pcc",
+            _exact_correlation_fact(proof.boot_id),
+            _exact_correlation_fact(proof.canonical),
+            _exact_correlation_fact(proof.content_sha256),
+            _exact_correlation_fact(proof.event_id),
+            _exact_correlation_fact(proof.event_type),
+            _exact_correlation_fact(proof.evidence_ref),
+            _exact_correlation_fact(proof.host_id),
+            _exact_correlation_fact(proof.request),
+            _exact_correlation_fact(proof.snapshot),
+            _exact_correlation_fact(proof.source_sequence),
+        ]
+    if isinstance(value, BaseModel):
+        if type(value.model_fields_set) is not set:
+            raise TypeError("frozen correlation model fields-set is not exact")
+        return [
+            "model",
+            type_name,
+            _exact_correlation_fact(value.model_fields_set),
+            [
+                [name, _exact_correlation_fact(getattr(value, name))]
+                for name in type(value).model_fields
+            ],
+        ]
+    if is_dataclass(value) and not isinstance(value, type):
+        return [
+            "dataclass",
+            type_name,
+            [
+                [field.name, _exact_correlation_fact(getattr(value, field.name))]
+                for field in fields(value)
+            ],
+        ]
+    raise TypeError(f"frozen correlation cannot encode exact {type_name}")
+
+
+def _proof_facts_canonical(proof: AuthenticatedPCCInput) -> bytes:
+    if type(proof) is not AuthenticatedPCCInput:
+        raise TypeError("frozen PCC proof is not exact")
+    return _FROZEN_PCC_PROOF_DOMAIN + canonical_json(
+        _exact_correlation_fact(proof)
+    )
+
+
+def _context_facts_canonical(
+    context: CorrelationContext,
+    *,
+    frozen: bool,
+) -> bytes:
+    if type(context) is not CorrelationContext:
+        raise TypeError("frozen PCC context is not exact")
+    registry = context.special_use_registry
+    if context._authority_kind == "failed_only":
+        if any(
+            value is not None
+            for value in (
+                registry,
+                context.pinned_detector_bundle_sha256,
+                context.coverage,
+                context.lookup_key,
+                context.active_duplicate,
+                context.terminal_observation,
+            )
+        ):
+            raise TypeError("failed-only frozen context carries authority facts")
+        registry_authority_sha256 = None
+        registry_facts = None
+    else:
+        expected_registry_type = (
+            ParsedSpecialUseRegistry if frozen else SpecialUseRegistry
+        )
+        if type(registry) is not expected_registry_type:
+            raise TypeError("frozen PCC registry facts are not exact")
+        registry_authority_sha256 = PCC_SPECIAL_USE_REGISTRY_SHA256
+        registry_facts = _canonical_registry_binding(
+            cast(SpecialUseRegistry, registry)
+        )
+    return _FROZEN_PCC_CONTEXT_DOMAIN + canonical_json(
+        _exact_correlation_fact(
+            (
+                context._authority_kind,
+                context.pinned_detector_bundle_sha256,
+                registry_authority_sha256,
+                registry_facts,
+                context.coverage,
+                context.lookup_key,
+                context.active_duplicate,
+                context.terminal_observation,
+            )
+        )
+    )
+
+
+def _detached_pcc_proof(
+    proof: AuthenticatedPCCInput,
+) -> AuthenticatedPCCInput:
+    evidence_ref = proof.evidence_ref
+    if type(evidence_ref) is not EvidenceRef:
+        raise TypeError("frozen PCC evidence ref is not exact")
+    detached = object.__new__(AuthenticatedPCCInput)
+    object.__setattr__(detached, "_boot_id", proof.boot_id)
+    object.__setattr__(detached, "_canonical", bytes(proof.canonical))
+    object.__setattr__(detached, "_content_sha256", proof.content_sha256)
+    object.__setattr__(detached, "_event_id", proof.event_id)
+    object.__setattr__(detached, "_event_type", proof.event_type)
+    object.__setattr__(
+        detached,
+        "_evidence_ref",
+        EvidenceRef(
+            segment_id=evidence_ref.segment_id,
+            segment_relative_path=evidence_ref.segment_relative_path,
+            frame_offset=evidence_ref.frame_offset,
+            frame_size=evidence_ref.frame_size,
+            frame_sha256=evidence_ref.frame_sha256,
+            event_id=evidence_ref.event_id,
+            source_sequence=evidence_ref.source_sequence,
+            content_sha256=evidence_ref.content_sha256,
+        ),
+    )
+    object.__setattr__(detached, "_host_id", proof.host_id)
+    object.__setattr__(
+        detached,
+        "_request",
+        PCCCorrelationSnapshotRequestV1.model_validate_json(
+            canonical_json(proof.request),
+            strict=True,
+        ),
+    )
+    object.__setattr__(
+        detached,
+        "_snapshot",
+        PCCCorrelationSnapshotV1.model_validate_json(
+            canonical_json(proof.snapshot),
+            strict=True,
+        ),
+    )
+    object.__setattr__(detached, "_source_sequence", proof.source_sequence)
+    return detached
+
+
+def _detached_pcc_context(context: CorrelationContext) -> CorrelationContext:
+    if context._authority_kind == "failed_only":
+        detached_failed = CorrelationContext.failed_snapshot()
+        if _context_facts_canonical(detached_failed, frozen=True) != (
+            _context_facts_canonical(context, frozen=False)
+        ):
+            raise TypeError("failed-only PCC context facts are not exact")
+        return detached_failed
+    registry = context.special_use_registry
+    if type(registry) is not SpecialUseRegistry:
+        raise TypeError("live PCC registry authority is not exact")
+    detached_registry = ParsedSpecialUseRegistry(
+        tuple(
+            SpecialUseEntry(entry.prefix, entry.globally_reachable)
+            for entry in registry.entries
+        )
+    )
+    coverage = context.coverage
+    lookup_key = context.lookup_key
+    if (
+        context._authority_kind != "raw"
+        or type(coverage) is not HistoricalCoverageAssessment
+        or type(lookup_key) is not CandidateDuplicateKey
+    ):
+        raise TypeError("live PCC correlation facts are incomplete")
+    detached = object.__new__(CorrelationContext)
+    object.__setattr__(detached, "_authority_kind", "raw")
+    object.__setattr__(
+        detached,
+        "pinned_detector_bundle_sha256",
+        context.pinned_detector_bundle_sha256,
+    )
+    object.__setattr__(detached, "special_use_registry", detached_registry)
+    object.__setattr__(
+        detached,
+        "coverage",
+        HistoricalCoverageAssessment(
+            host_id=coverage.host_id,
+            boot_id=coverage.boot_id,
+            trigger_event_id=coverage.trigger_event_id,
+            trigger_source_sequence=coverage.trigger_source_sequence,
+            coverage_through_sequence=coverage.coverage_through_sequence,
+            window_start=coverage.window_start,
+            window_end=coverage.window_end,
+            complete=coverage.complete,
+            critical_gap=coverage.critical_gap,
+            coverage_snapshot_sha256=coverage.coverage_snapshot_sha256,
+        ),
+    )
+    object.__setattr__(detached, "lookup_key", _clone_duplicate_key(lookup_key))
+    active = context.active_duplicate
+    object.__setattr__(
+        detached,
+        "active_duplicate",
+        None
+        if active is None
+        else ActiveCandidateObservation(
+            key=_clone_duplicate_key(active.key),
+            candidate_id=active.candidate_id,
+            primary_source_sequence=active.primary_source_sequence,
+            primary_event_id=active.primary_event_id,
+        ),
+    )
+    terminal = context.terminal_observation
+    object.__setattr__(
+        detached,
+        "terminal_observation",
+        None
+        if terminal is None
+        else TerminalCandidateObservation(
+            key=_clone_duplicate_key(terminal.key),
+            candidate_id=terminal.candidate_id,
+            state=terminal.state,
+            terminal_at=terminal.terminal_at,
+        ),
+    )
+    return detached
+
+
+def _freeze_pcc_correlation_input(
+    proof: AuthenticatedPCCInput,
+    context: CorrelationContext,
+    *,
+    proof_canonical: bytes | None = None,
+    context_canonical: bytes | None = None,
+) -> _FrozenPCCCorrelationInput:
+    """Validate live authority once, then return detached immutable facts."""
+    proof_is_issued = authenticated_pcc_input_is_issued(proof)
+    registry = getattr(context, "special_use_registry", None)
+    raw_context = (
+        type(context) is CorrelationContext
+        and context._authority_kind == "raw"
+    )
+    registry_is_issued = (
+        special_use_registry_is_issued(registry) if raw_context else False
+    )
+    failed_context = (
+        type(context) is CorrelationContext
+        and context._authority_kind == "failed_only"
+        and registry is None
+    )
+    if (
+        type(proof) is not AuthenticatedPCCInput
+        or not proof_is_issued
+        or type(context) is not CorrelationContext
+        or not (
+            (type(registry) is SpecialUseRegistry and registry_is_issued)
+            or failed_context
+        )
+        or _context_live_fingerprint(context) is None
+    ):
+        raise TypeError("PCC freeze requires exact issued live facts")
+    expected_proof = _proof_facts_canonical(proof)
+    expected_context = _context_facts_canonical(context, frozen=False)
+    supplied_proof = expected_proof if proof_canonical is None else proof_canonical
+    supplied_context = (
+        expected_context if context_canonical is None else context_canonical
+    )
+    if (
+        type(supplied_proof) is not bytes
+        or type(supplied_context) is not bytes
+        or supplied_proof != expected_proof
+        or supplied_context != expected_context
+    ):
+        raise ValueError("serialized PCC correlation facts are not exact")
+    detached_proof = _detached_pcc_proof(proof)
+    detached_context = _detached_pcc_context(context)
+    if (
+        _proof_facts_canonical(detached_proof) != expected_proof
+        or _context_facts_canonical(detached_context, frozen=True)
+        != expected_context
+    ):
+        raise ValueError("detached PCC correlation facts changed")
+    return _FrozenPCCCorrelationInput(
+        proof=detached_proof,
+        context=detached_context,
+        proof_canonical=expected_proof,
+        context_canonical=expected_context,
+        facts_sha256=hashlib.sha256(
+            _FROZEN_PCC_FACTS_DOMAIN + expected_proof + expected_context
+        ).digest(),
+    )
 
 
 type _AuthorityEvaluator = Callable[[Callable[[], object]], object]
@@ -1321,7 +1669,7 @@ def _correlate_pcc_kernel(
     authenticated: AuthenticatedPCCInput,
     context: CorrelationContext,
 ) -> CorrelationResult:
-    """Deterministic fact kernel with no public authority promotion."""
+    """Compatibility wrapper for the live issued-context evaluator."""
     if (
         type(authenticated) is not AuthenticatedPCCInput
         or not authenticated_pcc_input_is_issued(authenticated)
@@ -1330,6 +1678,72 @@ def _correlate_pcc_kernel(
         raise TypeError(
             "correlation requires exact issued proof and context facts"
         )
+    registry = context.special_use_registry
+    if context._authority_kind == "failed_only":
+        registry_authority_sha256 = PCC_SPECIAL_USE_REGISTRY_SHA256
+    elif type(registry) is SpecialUseRegistry:
+        registry_authority_sha256 = registry.authority_sha256
+    else:
+        raise TypeError("live correlation registry is not exact")
+    return _correlate_pcc_values(
+        authenticated,
+        context,
+        registry_authority_sha256=registry_authority_sha256,
+    )
+
+
+def _correlate_frozen_pcc(
+    input: _FrozenPCCCorrelationInput,
+) -> CorrelationResult:
+    """Correlate only detached, canonical, authority-free values."""
+    if type(input) is not _FrozenPCCCorrelationInput:
+        raise TypeError("frozen PCC correlation input is not exact")
+    proof = input.proof
+    context = input.context
+    if (
+        type(proof) is not AuthenticatedPCCInput
+        or type(context) is not CorrelationContext
+        or not (
+            type(context.special_use_registry) is ParsedSpecialUseRegistry
+            or (
+                context._authority_kind == "failed_only"
+                and context.special_use_registry is None
+            )
+        )
+        or type(input.proof_canonical) is not bytes
+        or type(input.context_canonical) is not bytes
+        or type(input.facts_sha256) is not bytes
+        or len(input.facts_sha256) != 32
+    ):
+        raise TypeError("frozen PCC correlation values are not exact")
+    try:
+        proof_canonical = _proof_facts_canonical(proof)
+        context_canonical = _context_facts_canonical(context, frozen=True)
+        facts_sha256 = hashlib.sha256(
+            _FROZEN_PCC_FACTS_DOMAIN + proof_canonical + context_canonical
+        ).digest()
+    except (AttributeError, RecursionError, TypeError, ValueError) as error:
+        raise TypeError("frozen PCC correlation values are malformed") from error
+    if (
+        proof_canonical != input.proof_canonical
+        or context_canonical != input.context_canonical
+        or facts_sha256 != input.facts_sha256
+    ):
+        raise ValueError("frozen PCC correlation canonical facts changed")
+    return _correlate_pcc_values(
+        proof,
+        context,
+        registry_authority_sha256=PCC_SPECIAL_USE_REGISTRY_SHA256,
+    )
+
+
+def _correlate_pcc_values(
+    authenticated: AuthenticatedPCCInput,
+    context: CorrelationContext,
+    *,
+    registry_authority_sha256: str,
+) -> CorrelationResult:
+    """Deterministic value-only kernel with no issuance/global-registry query."""
     snapshot = authenticated.snapshot
     trigger = snapshot.trigger
 
@@ -1446,8 +1860,7 @@ def _correlate_pcc_kernel(
         )
     if (
         snapshot.special_use_registry_sha256 is None
-        or registry.authority_sha256
-        != snapshot.special_use_registry_sha256
+        or registry_authority_sha256 != snapshot.special_use_registry_sha256
     ):
         return _one_rejection(
             authenticated,

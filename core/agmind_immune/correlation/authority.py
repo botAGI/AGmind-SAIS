@@ -6,7 +6,8 @@ import os
 import stat
 import weakref
 from _thread import RLock as RLockType
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Never, Protocol, Self, SupportsIndex, cast, final
 
@@ -513,6 +514,7 @@ class CorrelationProjectionAuthority:
 @dataclass(slots=True)
 class _ProjectionAuthorityBinding:
     token: object
+    lifecycle_token: bytes
     store: SegmentStore
     store_lifecycle: object
     registry: SpecialUseRegistry
@@ -522,6 +524,21 @@ class _ProjectionAuthorityBinding:
     revision: object
     closed: bool
     lock: RLockType
+
+
+_CORRELATION_REPLAY_REGISTRY_DOMAIN = (
+    b"AGMIND_CORRELATION_REPLAY_REGISTRY_FACTS_V1\0"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _CorrelationReplaySnapshot:
+    lifecycle_token: bytes
+    revision: object
+    predecessor: _ProjectionPredecessor
+    predecessor_canonical: bytes
+    detector_bundle_sha256: str
+    registry_facts_canonical: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,6 +663,150 @@ def _require_authority_locked(
     except (AttributeError, TypeError, ValueError) as error:
         raise CorrelationProjectionError(
             "correlation projection predecessor facts are invalid"
+        ) from error
+
+
+def _registry_facts_canonical(registry_facts: object) -> bytes:
+    if (
+        type(registry_facts) is not tuple
+        or len(registry_facts) != 2
+        or type(registry_facts[0]) is not tuple
+        or type(registry_facts[1]) is not tuple
+    ):
+        raise TypeError("correlation registry facts are not exact tuples")
+    entries = registry_facts[0]
+    index = registry_facts[1]
+    if any(
+        type(entry) is not tuple
+        or len(entry) != 2
+        or any(type(value) is not str for value in entry)
+        for entry in entries
+    ) or any(
+        type(item) is not tuple
+        or len(item) != 3
+        or type(item[0]) is not int
+        or type(item[1]) is not int
+        or type(item[2]) is not str
+        for item in index
+    ):
+        raise TypeError("correlation registry scalar facts are not exact")
+    return _CORRELATION_REPLAY_REGISTRY_DOMAIN + canonical_json(
+        (
+            (
+                "entries",
+                tuple(
+                    (("str", prefix), ("str", reachability))
+                    for prefix, reachability in entries
+                ),
+            ),
+            (
+                "index",
+                tuple(
+                    (
+                        ("int", str(network)),
+                        ("int", str(prefix_length)),
+                        ("str", reachability),
+                    )
+                    for network, prefix_length, reachability in index
+                ),
+            ),
+        )
+    )
+
+
+@contextmanager
+def _correlation_projection_snapshot_gate(
+    authority: CorrelationProjectionAuthority,
+) -> Iterator[_ProjectionAuthorityBinding]:
+    binding = _authority_binding(authority)
+    with binding.lock:
+        _require_authority_locked(authority, binding)
+        yield binding
+
+
+def _capture_correlation_replay_locked(
+    authority: CorrelationProjectionAuthority,
+    binding: _ProjectionAuthorityBinding,
+    expected: _ProjectionPredecessor,
+) -> _CorrelationReplaySnapshot:
+    if type(binding) is not _ProjectionAuthorityBinding:
+        raise CorrelationProjectionError(
+            "correlation replay binding is not exact"
+        )
+    try:
+        _require_authority_locked(authority, binding)
+        expected_seal = _seal_projection_predecessor(expected)
+        bound_predecessor = binding.predecessor
+        bound_seal = _seal_projection_predecessor(bound_predecessor)
+        registry_facts = _registry_facts(binding.registry)
+        registry_canonical = _registry_facts_canonical(registry_facts)
+        lifecycle_token = binding.lifecycle_token
+        detector = binding.detector_bundle_sha256
+        if (
+            expected_seal.canonical != bound_seal.canonical
+            or registry_facts != binding.registry_facts
+            or not special_use_registry_is_issued(binding.registry)
+            or type(lifecycle_token) is not bytes
+            or len(lifecycle_token) != 32
+            or type(detector) is not str
+        ):
+            raise CorrelationProjectionError(
+                "correlation replay predecessor or pins changed"
+            )
+        _exact_hex64(detector, "detector_bundle_sha256")
+    except CorrelationProjectionError:
+        raise
+    except (AttributeError, RecursionError, TypeError, ValueError) as error:
+        raise CorrelationProjectionError(
+            "correlation replay snapshot facts are invalid"
+        ) from error
+    return _CorrelationReplaySnapshot(
+        lifecycle_token=lifecycle_token,
+        revision=binding.revision,
+        predecessor=bound_predecessor,
+        predecessor_canonical=bound_seal.canonical,
+        detector_bundle_sha256=detector,
+        registry_facts_canonical=registry_canonical,
+    )
+
+
+def _revalidate_correlation_replay_locked(
+    authority: CorrelationProjectionAuthority,
+    binding: _ProjectionAuthorityBinding,
+    snapshot: _CorrelationReplaySnapshot,
+) -> None:
+    if (
+        type(binding) is not _ProjectionAuthorityBinding
+        or type(snapshot) is not _CorrelationReplaySnapshot
+    ):
+        raise CorrelationProjectionError(
+            "correlation replay snapshot is not exact"
+        )
+    try:
+        _require_authority_locked(authority, binding)
+        predecessor = binding.predecessor
+        predecessor_seal = _seal_projection_predecessor(predecessor)
+        registry_facts = _registry_facts(binding.registry)
+        registry_canonical = _registry_facts_canonical(registry_facts)
+        if (
+            binding.lifecycle_token != snapshot.lifecycle_token
+            or binding.revision is not snapshot.revision
+            or predecessor is not snapshot.predecessor
+            or predecessor_seal.canonical != snapshot.predecessor_canonical
+            or binding.detector_bundle_sha256
+            != snapshot.detector_bundle_sha256
+            or registry_facts != binding.registry_facts
+            or registry_canonical != snapshot.registry_facts_canonical
+            or not special_use_registry_is_issued(binding.registry)
+        ):
+            raise CorrelationProjectionError(
+                "correlation replay predecessor, revision, or pins changed"
+            )
+    except CorrelationProjectionError:
+        raise
+    except (AttributeError, RecursionError, TypeError, ValueError) as error:
+        raise CorrelationProjectionError(
+            "correlation replay revalidation failed"
         ) from error
 
 
@@ -826,17 +987,63 @@ def _create_correlation_projection_authority(
         raise CorrelationProjectionError(
             "correlation projection pins changed during creation"
         )
+    return _issue_correlation_projection_authority(
+        store,
+        registry,
+        predecessor_after,
+        detector_after,
+        registry_after,
+    )
+
+
+def _issue_correlation_projection_authority(
+    store: SegmentStore,
+    registry: SpecialUseRegistry,
+    predecessor: _ProjectionPredecessor,
+    detector_bundle_sha256: str,
+    registry_facts: object,
+) -> CorrelationProjectionAuthority:
+    """Issue from already captured exact pins after validating live ownership."""
+    if (
+        type(store) is not SegmentStore
+        or type(registry) is not SpecialUseRegistry
+        or type(predecessor) is not _ProjectionPredecessor
+        or type(detector_bundle_sha256) is not str
+        or not special_use_registry_is_issued(registry)
+    ):
+        raise TypeError("correlation projection captured pins are not exact")
+    lifecycle = store._lifecycle_identity
+    try:
+        _exact_hex64(detector_bundle_sha256, "detector_bundle_sha256")
+        predecessor_facts = _clone_predecessor(predecessor)
+        current_registry_facts = _registry_facts(registry)
+        _registry_facts_canonical(registry_facts)
+        _healthy_store_cursor(store, lifecycle)
+    except CorrelationProjectionError:
+        raise
+    except (AttributeError, RecursionError, TypeError, ValueError) as error:
+        raise CorrelationProjectionError(
+            "correlation projection captured pins are invalid"
+        ) from error
+    if (
+        type(current_registry_facts) is not type(registry_facts)
+        or current_registry_facts != registry_facts
+    ):
+        raise CorrelationProjectionError(
+            "correlation projection captured registry facts changed"
+        )
     authority = object.__new__(CorrelationProjectionAuthority)
     token = object()
     object.__setattr__(authority, "_token", token)
     binding = _ProjectionAuthorityBinding(
         token=token,
+        lifecycle_token=os.urandom(32),
         store=store,
         store_lifecycle=lifecycle,
         registry=registry,
-        registry_facts=registry_after,
-        detector_bundle_sha256=detector_after,
-        predecessor=predecessor_after,
+        registry_facts=registry_facts,
+        detector_bundle_sha256=detector_bundle_sha256,
+        predecessor=predecessor_facts,
         revision=object(),
         closed=False,
         lock=RLockType(),
