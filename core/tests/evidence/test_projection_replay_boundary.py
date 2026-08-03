@@ -270,6 +270,40 @@ def test_source_snapshot_revalidation_rejects_revision_or_descriptor_change(
         store.close()
 
 
+def test_source_snapshot_revalidation_rejects_real_descriptor_substitution(
+    tmp_path: Path,
+) -> None:
+    _coordinator, store, terminal = _build_file_backed_source(tmp_path / "source")
+    snapshot = None
+    replacement_descriptor = -1
+    owned_fds: tuple[int, ...] = ()
+    try:
+        with store._replay_source_snapshot_gate():
+            snapshot = store._capture_replay_source_locked(terminal)
+        owned_fds = tuple(segment.descriptor for segment in snapshot.segments)
+        source_revision = snapshot.source_revision
+        replacement_path = tmp_path / "different-source"
+        replacement_path.write_bytes(b"not an AGF1 segment")
+        replacement_descriptor = os.open(replacement_path, os.O_RDONLY)
+        os.dup2(replacement_descriptor, snapshot.segments[0].descriptor)
+
+        assert store._source_revision == source_revision
+        with (
+            store._replay_source_snapshot_gate(),
+            pytest.raises(ProjectionAuthorityError),
+        ):
+            store._revalidate_replay_source_locked(snapshot)
+    finally:
+        if snapshot is not None:
+            segments_module._close_replay_source_snapshot(snapshot)
+        if replacement_descriptor >= 0:
+            os.close(replacement_descriptor)
+        store.close()
+    assert _all_descriptor_fstats_fail_with_ebadf(
+        (*owned_fds, replacement_descriptor)
+    )
+
+
 def test_partial_source_snapshot_failure_closes_every_owned_descriptor(
     tmp_path: Path,
 ) -> None:

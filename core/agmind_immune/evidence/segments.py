@@ -2448,6 +2448,7 @@ class SegmentStore:
         segment_create_step_hook: Callable[[str], None] | None = None,
     ) -> None:
         self._source_gate = Lock()
+        self._source_terminal_token: object | None = None
         self._source_lifecycle_token = os.urandom(32)
         self._source_active_writers = 0
         self._source_revision = 0
@@ -2656,6 +2657,8 @@ class SegmentStore:
             if depth:
                 self._source_writer_depths[thread_id] = depth + 1
                 return
+            if self._source_terminal_token is not None and not allow_during_terminal:
+                raise EvidenceStoreError("source terminal evaluation is active")
             if (
                 type(self._source_active_writers) is not int
                 or self._source_active_writers < 0
@@ -2680,6 +2683,52 @@ class SegmentStore:
             if type(self._source_active_writers) is not int or self._source_active_writers < 1:
                 raise EvidenceStoreError("source active-writer count changed")
             self._source_active_writers -= 1
+
+    def _evaluate_source_terminal[SourceTerminalResult](
+        self,
+        lifecycle: object,
+        callback: Callable[[], SourceTerminalResult],
+        *,
+        _factory: object,
+    ) -> SourceTerminalResult:
+        if (
+            _factory is not _SOURCE_TERMINAL_FACTORY
+            or lifecycle is not self._lifecycle_identity
+            or not callable(callback)
+        ):
+            raise EvidenceStoreError("source terminal evaluation lacks exact authority")
+        terminal_token = object()
+        with self._source_gate:
+            if (
+                self._source_terminal_token is not None
+                or type(self._source_active_writers) is not int
+                or self._source_active_writers != 0
+                or type(self._source_revision) is not int
+                or self._source_revision < 0
+            ):
+                raise EvidenceStoreError("source terminal evaluation conflicts with a writer")
+            revision = self._source_revision
+            self._source_terminal_token = terminal_token
+        try:
+            result = callback()
+        except BaseException:
+            with self._source_gate:
+                if self._source_terminal_token is terminal_token:
+                    self._source_terminal_token = None
+            raise
+        with self._source_gate:
+            valid = (
+                self._source_terminal_token is terminal_token
+                and type(self._source_active_writers) is int
+                and self._source_active_writers == 0
+                and type(self._source_revision) is int
+                and self._source_revision == revision
+            )
+            if self._source_terminal_token is terminal_token:
+                self._source_terminal_token = None
+        if not valid:
+            raise EvidenceStoreError("source changed during terminal evaluation")
+        return result
 
     @contextmanager
     def _replay_source_snapshot_gate(self) -> Iterator[None]:
