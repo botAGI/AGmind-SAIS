@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import os
 import re
 import stat
 from _thread import LockType
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
 from typing import BinaryIO, Literal, Protocol, TypeVar, cast
@@ -198,6 +200,29 @@ class _AckUnpublishedAnchor:
     acceptance_cursor: int
 
 
+@dataclass(frozen=True, slots=True)
+class _AckReplaySnapshot:
+    lifecycle_token: bytes
+    mutation_revision: int
+    generation: int
+    confirmed: tuple[int, str, str] | None
+    pending: tuple[int, str, str] | None
+    committed_prefix_size: int
+    committed_prefix_sha256: bytes
+    retention_pending: bool
+    descriptor: int
+    device: int
+    inode: int
+    size: int
+
+
+def _close_replay_ack_snapshot(snapshot: _AckReplaySnapshot) -> None:
+    """Close the read-only descriptor owned by one ACK replay snapshot."""
+    if type(snapshot) is not _AckReplaySnapshot:
+        raise TypeError("replay ACK close requires an exact snapshot")
+    os.close(snapshot.descriptor)
+
+
 def _validate_journal_stat(info: os.stat_result) -> None:
     if (
         not stat.S_ISREG(info.st_mode)
@@ -269,6 +294,8 @@ class AckJournal:
     _delivery_lease: AckDeliveryLease | None
     _retention_lock: LockType
     _retention_gate_lease: _AckRetentionBoundaryLease | None
+    _replay_lifecycle_token: bytes
+    _mutation_revision: int
 
     def __init__(self) -> None:
         raise TypeError("use AckJournal.create_new() or open_and_recover()")
@@ -350,6 +377,8 @@ class AckJournal:
         journal._delivery_lease = None
         journal._retention_lock = Lock()
         journal._retention_gate_lease = None
+        journal._replay_lifecycle_token = os.urandom(32)
+        journal._mutation_revision = 0
         try:
             root_descriptor, lifecycle_identity = (
                 segment_store._acquire_ack_journal(
@@ -418,7 +447,7 @@ class AckJournal:
             )
             return journal
         except _AckLifecycleIoUncertain as error:
-            journal._healthy = False
+            journal._mark_unhealthy_locked()
             primary = _primary_io_error(error)
             authenticated_digest = (
                 None
@@ -434,7 +463,7 @@ class AckJournal:
             raise primary from error
         except _AckLifecycleCorrupt as error:
             corrupt_error = AckJournalCorrupt(str(error))
-            journal._healthy = False
+            journal._mark_unhealthy_locked()
             journal._attempt_corruption_fence(corrupt_error)
             journal._close_after_failed_open(corrupt_error)
             raise corrupt_error from error
@@ -443,7 +472,7 @@ class AckJournal:
             journal._close_after_failed_open(state_error)
             raise state_error from error
         except AckJournalCorrupt as corrupt_error:
-            journal._healthy = False
+            journal._mark_unhealthy_locked()
             journal._attempt_corruption_fence(corrupt_error)
             journal._close_after_failed_open(corrupt_error)
             raise
@@ -854,6 +883,19 @@ class AckJournal:
             )
         return published
 
+    def _bump_mutation_revision_locked(self) -> None:
+        revision = self._mutation_revision
+        if type(revision) is not int or revision < 0:
+            raise AckJournalStateError("ACK mutation revision changed")
+        self._mutation_revision = revision + 1
+
+    def _mark_unhealthy_locked(self) -> None:
+        if self._healthy is True:
+            self._healthy = False
+            self._bump_mutation_revision_locked()
+        else:
+            self._healthy = False
+
     def _bind_published_or_latch(self) -> os.stat_result:
         try:
             published = self._bind_published()
@@ -863,14 +905,14 @@ class AckJournal:
                     "ACK-journal identity changed outside its durable writer"
                 )
         except AckJournalCorrupt as primary:
-            self._healthy = False
+            self._mark_unhealthy_locked()
             self._attempt_corruption_fence(primary)
             raise
         except OSError as error:
             retained_error = AckJournalCorrupt(
                 "ACK-journal retained inode became unavailable"
             )
-            self._healthy = False
+            self._mark_unhealthy_locked()
             self._attempt_corruption_fence(retained_error)
             raise retained_error from error
         return published
@@ -929,13 +971,13 @@ class AckJournal:
                 self._lifecycle_identity,
             )
         except _AckLifecycleIoUncertain as error:
-            self._healthy = False
+            self._mark_unhealthy_locked()
             primary = _primary_io_error(error)
             self._attempt_commitment_uncertain(primary)
             raise primary from error
         except _AckLifecycleCorrupt as error:
             corrupt_error = AckJournalCorrupt(str(error))
-            self._healthy = False
+            self._mark_unhealthy_locked()
             self._attempt_corruption_fence(corrupt_error)
             raise corrupt_error from error
         except _AckLifecycleStateError as error:
@@ -1000,11 +1042,11 @@ class AckJournal:
             authenticated_hasher_after = authenticated_hasher.copy()
             authenticated_hasher_after.update(frame)
         except AckJournalCorrupt as primary:
-            self._healthy = False
+            self._mark_unhealthy_locked()
             self._attempt_corruption_fence(primary)
             raise
         except BaseException as primary:
-            self._healthy = False
+            self._mark_unhealthy_locked()
             if (
                 authenticated_before is None
                 or authenticated_digest_before is None
@@ -1052,7 +1094,7 @@ class AckJournal:
                     "retention ACK boundary is already held"
                 )
             self._require_usable()
-            snapshot = self.snapshot()
+            snapshot = self._snapshot_locked()
             if (
                 not snapshot.healthy
                 or snapshot.pending is not None
@@ -1067,6 +1109,7 @@ class AckJournal:
                 _factory=_RETENTION_ACK_GATE_FACTORY,
             )
             self._retention_gate_lease = lease
+            self._bump_mutation_revision_locked()
             return lease
 
     def _release_retention_boundary(
@@ -1092,12 +1135,261 @@ class AckJournal:
             self._retention_gate_lease = None
             lease._released = True
             lease._journal = None
+            self._bump_mutation_revision_locked()
 
     def _require_retention_mutation_permitted(self) -> None:
         if self._retention_gate_lease is not None:
             raise AckJournalStateError(
                 "ACK mutation is fenced by active retention"
             )
+
+    @contextmanager
+    def _replay_ack_snapshot_gate(self) -> Iterator[None]:
+        """Exclude sanctioned ACK writers during replay freeze/revalidation."""
+        with self._retention_lock:
+            yield
+
+    @staticmethod
+    def _hash_replay_ack_prefix(descriptor: int, size: int) -> bytes:
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < size:
+            chunk = os.pread(
+                descriptor,
+                min(1024 * 1024, size - offset),
+                offset,
+            )
+            if not chunk:
+                raise AckJournalAuthorityError(
+                    "replay ACK prefix shortened during verification"
+                )
+            digest.update(chunk)
+            offset += len(chunk)
+        return digest.digest()
+
+    @staticmethod
+    def _exact_durable_confirmed(
+        commitment: _AckCommitmentV1,
+    ) -> tuple[int, str, str] | None:
+        confirmed = commitment.confirmed
+        if confirmed is None:
+            return None
+        if (
+            type(confirmed.sequence) is not int
+            or not 1 <= confirmed.sequence <= MAX_UINT64
+            or type(confirmed.event_id) is not str
+            or _EVENT_ID.fullmatch(confirmed.event_id) is None
+            or type(confirmed.content_sha256) is not str
+            or _HEX64.fullmatch(confirmed.content_sha256) is None
+        ):
+            raise AckJournalAuthorityError(
+                "replay ACK durable confirmed identity is not exact"
+            )
+        return (
+            confirmed.sequence,
+            confirmed.event_id,
+            confirmed.content_sha256,
+        )
+
+    def _capture_replay_ack_locked(
+        self,
+        acceptance_cursor: int,
+    ) -> _AckReplaySnapshot:
+        """Freeze exact ACK facts and one owned read-only journal descriptor."""
+        if (
+            type(acceptance_cursor) is not int
+            or not 0 <= acceptance_cursor <= MAX_UINT64
+        ):
+            raise AckJournalAuthorityError(
+                "replay ACK capture cursor is not exact"
+            )
+        self._require_usable()
+        if (
+            type(self._replay_lifecycle_token) is not bytes
+            or len(self._replay_lifecycle_token) != 32
+            or type(self._mutation_revision) is not int
+            or self._mutation_revision < 0
+        ):
+            raise AckJournalAuthorityError("replay ACK identity changed")
+        status = self._store.status()
+        if (
+            status.healthy is not True
+            or type(status.acceptance_cursor) is not int
+            or status.acceptance_cursor != acceptance_cursor
+            or type(status.retention_pending) is not bool
+        ):
+            raise AckJournalAuthorityError(
+                "replay ACK capture differs from source acceptance"
+            )
+        confirmed = self._exact_anchor_identity(self._confirmed)
+        pending = self._exact_anchor_identity(self._pending)
+        committed_prefix_sha256 = bytes.fromhex(
+            self._committed_prefix_sha256
+        )
+        if (
+            type(self._confirmed_generation) is not int
+            or self._confirmed_generation < 0
+            or type(self._committed_prefix_size) is not int
+            or not 0 <= self._committed_prefix_size <= self._size
+            or len(committed_prefix_sha256) != 32
+            or (confirmed is not None and confirmed[0] > acceptance_cursor)
+            or (pending is not None and pending[0] > acceptance_cursor)
+        ):
+            raise AckJournalAuthorityError("replay ACK facts are not exact")
+
+        descriptor = -1
+        try:
+            live_info = self._bind_published_or_latch()
+            flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(
+                _JOURNAL_NAME,
+                flags,
+                dir_fd=self._root_descriptor,
+            )
+            descriptor_info = os.fstat(descriptor)
+            _validate_journal_stat(descriptor_info)
+            commitment = self._store._validate_ack_commitment_binding()
+            prefix_digest = self._hash_replay_ack_prefix(
+                descriptor,
+                self._committed_prefix_size,
+            )
+            if (
+                not _same_file(descriptor_info, live_info)
+                or descriptor_info.st_size != self._size
+                or fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+                != os.O_RDONLY
+                or not hmac.compare_digest(
+                    prefix_digest,
+                    committed_prefix_sha256,
+                )
+                or type(commitment) is not _AckCommitmentV1
+                or commitment.phase != "ready"
+                or commitment.generation != self._confirmed_generation
+                or commitment.journal_prefix_size
+                != self._committed_prefix_size
+                or not hmac.compare_digest(
+                    commitment.journal_prefix_sha256,
+                    self._committed_prefix_sha256,
+                )
+                or self._exact_durable_confirmed(commitment) != confirmed
+            ):
+                raise AckJournalAuthorityError(
+                    "replay ACK durable facts changed during capture"
+                )
+            snapshot = _AckReplaySnapshot(
+                lifecycle_token=self._replay_lifecycle_token,
+                mutation_revision=self._mutation_revision,
+                generation=self._confirmed_generation,
+                confirmed=confirmed,
+                pending=pending,
+                committed_prefix_size=self._committed_prefix_size,
+                committed_prefix_sha256=committed_prefix_sha256,
+                retention_pending=status.retention_pending,
+                descriptor=descriptor,
+                device=descriptor_info.st_dev,
+                inode=descriptor_info.st_ino,
+                size=descriptor_info.st_size,
+            )
+            descriptor = -1
+            return snapshot
+        except BaseException as error:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    error.add_note(
+                        "replay ACK descriptor cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            raise
+
+    def _revalidate_replay_ack_locked(
+        self,
+        snapshot: _AckReplaySnapshot,
+    ) -> None:
+        """Reject replay unless the frozen ACK authority remains exact."""
+        from agmind_immune.evidence.projection import ProjectionAuthorityError
+
+        try:
+            if (
+                type(snapshot) is not _AckReplaySnapshot
+                or type(snapshot.lifecycle_token) is not bytes
+                or not hmac.compare_digest(
+                    snapshot.lifecycle_token,
+                    self._replay_lifecycle_token,
+                )
+                or type(snapshot.mutation_revision) is not int
+                or snapshot.mutation_revision != self._mutation_revision
+                or type(snapshot.generation) is not int
+                or snapshot.generation != self._confirmed_generation
+                or snapshot.confirmed
+                != self._exact_anchor_identity(self._confirmed)
+                or snapshot.pending != self._exact_anchor_identity(self._pending)
+                or type(snapshot.committed_prefix_size) is not int
+                or snapshot.committed_prefix_size
+                != self._committed_prefix_size
+                or type(snapshot.committed_prefix_sha256) is not bytes
+                or len(snapshot.committed_prefix_sha256) != 32
+                or not hmac.compare_digest(
+                    snapshot.committed_prefix_sha256,
+                    bytes.fromhex(self._committed_prefix_sha256),
+                )
+                or type(snapshot.retention_pending) is not bool
+            ):
+                raise ProjectionAuthorityError(
+                    "replay ACK revision or facts changed"
+                )
+            self._require_usable()
+            status = self._store.status()
+            live_info = self._bind_published_or_latch()
+            descriptor_info = os.fstat(snapshot.descriptor)
+            commitment = self._store._validate_ack_commitment_binding()
+            if (
+                status.healthy is not True
+                or status.retention_pending is not snapshot.retention_pending
+                or type(snapshot.descriptor) is not int
+                or type(snapshot.device) is not int
+                or type(snapshot.inode) is not int
+                or type(snapshot.size) is not int
+                or snapshot.size != self._size
+                or not stat.S_ISREG(descriptor_info.st_mode)
+                or descriptor_info.st_dev != snapshot.device
+                or descriptor_info.st_ino != snapshot.inode
+                or descriptor_info.st_size != snapshot.size
+                or not _same_file(descriptor_info, live_info)
+                or fcntl.fcntl(snapshot.descriptor, fcntl.F_GETFL)
+                & os.O_ACCMODE
+                != os.O_RDONLY
+                or not hmac.compare_digest(
+                    self._hash_replay_ack_prefix(
+                        snapshot.descriptor,
+                        snapshot.committed_prefix_size,
+                    ),
+                    snapshot.committed_prefix_sha256,
+                )
+                or type(commitment) is not _AckCommitmentV1
+                or commitment.phase != "ready"
+                or commitment.generation != snapshot.generation
+                or commitment.journal_prefix_size
+                != snapshot.committed_prefix_size
+                or not hmac.compare_digest(
+                    commitment.journal_prefix_sha256,
+                    snapshot.committed_prefix_sha256.hex(),
+                )
+                or self._exact_durable_confirmed(commitment)
+                != snapshot.confirmed
+            ):
+                raise ProjectionAuthorityError(
+                    "replay ACK durable authority changed"
+                )
+        except ProjectionAuthorityError:
+            raise
+        except Exception as error:
+            raise ProjectionAuthorityError(
+                "replay ACK authority is unavailable"
+            ) from error
 
     @staticmethod
     def _exact_anchor_identity(identity: AckIdentity | None) -> tuple[int, str, str] | None:
@@ -1295,6 +1587,7 @@ class AckJournal:
         """Durably establish the one exact observer ACK permitted in flight."""
         with self._retention_lock:
             self._require_retention_mutation_permitted()
+            self._bump_mutation_revision_locked()
             self._record_pending_locked(ref)
 
     def _record_pending_locked(self, ref: EvidenceRef) -> None:
@@ -1331,6 +1624,7 @@ class AckJournal:
         """Durably confirm only the exact currently pending ACK identity."""
         with self._retention_lock:
             self._require_retention_mutation_permitted()
+            self._bump_mutation_revision_locked()
             self._record_confirmed_locked(ref)
 
     def _record_confirmed_locked(self, ref: EvidenceRef) -> None:
@@ -1378,17 +1672,17 @@ class AckJournal:
                 step_hook=self._step_hook,
             )
         except _AckLifecycleIoUncertain as error:
-            self._healthy = False
+            self._mark_unhealthy_locked()
             primary = _primary_io_error(error)
             self._attempt_commitment_uncertain(primary)
             raise primary from error
         except _AckLifecycleCorrupt as error:
             corrupt_error = AckJournalCorrupt(str(error))
-            self._healthy = False
+            self._mark_unhealthy_locked()
             self._attempt_corruption_fence(corrupt_error)
             raise corrupt_error from error
         except BaseException as primary:
-            self._healthy = False
+            self._mark_unhealthy_locked()
             self._attempt_commitment_uncertain(primary)
             raise
         self._confirmed_generation = next_generation
@@ -1398,18 +1692,22 @@ class AckJournal:
         self._pending = None
 
     def snapshot(self) -> AckJournalSnapshot:
+        with self._retention_lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> AckJournalSnapshot:
         self._require_open()
         if self._healthy:
             try:
                 self._store._validate_ack_commitment_binding()
             except _AckLifecycleIoUncertain as error:
-                self._healthy = False
+                self._mark_unhealthy_locked()
                 primary = _primary_io_error(error)
                 self._attempt_commitment_uncertain(primary)
                 raise primary from error
             except _AckLifecycleCorrupt as error:
                 corrupt_error = AckJournalCorrupt(str(error))
-                self._healthy = False
+                self._mark_unhealthy_locked()
                 self._attempt_corruption_fence(corrupt_error)
                 raise corrupt_error from error
             self._bind_published_or_latch()
@@ -1421,22 +1719,23 @@ class AckJournal:
 
     def pending_request_body(self) -> bytes | None:
         """Return byte-stable canonical observer ACK JSON for restart retry."""
-        self._require_usable()
-        pending = self._pending
-        if pending is None:
-            return None
-        return canonical_json(
-            {
-                "schema_version": "agmind.observer-ack.v1",
-                "sequence": pending.sequence,
-                "event_id": pending.event_id,
-                "content_sha256": pending.content_sha256,
-            }
-        )
+        with self._retention_lock:
+            self._require_usable()
+            pending = self._pending
+            if pending is None:
+                return None
+            return canonical_json(
+                {
+                    "schema_version": "agmind.observer-ack.v1",
+                    "sequence": pending.sequence,
+                    "event_id": pending.event_id,
+                    "content_sha256": pending.content_sha256,
+                }
+            )
 
     def claim_delivery(self, segment_store: SegmentStore) -> AckDeliveryLease:
         """Claim the one delivery writer bound to this exact live store."""
-        with self._delivery_lock:
+        with self._retention_lock, self._delivery_lock:
             self._require_usable()
             if segment_store is not self._store:
                 raise AckJournalAuthorityError(
@@ -1588,6 +1887,8 @@ class AckJournal:
     def close(self) -> None:
         with self._retention_lock:
             self._require_retention_mutation_permitted()
+            if not self._closed:
+                self._bump_mutation_revision_locked()
             self._close_locked()
 
     def _close_locked(self) -> None:
@@ -1623,7 +1924,7 @@ class AckJournal:
                     self._authenticated_digest(),
                 )
             except _AckLifecycleIoUncertain as error:
-                self._healthy = False
+                self._mark_unhealthy_locked()
                 primary = _primary_io_error(error)
                 self._attempt_io_uncertain(
                     primary,
@@ -1634,7 +1935,7 @@ class AckJournal:
                 raise primary from error
             except _AckLifecycleCorrupt as error:
                 corrupt_error = AckJournalCorrupt(str(error))
-                self._healthy = False
+                self._mark_unhealthy_locked()
                 self._attempt_corruption_fence(corrupt_error)
                 self._close_after_failed_open(corrupt_error)
                 raise corrupt_error from error
@@ -1643,7 +1944,7 @@ class AckJournal:
                 self._close_after_failed_open(state_error)
                 raise state_error from error
             except AckJournalCorrupt as corrupt_error:
-                self._healthy = False
+                self._mark_unhealthy_locked()
                 self._attempt_corruption_fence(corrupt_error)
                 self._close_after_failed_open(corrupt_error)
                 raise
@@ -1651,7 +1952,7 @@ class AckJournal:
                 retained_error = AckJournalCorrupt(
                     "ACK-journal retained inode became unavailable during close"
                 )
-                self._healthy = False
+                self._mark_unhealthy_locked()
                 self._attempt_corruption_fence(retained_error)
                 self._close_after_failed_open(retained_error)
                 raise retained_error from error

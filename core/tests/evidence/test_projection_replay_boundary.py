@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import os
 import resource
+import stat
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +24,11 @@ from agmind_immune.evidence.segments import (
     EvidencePriority,
     EvidenceRef,
     SegmentStore,
+)
+from agmind_immune.ingest import ack_journal as ack_journal_module
+from agmind_immune.ingest.ack_journal import (
+    AckJournal,
+    AckJournalCorrupt,
 )
 from agmind_immune.ingest.envelope import EnvelopeVerifier
 from agmind_immune.ingest.service import AcceptanceCoordinator
@@ -232,6 +240,126 @@ def _all_descriptor_fstats_fail_with_ebadf(descriptors: tuple[int, ...]) -> bool
                 continue
         return False
     return True
+
+
+def _build_ack_snapshot_journal(
+    path: Path,
+) -> tuple[AckJournal, SegmentStore, tuple[EvidenceRef, ...]]:
+    _coordinator, store, _terminal = _build_file_backed_source(path)
+    refs = tuple(record.ref for record in store.iter_authenticated_records())
+    assert tuple(ref.source_sequence for ref in refs) == (1, 2)
+    journal = AckJournal.create_new(store)
+    journal.record_pending(refs[0])
+    journal.record_confirmed(refs[0])
+    return journal, store, refs
+
+
+@pytest.mark.parametrize(
+    "writer",
+    ("pending", "confirmed", "retention_acquire", "retention_release", "close", "health"),
+)
+def test_ack_snapshot_revision_changes_for_every_sanctioned_writer(
+    tmp_path: Path,
+    writer: str,
+) -> None:
+    journal, store, refs = _build_ack_snapshot_journal(tmp_path / writer)
+    lease = None
+    snapshot = None
+    try:
+        if writer == "confirmed":
+            journal.record_pending(refs[1])
+        elif writer == "retention_release":
+            lease = store._acquire_retention_ack_boundary(
+                journal,
+                confirmed_through=refs[0].source_sequence,
+            )
+
+        with journal._replay_ack_snapshot_gate():
+            snapshot = journal._capture_replay_ack_locked(
+                refs[-1].source_sequence
+            )
+
+        if writer == "pending":
+            journal.record_pending(refs[1])
+        elif writer == "confirmed":
+            journal.record_confirmed(refs[1])
+        elif writer == "retention_acquire":
+            lease = store._acquire_retention_ack_boundary(
+                journal,
+                confirmed_through=refs[0].source_sequence,
+            )
+        elif writer == "retention_release":
+            assert lease is not None
+            store._release_retention_ack_boundary(journal, lease)
+            lease = None
+        elif writer == "close":
+            journal.close()
+        else:
+            replacement = tmp_path / writer / "ack-journal.replacement"
+            replacement.write_bytes(b"")
+            replacement.chmod(0o600)
+            os.replace(replacement, tmp_path / writer / "ack-journal.agf")
+            with pytest.raises(AckJournalCorrupt):
+                journal.snapshot()
+
+        with (
+            journal._replay_ack_snapshot_gate(),
+            pytest.raises(ProjectionAuthorityError),
+        ):
+            journal._revalidate_replay_ack_locked(snapshot)
+    finally:
+        if snapshot is not None:
+            ack_journal_module._close_replay_ack_snapshot(snapshot)
+        if lease is not None:
+            store._release_retention_ack_boundary(journal, lease)
+        journal.close()
+        store.close(flush=False)
+
+
+def test_ack_snapshot_has_no_callback_and_owns_exact_prefix_descriptor(
+    tmp_path: Path,
+) -> None:
+    journal, store, refs = _build_ack_snapshot_journal(tmp_path / "ack")
+    snapshot = None
+    descriptor = -1
+    try:
+        with journal._replay_ack_snapshot_gate():
+            snapshot = journal._capture_replay_ack_locked(
+                refs[-1].source_sequence
+            )
+        descriptor = snapshot.descriptor
+        descriptor_stat = os.fstat(descriptor)
+        assert snapshot.committed_prefix_sha256 == bytes.fromhex(
+            "916c45030c830eaf5665c9b8eef95ca5266c40fe4e0058e023ca1e128cce0acb"
+        )
+        assert tuple(
+            field.name
+            for field in fields(snapshot)
+            if callable(getattr(snapshot, field.name))
+        ) == ()
+        assert stat.S_ISREG(descriptor_stat.st_mode)
+        assert (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+            descriptor_stat.st_size,
+        ) == (snapshot.device, snapshot.inode, snapshot.size)
+        assert (
+            fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+        ) == os.O_RDONLY
+        assert hashlib.sha256(
+            os.pread(descriptor, snapshot.committed_prefix_size, 0)
+        ).digest() == snapshot.committed_prefix_sha256
+
+        journal.close()
+        assert len(
+            os.pread(descriptor, snapshot.committed_prefix_size, 0)
+        ) == snapshot.committed_prefix_size
+    finally:
+        if snapshot is not None:
+            ack_journal_module._close_replay_ack_snapshot(snapshot)
+        journal.close()
+        store.close(flush=False)
+    assert _all_descriptor_fstats_fail_with_ebadf((descriptor,))
 
 
 def test_source_snapshot_reads_held_descriptors_without_path_reopen(
