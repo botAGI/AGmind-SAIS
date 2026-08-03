@@ -55,6 +55,7 @@ from agmind_immune.correlation.pcc import (
     _FrozenPCCCorrelationInput,
     _incident_from_frozen_falco,
     _rebind_frozen_pcc_observations,
+    _validate_frozen_pcc_correlation_input,
     correlate_pcc,
     incident_from_verified_falco,
 )
@@ -117,6 +118,7 @@ from agmind_immune.evidence.segments import (
     StoredEvidenceRecord,
     _AcceptedEnvelopeRecordV1,
     _exact_coverage_record_key,
+    _exact_coverage_ref_key,
     _ReplayRecordDescriptor,
     _ReplaySegmentDescriptor,
     _ReplaySourceSnapshot,
@@ -128,8 +130,12 @@ from agmind_immune.ingest.ack_journal import (
     AckJournal,
     AckJournalError,
     AckJournalSnapshot,
+    _AckJournalRecordV1,
     _AckReplaySnapshot,
     _AckUnpublishedAnchor,
+)
+from agmind_immune.ingest.ack_journal import (
+    _MAX_RECORD_BYTES as _MAX_ACK_RECORD_BYTES,
 )
 from agmind_immune.ingest.correlation_journal import (
     _MAX_COMPLETED_BATCH,
@@ -1410,6 +1416,10 @@ def _validate_replay_snapshot_shape_v2(
         for item in source.retained_ranges
     ):
         raise TypeError("Projection V2 replay retained ranges are not exact")
+    try:
+        _exact_coverage_ref_key(source.terminal_ref)
+    except ValueError as error:
+        raise TypeError("Projection V2 replay terminal ref is malformed") from error
     if (
         type(ack.lifecycle_token) is not bytes
         or len(ack.lifecycle_token) != 32
@@ -1463,6 +1473,12 @@ def _decode_replay_records_v2(
     ]
     for ordinal, record in enumerate(source.records, start=1):
         counters.administrative_visits += 1
+        try:
+            _exact_coverage_ref_key(record.ref)
+        except ValueError as error:
+            raise TypeError(
+                "Projection V2 replay record ref is malformed"
+            ) from error
         if (
             type(record.ref) is not EvidenceRef
             or type(record.accepted_at) is not str
@@ -1567,21 +1583,41 @@ def _decode_replay_records_v2(
     return tuple(records)
 
 
+def _exact_replay_ack_identity_v2(
+    value: object,
+) -> tuple[int, str, str] | None:
+    if value is None:
+        return None
+    if (
+        type(value) is not tuple
+        or len(value) != 3
+        or type(value[0]) is not int
+        or not 1 <= value[0] <= MAX_UINT64
+        or type(value[1]) is not str
+        or _EVENT_ID_V2.fullmatch(value[1]) is None
+        or type(value[2]) is not str
+        or _HEX64_V2.fullmatch(value[2]) is None
+    ):
+        raise TypeError("Projection V2 replay ACK identity is not exact")
+    return value
+
+
 def _verify_replay_ack_v2(
     ack: _AckReplaySnapshot,
     terminal: EvidenceRef,
     counters: _ReplayComputeCounters,
 ) -> None:
-    confirmed = ack.confirmed
+    try:
+        terminal_key = _exact_coverage_ref_key(terminal)
+    except ValueError as error:
+        raise TypeError("Projection V2 replay ACK terminal is malformed") from error
+    confirmed = _exact_replay_ack_identity_v2(ack.confirmed)
+    pending = _exact_replay_ack_identity_v2(ack.pending)
     if (
-        type(confirmed) is not tuple
-        or len(confirmed) != 3
-        or type(confirmed[0]) is not int
-        or type(confirmed[1]) is not str
-        or type(confirmed[2]) is not str
+        confirmed is None
         or confirmed
-        != (terminal.source_sequence, terminal.event_id, terminal.content_sha256)
-        or ack.pending is not None
+        != (terminal_key[6], terminal_key[5], terminal_key[7])
+        or pending is not None
         or ack.retention_pending
         or not 0 <= ack.committed_prefix_size <= ack.size
     ):
@@ -1603,6 +1639,62 @@ def _verify_replay_ack_v2(
     )
     if hashlib.sha256(prefix).digest() != ack.committed_prefix_sha256:
         raise ProjectionAuthorityError("Projection V2 replay ACK prefix changed")
+    try:
+        decoded = decode_frames(prefix, max_frame=_MAX_ACK_RECORD_BYTES)
+    except (JournalCorrupt, ValueError) as error:
+        raise ProjectionAuthorityError(
+            "Projection V2 replay ACK prefix is corrupt"
+        ) from error
+    if decoded.torn_tail or decoded.verified_bytes != len(prefix):
+        raise ProjectionAuthorityError(
+            "Projection V2 replay ACK prefix is incomplete"
+        )
+    reduced_confirmed: tuple[int, str, str] | None = None
+    reduced_pending: tuple[int, str, str] | None = None
+    reduced_generation = 0
+    for frame in decoded.records:
+        counters.administrative_visits += 1
+        try:
+            record = decode_strict(
+                frame.payload,
+                _AckJournalRecordV1,
+                _MAX_ACK_RECORD_BYTES,
+            )
+            if frame.payload != canonical_json(record):
+                raise ValueError("ACK record is not canonical")
+            identity = _exact_replay_ack_identity_v2(
+                (record.sequence, record.event_id, record.content_sha256)
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 replay ACK record is invalid"
+            ) from error
+        assert identity is not None
+        if record.kind == "pending_ack":
+            expected_sequence = (
+                1 if reduced_confirmed is None else reduced_confirmed[0] + 1
+            )
+            if reduced_pending is not None or identity[0] != expected_sequence:
+                raise ProjectionAuthorityError(
+                    "Projection V2 replay ACK pending transition is invalid"
+                )
+            reduced_pending = identity
+            continue
+        if reduced_pending is None or identity != reduced_pending:
+            raise ProjectionAuthorityError(
+                "Projection V2 replay ACK confirmation is invalid"
+            )
+        reduced_confirmed = identity
+        reduced_pending = None
+        reduced_generation += 1
+    if (
+        reduced_confirmed != confirmed
+        or reduced_pending != pending
+        or reduced_generation != ack.generation
+    ):
+        raise ProjectionAuthorityError(
+            "Projection V2 replay ACK prefix facts changed"
+        )
 
 
 def _replay_connection_v2(schema_domain: bytes) -> sqlite3.Connection:
@@ -1918,12 +2010,14 @@ def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
         proofs_by_event: dict[str, AuthenticatedPCCInput] = {}
         for frozen_input in frozen_inputs:
             counters.administrative_visits += 1
-            proof = frozen_input.proof
-            if type(proof) is not AuthenticatedPCCInput:
-                raise TypeError("Projection V2 replay PCC proof is not exact")
+            proof, _context = _validate_frozen_pcc_correlation_input(
+                frozen_input
+            )
             evidence_ref = proof.evidence_ref
-            if type(evidence_ref) is not EvidenceRef:
-                raise TypeError("Projection V2 replay PCC ref is not exact")
+            try:
+                _exact_coverage_ref_key(evidence_ref)
+            except ValueError as error:
+                raise TypeError("Projection V2 replay PCC ref is malformed") from error
             key = (proof.event_id, proof.content_sha256)
             if proof.event_id in frozen_by_event:
                 raise ProjectionConflict("Projection V2 replay PCC input is duplicated")

@@ -92,6 +92,19 @@ class _EqualityLaunderedRef(EvidenceRef):
         return False
 
 
+class _NestedBombStr(str):
+    def __eq__(self, other: object) -> bool:
+        del other
+        raise AssertionError("nested hostile equality executed")
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        raise AssertionError("nested hostile inequality executed")
+
+    def __hash__(self) -> int:
+        raise AssertionError("nested hostile hash executed")
+
+
 class _Crash(RuntimeError):
     pass
 
@@ -792,6 +805,8 @@ def _with_conservative_sequence_gap(
     resources: dict[str, object],
     path: Path,
     proof: AuthenticatedPCCInput,
+    *,
+    bind_ack_prefix: bool = True,
 ) -> object:
     frames = importlib.import_module("agmind_immune.evidence.frames")
     gap = _gap_open(
@@ -857,13 +872,138 @@ def _with_conservative_sequence_gap(
             ),
         ),
     )
-    ack = replace(
-        snapshot.ack,
-        confirmed=(ref.source_sequence, ref.event_id, ref.content_sha256),
-    )
+    ack = snapshot.ack
+    if bind_ack_prefix:
+        ack_module = importlib.import_module("agmind_immune.ingest.ack_journal")
+        prefix = os.pread(ack.descriptor, ack.committed_prefix_size, 0)
+        assert len(prefix) == ack.committed_prefix_size
+        decoded_ack = frames.decode_frames(
+            prefix,
+            max_frame=ack_module._MAX_RECORD_BYTES,
+        )
+        assert not decoded_ack.torn_tail
+        previous_hash = (
+            bytes(32)
+            if not decoded_ack.records
+            else decoded_ack.records[-1].record_hash
+        )
+        appended: list[bytes] = []
+        for kind in ("pending_ack", "confirmed_ack"):
+            ack_payload = canonical_json(
+                {
+                    "schema_version": "agmind.core-ack-journal-record.v1",
+                    "kind": kind,
+                    "sequence": ref.source_sequence,
+                    "event_id": ref.event_id,
+                    "content_sha256": ref.content_sha256,
+                }
+            )
+            ack_frame = frames.encode_frame(
+                ack_payload,
+                previous_hash=previous_hash,
+                max_frame=ack_module._MAX_RECORD_BYTES,
+            )
+            previous_hash = ack_frame[-32:]
+            appended.append(ack_frame)
+        ack_bytes = prefix + b"".join(appended)
+        ack_path = path.with_name(f"{path.stem}-ack.agf")
+        ack_path.write_bytes(ack_bytes)
+        ack_descriptor = os.open(ack_path, os.O_RDONLY)
+        ack_info = os.fstat(ack_descriptor)
+        os.close(ack.descriptor)
+        ack = replace(
+            ack,
+            mutation_revision=ack.mutation_revision + 2,
+            generation=ack.generation + 1,
+            confirmed=(ref.source_sequence, ref.event_id, ref.content_sha256),
+            pending=None,
+            committed_prefix_size=len(ack_bytes),
+            committed_prefix_sha256=hashlib.sha256(ack_bytes).digest(),
+            descriptor=ack_descriptor,
+            device=ack_info.st_dev,
+            inode=ack_info.st_ino,
+            size=ack_info.st_size,
+        )
+    else:
+        ack = replace(
+            ack,
+            confirmed=(ref.source_sequence, ref.event_id, ref.content_sha256),
+        )
     resources["source_snapshot"] = source
     resources["ack_snapshot"] = ack
     return replace(snapshot, source=source, ack=ack)
+
+
+def test_compute_rejects_ack_tuple_not_bound_by_frozen_prefix(
+    tmp_path: Path,
+) -> None:
+    subject = _subject()
+    coordinator, proof = _accepted_complete(
+        tmp_path / "unbound-ack-prefix",
+        ttl_seconds=120,
+    )
+    records = tuple(coordinator.segment_store.iter_authenticated_records())
+    frozen_inputs = (_frozen_compute_pcc_input(proof, records),)
+    snapshot, resources = _capture_compute_input(
+        subject,
+        coordinator,
+        frozen_inputs,
+    )
+    snapshot = _with_conservative_sequence_gap(
+        subject,
+        snapshot,
+        resources,
+        tmp_path / "unbound-ack-prefix" / "conservative-gap.agf",
+        proof,
+        bind_ack_prefix=False,
+    )
+    try:
+        with pytest.raises(ProjectionAuthorityError):
+            subject._compute_replay(snapshot)
+    finally:
+        _close_compute_input(resources)
+
+
+def test_compute_rejects_nested_pcc_fact_before_callback(
+    tmp_path: Path,
+) -> None:
+    subject = _subject()
+    coordinator, proof = _accepted_complete(
+        tmp_path / "nested-pcc-fact",
+        ttl_seconds=120,
+    )
+    records = tuple(coordinator.segment_store.iter_authenticated_records())
+    frozen = _frozen_compute_pcc_input(proof, records)
+    hostile_proof = object.__new__(AuthenticatedPCCInput)
+    for name in (
+        "_boot_id",
+        "_canonical",
+        "_content_sha256",
+        "_event_id",
+        "_event_type",
+        "_evidence_ref",
+        "_host_id",
+        "_request",
+        "_snapshot",
+        "_source_sequence",
+    ):
+        object.__setattr__(hostile_proof, name, getattr(frozen.proof, name))
+    object.__setattr__(
+        hostile_proof,
+        "_event_id",
+        _NestedBombStr(frozen.proof.event_id),
+    )
+    hostile_frozen = replace(frozen, proof=hostile_proof)
+    snapshot, resources = _capture_compute_input(
+        subject,
+        coordinator,
+        (hostile_frozen,),
+    )
+    try:
+        with pytest.raises(TypeError):
+            subject._compute_replay(snapshot)
+    finally:
+        _close_compute_input(resources)
 
 
 @pytest.mark.parametrize(

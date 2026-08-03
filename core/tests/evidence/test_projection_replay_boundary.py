@@ -78,6 +78,19 @@ _REGISTRY_PATH = Path("contracts/v1/ipv4-special-use.csv")
 _DETECTOR_HASH = "1" * 64
 
 
+class _NestedBombStr(str):
+    def __eq__(self, other: object) -> bool:
+        del other
+        raise AssertionError("nested hostile equality executed")
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        raise AssertionError("nested hostile inequality executed")
+
+    def __hash__(self) -> int:
+        raise AssertionError("nested hostile hash executed")
+
+
 def _correlation_modules() -> tuple[Any, Any]:
     return (
         importlib.import_module("agmind_immune.correlation.authority"),
@@ -953,6 +966,30 @@ def test_compute_accepts_only_frozen_value_snapshot(
             subject._compute_replay(
                 replace(snapshot, source=_WrongSource())
             )
+    finally:
+        _close_complete_replay_input(resources)
+
+
+def test_compute_rejects_nested_evidence_ref_before_callback(
+    tmp_path: Path,
+) -> None:
+    subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+    snapshot, resources = _build_complete_replay_input_snapshot(
+        tmp_path / "compute-nested-ref"
+    )
+    source = snapshot.source
+    first = source.records[0]
+    hostile_ref = replace(
+        first.ref,
+        source_sequence=_NestedBombStr(str(first.ref.source_sequence)),
+    )
+    hostile_source = replace(
+        source,
+        records=(replace(first, ref=hostile_ref), *source.records[1:]),
+    )
+    try:
+        with pytest.raises(TypeError):
+            subject._compute_replay(replace(snapshot, source=hostile_source))
     finally:
         _close_complete_replay_input(resources)
 
