@@ -646,7 +646,31 @@ def test_frozen_pcc_kernel_accepts_values_only_and_matches_live_result(
     _authority_module, pcc_module = _correlation_modules()
     coordinator, proof = _accepted_complete(tmp_path / "frozen")
     context = _context(proof)
+
+    def attribute_trap(observed: list[str]) -> object:
+        class _WrongType:
+            def __getattribute__(self, name: str) -> object:
+                observed.append(name)
+                raise AssertionError("wrong-type attribute access executed")
+
+        return _WrongType()
+
     try:
+        proof_accesses: list[str] = []
+        context_accesses: list[str] = []
+        with pytest.raises(TypeError):
+            pcc_module._freeze_pcc_correlation_input(
+                attribute_trap(proof_accesses),
+                context,
+            )
+        with pytest.raises(TypeError):
+            pcc_module._freeze_pcc_correlation_input(
+                proof,
+                attribute_trap(context_accesses),
+            )
+        assert proof_accesses == []
+        assert context_accesses == []
+
         expected = pcc_module._correlate_pcc_kernel(proof, context)
         frozen = pcc_module._freeze_pcc_correlation_input(proof, context)
 

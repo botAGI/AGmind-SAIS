@@ -690,24 +690,23 @@ def _freeze_pcc_correlation_input(
     context_canonical: bytes | None = None,
 ) -> _FrozenPCCCorrelationInput:
     """Validate live authority once, then return detached immutable facts."""
+    if (
+        type(proof) is not AuthenticatedPCCInput
+        or type(context) is not CorrelationContext
+    ):
+        raise TypeError("PCC freeze requires exact issued live facts")
     proof_is_issued = authenticated_pcc_input_is_issued(proof)
-    registry = getattr(context, "special_use_registry", None)
-    raw_context = (
-        type(context) is CorrelationContext
-        and context._authority_kind == "raw"
-    )
+    registry = context.special_use_registry
+    raw_context = context._authority_kind == "raw"
     registry_is_issued = (
         special_use_registry_is_issued(registry) if raw_context else False
     )
     failed_context = (
-        type(context) is CorrelationContext
-        and context._authority_kind == "failed_only"
+        context._authority_kind == "failed_only"
         and registry is None
     )
     if (
-        type(proof) is not AuthenticatedPCCInput
-        or not proof_is_issued
-        or type(context) is not CorrelationContext
+        not proof_is_issued
         or not (
             (type(registry) is SpecialUseRegistry and registry_is_issued)
             or failed_context
