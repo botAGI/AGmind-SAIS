@@ -229,7 +229,7 @@ Expected: missing snapshot API and current callback-based `_evaluate_source_term
 
 - [ ] **Step 3: Implement capture/revalidation/close**
 
-Use `os.dup`, `os.fstat`, and `os.pread`; bind device/inode/size and the maximum byte prefix referenced by the frozen records. Snapshot construction owns descriptors as soon as `dup` succeeds and closes partial state in `except BaseException`. Revalidation compares lifecycle token, source revision, terminal ref, retained ranges, and every descriptor binding. Delete `_evaluate_source_terminal` and `_source_mutation_checkpoint`; retain `_source_gate`, `_source_revision`, `_begin_source_mutation`, and `_end_source_mutation`.
+Use `os.dup`, `os.fstat`, and `os.pread`; bind device/inode/size and the maximum byte prefix referenced by the frozen records. Snapshot construction owns descriptors as soon as `dup` succeeds and closes partial state in `except BaseException`. Revalidation compares lifecycle token, source revision, terminal ref, retained ranges, and every descriptor binding. Retain the existing `_evaluate_source_terminal` unchanged only as a staged compatibility path for the still-dormant `projection_v2.py` caller; Task 6 removes that method and caller together when orchestration migrates. Retain `_source_gate`, `_source_revision`, `_begin_source_mutation`, and `_end_source_mutation`; no new code may call the compatibility evaluator.
 
 - [ ] **Step 4: Run focused GREEN**
 
