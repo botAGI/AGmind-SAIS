@@ -6,12 +6,13 @@ import hashlib
 import hmac
 import json
 import weakref
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from threading import RLock, get_ident
+from types import MappingProxyType
 from typing import Never, SupportsIndex, cast, final, overload
 
 from pydantic import BaseModel, ValidationError
@@ -312,6 +313,7 @@ def _prepare_historical_record(record: StoredEvidenceRecord) -> _PreparedHistori
 class _HistoricalPreparedPrefix:
     prepared: tuple[_PreparedHistoricalRecord, ...]
     primary: tuple[bool, ...]
+    ordinal_by_sequence: Mapping[int, int]
 
     def before(self, source_sequence: int) -> tuple[_PreparedHistoricalRecord, ...]:
         return tuple(
@@ -343,24 +345,34 @@ class _HistoricalReductionResult:
     diagnostics: _HistoricalReductionDiagnostics
 
 
+@dataclass(slots=True)
+class _HistoricalReductionCounters:
+    primary_checks: int = 0
+    semantic_prefix_visits: int = 0
+
+
 def _prepared_prefix_primary(
     prefix: _HistoricalPreparedPrefix,
     candidate: _PreparedHistoricalRecord,
+    counters: _HistoricalReductionCounters,
 ) -> bool:
-    for prepared, primary in zip(prefix.prepared, prefix.primary, strict=True):
-        if prepared is candidate:
-            return primary
-    raise HistoricalCoverageConflict("historical record is outside the prepared prefix")
+    counters.primary_checks += 1
+    ordinal = prefix.ordinal_by_sequence.get(candidate.envelope.source_sequence)
+    if ordinal is None or prefix.prepared[ordinal] is not candidate:
+        raise HistoricalCoverageConflict("historical record is outside the prepared prefix")
+    return prefix.primary[ordinal]
 
 
 def _episode_was_closed(
     prefix: _HistoricalPreparedPrefix,
+    counters: _HistoricalReductionCounters,
     before_sequence: int,
     key: tuple[str | None, str, str, str],
 ) -> bool:
     closed = False
     for candidate in prefix.before(before_sequence):
-        if not _prepared_prefix_primary(prefix, candidate):
+        counters.semantic_prefix_visits += 1
+        if not _prepared_prefix_primary(prefix, candidate, counters):
             continue
         if (
             candidate.coverage is None
@@ -378,16 +390,18 @@ def _episode_was_closed(
 
 def _sequence_range_was_seen(
     prefix: _HistoricalPreparedPrefix,
+    counters: _HistoricalReductionCounters,
     before_sequence: int,
     start: int,
     end: int,
 ) -> bool:
     for candidate in prefix.before(before_sequence):
+        counters.semantic_prefix_visits += 1
         coverage = candidate.coverage
         if (
             coverage is None
             or candidate.fact.classification.action != "sequence_open"
-            or not _prepared_prefix_primary(prefix, candidate)
+            or not _prepared_prefix_primary(prefix, candidate, counters)
         ):
             continue
         prior_start = coverage.affected_source_sequence_start
@@ -403,18 +417,20 @@ def _sequence_range_was_seen(
 
 def _docker_episode_was_seen(
     prefix: _HistoricalPreparedPrefix,
+    counters: _HistoricalReductionCounters,
     before_sequence: int,
     opened_at: str,
     generation: int,
 ) -> bool:
     for candidate in prefix.before(before_sequence):
+        counters.semantic_prefix_visits += 1
         coverage = candidate.coverage
         if (
             coverage is not None
             and candidate.fact.classification.action == "docker_open"
             and coverage.opened_at == opened_at
             and coverage.reconcile_generation == generation
-            and _prepared_prefix_primary(prefix, candidate)
+            and _prepared_prefix_primary(prefix, candidate, counters)
         ):
             return True
     return False
@@ -520,7 +536,17 @@ def _reduce_historical_coverage_result(
         primary_mask.append(primary)
         if primary:
             seen_primary_keys.add(primary_key)
-    prefix = _HistoricalPreparedPrefix(selected_prepared, tuple(primary_mask))
+    prefix = _HistoricalPreparedPrefix(
+        selected_prepared,
+        tuple(primary_mask),
+        MappingProxyType(
+            {
+                prepared.envelope.source_sequence: ordinal
+                for ordinal, prepared in enumerate(selected_prepared)
+            }
+        ),
+    )
+    counters = _HistoricalReductionCounters()
     window = _historical_coverage_window(
         trigger_event_time,
         clock_uncertainty_ms,
@@ -537,13 +563,14 @@ def _reduce_historical_coverage_result(
     current_boot: str | None = None
 
     for prepared in selected_prepared:
+        counters.semantic_prefix_visits += 1
         envelope = prepared.envelope
         if envelope.host_id != host_id or envelope.source_sequence <= last_sequence:
             raise HistoricalCoverageConflict("historical records are not one host in order")
         last_sequence = envelope.source_sequence
         if envelope.source_sequence > coverage_through_sequence:
             continue
-        if not _prepared_prefix_primary(prefix, prepared):
+        if not _prepared_prefix_primary(prefix, prepared, counters):
             continue
         if current_boot is not None and envelope.boot_id != current_boot:
             active = {
@@ -572,6 +599,7 @@ def _reduce_historical_coverage_result(
             docker_key = (coverage.opened_at, generation)
             if docker_key in docker_active or _docker_episode_was_seen(
                 prefix,
+                counters,
                 envelope.source_sequence,
                 coverage.opened_at,
                 generation,
@@ -641,6 +669,7 @@ def _reduce_historical_coverage_result(
             sequence_key = (start, end, coverage.opened_at)
             if sequence_key in sequence_active or _sequence_range_was_seen(
                 prefix,
+                counters,
                 envelope.source_sequence,
                 start,
                 end,
@@ -726,6 +755,7 @@ def _reduce_historical_coverage_result(
                 if active_opened is None:
                     if _episode_was_closed(
                         prefix,
+                        counters,
                         envelope.source_sequence,
                         episode_key,
                     ):
@@ -814,8 +844,9 @@ def _reduce_historical_coverage_result(
                 for prior in prefix.before(
                     envelope.source_sequence
                 ):
+                    counters.semantic_prefix_visits += 1
                     if (
-                        _prepared_prefix_primary(prefix, prior)
+                        _prepared_prefix_primary(prefix, prior, counters)
                         and prior.coverage is not None
                         and prior.fact.classification.action
                         in {"generic_open", "generic_close"}
@@ -989,11 +1020,11 @@ def _reduce_historical_coverage_result(
         semantic_digest=semantic_digest,
         diagnostics=_HistoricalReductionDiagnostics(
             prepared_records=len(selected_prepared),
-            primary_checks=len(selected_prepared),
+            primary_checks=counters.primary_checks,
             interval_materializations=len(sorted_intervals),
             event_materializations=len(coverage_ids),
             leaf_materializations=len(sorted_intervals) + len(coverage_ids),
-            semantic_prefix_visits=len(selected_prepared) * (len(selected_prepared) + 1),
+            semantic_prefix_visits=counters.semantic_prefix_visits,
         ),
     )
 

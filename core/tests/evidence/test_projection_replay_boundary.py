@@ -5,8 +5,8 @@ from agmind_immune.coverage.historical import (
     _reduce_historical_coverage_result,
 )
 from tests.coverage.test_historical import _self_close_records
-from tests.coverage.test_state import T0, T1
-from tests.phase5b_helpers import BOOT_A, HOST_ID
+from tests.coverage.test_state import T0, T1, _event, _stored
+from tests.phase5b_helpers import BOOT_A, HOST_ID, private_key
 
 _PCC_CONTENT_HASHES = (
     "6f0db0a71c24c3a490f886bc3537a66826722e188d0557099f3b200876544e9f",
@@ -50,6 +50,25 @@ def eight_pcc_fixture() -> dict[str, object]:
     return _pcc_fixture(8)
 
 
+def no_prefix_scan_pcc_fixture(count: int) -> dict[str, object]:
+    key = private_key(11)
+    records = tuple(
+        _stored(_event(key, sequence, kind=f"ordinary_{sequence}"))
+        for sequence in range(1, count + 1)
+    )
+    return {
+        "records": records,
+        "host_id": HOST_ID,
+        "boot_id": BOOT_A,
+        "trigger_event_id": "evt_" + "6" * 64,
+        "trigger_source_sequence": count,
+        "trigger_event_time": T0,
+        "clock_uncertainty_ms": 0,
+        "coverage_through_sequence": count,
+        "window_end": T1,
+    }
+
+
 def test_replay_reduction_returns_immutable_ordered_leaf_facts() -> None:
     result = _reduce_historical_coverage_result(**four_pcc_fixture())
     assert type(result) is _HistoricalReductionResult
@@ -66,8 +85,12 @@ def test_replay_reduction_returns_immutable_ordered_leaf_facts() -> None:
 def test_replay_reduction_reports_exact_admin_and_semantic_work_at_four_and_eight() -> None:
     four = _reduce_historical_coverage_result(**four_pcc_fixture())
     eight = _reduce_historical_coverage_result(**eight_pcc_fixture())
-    assert four.diagnostics.semantic_prefix_visits == 20
-    assert eight.diagnostics.semantic_prefix_visits == 72
+    no_prefix = _reduce_historical_coverage_result(**no_prefix_scan_pcc_fixture(4))
+    assert no_prefix.diagnostics.semantic_prefix_visits == 4
+    assert no_prefix.diagnostics.primary_checks == 4
+    assert four.diagnostics.semantic_prefix_visits == 10
+    assert four.diagnostics.primary_checks == 10
+    assert eight.diagnostics.semantic_prefix_visits == 36
+    assert eight.diagnostics.primary_checks == 36
     assert eight.diagnostics.prepared_records == 2 * four.diagnostics.prepared_records
-    assert eight.diagnostics.primary_checks == 2 * four.diagnostics.primary_checks
     assert eight.diagnostics.leaf_materializations == 2 * four.diagnostics.leaf_materializations
