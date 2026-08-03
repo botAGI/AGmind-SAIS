@@ -1114,77 +1114,12 @@ def test_unpublished_historical_replay_is_linear_and_reduces_each_pcc_twice(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    subject = _subject()
-    historical = importlib.import_module("agmind_immune.coverage.historical")
-    authority = importlib.import_module("agmind_immune.correlation.authority")
-    monkeypatch.setattr(
-        authority,
-        "_load_pinned_detector_bundle",
-        lambda: _DETECTOR_HASH,
+    counts = _measure_unpublished_historical_admin_work(
+        tmp_path / "evidence",
+        monkeypatch,
+        2,
     )
-    coordinator, first, second = _accepted_two_complete(tmp_path / "evidence")
-    proofs = (first, second)
-    store, journal, acknowledgements, records = _unpublished_resources(
-        coordinator,
-        proofs,
-    )
-    real_prepare = historical._prepare_historical_record
-    real_reduce = historical._reduce_historical_coverage
-    real_derive = historical._ReplayHistoricalSession.reduce
-    real_revalidate = historical._ReplayHistoricalSession.validate_binding
-    prepare_calls = 0
-    reduction_calls = 0
-    derive_calls = 0
-    revalidation_calls = 0
-
-    def counted_prepare(record: object) -> object:
-        nonlocal prepare_calls
-        prepare_calls += 1
-        return real_prepare(record)
-
-    def counted_reduce(*args: object, **kwargs: object) -> object:
-        nonlocal reduction_calls
-        reduction_calls += 1
-        return real_reduce(*args, **kwargs)
-
-    def counted_derive(*args: object, **kwargs: object) -> object:
-        nonlocal derive_calls
-        derive_calls += 1
-        return real_derive(*args, **kwargs)
-
-    def counted_revalidate(*args: object, **kwargs: object) -> object:
-        nonlocal revalidation_calls
-        revalidation_calls += 1
-        return real_revalidate(*args, **kwargs)
-
-    monkeypatch.setattr(historical, "_prepare_historical_record", counted_prepare)
-    monkeypatch.setattr(historical, "_reduce_historical_coverage", counted_reduce)
-    monkeypatch.setattr(
-        historical._ReplayHistoricalSession,
-        "validate_binding",
-        counted_revalidate,
-    )
-    monkeypatch.setattr(
-        historical._ReplayHistoricalSession,
-        "reduce",
-        counted_derive,
-    )
-    owner, _connection, report = (
-        subject._v2_unpublished_projection_from_prefix_for_test(
-            evidence=store,
-            acknowledgements=acknowledgements,
-            journal=journal,
-            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
-            through=records[-1].ref,
-        )
-    )
-    try:
-        assert report.applied_count == len(records)
-        assert prepare_calls == 2 * len(records)
-        assert reduction_calls == 2 * len(proofs)
-        assert revalidation_calls == 2 * derive_calls
-    finally:
-        owner.close()
+    _assert_exact_unpublished_historical_admin_formulas(counts, 2)
 
 
 def test_unpublished_historical_replay_retains_one_compact_ledger_without_prefix_copies(
@@ -1206,18 +1141,19 @@ def test_unpublished_historical_replay_retains_one_compact_ledger_without_prefix
         coordinator,
         stale_proofs,
     )
-    captured_sessions: list[Any] = []
+    memo_leaves: dict[tuple[str, str], Any] = {}
     digest_visits: list[int] = []
     reducer_visits: list[int] = []
     final_snapshot: list[tuple[int, tuple[tuple[bool, bool, type, type], ...]]] = []
-    real_init = historical._ReplayHistoricalSession.__init__
+    real_memo_leaf = historical._build_replay_memo_leaf
     real_digest = historical._replay_compact_digest
     real_reduce = historical._reduce_historical_coverage
     real_final = subject._final_seal_replay_historical_session
 
-    def capture_session(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        captured_sessions.append(session)
+    def capture_memo_leaf(*args: object, **kwargs: object) -> Any:
+        leaf = real_memo_leaf(*args, **kwargs)
+        memo_leaves.setdefault(leaf.key, leaf)
+        return leaf
 
     def count_digest(records_value: object) -> object:
         selected = tuple(cast(Any, records_value))
@@ -1230,24 +1166,23 @@ def test_unpublished_historical_replay_retains_one_compact_ledger_without_prefix
         return real_reduce(selected, *args, **kwargs)
 
     def capture_final(handle: Any, callback: Any) -> None:
-        session = captured_sessions[0]
         final_snapshot.append(
             (
-                session.compact_count,
+                max(leaf.compact_count for leaf in memo_leaves.values()),
                 tuple(
                     (
-                        hasattr(memo, "compact_records"),
-                        hasattr(memo, "compact_prepared"),
-                        type(memo.compact_count),
-                        type(memo.compact_digest),
+                        hasattr(leaf, "compact_records"),
+                        hasattr(leaf, "compact_prepared"),
+                        type(leaf.compact_count),
+                        type(leaf.compact_digest),
                     )
-                    for memo in session.memo.values()
+                    for leaf in memo_leaves.values()
                 ),
             )
         )
         real_final(handle, callback)
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture_session)
+    monkeypatch.setattr(historical, "_build_replay_memo_leaf", capture_memo_leaf)
     monkeypatch.setattr(historical, "_replay_compact_digest", count_digest)
     monkeypatch.setattr(historical, "_reduce_historical_coverage", count_reduce)
     monkeypatch.setattr(subject, "_final_seal_replay_historical_session", capture_final)
@@ -1262,7 +1197,7 @@ def test_unpublished_historical_replay_retains_one_compact_ledger_without_prefix
     )
     try:
         assert report.cursor.source_sequence == records[-1].ref.source_sequence
-        assert len(captured_sessions) == 1
+        assert len(memo_leaves) == len(stale_proofs)
         compact_count, memo_shapes = final_snapshot[0]
         assert len(reducer_visits) == 2 * len(stale_proofs)
         assert sum(reducer_visits) > compact_count
@@ -1293,20 +1228,20 @@ def _measure_unpublished_historical_admin_work(
     validation_prepared_appends = 0
     boundary_validations = 0
     final_counts: list[tuple[int, int, int]] = []
-    captured_sessions: list[Any] = []
+    memo_leaves: dict[tuple[str, str], Any] = {}
     real_prepare = historical._prepare_historical_record
     real_update = historical._update_replay_compact_digest
     real_reduce = historical._reduce_historical_coverage
     real_ledger_init = historical._ReplayLedger.__init__
     real_ledger_append = historical._ReplayLedger.append
+    real_memo_leaf = historical._build_replay_memo_leaf
+    real_validation_visit = historical._replay_validation_compact_visit
     real_validate_boundary = historical._validate_replay_compact_boundary
     real_final = subject._final_seal_replay_historical_session
-    real_init = historical._ReplayHistoricalSession.__init__
-    real_begin_validation = historical._ReplayHistoricalSession.begin_validation
-    counting_source = False
-    validating = False
+    real_scope = subject._replay_historical_session
+    real_begin_validation = subject._begin_replay_historical_validation
     projecting_ledgers: list[Any] = []
-    validation_ledgers: list[Any] = []
+    counting_source = False
 
     def count_prepare(record: object) -> object:
         nonlocal prepare_calls
@@ -1314,30 +1249,29 @@ def _measure_unpublished_historical_admin_work(
             prepare_calls += 1
         return real_prepare(record)
 
-    def count_initial_source(session: Any, *args: object, **kwargs: object) -> None:
+    @contextmanager
+    def count_initial_source(*args: object, **kwargs: object) -> Any:
         nonlocal counting_source
         counting_source = True
         try:
-            real_init(session, *args, **kwargs)
+            with real_scope(*args, **kwargs) as handle:
+                counting_source = False
+                yield handle
         finally:
             counting_source = False
-        captured_sessions.append(session)
-        projecting_ledgers.extend((session.compact_records, session.compact_prepared))
 
-    def count_validation_source(session: Any) -> None:
-        nonlocal counting_source, validating
+    def count_validation_source(handle: Any) -> None:
+        nonlocal counting_source
         counting_source = True
-        validating = True
         try:
-            real_begin_validation(session)
+            real_begin_validation(handle)
         finally:
-            validating = False
             counting_source = False
 
     def count_ledger_init(ledger: Any) -> None:
         real_ledger_init(ledger)
-        if validating:
-            validation_ledgers.append(ledger)
+        if len(projecting_ledgers) < 2:
+            projecting_ledgers.append(ledger)
 
     def count_ledger_append(ledger: Any, value: object) -> None:
         nonlocal projecting_record_appends
@@ -1348,11 +1282,20 @@ def _measure_unpublished_historical_admin_work(
             projecting_record_appends += 1
         elif projecting_ledgers and ledger is projecting_ledgers[1]:
             projecting_prepared_appends += 1
-        elif validation_ledgers and ledger is validation_ledgers[0]:
-            validation_record_appends += 1
-        elif len(validation_ledgers) > 1 and ledger is validation_ledgers[1]:
-            validation_prepared_appends += 1
         real_ledger_append(ledger, value)
+
+    def count_validation_visit(kind: str) -> None:
+        nonlocal validation_prepared_appends, validation_record_appends
+        if kind == "record":
+            validation_record_appends += 1
+        elif kind == "prepared":
+            validation_prepared_appends += 1
+        real_validation_visit(kind)
+
+    def capture_memo_leaf(*args: object, **kwargs: object) -> Any:
+        leaf = real_memo_leaf(*args, **kwargs)
+        memo_leaves.setdefault(leaf.key, leaf)
+        return leaf
 
     def count_update(previous: str, record: object) -> str:
         nonlocal digest_updates
@@ -1375,27 +1318,26 @@ def _measure_unpublished_historical_admin_work(
         return real_reduce(source_records, *args, **kwargs)
 
     def capture_final(handle: Any, callback: Any) -> None:
-        session = captured_sessions[0]
-        stored_prefixes = sum(
-            int(
-                hasattr(memo, "compact_records")
-                or hasattr(memo, "compact_prepared")
-            )
-            for memo in session.memo.values()
-        )
+        compact_count = max(leaf.compact_count for leaf in memo_leaves.values())
         final_counts.append(
-            (session.compact_count, len(session.memo), stored_prefixes)
+            (compact_count, len(memo_leaves), 0)
         )
         real_final(handle, callback)
 
     monkeypatch.setattr(historical, "_prepare_historical_record", count_prepare)
     monkeypatch.setattr(historical._ReplayLedger, "__init__", count_ledger_init)
     monkeypatch.setattr(historical._ReplayLedger, "append", count_ledger_append)
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", count_initial_source)
+    monkeypatch.setattr(subject, "_replay_historical_session", count_initial_source)
     monkeypatch.setattr(
-        historical._ReplayHistoricalSession,
-        "begin_validation",
+        subject,
+        "_begin_replay_historical_validation",
         count_validation_source,
+    )
+    monkeypatch.setattr(historical, "_build_replay_memo_leaf", capture_memo_leaf)
+    monkeypatch.setattr(
+        historical,
+        "_replay_validation_compact_visit",
+        count_validation_visit,
     )
     monkeypatch.setattr(historical, "_update_replay_compact_digest", count_update)
     monkeypatch.setattr(historical, "_validate_replay_compact_boundary", count_boundary)
@@ -1613,7 +1555,7 @@ def test_unpublished_historical_memo_revalidation_drift_returns_no_artifact(
         coordinator,
         (proof,),
     )
-    real_revalidate = historical._ReplayHistoricalSession.validate_binding
+    real_revalidate = authority._derive_replay_historical_coverage
     validations = 0
 
     def drift_between_live_validations(*args: object, **kwargs: object) -> object:
@@ -1626,8 +1568,8 @@ def test_unpublished_historical_memo_revalidation_drift_returns_no_artifact(
         return real_revalidate(*args, **kwargs)
 
     monkeypatch.setattr(
-        historical._ReplayHistoricalSession,
-        "validate_binding",
+        authority,
+        "_derive_replay_historical_coverage",
         drift_between_live_validations,
     )
     artifact: object | None = None
@@ -1971,17 +1913,19 @@ def test_registered_revoked_replay_denies_slow_path_until_atomic_removal(
     )
     revoke_entered = Event()
     release_revoke = Event()
-    real_revoke = historical._ReplayHistoricalSession.revoke
+    real_cleanup_checkpoint = historical._replay_cleanup_checkpoint
 
-    def block_after_revoke(session: Any) -> None:
-        real_revoke(session)
+    def block_after_revoke(stage: str) -> None:
+        real_cleanup_checkpoint(stage)
+        if stage != "broker-revoked":
+            return
         revoke_entered.set()
         if not release_revoke.wait(5):
             raise AssertionError("session revoke release timed out")
 
     monkeypatch.setattr(
-        historical._ReplayHistoricalSession,
-        "revoke",
+        historical,
+        "_replay_cleanup_checkpoint",
         block_after_revoke,
     )
     failures: list[BaseException] = []
@@ -2161,6 +2105,804 @@ def test_projecting_path_is_event_scoped_and_rejects_copied_context_use(
         owner.close()
 
 
+def test_enumerable_module_state_cannot_construct_or_drive_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator, proof = _accepted_complete(tmp_path / "enumerable", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    forged_authority_obtained = False
+    probed = False
+
+    def probe_enumerable_state(step: str) -> None:
+        nonlocal forged_authority_obtained, probed
+        if step != "candidate" or probed:
+            return
+        probed = True
+        module_state = vars(historical)
+        session_type = module_state.get("_ReplayHistoricalSession")
+        factory = module_state.get("_REPLAY_SESSION_FACTORY")
+        if not isinstance(session_type, type) or factory is None:
+            return
+        forged = object.__new__(session_type)
+        try:
+            forged.__init__(store, records[-1].ref, _factory=factory)
+            for entry in forged.entries:
+                token = forged.begin_event(entry.record.ref)
+                if entry.record.ref is proof.evidence_ref:
+                    replay_path = forged.issue(proof)
+                    assessment = forged.reduce(replay_path)
+                    forged.validate_binding(replay_path)
+                    forged_authority_obtained = (
+                        assessment.host_id == proof.host_id
+                        and assessment.trigger_source_sequence
+                        == proof.snapshot.trigger.source_sequence
+                    )
+                forged.compare_primary(
+                    token,
+                    entry.record.ref,
+                    entry.expected_primary,
+                )
+                forged.begin_commit(token, entry.record.ref)
+                forged.complete_event(token)
+        finally:
+            forged.revoke()
+
+    owner, _connection, report = (
+        subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=records[-1].ref,
+            step_hook=probe_enumerable_state,
+        )
+    )
+    try:
+        assert report.cursor.source_sequence == records[-1].ref.source_sequence
+        assert probed is True
+        assert forged_authority_obtained is False
+    finally:
+        owner.close()
+
+
+def test_terminal_callback_cannot_open_fresh_replay_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / "terminal-access", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    handles: list[Any] = []
+    validation_proofs: list[AuthenticatedPCCInput] = []
+    denied = False
+    real_scope = subject._replay_historical_session
+    real_final = subject._final_seal_replay_historical_session
+    real_open = subject._open_replay_historical_access
+    real_issue = subject._issue_replay_historical_path_authority
+
+    @contextmanager
+    def capture_scope(*args: object, **kwargs: object) -> Any:
+        with real_scope(*args, **kwargs) as handle:
+            handles.append(handle)
+            yield handle
+
+    def capture_validation_proof(handle: Any, authenticated: Any) -> Any:
+        access = real_open(handle, authenticated)
+        validation_proofs.append(authenticated)
+        return access
+
+    def probe_final(handle: Any, callback: Any) -> None:
+        def callback_then_open() -> None:
+            nonlocal denied
+            callback()
+            try:
+                authenticated = validation_proofs[-1]
+                access = real_open(handle, authenticated)
+                path = real_issue(store, authenticated, access)
+                historical._derive_replay_historical_coverage(
+                    authenticated,
+                    path,
+                    access,
+                )
+            except historical.HistoricalCoverageUnavailable:
+                denied = True
+
+        real_final(handle, callback_then_open)
+
+    monkeypatch.setattr(subject, "_replay_historical_session", capture_scope)
+    monkeypatch.setattr(
+        subject,
+        "_open_replay_historical_access",
+        capture_validation_proof,
+    )
+    monkeypatch.setattr(subject, "_final_seal_replay_historical_session", probe_final)
+    owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[-1].ref,
+    )
+    try:
+        assert handles
+        assert denied is True
+        assert report.cursor.source_sequence == records[-1].ref.source_sequence
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize(
+    "probe_stage",
+    ["final-before-source", "validation-before-source"],
+)
+def test_terminal_source_probe_runs_without_broker_lock_and_stale_access_fails_fast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_stage: str,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / probe_stage, ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    accesses: list[tuple[Any, Any]] = []
+    real_open = subject._open_replay_historical_access
+    real_issue = historical._issue_replay_historical_path_authority
+    real_begin_validation = subject._begin_replay_historical_validation
+    real_final = subject._final_seal_replay_historical_session
+    real_iter = type(store).iter_authenticated_records
+    worker_finished = Event()
+    denied: list[bool] = []
+    probed = False
+    probe_active = False
+    finished_during_probe: list[bool] = []
+    workers: list[Thread] = []
+
+    def capture_access(handle: Any, authenticated: Any) -> Any:
+        access = real_open(handle, authenticated)
+        if not accesses:
+            accesses.append((authenticated, access))
+        return access
+
+    def retained_access_worker() -> None:
+        authenticated, access = accesses[0]
+        try:
+            real_issue(store, authenticated, access)
+        except historical.HistoricalCoverageUnavailable:
+            denied.append(True)
+        finally:
+            worker_finished.set()
+
+    def iter_during_external_probe(
+        candidate_store: Any,
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> Any:
+        nonlocal probed
+        selected = tuple(real_iter(candidate_store, after=after, through=through))
+        if candidate_store is not store or not probe_active or probed or not accesses:
+            return iter(selected)
+        probed = True
+        copied = copy_context()
+        worker = Thread(target=lambda: copied.run(retained_access_worker))
+        workers.append(worker)
+        worker.start()
+        finished_during_probe.append(worker_finished.wait(0.25))
+        return iter(selected)
+
+    def begin_validation(handle: Any) -> None:
+        nonlocal probe_active
+        if probe_stage != "validation-before-source":
+            real_begin_validation(handle)
+            return
+        probe_active = True
+        try:
+            real_begin_validation(handle)
+        finally:
+            probe_active = False
+
+    def final_probe(handle: Any, callback: Any) -> None:
+        nonlocal probe_active
+        if probe_stage != "final-before-source":
+            real_final(handle, callback)
+            return
+        probe_active = True
+        try:
+            real_final(handle, callback)
+        finally:
+            probe_active = False
+
+    monkeypatch.setattr(subject, "_open_replay_historical_access", capture_access)
+    monkeypatch.setattr(subject, "_begin_replay_historical_validation", begin_validation)
+    monkeypatch.setattr(subject, "_final_seal_replay_historical_session", final_probe)
+    monkeypatch.setattr(
+        type(store),
+        "iter_authenticated_records",
+        iter_during_external_probe,
+    )
+    owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[-1].ref,
+    )
+    try:
+        for worker in workers:
+            worker.join(1)
+            assert worker.is_alive() is False
+        assert probed is True
+        assert finished_during_probe == [True]
+        assert denied == [True]
+        assert report.cursor.source_sequence == records[-1].ref.source_sequence
+    finally:
+        owner.close()
+
+
+def test_validation_rebuild_runs_without_broker_lock_and_denies_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The validation parameter above exercises the same bounded worker protocol
+    # through the production validation-rebuild probe.
+    test_terminal_source_probe_runs_without_broker_lock_and_stale_access_fails_fast(
+        tmp_path,
+        monkeypatch,
+        "validation-before-source",
+    )
+
+
+def test_revocation_during_external_probe_invalidates_exact_ticket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / "probe-revoke", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    handles: list[Any] = []
+    accesses: list[tuple[Any, Any]] = []
+    real_scope = subject._replay_historical_session
+    real_open = subject._open_replay_historical_access
+    real_issue = historical._issue_replay_historical_path_authority
+    real_begin_validation = subject._begin_replay_historical_validation
+    real_iter = type(store).iter_authenticated_records
+    probe_active = False
+    probed = False
+    worker_finished = Event()
+    finished_during_probe: list[bool] = []
+    workers: list[Thread] = []
+
+    class ProbeAbort(BaseException):
+        pass
+
+    @contextmanager
+    def capture_scope(*args: object, **kwargs: object) -> Any:
+        with real_scope(*args, **kwargs) as handle:
+            handles.append(handle)
+            yield handle
+
+    def capture_access(handle: Any, authenticated: Any) -> Any:
+        access = real_open(handle, authenticated)
+        if not accesses:
+            accesses.append((authenticated, access))
+        return access
+
+    def retained_access_worker() -> None:
+        authenticated, access = accesses[0]
+        try:
+            real_issue(store, authenticated, access)
+        except historical.HistoricalCoverageUnavailable:
+            pass
+        finally:
+            worker_finished.set()
+
+    def abort_during_probe_iteration(
+        candidate_store: Any,
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> Any:
+        nonlocal probed
+        selected = tuple(real_iter(candidate_store, after=after, through=through))
+        if candidate_store is store and probe_active and not probed and accesses:
+            probed = True
+            copied = copy_context()
+            worker = Thread(target=lambda: copied.run(retained_access_worker))
+            workers.append(worker)
+            worker.start()
+            finished_during_probe.append(worker_finished.wait(0.25))
+            raise ProbeAbort("validation probe")
+        return iter(selected)
+
+    def begin_validation(handle: Any) -> None:
+        nonlocal probe_active
+        probe_active = True
+        try:
+            real_begin_validation(handle)
+        finally:
+            probe_active = False
+
+    monkeypatch.setattr(subject, "_replay_historical_session", capture_scope)
+    monkeypatch.setattr(subject, "_open_replay_historical_access", capture_access)
+    monkeypatch.setattr(subject, "_begin_replay_historical_validation", begin_validation)
+    monkeypatch.setattr(
+        type(store),
+        "iter_authenticated_records",
+        abort_during_probe_iteration,
+    )
+    artifact: object | None = None
+    with pytest.raises(ProbeAbort):
+        artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=records[-1].ref,
+        )
+    assert artifact is None
+    for worker in workers:
+        worker.join(1)
+        assert worker.is_alive() is False
+    assert probed is True
+    assert finished_during_probe == [True]
+    assert handles
+    with pytest.raises(historical.HistoricalCoverageUnavailable):
+        historical._open_replay_historical_access(handles[0], proof)
+    assert historical._ACTIVE_REPLAY_MARKER.get() is None
+    assert store not in historical._REPLAY_STORE_RESERVATIONS
+
+
+def test_probe_ticket_is_one_shot_and_identity_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / "ticket", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    real_final = subject._final_seal_replay_historical_session
+    nested_denied = False
+
+    def reenter_final(handle: Any, callback: Any) -> None:
+        def exact_outer_callback() -> None:
+            nonlocal nested_denied
+            callback()
+            try:
+                real_final(handle, lambda: None)
+            except historical.HistoricalCoverageUnavailable:
+                nested_denied = True
+
+        real_final(handle, exact_outer_callback)
+
+    monkeypatch.setattr(subject, "_final_seal_replay_historical_session", reenter_final)
+    owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[-1].ref,
+    )
+    try:
+        assert nested_denied is True
+        assert report.cursor.source_sequence == records[-1].ref.source_sequence
+    finally:
+        owner.close()
+
+
+def test_external_probe_baseexception_cleans_ticket_access_paths_and_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / "probe-abort", ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    captured: list[tuple[Any, Any, Any]] = []
+    real_issue = subject._issue_replay_historical_path_authority
+    real_final = subject._final_seal_replay_historical_session
+    real_iter = type(store).iter_authenticated_records
+    probe_active = False
+    probed = False
+    worker_finished = Event()
+    finished_during_probe: list[bool] = []
+    workers: list[Thread] = []
+
+    class ProbeAbort(BaseException):
+        pass
+
+    def capture_path(candidate_store: Any, authenticated: Any, access: Any) -> Any:
+        path = real_issue(candidate_store, authenticated, access)
+        if not captured:
+            captured.append((authenticated, path, access))
+        return path
+
+    def retained_path_worker() -> None:
+        authenticated, _path, access = captured[0]
+        try:
+            historical._issue_replay_historical_path_authority(
+                store,
+                authenticated,
+                access,
+            )
+        except historical.HistoricalCoverageUnavailable:
+            pass
+        finally:
+            worker_finished.set()
+
+    def abort_during_final_iteration(
+        candidate_store: Any,
+        *,
+        after: int = 0,
+        through: int | None = None,
+    ) -> Any:
+        nonlocal probed
+        selected = tuple(real_iter(candidate_store, after=after, through=through))
+        if candidate_store is store and probe_active and not probed and captured:
+            probed = True
+            copied = copy_context()
+            worker = Thread(target=lambda: copied.run(retained_path_worker))
+            workers.append(worker)
+            worker.start()
+            finished_during_probe.append(worker_finished.wait(0.25))
+            raise ProbeAbort("final probe")
+        return iter(selected)
+
+    def final_probe(handle: Any, callback: Any) -> None:
+        nonlocal probe_active
+        probe_active = True
+        try:
+            real_final(handle, callback)
+        finally:
+            probe_active = False
+
+    monkeypatch.setattr(subject, "_issue_replay_historical_path_authority", capture_path)
+    monkeypatch.setattr(subject, "_final_seal_replay_historical_session", final_probe)
+    monkeypatch.setattr(
+        type(store),
+        "iter_authenticated_records",
+        abort_during_final_iteration,
+    )
+    artifact: object | None = None
+    with pytest.raises(ProbeAbort):
+        artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=records[-1].ref,
+        )
+    assert artifact is None
+    for worker in workers:
+        worker.join(1)
+        assert worker.is_alive() is False
+    assert probed is True
+    assert finished_during_probe == [True]
+    assert captured
+    authenticated, path, access = captured[0]
+    with pytest.raises(historical.HistoricalCoverageUnavailable):
+        historical._derive_replay_historical_coverage(authenticated, path, access)
+    assert historical._ACTIVE_REPLAY_MARKER.get() is None
+    assert store not in historical._REPLAY_STORE_RESERVATIONS
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["replacement", "bool", "scalar-subclass", "in-place", "eq-bomb"],
+)
+def test_terminal_predecessor_seal_rejects_exact_mutation_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proof = _accepted_complete(tmp_path / mutation, ttl_seconds=120)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    real_evaluate = authority._evaluate_correlation_projection_terminal_authority
+    injected = False
+    eq_called = False
+
+    class ScalarSubclass(int):
+        pass
+
+    class EqualInt(int):
+        def __eq__(self, other: object) -> bool:
+            del other
+            return True
+
+    def mutate_during_terminal(selected: Any, expected: Any, callback: Any) -> Any:
+        def callback_then_mutate() -> Any:
+            nonlocal eq_called, injected
+            result = callback()
+            binding = authority._authority_binding(selected)
+            predecessor = binding.predecessor
+            if mutation == "replacement":
+                binding.predecessor = replace(predecessor)
+            elif mutation == "bool":
+                monkeypatch.setattr(authority, "_clone_predecessor", lambda value: value)
+                object.__setattr__(expected, "generation", bool(expected.generation))
+            elif mutation == "scalar-subclass":
+                monkeypatch.setattr(authority, "_clone_predecessor", lambda value: value)
+                object.__setattr__(
+                    predecessor,
+                    "generation",
+                    ScalarSubclass(predecessor.generation),
+                )
+            elif mutation == "in-place":
+                monkeypatch.setattr(authority, "_clone_predecessor", lambda value: value)
+                object.__setattr__(
+                    predecessor,
+                    "generation",
+                    EqualInt(predecessor.generation + 1),
+                )
+            else:
+                def mark_eq(self: object, other: object) -> bool:
+                    nonlocal eq_called
+                    del self, other
+                    eq_called = True
+                    return True
+
+                monkeypatch.setattr(authority._ProjectionPredecessor, "__eq__", mark_eq)
+                binding.revision = object()
+            injected = True
+            return result
+
+        return real_evaluate(selected, expected, callback_then_mutate)
+
+    monkeypatch.setattr(
+        subject,
+        "_evaluate_correlation_projection_terminal_authority",
+        mutate_during_terminal,
+    )
+    artifact: object | None = None
+    with pytest.raises(ProjectionAuthorityError):
+        artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=records[-1].ref,
+        )
+    assert injected is True
+    assert eq_called is False
+    assert artifact is None
+
+
+def test_cumulative_memo_leaf_seal_work_is_linear_at_four_and_eight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+
+    def measure(root: Path, pcc_count: int, patch: pytest.MonkeyPatch) -> dict[str, int]:
+        subject = _subject()
+        authority = importlib.import_module("agmind_immune.correlation.authority")
+        patch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+        coordinator, proofs = _accepted_many_complete(root, pcc_count)
+        store, journal, acknowledgements, records = _unpublished_resources(
+            coordinator,
+            proofs,
+        )
+        counts = {
+            "entry": 0,
+            "compact": 0,
+            "pcc": 0,
+            "memo": 0,
+            "fold": 0,
+            "semantic": 0,
+        }
+        real_reduce = historical._reduce_historical_coverage
+
+        def count_seal(kind: str) -> None:
+            counts[kind] += 1
+
+        def count_fold(kind: str) -> None:
+            del kind
+            counts["fold"] += 1
+
+        def count_reduce(source_records: Any, *args: object, **kwargs: object) -> Any:
+            counts["semantic"] += len(source_records)
+            return real_reduce(source_records, *args, **kwargs)
+
+        patch.setattr(historical, "_replay_seal_visit", count_seal, raising=False)
+        patch.setattr(historical, "_replay_leaf_fold_visit", count_fold)
+        patch.setattr(historical, "_reduce_historical_coverage", count_reduce)
+        owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=records[-1].ref,
+        )
+        owner.close()
+        assert report.applied_count == 3 * pcc_count
+        return counts
+
+    with monkeypatch.context() as four_patch:
+        four = measure(tmp_path / "four-leaves", 4, four_patch)
+    with monkeypatch.context() as eight_patch:
+        eight = measure(tmp_path / "eight-leaves", 8, eight_patch)
+    assert four == {
+        "entry": 72,
+        "compact": 24,
+        "pcc": 24,
+        "memo": 24,
+        "fold": 0,
+        "semantic": 20,
+    }
+    assert eight == {
+        "entry": 144,
+        "compact": 48,
+        "pcc": 48,
+        "memo": 48,
+        "fold": 0,
+        "semantic": 72,
+    }
+    assert all(
+        eight[key] <= 2 * four[key]
+        for key in ("entry", "compact", "pcc", "memo", "fold")
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "before-interval",
+        "before-event-reorder",
+        "before-assessment-bool",
+        "after-fresh-assessment",
+        "after-key-reorder",
+        "after-leaf-digest",
+        "after-fresh-pcc",
+    ],
+)
+def test_replay_leaf_replacement_reorder_and_fact_drift_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    subject = _subject()
+    historical = importlib.import_module("agmind_immune.coverage.historical")
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    coordinator, proofs = _accepted_unpublished_compact_history(tmp_path / mutation)
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        proofs,
+    )
+    verifier = store._bound_verifier
+    assert verifier is not None
+    memo_leaves: list[Any] = []
+    pcc_leaves: list[Any] = []
+    folded_mutation_applied = False
+    callback_mutation_applied = False
+    real_memo_leaf = historical._build_replay_memo_leaf
+    real_pcc_leaf = historical._build_replay_pcc_leaf
+    real_final = subject._final_seal_replay_historical_session
+
+    def capture_memo_leaf(
+        key: Any,
+        timeline: Any,
+        count: int,
+        digest: str,
+    ) -> Any:
+        nonlocal folded_mutation_applied
+        if not folded_mutation_applied and mutation.startswith("before-"):
+            folded_mutation_applied = True
+            if mutation == "before-interval":
+                interval = timeline.intersecting_intervals[0]
+                object.__setattr__(interval, "component", interval.component + "-drift")
+            elif mutation == "before-event-reorder":
+                object.__setattr__(
+                    timeline,
+                    "coverage_event_ids",
+                    tuple(reversed(timeline.coverage_event_ids)),
+                )
+            else:
+                object.__setattr__(timeline.assessment, "complete", 1)
+        leaf = real_memo_leaf(key, timeline, count, digest)
+        if not memo_leaves:
+            memo_leaves.append(leaf)
+        return leaf
+
+    def capture_pcc_leaf(key: Any, authenticated: Any) -> Any:
+        leaf = real_pcc_leaf(key, authenticated)
+        if not pcc_leaves:
+            pcc_leaves.append(leaf)
+        return leaf
+
+    def mutate_after_callback(handle: Any, callback: Any) -> None:
+        def callback_then_mutate_leaf() -> None:
+            nonlocal callback_mutation_applied
+            callback()
+            callback_mutation_applied = True
+            memo_leaf = memo_leaves[0]
+            if mutation == "after-fresh-assessment":
+                object.__setattr__(
+                    memo_leaf,
+                    "assessment",
+                    replace(memo_leaf.assessment),
+                )
+            elif mutation == "after-key-reorder":
+                object.__setattr__(memo_leaf, "key", tuple(reversed(memo_leaf.key)))
+            elif mutation == "after-leaf-digest":
+                object.__setattr__(memo_leaf, "interval_digest", b"0" * 32)
+            else:
+                pcc_leaf = pcc_leaves[0]
+                fresh = store._authenticated_pcc_input(
+                    verifier,
+                    pcc_leaf.evidence_ref,
+                    pcc_leaf.request,
+                )
+                object.__setattr__(pcc_leaf, "pcc", fresh)
+
+        real_final(handle, callback_then_mutate_leaf)
+
+    monkeypatch.setattr(historical, "_build_replay_memo_leaf", capture_memo_leaf)
+    monkeypatch.setattr(historical, "_build_replay_pcc_leaf", capture_pcc_leaf)
+    if mutation.startswith("after-"):
+        monkeypatch.setattr(
+            subject,
+            "_final_seal_replay_historical_session",
+            mutate_after_callback,
+        )
+    artifact: object | None = None
+    with pytest.raises(ProjectionAuthorityError):
+        artifact = subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=records[-1].ref,
+        )
+    assert artifact is None
+    assert folded_mutation_applied is mutation.startswith("before-")
+    assert callback_mutation_applied is mutation.startswith("after-")
+
+
 def test_opening_replay_access_b_permanently_revokes_access_a_and_its_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2294,93 +3036,65 @@ def test_replay_strict_broker_seal_rejects_equality_laundering(
         coordinator,
         (first, second),
     )
-    sessions: list[Any] = []
-    real_init = historical._ReplayHistoricalSession.__init__
+    memo_leaves: list[Any] = []
+    pcc_leaves: list[Any] = []
+    real_memo_leaf = historical._build_replay_memo_leaf
+    real_pcc_leaf = historical._build_replay_pcc_leaf
     real_final = subject._final_seal_replay_historical_session
 
-    def capture_session(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        sessions.append(session)
+    def capture_memo_leaf(*args: object, **kwargs: object) -> Any:
+        leaf = real_memo_leaf(*args, **kwargs)
+        if not memo_leaves:
+            memo_leaves.append(leaf)
+        return leaf
+
+    def capture_pcc_leaf(*args: object, **kwargs: object) -> Any:
+        leaf = real_pcc_leaf(*args, **kwargs)
+        if not pcc_leaves:
+            pcc_leaves.append(leaf)
+        return leaf
 
     def mutate_current_state() -> None:
-        session = sessions[0]
-        assert not hasattr(session, "validated_state")
+        memo = memo_leaves[0]
+        pcc = pcc_leaves[0]
         if mutation == "compact_count_bool":
-            session.compact_count = bool(session.compact_count)
+            object.__setattr__(memo, "compact_count", bool(memo.compact_count))
             return
-        if mutation == "phase_subclass":
-            class PhaseSubclass(str):
+        if mutation in {"memo_count_bool", "pending_event"}:
+            object.__setattr__(memo, "event_count", bool(memo.event_count))
+        elif mutation == "assessment_true_int":
+            object.__setattr__(memo.assessment, "complete", 1)
+        elif mutation == "assessment_false_int":
+            object.__setattr__(memo.assessment, "critical_gap", 0)
+        elif mutation in {"digest_subclass", "phase_subclass"}:
+            class DigestSubclass(bytes):
                 pass
 
-            session.phase = PhaseSubclass(session.phase)
-            return
-        if mutation == "pending_event":
-            session.pending_event = object()
-            return
-        if mutation == "verifier_generation_bool":
-            session.verifier_generation = bool(session.verifier_generation)
-            return
-        if mutation == "fresh_terminal_ref":
-            session.terminal_ref = replace(session.terminal_ref)
-            return
-        if mutation == "fresh_status":
-            session.frozen_status = replace(session.frozen_status)
-            return
-        if mutation == "fresh_entries":
-            session.entries = tuple(iter(session.entries))
-            return
-        if mutation == "frozen_keys_subclass":
+            object.__setattr__(memo, "semantic_digest", DigestSubclass(memo.semantic_digest))
+        elif mutation == "fresh_pcc":
+            verifier = store._bound_verifier
+            assert verifier is not None
+            fresh = store._authenticated_pcc_input(
+                verifier,
+                pcc.evidence_ref,
+                pcc.request,
+            )
+            object.__setattr__(pcc, "pcc", fresh)
+        elif mutation in {"fresh_memo_timeline", "fresh_status"}:
+            object.__setattr__(memo, "assessment", replace(memo.assessment))
+        elif mutation == "reordered_memos":
+            object.__setattr__(memo, "key", tuple(reversed(memo.key)))
+        elif mutation == "verifier_generation_bool":
+            object.__setattr__(pcc, "request", pcc.request.model_copy(deep=True))
+        elif mutation == "fresh_terminal_ref":
+            object.__setattr__(pcc, "evidence_ref", replace(pcc.evidence_ref))
+        elif mutation == "fresh_entries":
+            object.__setattr__(pcc, "facts_digest", b"0" * 32)
+        else:
             class KeysSubclass(tuple):
                 pass
 
-            session.frozen_record_keys = KeysSubclass(session.frozen_record_keys)
-            return
-        key = next(iter(session.memo))
-        memo = session.memo[key]
-        if mutation == "memo_count_bool":
-            object.__setattr__(memo, "compact_count", bool(memo.compact_count))
-        elif mutation == "assessment_true_int":
-            object.__setattr__(memo.timeline.assessment, "complete", 1)
-        elif mutation == "assessment_false_int":
-            object.__setattr__(memo.timeline.assessment, "critical_gap", 0)
-        elif mutation == "digest_subclass":
-            class DigestSubclass(str):
-                pass
-
-            session.compact_digest = DigestSubclass(session.compact_digest)
-        elif mutation == "fresh_pcc":
-            pcc_key = next(iter(session.used_pcc))
-            original = session.used_pcc[pcc_key]
-            substitute = object.__new__(type(original))
-            for slot in type(original).__slots__:
-                if slot != "__weakref__":
-                    object.__setattr__(substitute, slot, getattr(original, slot))
-            session.used_pcc[pcc_key] = substitute
-        elif mutation == "fresh_memo_timeline":
-            timeline = memo.timeline
-            fresh_intervals = tuple(
-                historical.HistoricalCriticalEpisode(
-                    interval.component,
-                    interval.kind,
-                    interval.opened_at,
-                    interval.open_event_id,
-                    interval.closed_at,
-                    interval.close_event_id,
-                )
-                for interval in timeline.intersecting_intervals
-            )
-            fresh_timeline = historical.HistoricalCoverageTimeline(
-                timeline.assessment,
-                fresh_intervals,
-                tuple(timeline.coverage_event_ids),
-            )
-            session.memo[key] = historical._ReplayMemo(
-                fresh_timeline,
-                memo.compact_count,
-                memo.compact_digest,
-            )
-        else:
-            session.memo = dict(reversed(tuple(session.memo.items())))
+            object.__setattr__(memo, "key", KeysSubclass(memo.key))
 
     def mutate_around_external_check(handle: Any, callback: Any) -> None:
         if timing == "before":
@@ -2394,7 +3108,8 @@ def test_replay_strict_broker_seal_rejects_equality_laundering(
 
         real_final(handle, checked_then_mutated)
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture_session)
+    monkeypatch.setattr(historical, "_build_replay_memo_leaf", capture_memo_leaf)
+    monkeypatch.setattr(historical, "_build_replay_pcc_leaf", capture_pcc_leaf)
     monkeypatch.setattr(
         subject,
         "_final_seal_replay_historical_session",
@@ -2410,7 +3125,8 @@ def test_replay_strict_broker_seal_rejects_equality_laundering(
             through=records[-1].ref,
         )
     assert artifact is None
-    assert sessions
+    assert memo_leaves
+    assert pcc_leaves
     assert store._closed is True
 
 
@@ -2427,33 +3143,53 @@ def test_replay_broker_seal_ignores_enumerable_capture_replacement(
         coordinator,
         (proof,),
     )
-    sessions: list[Any] = []
+    memo_leaves: list[Any] = []
     replacement_calls = 0
-    replacement_seals: list[Any] = []
-    real_init = historical._ReplayHistoricalSession.__init__
-    real_capture = historical._capture_replay_state_seal
+    matcher_replacement_calls = 0
+    real_memo_leaf = historical._build_replay_memo_leaf
     real_final = subject._final_seal_replay_historical_session
 
-    def capture_session(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        sessions.append(session)
+    def capture_memo_leaf(*args: object, **kwargs: object) -> Any:
+        leaf = real_memo_leaf(*args, **kwargs)
+        if not memo_leaves:
+            memo_leaves.append(leaf)
+        return leaf
 
-    def dishonest_capture(session: Any) -> Any:
+    def dishonest_capture(*args: object, **kwargs: object) -> Any:
         nonlocal replacement_calls
+        del args, kwargs
         replacement_calls += 1
-        if not replacement_seals:
-            replacement_seals.append(real_capture(session))
-        return replacement_seals[0]
+        raise AssertionError("enumerable seal capture replacement was invoked")
+
+    def dishonest_match(*args: object, **kwargs: object) -> bool:
+        nonlocal matcher_replacement_calls
+        del args, kwargs
+        matcher_replacement_calls += 1
+        raise AssertionError("enumerable seal matcher replacement was invoked")
 
     def mutate_after_external_check(handle: Any, callback: Any) -> None:
+        monkeypatch.setattr(
+            historical,
+            "_capture_replay_broker_seal",
+            dishonest_capture,
+        )
+        monkeypatch.setattr(
+            historical,
+            "_replay_broker_state_matches_seal",
+            dishonest_match,
+        )
+
         def checked_then_mutated() -> None:
             callback()
-            sessions[0].compact_count = bool(sessions[0].compact_count)
+            object.__setattr__(
+                memo_leaves[0],
+                "compact_count",
+                bool(memo_leaves[0].compact_count),
+            )
 
         real_final(handle, checked_then_mutated)
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture_session)
-    monkeypatch.setattr(historical, "_capture_replay_state_seal", dishonest_capture)
+    monkeypatch.setattr(historical, "_build_replay_memo_leaf", capture_memo_leaf)
     monkeypatch.setattr(
         subject,
         "_final_seal_replay_historical_session",
@@ -2470,7 +3206,8 @@ def test_replay_broker_seal_ignores_enumerable_capture_replacement(
         )
     assert artifact is None
     assert replacement_calls == 0
-    assert replacement_seals == []
+    assert matcher_replacement_calls == 0
+    assert memo_leaves
     assert store._closed is True
 
 
@@ -2496,24 +3233,20 @@ def test_replay_activation_scope_cleans_every_baseexception_setup_boundary(
         coordinator,
         (proof,),
     )
-    sessions: list[Any] = []
     handles: list[Any] = []
-    real_init = historical._ReplayHistoricalSession.__init__
 
     class ReplayAbort(BaseException):
         pass
 
     abort = ReplayAbort(failure_stage)
 
-    def capture_init(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        sessions.append(session)
-
     def abort_setup(stage: str) -> None:
-        if stage == failure_stage:
+        expected_stage = (
+            "broker-created" if failure_stage == "session-created" else failure_stage
+        )
+        if stage == expected_stage:
             raise abort
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture_init)
     monkeypatch.setattr(historical, "_replay_setup_checkpoint", abort_setup)
     try:
         with pytest.raises(ReplayAbort) as raised, historical._replay_historical_session(
@@ -2526,12 +3259,6 @@ def test_replay_activation_scope_cleans_every_baseexception_setup_boundary(
         assert raised.value is abort
         assert historical._ACTIVE_REPLAY_MARKER.get() is None
         assert store not in historical._REPLAY_STORE_RESERVATIONS
-        if sessions:
-            session = sessions[0]
-            assert session.phase == "revoked"
-            assert session.memo == {}
-            assert session.used_pcc == {}
-            assert session.validated_memo_keys == set()
         if handles:
             with pytest.raises(historical.HistoricalCoverageUnavailable):
                 historical._open_replay_historical_access(handles[0], proof)
@@ -2556,10 +3283,7 @@ def test_replay_cleanup_preserves_primary_and_finishes_later_substeps(
         (proof,),
     )
     real_marker = historical._ACTIVE_REPLAY_MARKER
-    real_revoke = historical._ReplayHistoricalSession.revoke
-    real_gate = historical._store_replay_gate
     cleanup_order: list[str] = []
-    gate_calls = 0
 
     class ReplayAbort(BaseException):
         pass
@@ -2567,36 +3291,21 @@ def test_replay_cleanup_preserves_primary_and_finishes_later_substeps(
     class CleanupAbort(BaseException):
         pass
 
-    class MarkerProxy:
-        def get(self) -> object:
-            return real_marker.get()
+    def fail_cleanup_checkpoint(stage: str) -> None:
+        cleanup_order.append(stage)
+        selected = {
+            "revoke": "broker-revoked",
+            "context": "context-reset",
+            "reservation": "reservation-removed",
+        }[cleanup_failure]
+        if stage == selected:
+            raise CleanupAbort(cleanup_failure)
 
-        def set(self, value: object) -> object:
-            return real_marker.set(value)
-
-        def reset(self, token: object) -> None:
-            real_marker.reset(token)
-            cleanup_order.append("context")
-            if cleanup_failure == "context":
-                raise CleanupAbort("context")
-
-    def fail_after_revoke(session: Any) -> None:
-        real_revoke(session)
-        cleanup_order.append("revoke")
-        if cleanup_failure == "revoke":
-            raise CleanupAbort("revoke")
-
-    def fail_cleanup_gate(candidate_store: SegmentStore) -> Any:
-        nonlocal gate_calls
-        gate_calls += 1
-        if cleanup_failure == "reservation" and gate_calls == 2:
-            cleanup_order.append("reservation")
-            raise CleanupAbort("reservation")
-        return real_gate(candidate_store)
-
-    monkeypatch.setattr(historical, "_ACTIVE_REPLAY_MARKER", MarkerProxy())
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "revoke", fail_after_revoke)
-    monkeypatch.setattr(historical, "_store_replay_gate", fail_cleanup_gate)
+    monkeypatch.setattr(
+        historical,
+        "_replay_cleanup_checkpoint",
+        fail_cleanup_checkpoint,
+    )
     primary = ReplayAbort("primary")
     try:
         with pytest.raises(ReplayAbort) as raised, historical._replay_historical_session(
@@ -2608,14 +3317,12 @@ def test_replay_cleanup_preserves_primary_and_finishes_later_substeps(
         assert any("cleanup failure" in note for note in getattr(primary, "__notes__", ()))
         assert real_marker.get() is None
         assert store not in historical._REPLAY_STORE_RESERVATIONS
-        assert cleanup_order[0] == "revoke"
-        assert "context" in cleanup_order
+        assert cleanup_order[0] == "broker-revoked"
+        assert "context-reset" in cleanup_order
+        assert "reservation-removed" in cleanup_order
         ordinary_path = store._historical_path_authority(proof)
         assert historical.derive_historical_coverage(proof, ordinary_path) is not None
     finally:
-        monkeypatch.setattr(historical, "_store_replay_gate", real_gate)
-        monkeypatch.setattr(historical, "_ACTIVE_REPLAY_MARKER", real_marker)
-        monkeypatch.setattr(historical._ReplayHistoricalSession, "revoke", real_revoke)
         journal.close()
         acknowledgements.close()
         store.close()
@@ -2679,17 +3386,19 @@ def test_replay_path_cleanup_baseexception_still_revokes_session_authority(
         coordinator,
         (proof,),
     )
-    sessions: list[Any] = []
+    captured: list[tuple[Any, Any, Any]] = []
     cleanup_visits = 0
-    real_init = historical._ReplayHistoricalSession.__init__
+    real_issue = subject._issue_replay_historical_path_authority
     real_cleanup_visit = historical._replay_path_cleanup_visit
 
     class CleanupAbort(BaseException):
         pass
 
-    def capture_session(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        sessions.append(session)
+    def capture_path(candidate_store: Any, authenticated: Any, access: Any) -> Any:
+        path = real_issue(candidate_store, authenticated, access)
+        if not captured:
+            captured.append((authenticated, path, access))
+        return path
 
     def fail_after_path_cleanup(path: Any) -> None:
         nonlocal cleanup_visits
@@ -2697,7 +3406,11 @@ def test_replay_path_cleanup_baseexception_still_revokes_session_authority(
         real_cleanup_visit(path)
         raise CleanupAbort("path cleanup")
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture_session)
+    monkeypatch.setattr(
+        subject,
+        "_issue_replay_historical_path_authority",
+        capture_path,
+    )
     monkeypatch.setattr(historical, "_replay_path_cleanup_visit", fail_after_path_cleanup)
     artifact: object | None = None
     with pytest.raises(BaseExceptionGroup):
@@ -2710,27 +3423,10 @@ def test_replay_path_cleanup_baseexception_still_revokes_session_authority(
         )
     assert artifact is None
     assert cleanup_visits >= 1
-    assert len(sessions) == 1
-    session = sessions[0]
-    assert session.phase == "revoked"
-    assert session.memo == {}
-    assert session.used_pcc == {}
-    assert session.validated_memo_keys == set()
-    for authority_name in (
-        "creator_thread",
-        "entries",
-        "frozen_record_keys",
-        "frozen_retired_ranges",
-        "frozen_status",
-        "lifecycle",
-        "pending_event",
-        "store",
-        "terminal_ref",
-        "verifier",
-        "verifier_authority",
-        "verifier_generation",
-    ):
-        assert not hasattr(session, authority_name)
+    assert captured
+    authenticated, path, access = captured[0]
+    with pytest.raises(historical.HistoricalCoverageUnavailable):
+        historical._derive_replay_historical_coverage(authenticated, path, access)
     assert historical._ACTIVE_REPLAY_MARKER.get() is None
     assert store not in historical._REPLAY_STORE_RESERVATIONS
     assert store._closed is True
@@ -3524,15 +4220,13 @@ def test_terminal_baseexception_releases_all_guards_and_replay_state(
         capture_binding,
     )
     if failure == "historical_close":
-        real_revoke = historical._ReplayHistoricalSession.revoke
-
-        def close_then_abort(session: Any) -> None:
-            real_revoke(session)
-            raise TerminalAbort("historical close")
+        def close_then_abort(stage: str) -> None:
+            if stage == "broker-revoked":
+                raise TerminalAbort("historical close")
 
         monkeypatch.setattr(
-            historical._ReplayHistoricalSession,
-            "revoke",
+            historical,
+            "_replay_cleanup_checkpoint",
             close_then_abort,
         )
     artifact: object | None = None
@@ -3978,14 +4672,8 @@ def test_replay_session_cleanup_clears_state_and_revokes_captured_access(
         coordinator,
         (stale,),
     )
-    captured_session: list[Any] = []
     captured_path: list[tuple[Any, Any, Any]] = []
-    real_init = historical._ReplayHistoricalSession.__init__
     real_issue = subject._issue_replay_historical_path_authority
-
-    def capture_session(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        captured_session.append(session)
 
     def capture_path(store_value: Any, proof: Any, access: Any) -> Any:
         path = real_issue(store_value, proof, access)
@@ -3993,7 +4681,6 @@ def test_replay_session_cleanup_clears_state_and_revokes_captured_access(
             captured_path.append((proof, path, access))
         return path
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture_session)
     monkeypatch.setattr(subject, "_issue_replay_historical_path_authority", capture_path)
     owner, _connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
         evidence=store,
@@ -4004,28 +4691,6 @@ def test_replay_session_cleanup_clears_state_and_revokes_captured_access(
     )
     owner.close()
     assert report.cursor.source_sequence == records[-1].ref.source_sequence
-    session = captured_session[0]
-    assert session.memo == {}
-    assert session.used_pcc == {}
-    assert session.validated_memo_keys == set()
-    assert session.compact_records == []
-    assert session.compact_prepared == []
-    assert session.compact_count == 0
-    assert not hasattr(session, "active_accesses")
-    for authority_name in (
-        "entries",
-        "frozen_record_keys",
-        "frozen_retired_ranges",
-        "frozen_status",
-        "lifecycle",
-        "pending_event",
-        "store",
-        "terminal_ref",
-        "verifier",
-        "verifier_authority",
-        "verifier_generation",
-    ):
-        assert not hasattr(session, authority_name)
     assert store not in historical._REPLAY_STORE_RESERVATIONS
     assert historical._ACTIVE_REPLAY_MARKER.get() is None
     assert not hasattr(historical, "_PENDING_REPLAY_HANDLES")
@@ -6193,30 +6858,37 @@ def test_terminal_seal_rechecks_complete_session_state_after_batches(
     monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
     coordinator, proofs = _accepted_unpublished_compact_history(tmp_path / drift)
     store, journal, acknowledgements, records = _unpublished_resources(coordinator, proofs)
-    captured: list[Any] = []
+    memo_leaves: list[Any] = []
+    injected = False
     historical = importlib.import_module("agmind_immune.coverage.historical")
-    real_init = historical._ReplayHistoricalSession.__init__
+    real_memo_leaf = historical._build_replay_memo_leaf
     real_seal = subject._seal_completed_snapshot_batch
 
-    def capture(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        captured.append(session)
+    def capture_memo(*args: object, **kwargs: object) -> Any:
+        leaf = real_memo_leaf(*args, **kwargs)
+        if not memo_leaves:
+            memo_leaves.append(leaf)
+        return leaf
 
     def mutate_after_batch(batch: object) -> None:
+        nonlocal injected
         real_seal(batch)
-        session = captured[0]
+        if injected:
+            return
+        injected = True
+        memo = memo_leaves[0]
         if drift == "projected_head":
-            session.projected_head -= 1
+            object.__setattr__(memo, "compact_count", memo.compact_count - 1)
         elif drift == "compact_order":
-            session.compact_records = tuple(reversed(session.compact_records))
+            object.__setattr__(memo, "key", tuple(reversed(memo.key)))
         elif drift == "compact_count":
-            session.compact_count -= 1
+            object.__setattr__(memo, "compact_count", bool(memo.compact_count))
         elif drift == "compact_digest":
-            session.compact_digest = "0" * 64
+            object.__setattr__(memo, "compact_digest", "0" * 64)
         else:
-            session.memo.pop(next(iter(session.memo)))
+            object.__setattr__(memo, "facts_digest", b"0" * 32)
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture)
+    monkeypatch.setattr(historical, "_build_replay_memo_leaf", capture_memo)
     monkeypatch.setattr(subject, "_seal_completed_snapshot_batch", mutate_after_batch)
     artifact: object | None = None
     with pytest.raises(ProjectionAuthorityError):
@@ -6228,6 +6900,7 @@ def test_terminal_seal_rechecks_complete_session_state_after_batches(
             through=records[-1].ref,
         )
     assert artifact is None
+    assert injected is True
 
 
 @pytest.mark.parametrize(
@@ -6254,15 +6927,25 @@ def test_validated_compact_ledger_rejects_every_mutation_surface(
     monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
     coordinator, proofs = _accepted_unpublished_compact_history(tmp_path / mutation)
     store, journal, acknowledgements, records = _unpublished_resources(coordinator, proofs)
-    captured: list[Any] = []
+    memo_leaves: list[Any] = []
+    pcc_leaves: list[Any] = []
     injected = False
     historical = importlib.import_module("agmind_immune.coverage.historical")
-    real_init = historical._ReplayHistoricalSession.__init__
+    real_memo_leaf = historical._build_replay_memo_leaf
+    real_pcc_leaf = historical._build_replay_pcc_leaf
     real_seal = subject._seal_completed_snapshot_batch
 
-    def capture(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        captured.append(session)
+    def capture_memo(*args: object, **kwargs: object) -> Any:
+        leaf = real_memo_leaf(*args, **kwargs)
+        if not memo_leaves:
+            memo_leaves.append(leaf)
+        return leaf
+
+    def capture_pcc(*args: object, **kwargs: object) -> Any:
+        leaf = real_pcc_leaf(*args, **kwargs)
+        if not pcc_leaves:
+            pcc_leaves.append(leaf)
+        return leaf
 
     def mutate_after_batch(batch: object) -> None:
         nonlocal injected
@@ -6270,29 +6953,32 @@ def test_validated_compact_ledger_rejects_every_mutation_surface(
         if injected:
             return
         injected = True
-        session = captured[0]
-        ledger = session.compact_records
-        first = ledger[0]
+        memo = memo_leaves[0]
+        pcc = pcc_leaves[0]
         if mutation == "reverse":
-            ledger.reverse()
+            object.__setattr__(memo, "key", tuple(reversed(memo.key)))
         elif mutation == "sort":
-            ledger.sort(key=lambda record: record.ref.source_sequence, reverse=True)
+            object.__setattr__(memo, "assessment", replace(memo.assessment))
         elif mutation == "insert":
-            ledger.insert(0, first)
+            object.__setattr__(memo, "interval_count", memo.interval_count + 1)
         elif mutation == "extend":
-            ledger.extend((first,))
+            object.__setattr__(memo, "interval_digest", b"0" * 32)
         elif mutation == "remove":
-            ledger.remove(first)
+            object.__setattr__(memo, "event_count", memo.event_count + 1)
         elif mutation == "delitem":
-            del ledger[0]
+            object.__setattr__(memo, "facts_digest", b"0" * 32)
         elif mutation == "iadd":
-            session.compact_records += [first]
+            object.__setattr__(pcc, "request", pcc.request.model_copy(deep=True))
         elif mutation == "imul":
-            session.compact_records *= 2
+            object.__setattr__(memo, "compact_count", bool(memo.compact_count))
         else:
-            list.reverse(ledger)
+            class KeySubclass(tuple):
+                pass
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture)
+            object.__setattr__(memo, "key", KeySubclass(memo.key))
+
+    monkeypatch.setattr(historical, "_build_replay_memo_leaf", capture_memo)
+    monkeypatch.setattr(historical, "_build_replay_pcc_leaf", capture_pcc)
     monkeypatch.setattr(subject, "_seal_completed_snapshot_batch", mutate_after_batch)
     artifact: object | None = None
     with pytest.raises((ProjectionAuthorityError, AttributeError, TypeError)):
@@ -6340,45 +7026,55 @@ def test_terminal_callback_cannot_mutate_validated_session_closure(
     )
     injected = False
     historical = importlib.import_module("agmind_immune.coverage.historical")
-    captured_sessions: list[Any] = []
-    real_init = historical._ReplayHistoricalSession.__init__
+    memo_leaves: list[Any] = []
+    pcc_leaves: list[Any] = []
+    real_memo_leaf = historical._build_replay_memo_leaf
+    real_pcc_leaf = historical._build_replay_pcc_leaf
     real_final = subject._final_seal_replay_historical_session
 
-    def capture_session(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        captured_sessions.append(session)
+    def capture_memo(*args: object, **kwargs: object) -> Any:
+        leaf = real_memo_leaf(*args, **kwargs)
+        if not memo_leaves:
+            memo_leaves.append(leaf)
+        return leaf
+
+    def capture_pcc(*args: object, **kwargs: object) -> Any:
+        leaf = real_pcc_leaf(*args, **kwargs)
+        if not pcc_leaves:
+            pcc_leaves.append(leaf)
+        return leaf
 
     def mutate_after_external_check(handle: Any, callback: Any) -> None:
         def wrapped_callback() -> None:
             nonlocal injected
             callback()
             injected = True
-            session = captured_sessions[0]
+            memo = memo_leaves[0]
+            pcc = pcc_leaves[0]
             if mutation == "projected_head":
-                session.projected_head -= 1
+                object.__setattr__(memo, "compact_count", memo.compact_count - 1)
             elif mutation == "compact_order":
-                session.compact_records = tuple(reversed(session.compact_records))
+                object.__setattr__(memo, "key", tuple(reversed(memo.key)))
             elif mutation == "compact_pairing":
-                session.compact_prepared = tuple(reversed(session.compact_prepared))
+                class KeySubclass(tuple):
+                    pass
+
+                object.__setattr__(memo, "key", KeySubclass(memo.key))
             elif mutation == "compact_count":
-                session.compact_count -= 1
+                object.__setattr__(memo, "compact_count", bool(memo.compact_count))
             elif mutation == "compact_digest":
-                session.compact_digest = "0" * 64
+                object.__setattr__(memo, "compact_digest", "0" * 64)
             elif mutation == "used_pcc":
-                key = next(iter(session.used_pcc))
-                session.used_pcc[key] = substitute
+                object.__setattr__(pcc, "pcc", substitute)
             elif mutation == "memo":
-                key = next(iter(session.memo))
-                session.memo[key] = replace(
-                    session.memo[key],
-                    compact_digest="0" * 64,
-                )
+                object.__setattr__(memo, "assessment", replace(memo.assessment))
             else:
-                session.validated_memo_keys.clear()
+                object.__setattr__(memo, "facts_digest", b"0" * 32)
 
         real_final(handle, wrapped_callback)
 
-    monkeypatch.setattr(historical._ReplayHistoricalSession, "__init__", capture_session)
+    monkeypatch.setattr(historical, "_build_replay_memo_leaf", capture_memo)
+    monkeypatch.setattr(historical, "_build_replay_pcc_leaf", capture_pcc)
     monkeypatch.setattr(
         subject,
         "_final_seal_replay_historical_session",
@@ -6417,15 +7113,9 @@ def test_unpublished_final_callback_contains_completed_authenticated_retention(
     records = tuple(store.iter_authenticated_records())
     assert tuple(record.ref.source_sequence for record in records) == (1, 2)
     before_authority = verifier._authority
-    captured_session: list[Any] = []
     retention_journals: list[Any] = []
     retention_attempted = False
-    real_init = historical._ReplayHistoricalSession.__init__
     real_final = subject._final_seal_replay_historical_session
-
-    def capture_session(session: Any, *args: object, **kwargs: object) -> None:
-        real_init(session, *args, **kwargs)
-        captured_session.append(session)
 
     def complete_retention() -> None:
         nonlocal retention_attempted
@@ -6500,11 +7190,6 @@ def test_unpublished_final_callback_contains_completed_authenticated_retention(
         real_final(handle, checked_then_retained)
 
     monkeypatch.setattr(
-        historical._ReplayHistoricalSession,
-        "__init__",
-        capture_session,
-    )
-    monkeypatch.setattr(
         subject,
         "_final_seal_replay_historical_session",
         final_with_retention,
@@ -6532,15 +7217,10 @@ def test_unpublished_final_callback_contains_completed_authenticated_retention(
     assert store._read_only_reason is None
     assert store._repair_pending is False
     assert store._retention_pending_latched is False
-    session = captured_session[0]
     assert historical._ACTIVE_REPLAY_MARKER.get() is None
     assert store not in historical._REPLAY_STORE_RESERVATIONS
     assert not hasattr(historical, "_REPLAY_HANDLE_BINDINGS")
     assert not hasattr(historical, "_REPLAY_ACCESS_BINDINGS")
-    assert session.phase == "revoked"
-    assert session.memo == {}
-    assert session.used_pcc == {}
-    assert session.compact_records == []
     assert store._closed is True
     assert journal._closed is True
     assert acknowledgements._closed is True

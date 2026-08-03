@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Never, Protocol, Self, SupportsIndex, cast, final
 
-from agmind_immune.canonicaljson import pcc_detector_bundle_sha256
+from agmind_immune.canonicaljson import canonical_json, pcc_detector_bundle_sha256
 from agmind_immune.contracts import MAX_UINT64
 from agmind_immune.correlation.pcc import (
     ActiveCandidateObservation,
@@ -368,6 +368,99 @@ class _ProjectionPredecessor:
         _exact_hex64(self.frame_sha256, "projection frame_sha256")
 
 
+_PROJECTION_PREDECESSOR_SEAL_DOMAIN = (
+    b"AGMIND_CORRELATION_PROJECTION_PREDECESSOR_SEAL_V1\0"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectionPredecessorSeal:
+    predecessor: _ProjectionPredecessor
+    generation: int
+    host_id: str | None
+    source_sequence: int
+    event_id: str | None
+    content_sha256: str | None
+    frame_sha256: str | None
+    canonical: bytes
+
+
+def _seal_projection_predecessor(
+    value: _ProjectionPredecessor,
+) -> _ProjectionPredecessorSeal:
+    if type(value) is not _ProjectionPredecessor:
+        raise TypeError("projection predecessor is not exact")
+    generation = value.generation
+    source_sequence = value.source_sequence
+    optional = (
+        value.host_id,
+        value.event_id,
+        value.content_sha256,
+        value.frame_sha256,
+    )
+    if (
+        type(generation) is not int
+        or not 0 <= generation <= MAX_UINT64
+        or type(source_sequence) is not int
+        or not 0 <= source_sequence <= MAX_UINT64
+    ):
+        raise ValueError("projection predecessor scalar facts are invalid")
+    if source_sequence == 0:
+        if any(item is not None for item in optional):
+            raise ValueError("empty projection predecessor has identity facts")
+    else:
+        _exact_uuid4(value.host_id, "projection host_id")
+        _exact_event_id(value.event_id, "projection event_id")
+        _exact_hex64(value.content_sha256, "projection content_sha256")
+        _exact_hex64(value.frame_sha256, "projection frame_sha256")
+    tagged_optional = tuple(
+        ("none",) if item is None else ("str", item)
+        for item in optional
+    )
+    canonical = _PROJECTION_PREDECESSOR_SEAL_DOMAIN + canonical_json(
+        (
+            ("generation", "int", str(generation)),
+            ("host_id", tagged_optional[0]),
+            ("source_sequence", "int", str(source_sequence)),
+            ("event_id", tagged_optional[1]),
+            ("content_sha256", tagged_optional[2]),
+            ("frame_sha256", tagged_optional[3]),
+        )
+    )
+    return _ProjectionPredecessorSeal(
+        predecessor=value,
+        generation=generation,
+        host_id=value.host_id,
+        source_sequence=source_sequence,
+        event_id=value.event_id,
+        content_sha256=value.content_sha256,
+        frame_sha256=value.frame_sha256,
+        canonical=canonical,
+    )
+
+
+def _projection_predecessor_seal_is_current(
+    expected: _ProjectionPredecessorSeal,
+    current: _ProjectionPredecessor,
+) -> bool:
+    if type(expected) is not _ProjectionPredecessorSeal or current is not expected.predecessor:
+        return False
+    try:
+        actual = _seal_projection_predecessor(current)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        actual.predecessor is expected.predecessor
+        and actual.generation is expected.generation
+        and actual.host_id is expected.host_id
+        and actual.source_sequence is expected.source_sequence
+        and actual.event_id is expected.event_id
+        and actual.content_sha256 is expected.content_sha256
+        and actual.frame_sha256 is expected.frame_sha256
+        and actual.canonical == expected.canonical
+    )
+
+
 def _clone_predecessor(
     value: _ProjectionPredecessor,
 ) -> _ProjectionPredecessor:
@@ -610,34 +703,11 @@ def _validate_correlation_projection_terminal_authority(
     authority: CorrelationProjectionAuthority,
     expected: _ProjectionPredecessor,
 ) -> None:
-    try:
-        expected_before = _clone_predecessor(expected)
-        binding = _authority_binding(authority)
-        with binding.lock:
-            _require_authority_locked(authority, binding)
-            revision = binding.revision
-            predecessor_before = _clone_predecessor(binding.predecessor)
-            registry_facts = _registry_facts(binding.registry)
-            detector_bundle_sha256 = _safe_detector_bundle_sha256()
-            predecessor_after = _clone_predecessor(binding.predecessor)
-            if (
-                _clone_predecessor(expected) != expected_before
-                or predecessor_before != expected_before
-                or predecessor_after != expected_before
-                or binding.revision is not revision
-                or not special_use_registry_is_issued(binding.registry)
-                or registry_facts != binding.registry_facts
-                or detector_bundle_sha256 != binding.detector_bundle_sha256
-            ):
-                raise CorrelationProjectionError(
-                    "correlation terminal predecessor or pins changed"
-                )
-    except CorrelationProjectionError:
-        raise
-    except Exception as error:
-        raise CorrelationProjectionError(
-            "correlation terminal authority validation failed"
-        ) from error
+    _evaluate_correlation_projection_terminal_authority(
+        authority,
+        expected,
+        lambda: None,
+    )
 
 
 def _evaluate_correlation_projection_terminal_authority[TerminalResult](
@@ -649,8 +719,10 @@ def _evaluate_correlation_projection_terminal_authority[TerminalResult](
         raise CorrelationProjectionError(
             "correlation terminal callback is not callable"
         )
+    seal_predecessor = _seal_projection_predecessor
+    seal_is_current = _projection_predecessor_seal_is_current
     try:
-        expected_before = _clone_predecessor(expected)
+        expected_seal = seal_predecessor(expected)
         binding = _authority_binding(authority)
     except CorrelationProjectionError:
         raise
@@ -663,19 +735,31 @@ def _evaluate_correlation_projection_terminal_authority[TerminalResult](
         registry = binding.registry
         registry_facts = binding.registry_facts
         detector_bundle_sha256 = binding.detector_bundle_sha256
+        bound_predecessor = binding.predecessor
+        try:
+            bound_seal = seal_predecessor(bound_predecessor)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise CorrelationProjectionError(
+                "correlation terminal predecessor facts are invalid"
+            ) from error
 
         def validate_locked() -> None:
             try:
                 _require_authority_locked(authority, binding)
-                predecessor_before = _clone_predecessor(binding.predecessor)
                 current_registry_facts = _registry_facts(binding.registry)
                 current_detector = _safe_detector_bundle_sha256()
-                predecessor_after = _clone_predecessor(binding.predecessor)
                 registry_facts_after = _registry_facts(binding.registry)
                 if (
-                    _clone_predecessor(expected) != expected_before
-                    or predecessor_before != expected_before
-                    or predecessor_after != expected_before
+                    not seal_is_current(
+                        expected_seal,
+                        expected,
+                    )
+                    or binding.predecessor is not bound_predecessor
+                    or not seal_is_current(
+                        bound_seal,
+                        binding.predecessor,
+                    )
+                    or bound_seal.canonical != expected_seal.canonical
                     or binding.revision is not revision
                     or binding.registry is not registry
                     or binding.registry_facts is not registry_facts

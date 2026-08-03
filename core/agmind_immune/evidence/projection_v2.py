@@ -71,7 +71,6 @@ from agmind_immune.coverage.historical import (
     _replay_historical_session,
     _ReplayAccess,
     _ReplayHandle,
-    _revalidate_replay_historical_source,
     _validate_replay_historical_event,
 )
 from agmind_immune.evidence.dedup import _logical_primary_identity_v2
@@ -2685,12 +2684,6 @@ class _V2ProjectionOwner:
                     raise ProjectionConflict(
                         "Projection V2 unpublished final prefix changed"
                     )
-                try:
-                    _revalidate_replay_historical_source(historical_handle)
-                except HistoricalCoverageUnavailable as error:
-                    raise ProjectionAuthorityError(
-                        "Projection V2 unpublished source changed after prefix seal"
-                    ) from error
                 final_ack = self._current_ack_boundary()
                 final_cursor = _current_v2_cursor(connection)
                 if (
