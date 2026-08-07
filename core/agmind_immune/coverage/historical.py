@@ -37,7 +37,6 @@ from agmind_immune.evidence.segments import (
     EvidenceStoreError,
     SegmentStore,
     StoredEvidenceRecord,
-    _exact_coverage_record_key,
 )
 from agmind_immune.ingest.envelope import (
     AuthenticatedPCCInput,

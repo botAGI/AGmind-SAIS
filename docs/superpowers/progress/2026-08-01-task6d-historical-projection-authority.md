@@ -228,3 +228,45 @@ resolutions for Task 6D. An entry is added only from observed command output.
   in 13.24s`; Ruff, mypy, and `git diff --check` passed on clean HEAD. Scoped
   re-review marked all four findings addressed and found no new Critical or
   Important breakage.
+
+### Task 7B Task 7 phase A — supported replay gates
+
+- Base: `2437c728ee343c4bce5bcb433fef0a94e9b956ea`. The obsolete
+  `test_historical_path.py` private-capability surface and private replay,
+  monkeypatch, copied-context, and callback-under-lock tests in
+  `test_projection_pcc.py` were retired. Their supported intent remains covered
+  by the Task 1-6 hostile serialized-input, wrong-store/stale snapshot, public
+  writer, cleanup, exact retry, conflict, and bounded-work nodes.
+- A single controller-owned 4,096/4,097 node now builds real accepted records,
+  completed correlation journal state, ACK state, correlation snapshots, and
+  authenticated PCC inputs. It patches no cap, connection, fsync, reducer,
+  descriptor, or production function. The node locks the mutation
+  `LIMIT cap + 1 -> LIMIT cap`: 4,096 must publish, while 4,097 must reject
+  without an artifact or cursor advance.
+- The written Step 3 command selected the whole replay-boundary file despite
+  also saying not to include the new boundary node. Its one execution therefore
+  attempted the prohibited heavy node before review: the 58 intended
+  non-boundary nodes passed, while the accepted 4,096 fixture failed during
+  PCC-seed freeze, before replay or cap evaluation, with
+  `ValueError: replay PCC detector pin changed` (`1 failed, 58 passed in
+  168.62s`). The 4,097 case was never constructed.
+- Root cause: `_complete_snapshot` supplied the test sentinel detector pin
+  `"1" * 64`, while controller authority issuance captured the repository
+  detector digest. The test-only fixture now computes the repository digest
+  once and feeds that same value into every signed PCC snapshot and controller
+  authority issuance. A count-one construction micro-check passed and proved
+  every frozen authenticated proof/context pin equals the captured correlation
+  authority pin. The 4,096/4,097 node and the 58-node group were not rerun.
+- Static gate: the exact mypy command passed all six selected production files.
+  The first exact Ruff command found seven stale test imports plus one
+  behavior-free production import, `_exact_coverage_record_key`, that `rg`,
+  `git show 2437c72:core/agmind_immune/coverage/historical.py`, and `git blame`
+  proved was already unused at base (introduced by `d81976a0`). Under the
+  controller-approved plan-gap resolution, Task 7 removed only those imports;
+  the exact Ruff rerun passed, and `git diff --check` passed. The earlier mypy
+  result remains authoritative because the only later production edit deleted
+  that unused import and the other deletions were test imports outside the
+  six-source mypy set.
+- Active `evidence/schema.sql`, `evidence/projection.py`, V1 behavior, and
+  public APIs remain unchanged. Two independent read-only reviews and the one
+  final authoritative boundary run remain pending. Task 8 must not start.

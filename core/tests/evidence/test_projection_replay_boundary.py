@@ -11,11 +11,12 @@ import signal
 import stat
 import time
 from collections.abc import Callable
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event, Thread
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from agmind_immune.canonicaljson import (
@@ -50,15 +51,16 @@ from agmind_immune.ingest.ack_journal import (
     AckJournalCorrupt,
 )
 from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
-from agmind_immune.ingest.envelope import EnvelopeVerifier
+from agmind_immune.ingest.envelope import AuthenticatedPCCInput, EnvelopeVerifier
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from tests.correlation.test_pcc import (
     _accepted_complete,
     _accepted_failed,
     _context,
 )
+from tests.correlation.test_pcc import _resign as _resign_pcc_envelope
 from tests.coverage.test_historical import _self_close_records
-from tests.coverage.test_state import T0, T1, _event, _stored
+from tests.coverage.test_state import T0, T1, _event, _generic_critical, _stored
 from tests.evidence.test_retention import (
     REQUEST_ID as RETENTION_REQUEST_ID,
 )
@@ -66,7 +68,16 @@ from tests.evidence.test_retention import (
     _live_store_with_active_routine,
     _proof_clock,
 )
-from tests.ingest.test_pcc_correlation_snapshot import _identity, _item
+from tests.ingest.test_pcc_correlation_snapshot import (
+    _accept,
+    _candidate_trigger,
+    _complete_snapshot,
+    _coordinator,
+    _identity,
+    _item,
+    _request,
+    _snapshot_envelope,
+)
 from tests.phase5b_helpers import (
     BOOT_A,
     HOST_ID,
@@ -169,6 +180,7 @@ def _build_registered_correlation_authority(
     store: SegmentStore,
     *,
     generation: int = 0,
+    detector_digest: str | None = None,
 ) -> tuple[Any, Any, Any]:
     authority_module, _pcc_module = _correlation_modules()
     registry = load_pinned_special_use_registry(_REGISTRY_PATH)
@@ -180,9 +192,10 @@ def _build_registered_correlation_authority(
         content_sha256=None,
         frame_sha256=None,
     )
-    detector_digest = pcc_detector_bundle_sha256(
-        Path("deploy/falco/rules.d/agmind-pcc.yaml").read_bytes()
-    )
+    if detector_digest is None:
+        detector_digest = pcc_detector_bundle_sha256(
+            Path("deploy/falco/rules.d/agmind-pcc.yaml").read_bytes()
+        )
     issued = authority_module._issue_correlation_projection_authority(
         store,
         registry,
@@ -458,6 +471,283 @@ def _drop_registered_correlation_authority(issued: object) -> None:
     authority_module._close_correlation_projection_authority(issued)
     with authority_module._ISSUED_AUTHORITIES_LOCK:
         authority_module._ISSUED_AUTHORITIES.pop(id(issued), None)
+
+
+@dataclass(frozen=True, slots=True)
+class _ControllerReplayReport:
+    pcc_count: int
+
+
+class _ControllerReplay:
+    def __init__(
+        self,
+        temporary_root: TemporaryDirectory[str],
+        snapshot: object,
+        resources: dict[str, object],
+        evidence_cursor: object,
+    ) -> None:
+        self._temporary_root = temporary_root
+        self._snapshot = snapshot
+        self._resources = resources
+        self._projection_artifact: bytes | None = None
+        self.projection_cursor: object | None = None
+        self.evidence_cursor = evidence_cursor
+
+    def run_public_replay(self) -> _ControllerReplayReport | None:
+        subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+        try:
+            try:
+                computation = subject._compute_replay(self._snapshot)
+            except subject.ProjectionConflict:
+                return None
+            connection, report = subject._validate_and_hydrate_replay(
+                self._snapshot,
+                computation,
+            )
+            try:
+                pcc_count = connection.execute(
+                    "SELECT count(*) FROM candidates"
+                ).fetchone()[0]
+                assert type(pcc_count) is int
+                assert pcc_count == len(computation.pcc_leaves)
+                self._projection_artifact = computation.database_image
+                self.projection_cursor = report.cursor
+                return _ControllerReplayReport(pcc_count=pcc_count)
+            finally:
+                connection.close()
+        finally:
+            _close_controller_replay_input(self._resources)
+            self._temporary_root.cleanup()
+
+    def has_partial_projection_artifact(self) -> bool:
+        return self._projection_artifact is not None
+
+
+def _complete_controller_journal(
+    journal: CorrelationRequestJournal,
+    proof: AuthenticatedPCCInput,
+) -> None:
+    store = journal._store
+    trigger_ref = store._bound_verifier.accepted_ref(
+        proof.snapshot.trigger.source_sequence
+    )
+    assert type(trigger_ref) is EvidenceRef
+    selected = journal.select(trigger_ref, canonical_json(proof.request))
+    snapshot_ref = cast(EvidenceRef, proof.evidence_ref)
+    journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+    journal.mark_completed(selected.request_sha256)
+
+
+def _append_controller_boundary_candidate(
+    coordinator: Any,
+    journal: CorrelationRequestJournal,
+    *,
+    detector_digest: str,
+    number: int,
+    trigger_sequence: int,
+) -> AuthenticatedPCCInput:
+    key = private_key(11)
+    trigger = _candidate_trigger(key, sequence=trigger_sequence)
+    fields = trigger["normalized_fields"]
+    assert isinstance(fields, dict)
+    raw_sha256 = hashlib.sha256(
+        f"controller-boundary-trigger-{number}".encode()
+    ).hexdigest()
+    fields["destination_ipv4"] = (
+        f"11.{number >> 16}.{number >> 8 & 255}.{number & 255}"
+    )
+    fields["raw_event_sha256"] = raw_sha256
+    fields["event_time"] = NOW
+    trigger["source_payload_hash"] = raw_sha256
+    trigger["event_time"] = NOW
+    trigger["ingest_time"] = NOW
+    _resign_pcc_envelope(trigger, key)
+    _accept(coordinator, trigger)
+    request = _request(trigger, ttl_seconds=120)
+    snapshot_fields = _complete_snapshot(trigger, request)
+    snapshot_fields["detector_bundle_sha256"] = detector_digest
+    snapshot_fields["coverage_through_sequence"] = trigger_sequence
+    snapshot_fields["decision_time"] = NOW
+    snapshot_fields["inventory_observed_at"] = NOW
+    snapshot = _snapshot_envelope(
+        key,
+        snapshot_fields,
+        sequence=trigger_sequence + 1,
+    )
+    snapshot["event_time"] = NOW
+    snapshot["ingest_time"] = NOW
+    _resign_pcc_envelope(snapshot, key)
+    proof = coordinator.accept_pcc_for_correlation(_item(snapshot), request)
+    _complete_controller_journal(journal, proof)
+    return proof
+
+
+def _capture_controller_replay_input(
+    coordinator: Any,
+    journal: CorrelationRequestJournal,
+    proofs: tuple[AuthenticatedPCCInput, ...],
+    *,
+    detector_digest: str,
+) -> tuple[object, dict[str, object]]:
+    subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+    authority_module, pcc_module = _correlation_modules()
+    store = coordinator.segment_store
+    records = tuple(store.iter_authenticated_records())
+    terminal = records[-1].ref
+    acknowledgements = AckJournal.create_new(store)
+    for record in records:
+        acknowledgements.record_pending(record.ref)
+        acknowledgements.record_confirmed(record.ref)
+    source_snapshot = None
+    ack_snapshot = None
+    issued = None
+    try:
+        with store._replay_source_snapshot_gate():
+            source_snapshot = store._capture_replay_source_locked(terminal)
+        with acknowledgements._replay_ack_snapshot_gate():
+            ack_snapshot = acknowledgements._capture_replay_ack_locked(
+                terminal.source_sequence
+            )
+        issued, binding, predecessor = _build_registered_correlation_authority(
+            store,
+            generation=1,
+            detector_digest=detector_digest,
+        )
+        with authority_module._correlation_projection_snapshot_gate(
+            issued
+        ) as held:
+            assert held is binding
+            correlation_snapshot = (
+                authority_module._capture_correlation_replay_locked(
+                    issued,
+                    held,
+                    predecessor,
+                )
+            )
+            pcc_inputs = tuple(
+                pcc_module._freeze_replay_pcc_seed(
+                    proof,
+                    detector_bundle_sha256=(
+                        correlation_snapshot.detector_bundle_sha256
+                    ),
+                    registry=binding.registry,
+                    registry_facts_canonical=(
+                        correlation_snapshot.registry_facts_canonical
+                    ),
+                )
+                for proof in proofs
+            )
+        snapshot = subject._ReplayInputSnapshot(
+            source=source_snapshot,
+            ack=ack_snapshot,
+            correlation=correlation_snapshot,
+            pcc_inputs=pcc_inputs,
+            schema_domain=(
+                b"AGMIND_PROJECTION_SCHEMA_V2\0"
+                + Path("core/agmind_immune/evidence/schema_v2.sql").read_bytes()
+            ),
+            base_projection_generation=1,
+            publish_generation=2,
+        )
+    except BaseException:
+        if source_snapshot is not None:
+            segments_module._close_replay_source_snapshot(source_snapshot)
+        if ack_snapshot is not None:
+            ack_journal_module._close_replay_ack_snapshot(ack_snapshot)
+        if issued is not None:
+            _drop_registered_correlation_authority(issued)
+        acknowledgements.close()
+        journal.close()
+        store.close()
+        raise
+    assert issued is not None
+    _drop_registered_correlation_authority(issued)
+    return snapshot, {
+        "store": store,
+        "journal": journal,
+        "acknowledgements": acknowledgements,
+        "source_snapshot": source_snapshot,
+        "ack_snapshot": ack_snapshot,
+    }
+
+
+def _close_controller_replay_input(resources: dict[str, object]) -> None:
+    segments_module._close_replay_source_snapshot(resources["source_snapshot"])
+    ack_journal_module._close_replay_ack_snapshot(resources["ack_snapshot"])
+    resources["journal"].close()
+    resources["acknowledgements"].close()
+    resources["store"].close()
+
+
+def build_controller_replay_with_authenticated_pcc_count(
+    count: int,
+) -> _ControllerReplay:
+    temporary_root = TemporaryDirectory(
+        prefix=f"agmind-controller-cap-{count}-"
+    )
+    coordinator = None
+    journal = None
+    try:
+        key = private_key(11)
+        detector_digest = pcc_detector_bundle_sha256(
+            Path("deploy/falco/rules.d/agmind-pcc.yaml").read_bytes()
+        )
+        coordinator = _coordinator(Path(temporary_root.name) / "evidence", key)
+        _accept(coordinator, boot_boundary(key))
+        journal = CorrelationRequestJournal.create_new(
+            coordinator.segment_store
+        )
+        proofs = tuple(
+            _append_controller_boundary_candidate(
+                coordinator,
+                journal,
+                detector_digest=detector_digest,
+                number=number,
+                trigger_sequence=2 + number * 2,
+            )
+            for number in range(count)
+        )
+        terminal = _accept(
+            coordinator,
+            _generic_critical(
+                key,
+                2 + count * 2,
+                component="falco-adapter",
+                kind="falco_heartbeat_gap",
+                opened_at=NOW,
+                closed_at=NOW,
+            ).envelope,
+        )
+        assert type(terminal) is EvidenceRef
+        snapshot, resources = _capture_controller_replay_input(
+            coordinator,
+            journal,
+            proofs,
+            detector_digest=detector_digest,
+        )
+        subject = importlib.import_module(
+            "agmind_immune.evidence.projection_v2"
+        )
+        evidence_cursor = subject.ProjectionCursor(
+            host_id=HOST_ID,
+            source_sequence=terminal.source_sequence,
+            event_id=terminal.event_id,
+            content_sha256=terminal.content_sha256,
+            frame_sha256=terminal.frame_sha256,
+        )
+        return _ControllerReplay(
+            temporary_root,
+            snapshot,
+            resources,
+            evidence_cursor,
+        )
+    except BaseException:
+        if journal is not None and not journal._closed:
+            journal.close()
+        if coordinator is not None and not coordinator.segment_store._closed:
+            coordinator.segment_store.close()
+        temporary_root.cleanup()
+        raise
 
 
 def _pcc_fixture(count: int) -> dict[str, object]:
@@ -1602,3 +1892,16 @@ def test_compute_is_deterministic_and_does_not_mutate_live_projection(
     finally:
         owner_connection.close()
         _close_complete_replay_input(resources)
+
+
+def test_controller_late_candidate_limit_4096_accepts_4097_fails_closed() -> None:
+    accepted = build_controller_replay_with_authenticated_pcc_count(4096)
+    accepted_report = accepted.run_public_replay()
+    assert accepted_report is not None
+    assert accepted_report.pcc_count == 4096
+    assert accepted.projection_cursor == accepted.evidence_cursor
+
+    rejected = build_controller_replay_with_authenticated_pcc_count(4097)
+    assert rejected.run_public_replay() is None
+    assert rejected.projection_cursor is None
+    assert rejected.has_partial_projection_artifact() is False
