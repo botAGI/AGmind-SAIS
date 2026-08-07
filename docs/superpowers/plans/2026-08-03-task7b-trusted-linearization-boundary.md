@@ -924,10 +924,12 @@ and commit `fix(core): drain replay fences after lock unwind`.
 ### Task 7: Retire false TCB tests and run the single boundary gate
 
 **Files:**
+- Modify: `core/agmind_immune/coverage/historical.py` (remove the inherited,
+  provably unused `_exact_coverage_record_key` import only)
 - Modify: `core/tests/evidence/test_projection_pcc.py`
 - Delete: `core/tests/evidence/test_historical_path.py`
 - Modify: `core/tests/evidence/test_projection_replay_boundary.py`
-- Modify: `docs/superpowers/progress/2026-07-27-proof-carrying-containment-progress.md`
+- Modify: `docs/superpowers/progress/2026-08-01-task6d-historical-projection-authority.md`
 
 **Interfaces:**
 - Consumes: completed Task 1-6 implementation and immutable replay diagnostics/status.
@@ -961,6 +963,7 @@ The fixture uses real authenticated records and production limits. It does not p
 TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
   .venv/bin/python -m pytest -q \
   core/tests/evidence/test_projection_replay_boundary.py \
+  --deselect=core/tests/evidence/test_projection_replay_boundary.py::test_controller_late_candidate_limit_4096_accepts_4097_fails_closed \
   core/tests/coverage/test_historical.py::test_historical_and_live_reducers_share_the_exact_classifier \
   core/tests/coverage/test_historical.py::test_historical_conflict_matrix \
   core/tests/evidence/test_projection_pcc.py::test_completed_safe_pcc_persists_candidate_and_primary_evidence \
@@ -972,13 +975,19 @@ TMPDIR=/Users/testbot/.codex/tmp-agmind-tests \
 
 Expected: all focused nodes pass with no warnings. Do not include the 4,096/4,097 node in this command.
 
+The explicit `--deselect` is load-bearing: whole-file collection otherwise
+includes the boundary node. Task 7 phase A exposed this plan contradiction by
+accidentally collecting the node once; that attempt failed during fixture
+construction before replay/cap computation and is diagnostic evidence only,
+not the single authoritative post-review boundary run.
+
 - [ ] **Step 4: Static final gate and commit test-surface cleanup**
 
 ```bash
 .venv/bin/ruff check core/agmind_immune core/tests/evidence/test_projection_replay_boundary.py core/tests/evidence/test_projection_pcc.py core/tests/coverage/test_historical.py
 .venv/bin/mypy core/agmind_immune/coverage/historical.py core/agmind_immune/evidence/segments.py core/agmind_immune/ingest/ack_journal.py core/agmind_immune/correlation/authority.py core/agmind_immune/correlation/pcc.py core/agmind_immune/evidence/projection_v2.py
 git diff --check
-git add core/tests/evidence/test_projection_pcc.py core/tests/evidence/test_historical_path.py core/tests/evidence/test_projection_replay_boundary.py docs/superpowers/progress/2026-07-27-proof-carrying-containment-progress.md
+git add core/agmind_immune/coverage/historical.py core/tests/evidence/test_projection_pcc.py core/tests/evidence/test_historical_path.py core/tests/evidence/test_projection_replay_boundary.py docs/superpowers/progress/2026-08-01-task6d-historical-projection-authority.md
 git commit -m "test(core): align replay gates with process trust boundary"
 ```
 
