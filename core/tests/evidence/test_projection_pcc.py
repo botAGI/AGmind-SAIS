@@ -1163,6 +1163,11 @@ def test_unpublished_replay_requires_exact_retention_completion(
         fault_tombstone,
         _factory=segments_module._RETENTION_PROOF_FACTORY,
     )
+    fault_surviving = tuple(
+        fault_store.iter_authenticated_records(
+            through=fault_target_ref.source_sequence
+        )
+    )
     try:
         with pytest.raises(KeyboardInterrupt):
             fault_owner._replay_unpublished_prefix(
@@ -1172,8 +1177,21 @@ def test_unpublished_replay_requires_exact_retention_completion(
                 _fault_phase=subject._ReplayFaultPhase.PRE_COMMIT,
             )
         fault_status = fault_owner._replay_status_for_test()
-        assert fault_status.phase is subject._ReplayPhase.PUBLISHED
+        assert fault_status.phase is subject._ReplayPhase.FAILED
+        assert fault_status.failure_phase is subject._ReplayPhase.VALIDATING
         assert fault_status.reservation_present is False
+        assert fault_owner._generation == 1
+        assert fault_owner._connection is fault_connection
+        assert fault_owner.status().cursor is None
+        assert fault_connection.execute(
+            "SELECT count(*) FROM events"
+        ).fetchone()[0] == 0
+        assert fault_connection.execute(
+            "SELECT count(*) FROM incidents"
+        ).fetchone()[0] == 0
+        assert fault_connection.execute(
+            "SELECT count(*) FROM candidates"
+        ).fetchone()[0] == 0
         assert fault_store._authenticated_retention_replay_scope is None
         assert fault_store._authenticated_retention_replay_consumed is None
         fresh_after_precommit = (
@@ -1185,6 +1203,32 @@ def test_unpublished_replay_requires_exact_retention_completion(
         fault_store._release_authenticated_retention_replay_scope(
             fresh_after_precommit
         )
+        fault_report = fault_owner._replay_unpublished_prefix(
+            fault_target_ref,
+            retention_completion=fault_completion,
+            _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+        )
+        assert fault_report.cursor is not None
+        assert (
+            fault_report.cursor.source_sequence
+            == fault_target_ref.source_sequence
+        )
+        assert fault_report.applied_count == len(fault_surviving)
+        assert fault_owner._generation == 2
+        retried_status = fault_owner._replay_status_for_test()
+        assert retried_status.phase is subject._ReplayPhase.PUBLISHED
+        assert retried_status.reservation_present is False
+        assert fault_store._authenticated_retention_replay_consumed is not None
+        with pytest.raises(EvidenceSealError):
+            fault_store._capture_authenticated_retention_replay_scope(
+                fault_completion,
+                fault_target_ref,
+            )
+        fault_store._finalize_authenticated_retention_completion(
+            fault_completion,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        assert fault_store._authenticated_retention_replay_consumed is None
     finally:
         fault_coverage.close()
         fault_owner.close()

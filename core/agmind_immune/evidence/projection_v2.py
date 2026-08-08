@@ -4177,6 +4177,15 @@ class _V2ProjectionOwner:
                             retention_scope,
                             exact_retention_gate,
                         )
+                    published_status = _ReplayStatus(
+                        generation=base_generation + 1,
+                        phase=_ReplayPhase.PUBLISHED,
+                        reservation_present=False,
+                    )
+                    if _fault_phase is _ReplayFaultPhase.PRE_COMMIT:
+                        raise KeyboardInterrupt(
+                            "injected replay pre-commit failure"
+                        )
 
                     owned_ack_snapshot = ack_snapshot
                     ack_snapshot = None
@@ -4189,27 +4198,24 @@ class _V2ProjectionOwner:
                         authority,
                         computation.terminal_predecessor,
                     )
-                    self._connection = hydrated_connection
-                    hydrated_connection = None
-                    self._generation = base_generation + 1
                     with self._replay_state_lock:
-                        self._replay_reservation = None
-                        self._set_replay_status_locked(
-                            _ReplayStatus(
-                                generation=base_generation + 1,
-                                phase=_ReplayPhase.PUBLISHED,
-                                reservation_present=False,
+                        if self._replay_reservation is not reservation:
+                            raise ProjectionAuthorityError(
+                                "Projection V2 replay reservation changed "
+                                "before commit"
                             )
-                        )
+                        # Keep the final edge non-raising and publish status last:
+                        # PUBLISHED must imply exact retention consumption.
+                        if retention_consumption is not None:
+                            self._evidence._commit_prevalidated_retention_replay_consumption_locked(
+                                retention_consumption
+                            )
+                        self._connection = hydrated_connection
+                        hydrated_connection = None
+                        self._generation = base_generation + 1
+                        self._replay_reservation = None
+                        self._replay_status = published_status
                     published = True
-                    if _fault_phase is _ReplayFaultPhase.PRE_COMMIT:
-                        raise KeyboardInterrupt(
-                            "injected replay pre-commit failure"
-                        )
-                    if retention_consumption is not None:
-                        self._evidence._commit_prevalidated_retention_replay_consumption_locked(
-                            retention_consumption
-                        )
                     return report
         except (
             AckJournalError,
