@@ -270,3 +270,50 @@ resolutions for Task 6D. An entry is added only from observed command output.
 - Active `evidence/schema.sql`, `evidence/projection.py`, V1 behavior, and
   public APIs remain unchanged. Two independent read-only reviews and the one
   final authoritative boundary run remain pending. Task 8 must not start.
+
+### Task 7B Task 7 completion — real owner and native cap boundary
+
+- Review fix `ea1d7fd9afa7005e4d02de4d6b8c51143c80f1ce`
+  (`test(core): bind cap gate to projection owner`) replaced the manual
+  compute/hydrate fixture path with the real dormant
+  `_V2ProjectionOwner._replay_unpublished_prefix` transaction. The fixture
+  observes the owner's persisted SQLite cursor and projection tables, consumes
+  ownership once, rejects repeat execution, and drains cleanup on every
+  `BaseException`. A protected count-one smoke passed in `linux/arm64` with
+  Python `3.12.13` and SQLite `3.46.1`.
+- Review fix `b050450c32823bcf188443103007dc64fdae7983`
+  (`test(core): close controller fixture transfer gaps`) closed the two final
+  pre-factory and post-consumption cleanup windows. Both independent scoped
+  re-reviews marked every Important finding addressed and found no new
+  Critical or Important breakage.
+- Native runtime fix `90bccfa55d21b58470b00a65ef760c7cf6a431ca`
+  (`fix(runtime): pin SQLite integrity semantics`) moved both Docker stages to
+  immutable `python:3.12.13-slim-trixie@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36`.
+  The old ARM64 SQLite `3.40.1` image reproduced the false-NULL
+  `WITHOUT ROWID` check RED; the single final-image gate passed as non-root
+  `sais`, network-none and read-only with SQLite `3.46.1`, exact detector pin,
+  and both `quick_check` and `integrity_check` equal to `[("ok",)]`. Runtime
+  review found no Critical, Important, or Minor issue. Final image ID:
+  `sha256:d3fa2357d39ca8d33f4eb28145604a343e3b2babdd86ebc3b70c6a7f3336141a`.
+- The genuine boundary ran exactly once after those reviews, in an ephemeral
+  pytest layer `sha256:018650370759070e909a962a17cb4f75283faf021340bfae4bef97306133b0f4`
+  over that final image, with `--platform linux/arm64`, `--network none`,
+  `--read-only`, `/tmp` tmpfs, user `sais`, and a read-only worktree mount:
+
+  ```text
+  core/tests/evidence/test_projection_replay_boundary.py::test_controller_late_candidate_limit_4096_accepts_4097_fails_closed
+  1 passed, 21 warnings in 660.11s (0:11:00)
+  ```
+
+  Its first independent case published the coherent 4,096-PCC owner state;
+  its second rejected 4,097 with no projection rows or cursor advance. The
+  warnings were collection-only consequences of the deliberately minimal
+  temporary pytest layer (no `pytest-asyncio`) and its read-only cache path;
+  the selected synchronous node passed. Per the one-run rule, it was not
+  repeated.
+- Active V1 stayed byte-identical through Task 7:
+  `schema.sql == schema_v1.sql == e27ea065b3659197aae7b58939695a5e79439faeb0b841dc600c6c822b1919f2`;
+  `projection.py == 34662ab089ae1817e3cc8c370492e097e687a8f9f1cadac2f83a75922b4a3888`.
+  The prior 58 intended non-boundary nodes remain `58 passed`; they were not
+  rerun. No Task 7 Critical/Important concern remains. Task 8 may start after
+  this completion record is committed on a clean worktree.
