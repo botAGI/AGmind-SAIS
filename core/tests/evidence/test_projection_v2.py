@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import os
 import sqlite3
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -87,6 +90,75 @@ def _schema_objects(connection: sqlite3.Connection) -> dict[str, str]:
             "SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name"
         )
     }
+
+
+def _projection_image_artifacts(path: Path) -> dict[str, tuple[tuple[int, ...], bytes]]:
+    artifacts: dict[str, tuple[tuple[int, ...], bytes]] = {}
+    for candidate in (
+        path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+        Path(f"{path}-journal"),
+    ):
+        try:
+            info = candidate.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        artifacts[candidate.name] = (
+            (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_nlink,
+                info.st_uid,
+                info.st_gid,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            ),
+            candidate.read_bytes(),
+        )
+    return artifacts
+
+
+def _create_projection_image(
+    active: Any,
+    subject: Any,
+    path: Path,
+    image: str,
+) -> None:
+    if image == "absent":
+        return
+    if image == "zero-length":
+        path.touch(mode=0o600)
+        path.chmod(0o600)
+        return
+    if image.startswith("v1"):
+        connection = active._connect(path)
+        try:
+            active._create_schema(connection)
+        finally:
+            connection.close()
+    else:
+        connection = subject._v2_connection_for_test(path)
+        connection.close()
+    path.chmod(0o600)
+    if image == "v1-altered-view":
+        connection = active._connect(path)
+        try:
+            connection.execute("CREATE VIEW altered_projection AS SELECT key FROM schema_meta")
+        finally:
+            connection.close()
+    elif image == "v2-altered-index":
+        connection = subject._v2_connection_for_test(path)
+        try:
+            connection.execute("DROP INDEX candidate_invalidations_candidate")
+            connection.execute(
+                "CREATE INDEX candidate_invalidations_candidate "
+                "ON candidate_invalidations(coverage_source_sequence)"
+            )
+        finally:
+            connection.close()
 
 
 def _persist_hostile_row(
@@ -411,6 +483,123 @@ def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
         assert dict(connection.execute("SELECT key,value FROM schema_meta")) == active._SCHEMA_META
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize(
+    ("image", "expected", "v1_verifications", "v2_verifications"),
+    (
+        ("absent", "new", 0, 0),
+        ("zero-length", "unknown", 0, 0),
+        ("v1", "v1", 1, 0),
+        ("v2", "v2", 0, 1),
+        ("v1-altered-view", "unknown", 1, 0),
+        ("v2-altered-index", "unknown", 0, 1),
+    ),
+)
+def test_projection_image_classifier_is_read_only_and_exact_for_new_v1_v2_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    image: str,
+    expected: str,
+    v1_verifications: int,
+    v2_verifications: int,
+) -> None:
+    """Catches mutating probes, loose V1/V2 selection, and V2-to-V1 fallback."""
+    active = importlib.import_module("agmind_immune.evidence.projection")
+    subject = _subject()
+    root = tmp_path / image
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    path = root / "projection.sqlite3"
+    _create_projection_image(active, subject, path, image)
+
+    schema_v1 = Path(active.__file__).with_name("schema_v1.sql")
+    assert active._SCHEMA_V1_PATH == schema_v1
+    assert active._SCHEMA_V1_SHA256 == (
+        "e27ea065b3659197aae7b58939695a5e79439faeb0b841dc600c6c822b1919f2"
+    )
+    assert hashlib.sha256(schema_v1.read_bytes()).hexdigest() == active._SCHEMA_V1_SHA256
+
+    calls = {"v1": 0, "v2": 0}
+    real_v1 = active._verify_v1_schema
+    real_v2 = subject._verify_v2_schema
+
+    def count_v1(*args: object, **kwargs: object) -> None:
+        calls["v1"] += 1
+        real_v1(*args, **kwargs)
+
+    def count_v2(*args: object, **kwargs: object) -> None:
+        calls["v2"] += 1
+        real_v2(*args, **kwargs)
+
+    monkeypatch.setattr(active, "_verify_v1_schema", count_v1)
+    monkeypatch.setattr(subject, "_verify_v2_schema", count_v2)
+
+    parent_fd = active._validate_parent(root)
+    lock_fd = active._open_stable_lock(
+        parent_fd,
+        f".{path.name}.projection.lock",
+    )
+    try:
+        existing = active._lstat_at(parent_fd, path.name)
+        main_binding = (
+            None
+            if existing is None
+            else active._bind_regular_at(
+                parent_fd,
+                path.name,
+                label="projection database",
+            )
+        )
+        before = _projection_image_artifacts(path)
+
+        classified = active._classify_projection_image_locked(
+            path,
+            parent_fd=parent_fd,
+            main_binding=main_binding,
+        )
+
+        assert classified is active._ProjectionImageKind(expected)
+        assert calls == {"v1": v1_verifications, "v2": v2_verifications}
+        assert _projection_image_artifacts(path) == before
+    finally:
+        os.close(lock_fd)
+        os.close(parent_fd)
+
+
+def test_projection_import_orders_do_not_form_a_cycle() -> None:
+    """Catches making Projection V2 an eager dependency of active Projection V1."""
+    root = Path(__file__).parents[3]
+    environment = dict(os.environ)
+    python_path = str(root / "core")
+    if environment.get("PYTHONPATH"):
+        python_path = f"{python_path}{os.pathsep}{environment['PYTHONPATH']}"
+    environment["PYTHONPATH"] = python_path
+    projection_first = (
+        "import importlib, sys\n"
+        "p = importlib.import_module('agmind_immune.evidence.projection')\n"
+        "assert 'agmind_immune.evidence.projection_v2' not in sys.modules\n"
+        "v2 = importlib.import_module('agmind_immune.evidence.projection_v2')\n"
+        "assert callable(p._classify_projection_image_locked)\n"
+        "assert v2._V2ProjectionOwner.__name__ == '_V2ProjectionOwner'\n"
+    )
+    v2_first = (
+        "import importlib\n"
+        "v2 = importlib.import_module('agmind_immune.evidence.projection_v2')\n"
+        "p = importlib.import_module('agmind_immune.evidence.projection')\n"
+        "assert callable(p._classify_projection_image_locked)\n"
+        "assert v2._V2ProjectionOwner.__name__ == '_V2ProjectionOwner'\n"
+    )
+    for script in (projection_first, v2_first):
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=root,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize("corruption", ["removed_fk", "missing", "unreadable", "non_utf8"])

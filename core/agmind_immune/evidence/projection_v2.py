@@ -806,16 +806,25 @@ def _configure_v2_connection(connection: sqlite3.Connection, *, file_backed: boo
         raise ProjectionConflict("Projection V2 did not enter its safe journal mode")
 
 
-def _verify_v2_pragmas(connection: sqlite3.Connection) -> None:
+def _verify_v2_pragmas(
+    connection: sqlite3.Connection,
+    *,
+    immutable_read_only: bool = False,
+) -> None:
     database_path = str(connection.execute("PRAGMA database_list").fetchone()[2])
     expected: tuple[tuple[str, object], ...] = (
-        ("journal_mode", "wal" if database_path else "memory"),
+        (
+            "journal_mode",
+            "delete" if immutable_read_only else ("wal" if database_path else "memory"),
+        ),
         ("synchronous", 2),
         ("foreign_keys", 1),
         ("trusted_schema", 0),
         ("busy_timeout", 5000),
         ("ignore_check_constraints", 0),
     )
+    if immutable_read_only:
+        expected += (("query_only", 1),)
     for pragma, wanted in expected:
         actual = connection.execute(f"PRAGMA {pragma}").fetchone()[0]
         if isinstance(wanted, str):
@@ -843,21 +852,27 @@ def _schema_rows(connection: sqlite3.Connection) -> list[tuple[object, ...]]:
         tuple(row)
         for row in connection.execute(
             "SELECT type,name,tbl_name,sql FROM sqlite_schema "
-            "WHERE sql IS NOT NULL ORDER BY type,name"
+            "WHERE sql IS NOT NULL "
+            "ORDER BY type COLLATE BINARY,name COLLATE BINARY"
         )
     ]
 
 
-def _verify_v2_schema(connection: sqlite3.Connection) -> None:
+def _verify_v2_schema(
+    connection: sqlite3.Connection,
+    *,
+    immutable_read_only: bool = False,
+) -> None:
     try:
-        actual_tables = {
+        actual_tables = tuple(
             str(row[0])
             for row in connection.execute(
                 "SELECT name FROM sqlite_schema "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name COLLATE BINARY"
             )
-        }
-        if actual_tables != _TABLE_NAMES_V2:
+        )
+        if actual_tables != tuple(sorted(_TABLE_NAMES_V2)):
             raise ProjectionConflict("Projection V2 table set is not exact")
         expected = sqlite3.connect(":memory:", isolation_level=None)
         try:
@@ -868,15 +883,23 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
             expected.close()
         if _schema_rows(connection) != expected_schema:
             raise ProjectionConflict("Projection V2 schema definition is not exact")
-        metadata = dict(connection.execute("SELECT key,value FROM schema_meta ORDER BY key"))
-        if metadata != _SCHEMA_META_V2:
+        metadata = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT key,value FROM schema_meta ORDER BY key COLLATE BINARY"
+            )
+        )
+        if metadata != tuple(sorted(_SCHEMA_META_V2.items())):
             raise ProjectionConflict("Projection V2 metadata is not exact")
         integrity = connection.execute("PRAGMA integrity_check").fetchall()
         if [str(row[0]) for row in integrity] != ["ok"]:
             raise ProjectionConflict("Projection V2 integrity check failed")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise ProjectionConflict("Projection V2 foreign-key check failed")
-        _verify_v2_pragmas(connection)
+        _verify_v2_pragmas(
+            connection,
+            immutable_read_only=immutable_read_only,
+        )
     except ProjectionConflict:
         raise
     except (sqlite3.DatabaseError, TypeError, ValueError) as error:
@@ -2602,6 +2625,7 @@ class _V2ProjectionOwner:
     _replay_test_barrier: _ReplayTestBarrier | None
     _healthy: bool
     _closed: bool
+    _owns_authorities: bool
 
     def __init__(self) -> None:
         raise TypeError("use the module-private Projection V2 owner factory")
@@ -2617,6 +2641,49 @@ class _V2ProjectionOwner:
         registry: SpecialUseRegistry,
         step_hook: Callable[[str], None] | None,
     ) -> _V2ProjectionOwner:
+        return cls._open_owner(
+            connection,
+            evidence=evidence,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=registry,
+            step_hook=step_hook,
+            owns_authorities=True,
+        )
+
+    @classmethod
+    def _borrow_authorities(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        evidence: SegmentStore,
+        acknowledgements: AckJournal,
+        journal: CorrelationRequestJournal,
+        registry: SpecialUseRegistry,
+        step_hook: Callable[[str], None] | None,
+    ) -> _V2ProjectionOwner:
+        return cls._open_owner(
+            connection,
+            evidence=evidence,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=registry,
+            step_hook=step_hook,
+            owns_authorities=False,
+        )
+
+    @classmethod
+    def _open_owner(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        evidence: SegmentStore,
+        acknowledgements: AckJournal,
+        journal: CorrelationRequestJournal,
+        registry: SpecialUseRegistry,
+        step_hook: Callable[[str], None] | None,
+        owns_authorities: bool,
+    ) -> _V2ProjectionOwner:
         if (
             not isinstance(connection, sqlite3.Connection)
             or type(evidence) is not SegmentStore
@@ -2626,6 +2693,7 @@ class _V2ProjectionOwner:
             or getattr(acknowledgements, "_store", None) is not evidence
             or getattr(journal, "_store", None) is not evidence
             or (step_hook is not None and not callable(step_hook))
+            or type(owns_authorities) is not bool
         ):
             raise ProjectionAuthorityError(
                 "Projection V2 owner requires exact same-lifecycle resources"
@@ -2664,6 +2732,7 @@ class _V2ProjectionOwner:
         owner._replay_test_barrier = None
         owner._healthy = True
         owner._closed = False
+        owner._owns_authorities = owns_authorities
         try:
             if connection.in_transaction:
                 raise ProjectionConflict(
@@ -5199,30 +5268,36 @@ class _V2ProjectionOwner:
                 errors.append(error)
             else:
                 self._connection = None
-        if not getattr(self._journal, "_closed", True):
-            try:
-                self._journal.close()
-            except BaseException as error:  # noqa: BLE001 - close all owned resources
-                errors.append(error)
-        if not getattr(self._acknowledgements, "_closed", True):
-            try:
-                self._acknowledgements.close()
-            except BaseException as error:  # noqa: BLE001 - close all owned resources
-                errors.append(error)
-        if not getattr(self._evidence, "_closed", True):
-            try:
-                self._evidence.close()
-            except BaseException as error:  # noqa: BLE001 - close all owned resources
-                errors.append(error)
+        if self._owns_authorities:
+            if not getattr(self._journal, "_closed", True):
+                try:
+                    self._journal.close()
+                except BaseException as error:  # noqa: BLE001 - close all owned resources
+                    errors.append(error)
+            if not getattr(self._acknowledgements, "_closed", True):
+                try:
+                    self._acknowledgements.close()
+                except BaseException as error:  # noqa: BLE001 - close all owned resources
+                    errors.append(error)
+            if not getattr(self._evidence, "_closed", True):
+                try:
+                    self._evidence.close()
+                except BaseException as error:  # noqa: BLE001 - close all owned resources
+                    errors.append(error)
         return errors
 
     def _resources_released(self) -> bool:
         return (
             self._authority is None
             and self._connection is None
-            and getattr(self._journal, "_closed", False) is True
-            and getattr(self._acknowledgements, "_closed", False) is True
-            and getattr(self._evidence, "_closed", False) is True
+            and (
+                not self._owns_authorities
+                or (
+                    getattr(self._journal, "_closed", False) is True
+                    and getattr(self._acknowledgements, "_closed", False) is True
+                    and getattr(self._evidence, "_closed", False) is True
+                )
+            )
         )
 
     def _close_after_factory_failure(self, primary: BaseException) -> None:

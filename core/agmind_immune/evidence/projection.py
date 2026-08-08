@@ -20,6 +20,7 @@ import uuid
 from _thread import RLock as RLockType
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from threading import RLock
 
@@ -52,6 +53,8 @@ from agmind_immune.ingest.envelope import EnvelopeVerifier, KeyMetadataError
 _UINT64 = re.compile(r"^[0-9]{20}$")
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+_SCHEMA_V1_PATH = Path(__file__).with_name("schema_v1.sql")
+_SCHEMA_V1_SHA256 = "e27ea065b3659197aae7b58939695a5e79439faeb0b841dc600c6c822b1919f2"
 _SNAPSHOT_DOMAIN = b"AGMIND_PROJECTION_SNAPSHOT_V1\0"
 _SCHEMA_META = {
     "schema_version": "agmind.projection-schema.v1",
@@ -190,6 +193,7 @@ _TABLE_LAYOUT: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ),
 )
 _TABLE_NAMES = frozenset(item[0] for item in _TABLE_LAYOUT)
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _APPLY_STEPS = ("event", "dedup", "reducer", "cursor")
 _REBUILD_STEPS = (
     "temp_create",
@@ -227,6 +231,13 @@ class ProjectionUnhealthy(ProjectionError):
 
 class ProjectionBusy(ProjectionError):
     """Another process owns the stable projection lock."""
+
+
+class _ProjectionImageKind(StrEnum):
+    NEW = "new"
+    V1 = "v1"
+    V2 = "v2"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -438,14 +449,20 @@ def _connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _verify_pragmas(connection: sqlite3.Connection) -> None:
+def _verify_pragmas(
+    connection: sqlite3.Connection,
+    *,
+    immutable_read_only: bool = False,
+) -> None:
     expected: tuple[tuple[str, object], ...] = (
-        ("journal_mode", "wal"),
+        ("journal_mode", "delete" if immutable_read_only else "wal"),
         ("synchronous", 2),
         ("foreign_keys", 1),
         ("trusted_schema", 0),
         ("busy_timeout", 5000),
     )
+    if immutable_read_only:
+        expected += (("query_only", 1),)
     for pragma, wanted in expected:
         actual = connection.execute(f"PRAGMA {pragma}").fetchone()[0]
         if isinstance(wanted, str):
@@ -458,43 +475,212 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
-def _verify_schema(connection: sqlite3.Connection) -> None:
-    actual_tables = {
+def _create_v1_schema(connection: sqlite3.Connection) -> None:
+    try:
+        raw = _SCHEMA_V1_PATH.read_bytes()
+    except OSError as error:
+        raise ProjectionConflict("trusted Projection V1 schema is unavailable") from error
+    if hashlib.sha256(raw).hexdigest() != _SCHEMA_V1_SHA256:
+        raise ProjectionConflict("trusted Projection V1 schema bytes changed")
+    try:
+        script = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ProjectionConflict("trusted Projection V1 schema is not UTF-8") from error
+    connection.executescript(script)
+
+
+def _ordered_schema_rows(connection: sqlite3.Connection) -> list[tuple[object, ...]]:
+    return [
+        tuple(row)
+        for row in connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+            "WHERE sql IS NOT NULL ORDER BY type COLLATE BINARY, name COLLATE BINARY"
+        )
+    ]
+
+
+def _verify_schema_with(
+    connection: sqlite3.Connection,
+    *,
+    create_expected: Callable[[sqlite3.Connection], None],
+    immutable_read_only: bool,
+) -> None:
+    actual_tables = tuple(
         str(row[0])
         for row in connection.execute(
-            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            "SELECT name FROM sqlite_schema "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name COLLATE BINARY"
         )
-    }
-    if actual_tables != _TABLE_NAMES:
+    )
+    if actual_tables != tuple(sorted(_TABLE_NAMES)):
         raise ProjectionConflict("projection schema table set is not exact")
     expected_connection = sqlite3.connect(":memory:", isolation_level=None)
     try:
         expected_connection.execute("PRAGMA foreign_keys=ON")
         expected_connection.execute("PRAGMA trusted_schema=OFF")
-        _create_schema(expected_connection)
-        expected_schema = expected_connection.execute(
-            "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-            "WHERE sql IS NOT NULL ORDER BY type, name"
-        ).fetchall()
+        create_expected(expected_connection)
+        expected_schema = _ordered_schema_rows(expected_connection)
     finally:
         expected_connection.close()
-    actual_schema = connection.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-        "WHERE sql IS NOT NULL ORDER BY type, name"
-    ).fetchall()
-    if [tuple(row) for row in actual_schema] != [
-        tuple(row) for row in expected_schema
-    ]:
+    if _ordered_schema_rows(connection) != expected_schema:
         raise ProjectionConflict("projection schema definition is not exact")
-    meta = dict(connection.execute("SELECT key, value FROM schema_meta ORDER BY key"))
-    if meta != _SCHEMA_META:
+    meta = tuple(
+        tuple(row)
+        for row in connection.execute(
+            "SELECT key, value FROM schema_meta ORDER BY key COLLATE BINARY"
+        )
+    )
+    if meta != tuple(sorted(_SCHEMA_META.items())):
         raise ProjectionConflict("projection schema metadata is not exact")
     integrity = connection.execute("PRAGMA integrity_check").fetchall()
     if [str(row[0]) for row in integrity] != ["ok"]:
         raise ProjectionConflict("projection integrity check failed")
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise ProjectionConflict("projection foreign-key check failed")
-    _verify_pragmas(connection)
+    _verify_pragmas(connection, immutable_read_only=immutable_read_only)
+
+
+def _verify_schema(connection: sqlite3.Connection) -> None:
+    _verify_schema_with(
+        connection,
+        create_expected=_create_schema,
+        immutable_read_only=False,
+    )
+
+
+def _verify_v1_schema(
+    connection: sqlite3.Connection,
+    *,
+    immutable_read_only: bool = False,
+) -> None:
+    _verify_schema_with(
+        connection,
+        create_expected=_create_v1_schema,
+        immutable_read_only=immutable_read_only,
+    )
+
+
+def _projection_image_markers(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[str, ...], tuple[tuple[object, object], ...]]:
+    tables = tuple(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_schema "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name COLLATE BINARY"
+        )
+    )
+    metadata = tuple(
+        tuple(row)
+        for row in connection.execute(
+            "SELECT key, value FROM schema_meta ORDER BY key COLLATE BINARY"
+        )
+    )
+    return tables, metadata
+
+
+def _open_projection_image_read_only(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        f"{path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA query_only=ON")
+        if connection.execute("PRAGMA query_only").fetchone()[0] != 1:
+            raise ProjectionConflict("projection classifier is not query-only")
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _projection_sidecar_exists(parent_fd: int, name: str) -> bool:
+    return any(
+        _lstat_at(parent_fd, f"{name}{suffix}") is not None
+        for suffix in _SQLITE_SIDECAR_SUFFIXES
+    )
+
+
+def _classify_projection_image_locked(
+    path: Path,
+    *,
+    parent_fd: int,
+    main_binding: _FileBinding | None,
+) -> _ProjectionImageKind:
+    """Classify one stable-lock-bound image without mutating it or its sidecars."""
+    current = _lstat_at(parent_fd, path.name)
+    if main_binding is None:
+        return (
+            _ProjectionImageKind.NEW
+            if current is None
+            else _ProjectionImageKind.UNKNOWN
+        )
+    _require_entry_binding(
+        parent_fd,
+        path.name,
+        main_binding,
+        label="projection database",
+    )
+    assert current is not None
+    if current.st_size == 0 or _projection_sidecar_exists(parent_fd, path.name):
+        return _ProjectionImageKind.UNKNOWN
+
+    selected = _ProjectionImageKind.UNKNOWN
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _open_projection_image_read_only(path)
+        tables, metadata = _projection_image_markers(connection)
+        v1_tables = tuple(sorted(_TABLE_NAMES))
+        v1_metadata = tuple(sorted(_SCHEMA_META.items()))
+        if tables == v1_tables and metadata == v1_metadata:
+            try:
+                _verify_v1_schema(connection, immutable_read_only=True)
+            except (ProjectionConflict, sqlite3.DatabaseError, TypeError, ValueError):
+                selected = _ProjectionImageKind.UNKNOWN
+            else:
+                selected = _ProjectionImageKind.V1
+        else:
+            from agmind_immune.evidence import projection_v2
+
+            v2_tables = tuple(sorted(projection_v2._TABLE_NAMES_V2))
+            v2_metadata = tuple(sorted(projection_v2._SCHEMA_META_V2.items()))
+            if tables == v2_tables and metadata == v2_metadata:
+                try:
+                    projection_v2._verify_v2_schema(
+                        connection,
+                        immutable_read_only=True,
+                    )
+                except (
+                    ProjectionConflict,
+                    sqlite3.DatabaseError,
+                    TypeError,
+                    ValueError,
+                ):
+                    selected = _ProjectionImageKind.UNKNOWN
+                else:
+                    selected = _ProjectionImageKind.V2
+    except (OSError, ProjectionConflict, sqlite3.DatabaseError, TypeError, ValueError):
+        selected = _ProjectionImageKind.UNKNOWN
+    finally:
+        if connection is not None:
+            connection.close()
+
+    _require_entry_binding(
+        parent_fd,
+        path.name,
+        main_binding,
+        label="projection database",
+    )
+    if _projection_sidecar_exists(parent_fd, path.name):
+        return _ProjectionImageKind.UNKNOWN
+    return selected
 
 
 def _cursor_from_row(row: sqlite3.Row | None) -> ProjectionCursor | None:

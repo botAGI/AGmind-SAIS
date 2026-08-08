@@ -2860,6 +2860,215 @@ def test_owner_factory_rejects_closed_journal_lifecycle(
             store.close()
 
 
+def test_borrowed_v2_owner_close_releases_only_projection_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches borrowed close poisoning caller authorities or leaking its owner slot."""
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator = _coordinator(tmp_path / "evidence", private_key(11))
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    acknowledgements = AckJournal.create_new(store)
+    registry = load_pinned_special_use_registry(_REGISTRY_PATH)
+    connection = subject._v2_connection_for_test()
+    owner: Any | None = None
+    replacement: Any | None = None
+    replacement_connection: sqlite3.Connection | None = None
+    saved_authority: Any | None = None
+    try:
+        owner = subject._V2ProjectionOwner._borrow_authorities(
+            connection,
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=registry,
+            step_hook=None,
+        )
+        saved_authority = owner._authority
+        assert saved_authority is not None
+
+        owner.close()
+        owner.close()
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+        with pytest.raises(authority.CorrelationProjectionError):
+            authority._validate_correlation_projection_predecessor(
+                saved_authority,
+                subject._predecessor_v2(1, None),
+            )
+        assert store.acceptance_cursor == 0
+        assert acknowledgements.snapshot().healthy is True
+        assert journal._is_bound_to(store) is True
+        assert store._closed is False
+        assert acknowledgements._closed is False
+        assert journal._closed is False
+
+        replacement_connection = subject._v2_connection_for_test()
+        replacement = subject._V2ProjectionOwner._borrow_authorities(
+            replacement_connection,
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=registry,
+            step_hook=None,
+        )
+        assert replacement.status().healthy is True
+    finally:
+        if replacement is not None:
+            replacement.close()
+        elif replacement_connection is not None:
+            try:
+                replacement_connection.close()
+            except sqlite3.ProgrammingError:
+                pass
+        if owner is not None:
+            owner.close()
+        else:
+            connection.close()
+        if not journal._closed:
+            journal.close()
+        if not acknowledgements._closed:
+            acknowledgements.close()
+        if not store._closed:
+            store.close()
+
+
+def test_borrowed_v2_owner_reopen_rejects_missing_pcc_facts_without_backfill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches implicit security-fact repair during a borrowed V2 reopen."""
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    projection_path = tmp_path / "projection.sqlite3"
+    coordinator, proof = _accepted_complete(
+        tmp_path / "evidence",
+        ttl_seconds=120,
+    )
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    _complete_journal(journal, proof)
+    acknowledgements = AckJournal.create_new(store)
+    records = tuple(store.iter_authenticated_records())
+    _confirm_ack(acknowledgements, *[record.ref for record in records])
+    registry = load_pinned_special_use_registry(_REGISTRY_PATH)
+    connection = subject._v2_connection_for_test(projection_path)
+    owner: Any | None = None
+    failed_connection: sqlite3.Connection | None = None
+    unexpected_owner: Any | None = None
+    fresh_connection: sqlite3.Connection | None = None
+    fresh_owner: Any | None = None
+    try:
+        owner = subject._V2ProjectionOwner._borrow_authorities(
+            connection,
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=registry,
+            step_hook=None,
+        )
+        for record in records:
+            owner.apply(record.ref)
+        assert connection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 1
+        owner.close()
+
+        tamper = sqlite3.connect(projection_path, isolation_level=None)
+        try:
+            tamper.execute("PRAGMA foreign_keys=ON")
+            tamper.execute("BEGIN IMMEDIATE")
+            tamper.execute("DELETE FROM candidate_evidence")
+            tamper.execute("DELETE FROM candidate_invalidations")
+            tamper.execute("DELETE FROM candidates")
+            tamper.execute("DELETE FROM incidents")
+            tamper.execute("COMMIT")
+        finally:
+            tamper.close()
+        missing_before = (0, 0, 0, 0)
+
+        failed_connection = subject._v2_connection_for_test(projection_path)
+        with pytest.raises(subject.ProjectionConflict):
+            unexpected_owner = subject._V2ProjectionOwner._borrow_authorities(
+                failed_connection,
+                evidence=store,
+                acknowledgements=acknowledgements,
+                journal=journal,
+                registry=registry,
+                step_hook=None,
+            )
+        with pytest.raises(sqlite3.ProgrammingError):
+            failed_connection.execute("SELECT 1")
+        assert store.acceptance_cursor == records[-1].ref.source_sequence
+        assert acknowledgements.snapshot().healthy is True
+        assert journal._is_bound_to(store) is True
+
+        observed = sqlite3.connect(
+            f"{projection_path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
+        try:
+            missing_after = tuple(
+                int(observed.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "incidents",
+                    "candidates",
+                    "candidate_evidence",
+                    "candidate_invalidations",
+                )
+            )
+        finally:
+            observed.close()
+        assert missing_after == missing_before
+
+        fresh_connection = subject._v2_connection_for_test()
+        fresh_owner = subject._V2ProjectionOwner._borrow_authorities(
+            fresh_connection,
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=registry,
+            step_hook=None,
+        )
+        assert fresh_owner.status().healthy is True
+    finally:
+        if fresh_owner is not None:
+            fresh_owner.close()
+        elif fresh_connection is not None:
+            try:
+                fresh_connection.close()
+            except sqlite3.ProgrammingError:
+                pass
+        if unexpected_owner is not None:
+            unexpected_owner.close()
+        elif failed_connection is not None:
+            try:
+                failed_connection.close()
+            except sqlite3.ProgrammingError:
+                pass
+        if owner is not None:
+            owner.close()
+        else:
+            connection.close()
+        if not journal._closed:
+            journal.close()
+        if not acknowledgements._closed:
+            acknowledgements.close()
+        if not store._closed:
+            store.close()
+
+
 def test_apply_rejects_equality_laundered_ref_before_source_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
