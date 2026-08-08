@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import signal
+import sqlite3
 import stat
 import time
 from collections.abc import Callable
@@ -16,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from agmind_immune.canonicaljson import (
@@ -51,7 +52,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournalCorrupt,
 )
 from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
-from agmind_immune.ingest.envelope import AuthenticatedPCCInput, EnvelopeVerifier
+from agmind_immune.ingest.envelope import EnvelopeVerifier
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from tests.correlation.test_pcc import (
     _accepted_complete,
@@ -180,7 +181,6 @@ def _build_registered_correlation_authority(
     store: SegmentStore,
     *,
     generation: int = 0,
-    detector_digest: str | None = None,
 ) -> tuple[Any, Any, Any]:
     authority_module, _pcc_module = _correlation_modules()
     registry = load_pinned_special_use_registry(_REGISTRY_PATH)
@@ -192,10 +192,9 @@ def _build_registered_correlation_authority(
         content_sha256=None,
         frame_sha256=None,
     )
-    if detector_digest is None:
-        detector_digest = pcc_detector_bundle_sha256(
-            Path("deploy/falco/rules.d/agmind-pcc.yaml").read_bytes()
-        )
+    detector_digest = pcc_detector_bundle_sha256(
+        Path("deploy/falco/rules.d/agmind-pcc.yaml").read_bytes()
+    )
     issued = authority_module._issue_correlation_projection_authority(
         store,
         registry,
@@ -476,66 +475,165 @@ def _drop_registered_correlation_authority(issued: object) -> None:
 @dataclass(frozen=True, slots=True)
 class _ControllerReplayReport:
     pcc_count: int
+    projection_row_count: int
+
+
+_CONTROLLER_PROJECTION_STATE_TABLES = (
+    "events",
+    "projection_dedup",
+    "coverage_intervals",
+    "containers",
+    "process_observations",
+    "network_observations",
+    "incidents",
+    "candidates",
+    "candidate_evidence",
+    "candidate_invalidations",
+    "ingest_cursors",
+)
+
+
+def _drain_controller_cleanup(
+    primary_error: BaseException | None,
+    steps: tuple[tuple[str, Callable[[], None]], ...],
+) -> None:
+    cleanup_errors: list[tuple[str, BaseException]] = []
+    for label, cleanup in steps:
+        try:
+            cleanup()
+        except BaseException as error:  # noqa: BLE001 - cleanup must drain
+            cleanup_errors.append((label, error))
+    if not cleanup_errors:
+        return
+    if primary_error is not None:
+        for label, error in cleanup_errors:
+            primary_error.add_note(
+                "secondary controller replay cleanup failure "
+                f"({label}): {type(error).__name__}: {error}"
+            )
+        return
+    raise BaseExceptionGroup(
+        "controller replay cleanup failed",
+        [error for _label, error in cleanup_errors],
+    )
+
+
+def _controller_projection_row_count(
+    connection: sqlite3.Connection,
+) -> int:
+    total = 0
+    for table in _CONTROLLER_PROJECTION_STATE_TABLES:
+        value = connection.execute(
+            f"SELECT count(*) FROM {table}"
+        ).fetchone()[0]
+        assert type(value) is int
+        total += value
+    return total
 
 
 class _ControllerReplay:
     def __init__(
         self,
         temporary_root: TemporaryDirectory[str],
-        snapshot: object,
-        resources: dict[str, object],
+        owner: Any,
+        connection: sqlite3.Connection,
+        through: EvidenceRef,
         evidence_cursor: object,
     ) -> None:
-        self._temporary_root = temporary_root
-        self._snapshot = snapshot
-        self._resources = resources
-        self._projection_artifact: bytes | None = None
-        self.projection_cursor: object | None = None
+        self._temporary_root: TemporaryDirectory[str] | None = temporary_root
+        self._owner: Any | None = owner
+        self._connection: sqlite3.Connection | None = connection
+        self._through: EvidenceRef | None = through
+        self._projection_state_observed = False
+        self._projection_cursor: object | None = None
+        self._projection_row_count: int | None = None
         self.evidence_cursor = evidence_cursor
 
     def run_public_replay(self) -> _ControllerReplayReport | None:
+        owner = self._owner
+        connection = self._connection
+        through = self._through
+        temporary_root = self._temporary_root
+        if (
+            owner is None
+            or connection is None
+            or through is None
+            or temporary_root is None
+        ):
+            raise RuntimeError("controller replay ownership already consumed")
+        self._owner = None
+        self._connection = None
+        self._through = None
+        self._temporary_root = None
+
         subject = importlib.import_module("agmind_immune.evidence.projection_v2")
+        primary_error: BaseException | None = None
         try:
+            if owner._connection is not connection:
+                raise AssertionError("controller replay owner lost its connection")
             try:
-                computation = subject._compute_replay(self._snapshot)
-            except subject.ProjectionConflict:
-                return None
-            connection, report = subject._validate_and_hydrate_replay(
-                self._snapshot,
-                computation,
+                report = owner._replay_unpublished_prefix(
+                    through,
+                    _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+                )
+            except subject.ProjectionAuthorityError:
+                report = None
+
+            active_connection = owner._connection
+            if not isinstance(active_connection, sqlite3.Connection):
+                raise TypeError(
+                    "controller replay owner lost its active database"
+                )
+            projection_cursor = subject._current_v2_cursor(active_connection)
+            projection_row_count = _controller_projection_row_count(
+                active_connection
             )
-            try:
-                pcc_count = connection.execute(
-                    "SELECT count(*) FROM candidates"
-                ).fetchone()[0]
-                assert type(pcc_count) is int
-                assert pcc_count == len(computation.pcc_leaves)
-                self._projection_artifact = computation.database_image
-                self.projection_cursor = report.cursor
-                return _ControllerReplayReport(pcc_count=pcc_count)
-            finally:
-                connection.close()
+            pcc_count = active_connection.execute(
+                "SELECT count(*) FROM candidates"
+            ).fetchone()[0]
+            assert type(pcc_count) is int
+            self._projection_cursor = projection_cursor
+            self._projection_row_count = projection_row_count
+            self._projection_state_observed = True
+            if report is None:
+                return None
+            if report.cursor != projection_cursor:
+                raise AssertionError(
+                    "controller replay report cursor differs from owner database"
+                )
+            return _ControllerReplayReport(
+                pcc_count=pcc_count,
+                projection_row_count=projection_row_count,
+            )
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            _close_controller_replay_input(self._resources)
-            self._temporary_root.cleanup()
+            _drain_controller_cleanup(
+                primary_error,
+                (
+                    ("owner", owner.close),
+                    ("temporary root", temporary_root.cleanup),
+                ),
+            )
+
+    @property
+    def projection_cursor(self) -> object | None:
+        if not self._projection_state_observed:
+            raise RuntimeError("controller replay state was not observed")
+        return self._projection_cursor
+
+    @property
+    def projection_row_count(self) -> int:
+        if (
+            not self._projection_state_observed
+            or self._projection_row_count is None
+        ):
+            raise RuntimeError("controller replay state was not observed")
+        return self._projection_row_count
 
     def has_partial_projection_artifact(self) -> bool:
-        return self._projection_artifact is not None
-
-
-def _complete_controller_journal(
-    journal: CorrelationRequestJournal,
-    proof: AuthenticatedPCCInput,
-) -> None:
-    store = journal._store
-    trigger_ref = store._bound_verifier.accepted_ref(
-        proof.snapshot.trigger.source_sequence
-    )
-    assert type(trigger_ref) is EvidenceRef
-    selected = journal.select(trigger_ref, canonical_json(proof.request))
-    snapshot_ref = cast(EvidenceRef, proof.evidence_ref)
-    journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
-    journal.mark_completed(selected.request_sha256)
+        return self.projection_row_count > 0
 
 
 def _append_controller_boundary_candidate(
@@ -545,7 +643,7 @@ def _append_controller_boundary_candidate(
     detector_digest: str,
     number: int,
     trigger_sequence: int,
-) -> AuthenticatedPCCInput:
+) -> None:
     key = private_key(11)
     trigger = _candidate_trigger(key, sequence=trigger_sequence)
     fields = trigger["normalized_fields"]
@@ -578,105 +676,15 @@ def _append_controller_boundary_candidate(
     snapshot["ingest_time"] = NOW
     _resign_pcc_envelope(snapshot, key)
     proof = coordinator.accept_pcc_for_correlation(_item(snapshot), request)
-    _complete_controller_journal(journal, proof)
-    return proof
-
-
-def _capture_controller_replay_input(
-    coordinator: Any,
-    journal: CorrelationRequestJournal,
-    proofs: tuple[AuthenticatedPCCInput, ...],
-    *,
-    detector_digest: str,
-) -> tuple[object, dict[str, object]]:
-    subject = importlib.import_module("agmind_immune.evidence.projection_v2")
-    authority_module, pcc_module = _correlation_modules()
-    store = coordinator.segment_store
-    records = tuple(store.iter_authenticated_records())
-    terminal = records[-1].ref
-    acknowledgements = AckJournal.create_new(store)
-    for record in records:
-        acknowledgements.record_pending(record.ref)
-        acknowledgements.record_confirmed(record.ref)
-    source_snapshot = None
-    ack_snapshot = None
-    issued = None
-    try:
-        with store._replay_source_snapshot_gate():
-            source_snapshot = store._capture_replay_source_locked(terminal)
-        with acknowledgements._replay_ack_snapshot_gate():
-            ack_snapshot = acknowledgements._capture_replay_ack_locked(
-                terminal.source_sequence
-            )
-        issued, binding, predecessor = _build_registered_correlation_authority(
-            store,
-            generation=1,
-            detector_digest=detector_digest,
-        )
-        with authority_module._correlation_projection_snapshot_gate(
-            issued
-        ) as held:
-            assert held is binding
-            correlation_snapshot = (
-                authority_module._capture_correlation_replay_locked(
-                    issued,
-                    held,
-                    predecessor,
-                )
-            )
-            pcc_inputs = tuple(
-                pcc_module._freeze_replay_pcc_seed(
-                    proof,
-                    detector_bundle_sha256=(
-                        correlation_snapshot.detector_bundle_sha256
-                    ),
-                    registry=binding.registry,
-                    registry_facts_canonical=(
-                        correlation_snapshot.registry_facts_canonical
-                    ),
-                )
-                for proof in proofs
-            )
-        snapshot = subject._ReplayInputSnapshot(
-            source=source_snapshot,
-            ack=ack_snapshot,
-            correlation=correlation_snapshot,
-            pcc_inputs=pcc_inputs,
-            schema_domain=(
-                b"AGMIND_PROJECTION_SCHEMA_V2\0"
-                + Path("core/agmind_immune/evidence/schema_v2.sql").read_bytes()
-            ),
-            base_projection_generation=1,
-            publish_generation=2,
-        )
-    except BaseException:
-        if source_snapshot is not None:
-            segments_module._close_replay_source_snapshot(source_snapshot)
-        if ack_snapshot is not None:
-            ack_journal_module._close_replay_ack_snapshot(ack_snapshot)
-        if issued is not None:
-            _drop_registered_correlation_authority(issued)
-        acknowledgements.close()
-        journal.close()
-        store.close()
-        raise
-    assert issued is not None
-    _drop_registered_correlation_authority(issued)
-    return snapshot, {
-        "store": store,
-        "journal": journal,
-        "acknowledgements": acknowledgements,
-        "source_snapshot": source_snapshot,
-        "ack_snapshot": ack_snapshot,
-    }
-
-
-def _close_controller_replay_input(resources: dict[str, object]) -> None:
-    segments_module._close_replay_source_snapshot(resources["source_snapshot"])
-    ack_journal_module._close_replay_ack_snapshot(resources["ack_snapshot"])
-    resources["journal"].close()
-    resources["acknowledgements"].close()
-    resources["store"].close()
+    trigger_ref = coordinator.segment_store._bound_verifier.accepted_ref(
+        proof.snapshot.trigger.source_sequence
+    )
+    assert type(trigger_ref) is EvidenceRef
+    selected = journal.select(trigger_ref, canonical_json(proof.request))
+    snapshot_ref = proof.evidence_ref
+    assert type(snapshot_ref) is EvidenceRef
+    journal.mark_proof_observed(selected.request_sha256, snapshot_ref)
+    journal.mark_completed(selected.request_sha256)
 
 
 def build_controller_replay_with_authenticated_pcc_count(
@@ -687,6 +695,10 @@ def build_controller_replay_with_authenticated_pcc_count(
     )
     coordinator = None
     journal = None
+    acknowledgements = None
+    connection = None
+    owner = None
+    owner_resources_transferred = False
     try:
         key = private_key(11)
         detector_digest = pcc_detector_bundle_sha256(
@@ -697,7 +709,7 @@ def build_controller_replay_with_authenticated_pcc_count(
         journal = CorrelationRequestJournal.create_new(
             coordinator.segment_store
         )
-        proofs = tuple(
+        for number in range(count):
             _append_controller_boundary_candidate(
                 coordinator,
                 journal,
@@ -705,8 +717,6 @@ def build_controller_replay_with_authenticated_pcc_count(
                 number=number,
                 trigger_sequence=2 + number * 2,
             )
-            for number in range(count)
-        )
         terminal = _accept(
             coordinator,
             _generic_critical(
@@ -719,14 +729,24 @@ def build_controller_replay_with_authenticated_pcc_count(
             ).envelope,
         )
         assert type(terminal) is EvidenceRef
-        snapshot, resources = _capture_controller_replay_input(
-            coordinator,
-            journal,
-            proofs,
-            detector_digest=detector_digest,
-        )
+        store = coordinator.segment_store
+        acknowledgements = AckJournal.create_new(store)
+        for record in store.iter_authenticated_records():
+            acknowledgements.record_pending(record.ref)
+            acknowledgements.record_confirmed(record.ref)
         subject = importlib.import_module(
             "agmind_immune.evidence.projection_v2"
+        )
+        connection = subject._v2_connection_for_test()
+        # The factory owns all four resources even when its validation raises.
+        # Do not close them a second time from this builder's failure path.
+        owner_resources_transferred = True
+        owner = subject._v2_projection_owner_for_test(
+            connection,
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
         )
         evidence_cursor = subject.ProjectionCursor(
             host_id=HOST_ID,
@@ -737,16 +757,30 @@ def build_controller_replay_with_authenticated_pcc_count(
         )
         return _ControllerReplay(
             temporary_root,
-            snapshot,
-            resources,
+            owner,
+            connection,
+            terminal,
             evidence_cursor,
         )
-    except BaseException:
-        if journal is not None and not journal._closed:
-            journal.close()
-        if coordinator is not None and not coordinator.segment_store._closed:
-            coordinator.segment_store.close()
-        temporary_root.cleanup()
+    except BaseException as error:
+        cleanup_steps: list[tuple[str, Callable[[], None]]] = []
+        if owner is not None:
+            cleanup_steps.append(("owner", owner.close))
+        elif not owner_resources_transferred:
+            if connection is not None:
+                cleanup_steps.append(("connection", connection.close))
+            if journal is not None:
+                cleanup_steps.append(("journal", journal.close))
+            if acknowledgements is not None:
+                cleanup_steps.append(
+                    ("acknowledgements", acknowledgements.close)
+                )
+            if coordinator is not None:
+                cleanup_steps.append(
+                    ("evidence store", coordinator.segment_store.close)
+                )
+        cleanup_steps.append(("temporary root", temporary_root.cleanup))
+        _drain_controller_cleanup(error, tuple(cleanup_steps))
         raise
 
 
@@ -1899,7 +1933,11 @@ def test_controller_late_candidate_limit_4096_accepts_4097_fails_closed() -> Non
     accepted_report = accepted.run_public_replay()
     assert accepted_report is not None
     assert accepted_report.pcc_count == 4096
+    assert accepted_report.projection_row_count > 0
     assert accepted.projection_cursor == accepted.evidence_cursor
+    assert accepted.has_partial_projection_artifact() is True
+    with pytest.raises(RuntimeError, match="ownership already consumed"):
+        accepted.run_public_replay()
 
     rejected = build_controller_replay_with_authenticated_pcc_count(4097)
     assert rejected.run_public_replay() is None
