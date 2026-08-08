@@ -10,10 +10,11 @@ from typing import Any, cast
 
 import pytest
 from agmind_immune.canonicaljson import canonical_json
+from agmind_immune.contracts import PCCCorrelationSnapshotV1
 from agmind_immune.correlation.primitives import load_pinned_special_use_registry
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.projection import ProjectionAuthorityError
-from agmind_immune.evidence.segments import EvidenceRef
+from agmind_immune.evidence.segments import EvidenceRef, EvidenceSealError
 from agmind_immune.incidents.models import ContainmentCandidateV1
 from agmind_immune.ingest.ack_journal import (
     AckIdentity,
@@ -744,16 +745,9 @@ def _close_compute_input(resources: dict[str, object]) -> None:
 
 def test_unpublished_replay_supports_empty_confirmed_prefix(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches requiring a non-empty terminal instead of the confirmed prefix."""
     subject = _subject()
-    authority = importlib.import_module("agmind_immune.correlation.authority")
-    monkeypatch.setattr(
-        authority,
-        "_load_pinned_detector_bundle",
-        lambda: _DETECTOR_HASH,
-    )
     coordinator = _coordinator(tmp_path / "evidence", private_key(11))
     store = coordinator.segment_store
     journal = CorrelationRequestJournal.create_new(store)
@@ -784,16 +778,9 @@ def test_unpublished_replay_supports_empty_confirmed_prefix(
 
 def test_unpublished_replay_caps_at_lagged_confirmed_prefix(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches projecting the acceptance head or authenticated pending ACK."""
     subject = _subject()
-    authority = importlib.import_module("agmind_immune.correlation.authority")
-    monkeypatch.setattr(
-        authority,
-        "_load_pinned_detector_bundle",
-        lambda: _DETECTOR_HASH,
-    )
     coordinator = _coordinator(tmp_path / "evidence", private_key(11))
     _accept(coordinator, boot_boundary(private_key(11)))
     pending_ref = cast(
@@ -832,16 +819,31 @@ def test_unpublished_replay_caps_at_lagged_confirmed_prefix(
 
 def test_unpublished_replay_requires_exact_retention_completion(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches replacing the one-store completion proof with a pending Boolean."""
     subject = _subject()
-    authority = importlib.import_module("agmind_immune.correlation.authority")
-    monkeypatch.setattr(
-        authority,
-        "_load_pinned_detector_bundle",
-        lambda: _DETECTOR_HASH,
+    sparse_coordinator = _coordinator(
+        tmp_path / "sparse-without-scope",
+        private_key(11),
     )
+    _accept(sparse_coordinator, boot_boundary(private_key(11)))
+    sparse_snapshot, sparse_resources = _capture_compute_input(
+        subject,
+        sparse_coordinator,
+        (),
+    )
+    try:
+        sparse_source = replace(
+            sparse_snapshot.source,
+            retained_ranges=((1, 1),),
+        )
+        with pytest.raises(ProjectionAuthorityError):
+            subject._validate_replay_snapshot_shape_v2(
+                replace(sparse_snapshot, source=sparse_source)
+            )
+    finally:
+        _close_compute_input(sparse_resources)
+
     retention = importlib.import_module("tests.evidence.test_retention")
     key, acceptance, store, coverage = retention._live_store_with_active_routine(
         tmp_path / "evidence"
@@ -905,8 +907,60 @@ def test_unpublished_replay_requires_exact_retention_completion(
     surviving = tuple(store.iter_authenticated_records(through=target_ref.source_sequence))
     assert store.status().retention_pending is True
     assert store._authenticated_retired_ranges
+    wrong_terminal = surviving[0].ref
+    assert wrong_terminal != target_ref
 
     try:
+        with pytest.raises(EvidenceSealError):
+            store._capture_authenticated_retention_replay_scope(
+                completion,
+                wrong_terminal,
+            )
+
+        from tests.evidence.test_retention_unlink import _completed_case
+
+        foreign_case, foreign_completion = _completed_case(
+            tmp_path / "foreign-evidence"
+        )
+        try:
+            with pytest.raises(EvidenceSealError):
+                store._capture_authenticated_retention_replay_scope(
+                    foreign_completion,
+                    target_ref,
+                )
+        finally:
+            foreign_case.coverage.close()
+            foreign_case.store.close(flush=False)
+
+        probe_scope = store._capture_authenticated_retention_replay_scope(
+            completion,
+            target_ref,
+        )
+        store._release_authenticated_retention_replay_scope(cast(Any, True))
+        with pytest.raises(EvidenceSealError):
+            store._capture_authenticated_retention_replay_scope(
+                completion,
+                target_ref,
+            )
+        store._release_authenticated_retention_replay_scope(probe_scope)
+        with pytest.raises(EvidenceSealError):
+            store._authenticated_retention_replay_ranges_locked(
+                probe_scope,
+                through_sequence=target_ref.source_sequence,
+            )
+        retry_scope = store._capture_authenticated_retention_replay_scope(
+            completion,
+            target_ref,
+        )
+        store._consume_authenticated_retention_replay_scope(retry_scope)
+        with pytest.raises(EvidenceSealError):
+            store._consume_authenticated_retention_replay_scope(retry_scope)
+        fresh_scope = store._capture_authenticated_retention_replay_scope(
+            completion,
+            target_ref,
+        )
+        store._release_authenticated_retention_replay_scope(fresh_scope)
+
         with pytest.raises(ProjectionAuthorityError):
             owner._replay_unpublished_prefix(
                 target_ref,
@@ -914,6 +968,14 @@ def test_unpublished_replay_requires_exact_retention_completion(
             )
         assert owner._generation == 1
         assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+
+        with pytest.raises(KeyboardInterrupt):
+            owner._replay_unpublished_prefix(
+                target_ref,
+                retention_completion=completion,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+                _fault_phase=subject._ReplayFaultPhase.COMPUTE,
+            )
 
         report = owner._replay_unpublished_prefix(
             target_ref,
@@ -943,31 +1005,47 @@ def test_unpublished_replay_requires_exact_retention_completion(
         coverage.close()
         owner.close()
 
+    _recovered_coordinator, recovered_store = _reopen_evidence(
+        tmp_path / "evidence"
+    )
+    try:
+        with pytest.raises(EvidenceSealError):
+            recovered_store._capture_authenticated_retention_replay_scope(
+                completion,
+                target_ref,
+            )
+    finally:
+        recovered_store.close(flush=False)
+
 
 def test_historical_pin_mismatch_returns_no_artifact(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Catches reducing a protected PCC under a replacement detector pin."""
+    """Catches reducing a protected PCC under replacement fixed pin authority."""
     subject = _subject()
     authority = importlib.import_module("agmind_immune.correlation.authority")
-    monkeypatch.setattr(
-        authority,
-        "_load_pinned_detector_bundle",
-        lambda: _DETECTOR_HASH,
-    )
+    detector_bundle_sha256 = authority._load_pinned_detector_bundle()
+    assert detector_bundle_sha256 != "0" * 64
+
+    def mismatch_snapshot(fields: dict[str, object]) -> None:
+        fields["detector_bundle_sha256"] = "0" * 64
+
     coordinator, proof = _accepted_complete(
         tmp_path / "evidence",
         ttl_seconds=120,
+        snapshot_change=mismatch_snapshot,
     )
+    registry_mismatch = proof.snapshot.model_copy(
+        update={"special_use_registry_sha256": "0" * 64}
+    )
+    with pytest.raises(ValueError):
+        PCCCorrelationSnapshotV1.model_validate_json(
+            canonical_json(registry_mismatch),
+            strict=True,
+        )
     store, journal, acknowledgements, records = _unpublished_resources(
         coordinator,
         (proof,),
-    )
-    monkeypatch.setattr(
-        authority,
-        "_load_pinned_detector_bundle",
-        lambda: "2" * 64,
     )
     connection = subject._v2_connection_for_test()
     owner = subject._v2_projection_owner_for_test(
@@ -986,6 +1064,10 @@ def test_historical_pin_mismatch_returns_no_artifact(
             )
         assert artifact is None
         assert owner._generation == 1
+        replay_status = owner._replay_status_for_test()
+        assert replay_status.phase is subject._ReplayPhase.FAILED
+        assert replay_status.failure_phase is subject._ReplayPhase.FREEZING
+        assert owner.status().cursor is None
         assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM incidents").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 0

@@ -2499,6 +2499,9 @@ class SegmentStore:
         self._authenticated_retention_unlink_completion: (
             _AuthenticatedRetentionUnlinkCompletionBinding | None
         ) = None
+        self._authenticated_retention_replay_scope: (
+            _AuthenticatedRetentionReplayScope | None
+        ) = None
         self._retention_tombstone_lock = Lock()
         self._retention_commit_uncertain_latched = False
         self._retention_finalization_uncertain_latched = False
@@ -3075,6 +3078,10 @@ class SegmentStore:
                 "retention replay terminal is not exact"
             ) from error
         with self._retention_tombstone_lock:
+            if self._authenticated_retention_replay_scope is not None:
+                raise EvidenceSealError(
+                    "retention replay completion is already leased"
+                )
             binding = self._authenticated_retention_unlink_completion
             if binding is None or binding.capability is not capability:
                 raise EvidenceSealError(
@@ -3090,10 +3097,15 @@ class SegmentStore:
             retained_ranges = tuple(self._authenticated_retired_ranges)
             source_token = self._source_lifecycle_token
             source_revision = self._source_revision
+            tombstone = binding.tombstone
             if (
                 not selected
                 or type(completed_state_raw) is not bytes
                 or not completed_state_raw
+                or type(tombstone) is not _AuthenticatedRetentionTombstoneBinding
+                or tombstone.lifecycle_identity is not self._lifecycle_identity
+                or type(tombstone.target_ref) is not EvidenceRef
+                or _exact_coverage_ref_key(tombstone.target_ref) != terminal_key
                 or type(source_token) is not bytes
                 or len(source_token) != 32
                 or type(source_revision) is not int
@@ -3107,7 +3119,7 @@ class SegmentStore:
                 raise EvidenceSealError(
                     "retention replay completion does not bind a retained prefix"
                 )
-            return _AuthenticatedRetentionReplayScope(
+            scope = _AuthenticatedRetentionReplayScope(
                 capability=capability,
                 completion_binding=binding,
                 lifecycle_identity=self._lifecycle_identity,
@@ -3117,6 +3129,80 @@ class SegmentStore:
                 retained_ranges=retained_ranges,
                 terminal_key=terminal_key,
             )
+            self._authenticated_retention_replay_scope = scope
+            return scope
+
+    def _revalidate_authenticated_retention_replay_scope(
+        self,
+        scope: _AuthenticatedRetentionReplayScope,
+        terminal_ref: EvidenceRef,
+    ) -> None:
+        """Revalidate an active lease without minting a replacement scope."""
+        if (
+            type(scope) is not _AuthenticatedRetentionReplayScope
+            or type(terminal_ref) is not EvidenceRef
+        ):
+            raise EvidenceSealError("retention replay scope is not exact")
+        try:
+            terminal_key = _exact_coverage_ref_key(terminal_ref)
+        except ValueError as error:
+            raise EvidenceSealError(
+                "retention replay terminal is not exact"
+            ) from error
+        with self._retention_tombstone_lock:
+            binding = self._authenticated_retention_unlink_completion
+            if (
+                self._authenticated_retention_replay_scope is not scope
+                or binding is not scope.completion_binding
+                or binding.capability is not scope.capability
+                or terminal_key != scope.terminal_key
+            ):
+                raise EvidenceSealError("retention replay scope changed")
+            self._validate_authenticated_retention_completion(
+                scope.capability,
+                binding,
+            )
+            tombstone = binding.tombstone
+            if (
+                self._lifecycle_identity is not scope.lifecycle_identity
+                or tombstone.lifecycle_identity is not self._lifecycle_identity
+                or type(tombstone.target_ref) is not EvidenceRef
+                or _exact_coverage_ref_key(tombstone.target_ref)
+                != scope.terminal_key
+                or self._source_lifecycle_token
+                != scope.source_lifecycle_token
+                or self._source_revision != scope.source_revision
+                or tuple(self._authenticated_retired_ranges)
+                != scope.retained_ranges
+                or binding.completed_state_raw != scope.completed_state_raw
+            ):
+                raise EvidenceSealError("retention replay scope changed")
+
+    def _consume_authenticated_retention_replay_scope(
+        self,
+        scope: _AuthenticatedRetentionReplayScope,
+    ) -> None:
+        """Consume the exact active lease once, immediately before publish."""
+        with self._retention_tombstone_lock:
+            if (
+                type(scope) is not _AuthenticatedRetentionReplayScope
+                or self._authenticated_retention_replay_scope is not scope
+                or self._lifecycle_identity is not scope.lifecycle_identity
+                or self._authenticated_retention_unlink_completion
+                is not scope.completion_binding
+                or scope.completion_binding.capability is not scope.capability
+            ):
+                raise EvidenceSealError("retention replay scope is not active")
+            self._authenticated_retention_replay_scope = None
+
+    def _release_authenticated_retention_replay_scope(
+        self,
+        scope: _AuthenticatedRetentionReplayScope,
+    ) -> None:
+        """Release a failed replay's lease without reviving the scope object."""
+        with self._retention_tombstone_lock:
+            if self._authenticated_retention_replay_scope is scope:
+                self._authenticated_retention_replay_scope = None
 
     def _bind_authenticated_retention_replay_scope_locked(
         self,
@@ -3124,27 +3210,29 @@ class SegmentStore:
         source: _ReplaySourceSnapshot,
     ) -> None:
         """Bind an issued scope to the held source snapshot without path I/O."""
-        if (
-            type(scope) is not _AuthenticatedRetentionReplayScope
-            or type(source) is not _ReplaySourceSnapshot
-            or self._lifecycle_identity is not scope.lifecycle_identity
-            or self._authenticated_retention_unlink_completion
-            is not scope.completion_binding
-            or scope.completion_binding.capability is not scope.capability
-            or source.lifecycle_token != scope.source_lifecycle_token
-            or source.source_revision != scope.source_revision
-            or source.retained_ranges != scope.retained_ranges
-            or source.terminal_ref is None
-            or _exact_coverage_ref_key(source.terminal_ref)
-            != scope.terminal_key
-            or self._source_lifecycle_token != scope.source_lifecycle_token
-            or self._source_revision != scope.source_revision
-            or tuple(self._authenticated_retired_ranges)
-            != scope.retained_ranges
-            or scope.completion_binding.completed_state_raw
-            != scope.completed_state_raw
-        ):
-            raise EvidenceSealError("retention replay scope changed")
+        with self._retention_tombstone_lock:
+            if (
+                type(scope) is not _AuthenticatedRetentionReplayScope
+                or type(source) is not _ReplaySourceSnapshot
+                or self._authenticated_retention_replay_scope is not scope
+                or self._lifecycle_identity is not scope.lifecycle_identity
+                or self._authenticated_retention_unlink_completion
+                is not scope.completion_binding
+                or scope.completion_binding.capability is not scope.capability
+                or source.lifecycle_token != scope.source_lifecycle_token
+                or source.source_revision != scope.source_revision
+                or source.retained_ranges != scope.retained_ranges
+                or source.terminal_ref is None
+                or _exact_coverage_ref_key(source.terminal_ref)
+                != scope.terminal_key
+                or self._source_lifecycle_token != scope.source_lifecycle_token
+                or self._source_revision != scope.source_revision
+                or tuple(self._authenticated_retired_ranges)
+                != scope.retained_ranges
+                or scope.completion_binding.completed_state_raw
+                != scope.completed_state_raw
+            ):
+                raise EvidenceSealError("retention replay scope changed")
 
     def _authenticated_retention_replay_ranges_locked(
         self,
@@ -3153,24 +3241,27 @@ class SegmentStore:
         through_sequence: int,
     ) -> tuple[tuple[int, int], ...]:
         """Return retained gaps only for the exact issued completion scope."""
-        if (
-            type(scope) is not _AuthenticatedRetentionReplayScope
-            or type(through_sequence) is not int
-            or not 1 <= through_sequence <= MAX_UINT64
-            or scope.terminal_key[6] != through_sequence
-            or self._lifecycle_identity is not scope.lifecycle_identity
-            or self._authenticated_retention_unlink_completion
-            is not scope.completion_binding
-            or scope.completion_binding.capability is not scope.capability
-            or self._source_lifecycle_token != scope.source_lifecycle_token
-            or self._source_revision != scope.source_revision
-            or tuple(self._authenticated_retired_ranges)
-            != scope.retained_ranges
-            or scope.completion_binding.completed_state_raw
-            != scope.completed_state_raw
-        ):
-            raise EvidenceSealError("retention replay range scope changed")
-        return scope.retained_ranges
+        with self._retention_tombstone_lock:
+            if (
+                type(scope) is not _AuthenticatedRetentionReplayScope
+                or type(through_sequence) is not int
+                or not 1 <= through_sequence <= MAX_UINT64
+                or self._authenticated_retention_replay_scope is not scope
+                or scope.terminal_key[6] != through_sequence
+                or self._lifecycle_identity is not scope.lifecycle_identity
+                or self._authenticated_retention_unlink_completion
+                is not scope.completion_binding
+                or scope.completion_binding.capability is not scope.capability
+                or self._source_lifecycle_token
+                != scope.source_lifecycle_token
+                or self._source_revision != scope.source_revision
+                or tuple(self._authenticated_retired_ranges)
+                != scope.retained_ranges
+                or scope.completion_binding.completed_state_raw
+                != scope.completed_state_raw
+            ):
+                raise EvidenceSealError("retention replay range scope changed")
+            return scope.retained_ranges
 
     def _revalidate_replay_source_locked(
         self,

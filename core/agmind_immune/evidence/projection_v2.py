@@ -415,6 +415,7 @@ class _ReplayStatus:
     generation: int
     phase: _ReplayPhase
     reservation_present: bool
+    failure_phase: _ReplayPhase | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1312,23 +1313,16 @@ def _revalidate_retention_replay_scope_v2(
     scope: _AuthenticatedRetentionReplayScope,
     terminal: EvidenceRef | None,
 ) -> None:
-    current = _capture_retention_replay_scope_v2(
-        store,
-        scope.capability,
-        terminal,
-    )
-    if (
-        current.completion_binding is not scope.completion_binding
-        or current.lifecycle_identity is not scope.lifecycle_identity
-        or current.source_lifecycle_token != scope.source_lifecycle_token
-        or current.source_revision != scope.source_revision
-        or current.completed_state_raw != scope.completed_state_raw
-        or current.retained_ranges != scope.retained_ranges
-        or current.terminal_key != scope.terminal_key
-    ):
+    if type(terminal) is not EvidenceRef:
+        raise ProjectionAuthorityError(
+            "Projection V2 retention replay scope lost its terminal"
+        )
+    try:
+        store._revalidate_authenticated_retention_replay_scope(scope, terminal)
+    except EvidenceStoreError as error:
         raise ProjectionAuthorityError(
             "Projection V2 retention replay scope was substituted"
-        )
+        ) from error
 
 
 def _same_stored_record_v2(
@@ -1575,6 +1569,10 @@ def _validate_replay_snapshot_shape_v2(
     ):
         raise TypeError("Projection V2 replay retained ranges are not exact")
     retention_facts = snapshot.retention_facts
+    if source.retained_ranges and retention_facts is None:
+        raise ProjectionAuthorityError(
+            "Projection V2 sparse replay lacks authenticated retention facts"
+        )
     if retention_facts is not None and (
         type(retention_facts) is not _RetentionReplayFacts
         or type(retention_facts.completed_state_sha256) is not bytes
@@ -3038,6 +3036,7 @@ class _V2ProjectionOwner:
                 generation=status.generation,
                 phase=status.phase,
                 reservation_present=status.reservation_present,
+                failure_phase=status.failure_phase,
             )
 
     def _register_replay_status_barrier_for_test(
@@ -3872,16 +3871,7 @@ class _V2ProjectionOwner:
             raise ProjectionAuthorityError(
                 "Projection V2 unpublished terminal is not exact"
             ) from error
-        retention_scope = (
-            None
-            if retention_completion is None
-            else _capture_retention_replay_scope_v2(
-                self._evidence,
-                retention_completion,
-                through,
-            )
-        )
-
+        retention_scope: _AuthenticatedRetentionReplayScope | None = None
         reservation: _ReplayReservation | None = None
         source_snapshot: _ReplaySourceSnapshot | None = None
         ack_snapshot: _AckReplaySnapshot | None = None
@@ -3892,6 +3882,12 @@ class _V2ProjectionOwner:
         base_generation = self._generation
         acceptance_cursor = 0
         try:
+            if retention_completion is not None:
+                retention_scope = _capture_retention_replay_scope_v2(
+                    self._evidence,
+                    retention_completion,
+                    through,
+                )
             with self._mutex:
                 connection, authority = self._require_usable()
                 if self._generation >= MAX_UINT64:
@@ -4164,6 +4160,11 @@ class _V2ProjectionOwner:
                             "injected replay publish failure"
                         )
 
+                    if retention_scope is not None:
+                        self._evidence._consume_authenticated_retention_replay_scope(
+                            retention_scope
+                        )
+
                     owned_ack_snapshot = ack_snapshot
                     ack_snapshot = None
                     _close_replay_ack_snapshot(owned_ack_snapshot)
@@ -4234,9 +4235,17 @@ class _V2ProjectionOwner:
                     _close_replay_source_snapshot(owned_source_snapshot)
                 except BaseException as error:  # noqa: BLE001
                     cleanup_errors.append(error)
+            if retention_scope is not None:
+                try:
+                    self._evidence._release_authenticated_retention_replay_scope(
+                        retention_scope
+                    )
+                except BaseException as error:  # noqa: BLE001
+                    cleanup_errors.append(error)
             if not published:
                 with self._replay_state_lock:
                     if reservation is not None:
+                        failure_phase = self._replay_status.phase
                         if self._replay_reservation is reservation:
                             self._replay_reservation = None
                         self._set_replay_status_locked(
@@ -4244,6 +4253,7 @@ class _V2ProjectionOwner:
                                 generation=base_generation,
                                 phase=_ReplayPhase.FAILED,
                                 reservation_present=False,
+                                failure_phase=failure_phase,
                             )
                         )
                     if self._replay_test_barrier is not None:
