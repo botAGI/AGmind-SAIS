@@ -1,7 +1,7 @@
 # AGmind-SAIS: Security AI Sensor
 # Многоступенчатая сборка для минимального размера образа
 
-ARG PYTHON_IMAGE=python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
+ARG PYTHON_IMAGE=python:3.12.13-slim-trixie@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
 
 # ===== Stage 1: Build =====
 FROM ${PYTHON_IMAGE} AS builder

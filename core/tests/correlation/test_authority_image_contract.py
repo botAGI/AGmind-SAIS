@@ -5,8 +5,8 @@ from pathlib import Path
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 _PYTHON_IMAGE = (
-    "python:3.12.13-slim-bookworm@"
-    "sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+    "python:3.12.13-slim-trixie@"
+    "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36"
 )
 
 
@@ -22,8 +22,10 @@ def _make_target(makefile: str, name: str) -> str:
 
 def test_runtime_image_uses_pinned_base_and_root_owned_venv() -> None:
     dockerfile = _read("Dockerfile")
+    versions = _read("deploy/versions.env").splitlines()
 
     assert f"ARG PYTHON_IMAGE={_PYTHON_IMAGE}" in dockerfile
+    assert f"PYTHON_IMAGE={_PYTHON_IMAGE}" in versions
     assert dockerfile.count("FROM ${PYTHON_IMAGE}") == 2
     assert "python -m venv /opt/agmind-venv" in dockerfile
     assert "/opt/agmind-venv/bin/pip install --no-cache-dir -r requirements.txt" in dockerfile
@@ -94,6 +96,7 @@ def test_make_target_builds_and_smokes_real_image_without_root_or_network() -> N
     assert "docker build" in target
     assert '$(PYTHON_IMAGE)' in target
     assert "docker run --rm" in target
+    assert target.count("--platform linux/arm64") == 2
     assert "--network none" in target
     assert "--read-only" in target
     assert "--user" not in target
@@ -102,3 +105,4 @@ def test_make_target_builds_and_smokes_real_image_without_root_or_network() -> N
     assert "_load_pinned_detector_bundle" in target
     assert "pcc_detector_bundle_sha256" in target
     assert "/expected/agmind-pcc.yaml" in target
+    assert "/app/core/tests/correlation/sqlite_integrity_runtime_smoke.py" in target
