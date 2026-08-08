@@ -2540,14 +2540,13 @@ class SegmentStore:
         self._authenticated_retention_unlink_completion: (
             _AuthenticatedRetentionUnlinkCompletionBinding | None
         ) = None
-        self._authenticated_retention_replay_scope: (
-            _AuthenticatedRetentionReplayScope | None
+        self._authenticated_retention_replay_state: (
+            _AuthenticatedRetentionReplayScope
+            | _ConsumedAuthenticatedRetentionReplay
+            | None
         ) = None
         self._authenticated_retention_replay_gate: (
             _AuthenticatedRetentionReplayGate | None
-        ) = None
-        self._authenticated_retention_replay_consumed: (
-            _ConsumedAuthenticatedRetentionReplay | None
         ) = None
         self._retention_tombstone_lock = RLock()
         self._retention_commit_uncertain_latched = False
@@ -3101,6 +3100,35 @@ class SegmentStore:
             )
             raise
 
+    @property
+    def _authenticated_retention_replay_scope(
+        self,
+    ) -> _AuthenticatedRetentionReplayScope | None:
+        state = self._authenticated_retention_replay_state
+        return (
+            state
+            if type(state) is _AuthenticatedRetentionReplayScope
+            else None
+        )
+
+    @property
+    def _authenticated_retention_replay_consumed(
+        self,
+    ) -> _ConsumedAuthenticatedRetentionReplay | None:
+        state = self._authenticated_retention_replay_state
+        return (
+            state
+            if type(state) is _ConsumedAuthenticatedRetentionReplay
+            else None
+        )
+
+    def _authenticated_retention_replay_scope_is_active(
+        self,
+        scope: _AuthenticatedRetentionReplayScope,
+    ) -> bool:
+        """Read the single-slot lease state without acquiring a lower lock."""
+        return self._authenticated_retention_replay_state is scope
+
     def _capture_authenticated_retention_replay_scope(
         self,
         capability: object,
@@ -3192,7 +3220,7 @@ class SegmentStore:
                 retained_ranges=retained_ranges,
                 terminal_key=terminal_key,
             )
-            self._authenticated_retention_replay_scope = scope
+            self._authenticated_retention_replay_state = scope
             return scope
 
     @contextmanager
@@ -3298,8 +3326,7 @@ class SegmentStore:
         consumed: _ConsumedAuthenticatedRetentionReplay,
     ) -> None:
         """Persist prevalidated consumption; exact attribute writes cannot fail."""
-        self._authenticated_retention_replay_consumed = consumed
-        self._authenticated_retention_replay_scope = None
+        self._authenticated_retention_replay_state = consumed
 
     def _release_authenticated_retention_replay_scope(
         self,
@@ -3308,7 +3335,7 @@ class SegmentStore:
         """Release a failed replay's lease without reviving the scope object."""
         with self._retention_tombstone_lock:
             if self._authenticated_retention_replay_scope is scope:
-                self._authenticated_retention_replay_scope = None
+                self._authenticated_retention_replay_state = None
 
     def _bind_authenticated_retention_replay_scope_locked(
         self,
@@ -5689,7 +5716,7 @@ class SegmentStore:
                     consumed_replay is not None
                     and consumed_replay.completion_binding is binding
                 ):
-                    self._authenticated_retention_replay_consumed = None
+                    self._authenticated_retention_replay_state = None
                 self._authenticated_retention_unlink_completion = None
                 self._retention_finalization_uncertain_latched = False
                 self._retention_state_namespace_uncertain = False

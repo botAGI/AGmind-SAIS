@@ -410,6 +410,7 @@ class _ReplayFaultPhase(StrEnum):
     FREEZE = "freeze"
     COMPUTE = "compute"
     PUBLISH = "publish"
+    PRE_COMMIT = "pre_commit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -4191,10 +4192,6 @@ class _V2ProjectionOwner:
                     self._connection = hydrated_connection
                     hydrated_connection = None
                     self._generation = base_generation + 1
-                    if retention_consumption is not None:
-                        self._evidence._commit_prevalidated_retention_replay_consumption_locked(
-                            retention_consumption
-                        )
                     with self._replay_state_lock:
                         self._replay_reservation = None
                         self._set_replay_status_locked(
@@ -4205,6 +4202,14 @@ class _V2ProjectionOwner:
                             )
                         )
                     published = True
+                    if _fault_phase is _ReplayFaultPhase.PRE_COMMIT:
+                        raise KeyboardInterrupt(
+                            "injected replay pre-commit failure"
+                        )
+                    if retention_consumption is not None:
+                        self._evidence._commit_prevalidated_retention_replay_consumption_locked(
+                            retention_consumption
+                        )
                     return report
         except (
             AckJournalError,
@@ -4251,7 +4256,12 @@ class _V2ProjectionOwner:
                     _close_replay_source_snapshot(owned_source_snapshot)
                 except BaseException as error:  # noqa: BLE001
                     cleanup_errors.append(error)
-            if retention_scope is not None:
+            if (
+                retention_scope is not None
+                and self._evidence._authenticated_retention_replay_scope_is_active(
+                    retention_scope
+                )
+            ):
                 try:
                     self._evidence._release_authenticated_retention_replay_scope(
                         retention_scope

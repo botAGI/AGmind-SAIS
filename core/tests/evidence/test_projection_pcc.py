@@ -1076,6 +1076,9 @@ def test_unpublished_replay_requires_exact_retention_completion(
                 target_ref,
             )
         assert store._authenticated_retention_replay_consumed is not None
+        published_status = owner._replay_status_for_test()
+        assert published_status.phase is subject._ReplayPhase.PUBLISHED
+        assert published_status.reservation_present is False
         store._finalize_authenticated_retention_completion(
             completion,
             _factory=segments_module._RETENTION_PROOF_FACTORY,
@@ -1096,6 +1099,95 @@ def test_unpublished_replay_requires_exact_retention_completion(
             )
     finally:
         recovered_store.close(flush=False)
+
+    fault_key, fault_acceptance, fault_store, fault_coverage = (
+        retention._live_store_with_active_routine(
+            tmp_path / "pre-final-commit"
+        )
+    )
+    fault_journal = CorrelationRequestJournal.create_new(fault_store)
+    fault_acknowledgements = fault_store._ack_journal_owner
+    assert type(fault_acknowledgements) is AckJournal
+    fault_connection = subject._v2_connection_for_test()
+    fault_owner = subject._v2_projection_owner_for_test(
+        fault_connection,
+        evidence=fault_store,
+        acknowledgements=fault_acknowledgements,
+        journal=fault_journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+    )
+    fault_selected_snapshot = fault_store._freeze_retention_snapshot(
+        retention._proof_clock(),
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    fault_decision = retention.select_retention(
+        fault_selected_snapshot,
+        request_id=retention.REQUEST_ID,
+    )
+    fault_request = fault_decision.request
+    assert fault_request is not None
+    fault_retention_journal = (
+        retention.retention_module._open_retention_state_journal(fault_store)
+    )
+    fault_retention_journal.prepare_publication(fault_decision)
+    fault_target_item = retention._item(
+        envelope_value(
+            fault_key,
+            sequence=3,
+            event_type="retention_tombstone",
+            normalized_fields=fault_request.model_dump(mode="python"),
+        )
+    )
+    fault_target_ref = fault_acceptance.accept(fault_target_item)
+    fault_coverage._apply_live_accepted(fault_store, fault_target_ref, None)
+    fault_acknowledgements.record_pending(fault_target_ref)
+    fault_acknowledgements.record_confirmed(fault_target_ref)
+    fault_target = retention.retention_module.RetentionTargetV1(
+        sequence=fault_target_item.sequence,
+        event_id=fault_target_item.event_id,
+        content_sha256=fault_target_item.content_sha256,
+    )
+    fault_retention_journal.bind_target(fault_target)
+    fault_retention_journal.advance_evidence_appended(fault_target)
+    fault_final_snapshot = fault_store._freeze_retention_snapshot(
+        retention._proof_clock(seconds=1),
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    fault_tombstone = fault_store._authenticate_retention_tombstone(
+        fault_retention_journal,
+        fault_final_snapshot,
+        fault_target_ref,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    fault_completion = fault_store._execute_authenticated_retention_unlink(
+        fault_tombstone,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            fault_owner._replay_unpublished_prefix(
+                fault_target_ref,
+                retention_completion=fault_completion,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+                _fault_phase=subject._ReplayFaultPhase.PRE_COMMIT,
+            )
+        fault_status = fault_owner._replay_status_for_test()
+        assert fault_status.phase is subject._ReplayPhase.PUBLISHED
+        assert fault_status.reservation_present is False
+        assert fault_store._authenticated_retention_replay_scope is None
+        assert fault_store._authenticated_retention_replay_consumed is None
+        fresh_after_precommit = (
+            fault_store._capture_authenticated_retention_replay_scope(
+                fault_completion,
+                fault_target_ref,
+            )
+        )
+        fault_store._release_authenticated_retention_replay_scope(
+            fresh_after_precommit
+        )
+    finally:
+        fault_coverage.close()
+        fault_owner.close()
 
 
 def test_historical_pin_mismatch_returns_no_artifact(
