@@ -6,6 +6,7 @@ import os
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any, cast
 
 import pytest
@@ -936,6 +937,35 @@ def test_unpublished_replay_requires_exact_retention_completion(
             completion,
             target_ref,
         )
+        writer_started = Event()
+        writer_finished = Event()
+        writer_errors: list[BaseException] = []
+
+        def bounded_retention_writer() -> None:
+            writer_started.set()
+            try:
+                store._finalize_authenticated_retention_completion(
+                    completion,
+                    _factory=object(),
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                writer_errors.append(error)
+            finally:
+                writer_finished.set()
+
+        with store._authenticated_retention_replay_scope_gate(
+            probe_scope,
+            target_ref,
+        ), store._replay_source_snapshot_gate():
+            writer = Thread(target=bounded_retention_writer)
+            writer.start()
+            assert writer_started.wait(5)
+            assert writer_finished.is_set() is False
+        writer.join(5)
+        assert writer.is_alive() is False
+        assert len(writer_errors) == 1
+        assert isinstance(writer_errors[0], TypeError)
+
         store._release_authenticated_retention_replay_scope(cast(Any, True))
         with pytest.raises(EvidenceSealError):
             store._capture_authenticated_retention_replay_scope(
@@ -943,23 +973,19 @@ def test_unpublished_replay_requires_exact_retention_completion(
                 target_ref,
             )
         store._release_authenticated_retention_replay_scope(probe_scope)
-        with pytest.raises(EvidenceSealError):
-            store._authenticated_retention_replay_ranges_locked(
+        with (
+            pytest.raises(EvidenceSealError),
+            store._authenticated_retention_replay_scope_gate(
                 probe_scope,
-                through_sequence=target_ref.source_sequence,
-            )
+                target_ref,
+            ),
+        ):
+            pass
         retry_scope = store._capture_authenticated_retention_replay_scope(
             completion,
             target_ref,
         )
-        store._consume_authenticated_retention_replay_scope(retry_scope)
-        with pytest.raises(EvidenceSealError):
-            store._consume_authenticated_retention_replay_scope(retry_scope)
-        fresh_scope = store._capture_authenticated_retention_replay_scope(
-            completion,
-            target_ref,
-        )
-        store._release_authenticated_retention_replay_scope(fresh_scope)
+        store._release_authenticated_retention_replay_scope(retry_scope)
 
         with pytest.raises(ProjectionAuthorityError):
             owner._replay_unpublished_prefix(
@@ -969,13 +995,56 @@ def test_unpublished_replay_requires_exact_retention_completion(
         assert owner._generation == 1
         assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
 
-        with pytest.raises(KeyboardInterrupt):
-            owner._replay_unpublished_prefix(
-                target_ref,
-                retention_completion=completion,
-                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
-                _fault_phase=subject._ReplayFaultPhase.COMPUTE,
+        owner._register_replay_status_barrier_for_test(
+            subject._ReplayPhase.COMPUTING
+        )
+        replay_errors: list[BaseException] = []
+
+        def fail_replay() -> None:
+            try:
+                owner._replay_unpublished_prefix(
+                    target_ref,
+                    retention_completion=completion,
+                    _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+                    _fault_phase=subject._ReplayFaultPhase.COMPUTE,
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                replay_errors.append(error)
+
+        replay_worker = Thread(target=fail_replay)
+        replay_worker.start()
+        with owner._replay_state_condition:
+            assert owner._replay_state_condition.wait_for(
+                lambda: owner._replay_status.phase
+                is subject._ReplayPhase.COMPUTING,
+                timeout=5,
             )
+            failed_scope = store._authenticated_retention_replay_scope
+            assert failed_scope is not None
+        owner._release_replay_status_barrier_for_test(
+            subject._ReplayPhase.COMPUTING
+        )
+        replay_worker.join(5)
+        assert replay_worker.is_alive() is False
+        assert len(replay_errors) == 1
+        assert isinstance(replay_errors[0], KeyboardInterrupt)
+        with (
+            pytest.raises(EvidenceSealError),
+            store._authenticated_retention_replay_scope_gate(
+                failed_scope,
+                target_ref,
+            ),
+        ):
+            pass
+        retry_after_failure = (
+            store._capture_authenticated_retention_replay_scope(
+                completion,
+                target_ref,
+            )
+        )
+        store._release_authenticated_retention_replay_scope(
+            retry_after_failure
+        )
 
         report = owner._replay_unpublished_prefix(
             target_ref,
@@ -1001,6 +1070,17 @@ def test_unpublished_replay_requires_exact_retention_completion(
             for sequence in projected_sequences
             for start, end in store._authenticated_retired_ranges
         )
+        with pytest.raises(EvidenceSealError):
+            store._capture_authenticated_retention_replay_scope(
+                completion,
+                target_ref,
+            )
+        assert store._authenticated_retention_replay_consumed is not None
+        store._finalize_authenticated_retention_completion(
+            completion,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        assert store._authenticated_retention_replay_consumed is None
     finally:
         coverage.close()
         owner.close()

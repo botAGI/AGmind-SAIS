@@ -12,6 +12,7 @@ import stat
 from _thread import LockType
 from _thread import RLock as RLockType
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -110,6 +111,7 @@ from agmind_immune.evidence.segments import (
     SegmentStore,
     StoredEvidenceRecord,
     _AcceptedEnvelopeRecordV1,
+    _AuthenticatedRetentionReplayGate,
     _AuthenticatedRetentionReplayScope,
     _close_replay_source_snapshot,
     _exact_coverage_record_key,
@@ -1281,17 +1283,23 @@ def _bind_retention_replay_scope_v2(
     store: SegmentStore,
     scope: _AuthenticatedRetentionReplayScope,
     source: _ReplaySourceSnapshot,
+    gate: _AuthenticatedRetentionReplayGate | None,
 ) -> _RetentionReplayFacts:
     if (
         type(scope) is not _AuthenticatedRetentionReplayScope
         or type(source) is not _ReplaySourceSnapshot
+        or type(gate) is not _AuthenticatedRetentionReplayGate
         or type(scope.capability) is not AuthenticatedRetentionUnlinkCompletion
     ):
         raise ProjectionAuthorityError(
             "Projection V2 retention replay scope changed"
         )
     try:
-        store._bind_authenticated_retention_replay_scope_locked(scope, source)
+        store._bind_authenticated_retention_replay_scope_locked(
+            scope,
+            source,
+            gate,
+        )
     except EvidenceStoreError as error:
         raise ProjectionAuthorityError(
             "Projection V2 retention replay scope changed"
@@ -1306,23 +1314,6 @@ def _bind_retention_replay_scope_v2(
         retained_ranges=scope.retained_ranges,
         terminal_sequence=terminal_ref.source_sequence,
     )
-
-
-def _revalidate_retention_replay_scope_v2(
-    store: SegmentStore,
-    scope: _AuthenticatedRetentionReplayScope,
-    terminal: EvidenceRef | None,
-) -> None:
-    if type(terminal) is not EvidenceRef:
-        raise ProjectionAuthorityError(
-            "Projection V2 retention replay scope lost its terminal"
-        )
-    try:
-        store._revalidate_authenticated_retention_replay_scope(scope, terminal)
-    except EvidenceStoreError as error:
-        raise ProjectionAuthorityError(
-            "Projection V2 retention replay scope was substituted"
-        ) from error
 
 
 def _same_stored_record_v2(
@@ -3934,7 +3925,16 @@ class _V2ProjectionOwner:
                     base_generation,
                     None,
                 )
+                retention_gate_context = (
+                    nullcontext(None)
+                    if retention_scope is None
+                    else self._evidence._authenticated_retention_replay_scope_gate(
+                        retention_scope,
+                        cast(EvidenceRef, through),
+                    )
+                )
                 with (
+                    retention_gate_context as retention_gate,
                     self._evidence._replay_source_snapshot_gate(),
                     self._acknowledgements._replay_ack_snapshot_gate(),
                     _correlation_projection_snapshot_gate(
@@ -3962,6 +3962,7 @@ class _V2ProjectionOwner:
                             self._evidence,
                             retention_scope,
                             source_snapshot,
+                            retention_gate,
                         )
                     )
                     ack_snapshot = (
@@ -4000,6 +4001,7 @@ class _V2ProjectionOwner:
                                 0 if through is None else through.source_sequence
                             ),
                             retention_scope=retention_scope,
+                            retention_gate=retention_gate,
                         )
                     )
                     try:
@@ -4065,12 +4067,6 @@ class _V2ProjectionOwner:
                     "Projection V2 replay frozen authority changed"
                 ) from error
 
-            if retention_scope is not None:
-                _revalidate_retention_replay_scope_v2(
-                    self._evidence,
-                    retention_scope,
-                    through,
-                )
             with self._mutex:
                 if (
                     self._closed
@@ -4082,7 +4078,16 @@ class _V2ProjectionOwner:
                     raise ProjectionAuthorityError(
                         "Projection V2 replay owner changed before publication"
                     )
+                retention_gate_context = (
+                    nullcontext(None)
+                    if retention_scope is None
+                    else self._evidence._authenticated_retention_replay_scope_gate(
+                        retention_scope,
+                        cast(EvidenceRef, through),
+                    )
+                )
                 with (
+                    retention_gate_context as retention_gate,
                     self._evidence._replay_source_snapshot_gate(),
                     self._acknowledgements._replay_ack_snapshot_gate(),
                     _correlation_projection_snapshot_gate(
@@ -4117,6 +4122,7 @@ class _V2ProjectionOwner:
                             self._evidence,
                             retention_scope,
                             source_snapshot,
+                            retention_gate,
                         )
                         if current_retention_facts != snapshot.retention_facts:
                             raise ProjectionAuthorityError(
@@ -4160,9 +4166,15 @@ class _V2ProjectionOwner:
                             "injected replay publish failure"
                         )
 
+                    retention_consumption = None
                     if retention_scope is not None:
-                        self._evidence._consume_authenticated_retention_replay_scope(
-                            retention_scope
+                        exact_retention_gate = cast(
+                            _AuthenticatedRetentionReplayGate,
+                            retention_gate,
+                        )
+                        retention_consumption = self._evidence._prepare_authenticated_retention_replay_consumption_locked(
+                            retention_scope,
+                            exact_retention_gate,
                         )
 
                     owned_ack_snapshot = ack_snapshot
@@ -4179,6 +4191,10 @@ class _V2ProjectionOwner:
                     self._connection = hydrated_connection
                     hydrated_connection = None
                     self._generation = base_generation + 1
+                    if retention_consumption is not None:
+                        self._evidence._commit_prevalidated_retention_replay_consumption_locked(
+                            retention_consumption
+                        )
                     with self._replay_state_lock:
                         self._replay_reservation = None
                         self._set_replay_status_locked(

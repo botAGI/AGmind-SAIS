@@ -50,6 +50,7 @@ from agmind_immune.evidence.segments import (
     EvidenceSealError,
     SegmentStore,
     _AckAuthorityError,
+    _AuthenticatedRetentionReplayGate,
     _AuthenticatedRetentionReplayScope,
     _CorrelationJournalLifecycleCorrupt,
     _CorrelationJournalLifecycleIoUncertain,
@@ -2103,15 +2104,21 @@ def _completed_replay_facts_locked(
     *,
     through_sequence: int,
     retention_scope: _AuthenticatedRetentionReplayScope | None,
+    retention_gate: _AuthenticatedRetentionReplayGate | None,
 ) -> tuple[tuple[_CompletedPCCReplayFacts, ...], tuple[AuthenticatedPCCInput, ...]]:
-    retained_ranges = (
-        ()
-        if retention_scope is None
-        else journal._store._authenticated_retention_replay_ranges_locked(
+    retained_ranges: tuple[tuple[int, int], ...]
+    if retention_scope is None:
+        retained_ranges = ()
+    elif type(retention_gate) is _AuthenticatedRetentionReplayGate:
+        retained_ranges = journal._store._authenticated_retention_replay_ranges_locked(
             retention_scope,
+            retention_gate,
             through_sequence=through_sequence,
         )
-    )
+    else:
+        raise CorrelationRequestJournalAuthorityError(
+            "retention replay gate is not exact"
+        )
     records = tuple(
         journal._store.iter_authenticated_records(through=through_sequence)
     )
@@ -2192,6 +2199,7 @@ def _capture_correlation_journal_replay_locked(
     *,
     through_sequence: int,
     retention_scope: _AuthenticatedRetentionReplayScope | None = None,
+    retention_gate: _AuthenticatedRetentionReplayGate | None = None,
 ) -> tuple[_CorrelationJournalReplaySnapshot, tuple[AuthenticatedPCCInput, ...]]:
     """Capture immutable durable journal facts and ephemeral issued PCC proofs."""
     if (
@@ -2201,6 +2209,11 @@ def _capture_correlation_journal_replay_locked(
         or (
             retention_scope is not None
             and type(retention_scope) is not _AuthenticatedRetentionReplayScope
+        )
+        or (retention_scope is None) is not (retention_gate is None)
+        or (
+            retention_gate is not None
+            and type(retention_gate) is not _AuthenticatedRetentionReplayGate
         )
     ):
         raise CorrelationRequestJournalAuthorityError(
@@ -2227,6 +2240,7 @@ def _capture_correlation_journal_replay_locked(
         replay,
         through_sequence=through_sequence,
         retention_scope=retention_scope,
+        retention_gate=retention_gate,
     )
     replay_after = journal._authenticated_journal_replay()
     if (

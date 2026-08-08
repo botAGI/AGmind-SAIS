@@ -24,7 +24,7 @@ from enum import StrEnum
 from functools import wraps
 from itertools import pairwise
 from pathlib import Path
-from threading import Lock, get_ident
+from threading import Lock, RLock, get_ident
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -198,6 +198,30 @@ def _source_mutation[**SourceMutationP, SourceMutationR](
             return method(store, *args, **kwargs)
         finally:
             store._end_source_mutation()
+
+    return cast(
+        "Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR]",
+        guarded,
+    )
+
+
+def _retention_source_mutation[**SourceMutationP, SourceMutationR](
+    method: Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR],
+) -> Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR]:
+    """Order retention authority before the source mutation fence."""
+
+    @wraps(method)
+    def guarded(
+        store: SegmentStore,
+        *args: SourceMutationP.args,
+        **kwargs: SourceMutationP.kwargs,
+    ) -> SourceMutationR:
+        with store._retention_tombstone_lock:
+            store._begin_source_mutation(allow_during_terminal=False)
+            try:
+                return method(store, *args, **kwargs)
+            finally:
+                store._end_source_mutation()
 
     return cast(
         "Callable[Concatenate[SegmentStore, SourceMutationP], SourceMutationR]",
@@ -898,6 +922,23 @@ class _AuthenticatedRetentionReplayScope:
     source_revision: int
     completed_state_raw: bytes
     retained_ranges: tuple[tuple[int, int], ...]
+    terminal_key: tuple[str, str, int, int, str, str, int, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthenticatedRetentionReplayGate:
+    scope: _AuthenticatedRetentionReplayScope
+    completion_binding: _AuthenticatedRetentionUnlinkCompletionBinding
+    lifecycle_identity: object
+    retained_ranges: tuple[tuple[int, int], ...]
+    terminal_key: tuple[str, str, int, int, str, str, int, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ConsumedAuthenticatedRetentionReplay:
+    completion_binding: _AuthenticatedRetentionUnlinkCompletionBinding
+    lifecycle_identity: object
+    completed_state_raw: bytes
     terminal_key: tuple[str, str, int, int, str, str, int, str]
 
 
@@ -2502,7 +2543,13 @@ class SegmentStore:
         self._authenticated_retention_replay_scope: (
             _AuthenticatedRetentionReplayScope | None
         ) = None
-        self._retention_tombstone_lock = Lock()
+        self._authenticated_retention_replay_gate: (
+            _AuthenticatedRetentionReplayGate | None
+        ) = None
+        self._authenticated_retention_replay_consumed: (
+            _ConsumedAuthenticatedRetentionReplay | None
+        ) = None
+        self._retention_tombstone_lock = RLock()
         self._retention_commit_uncertain_latched = False
         self._retention_finalization_uncertain_latched = False
         self._retention_state_namespace_uncertain = False
@@ -3087,6 +3134,22 @@ class SegmentStore:
                 raise EvidenceSealError(
                     "retention replay completion is not registered"
                 )
+            consumed = self._authenticated_retention_replay_consumed
+            if consumed is not None:
+                if (
+                    type(consumed) is _ConsumedAuthenticatedRetentionReplay
+                    and consumed.completion_binding is binding
+                    and consumed.lifecycle_identity is self._lifecycle_identity
+                    and consumed.completed_state_raw
+                    == binding.completed_state_raw
+                    and consumed.terminal_key == terminal_key
+                ):
+                    raise EvidenceSealError(
+                        "retention replay completion was already consumed"
+                    )
+                raise EvidenceSealError(
+                    "retention replay consumed authority changed"
+                )
             selected, _boundary_raw = (
                 self._validate_authenticated_retention_completion(
                     capability,
@@ -3132,12 +3195,13 @@ class SegmentStore:
             self._authenticated_retention_replay_scope = scope
             return scope
 
-    def _revalidate_authenticated_retention_replay_scope(
+    @contextmanager
+    def _authenticated_retention_replay_scope_gate(
         self,
         scope: _AuthenticatedRetentionReplayScope,
         terminal_ref: EvidenceRef,
-    ) -> None:
-        """Revalidate an active lease without minting a replacement scope."""
+    ) -> Iterator[_AuthenticatedRetentionReplayGate]:
+        """Hold exact retention authority before entering the source gate."""
         if (
             type(scope) is not _AuthenticatedRetentionReplayScope
             or type(terminal_ref) is not EvidenceRef
@@ -3152,9 +3216,11 @@ class SegmentStore:
         with self._retention_tombstone_lock:
             binding = self._authenticated_retention_unlink_completion
             if (
-                self._authenticated_retention_replay_scope is not scope
+                self._authenticated_retention_replay_gate is not None
+                or self._authenticated_retention_replay_scope is not scope
                 or binding is not scope.completion_binding
                 or binding.capability is not scope.capability
+                or self._authenticated_retention_replay_consumed is not None
                 or terminal_key != scope.terminal_key
             ):
                 raise EvidenceSealError("retention replay scope changed")
@@ -3177,23 +3243,63 @@ class SegmentStore:
                 or binding.completed_state_raw != scope.completed_state_raw
             ):
                 raise EvidenceSealError("retention replay scope changed")
+            gate = _AuthenticatedRetentionReplayGate(
+                scope=scope,
+                completion_binding=binding,
+                lifecycle_identity=self._lifecycle_identity,
+                retained_ranges=scope.retained_ranges,
+                terminal_key=scope.terminal_key,
+            )
+            self._authenticated_retention_replay_gate = gate
+            try:
+                yield gate
+            finally:
+                if self._authenticated_retention_replay_gate is gate:
+                    self._authenticated_retention_replay_gate = None
 
-    def _consume_authenticated_retention_replay_scope(
+    def _require_authenticated_retention_replay_gate_locked(
         self,
         scope: _AuthenticatedRetentionReplayScope,
+        gate: _AuthenticatedRetentionReplayGate,
     ) -> None:
-        """Consume the exact active lease once, immediately before publish."""
-        with self._retention_tombstone_lock:
-            if (
-                type(scope) is not _AuthenticatedRetentionReplayScope
-                or self._authenticated_retention_replay_scope is not scope
-                or self._lifecycle_identity is not scope.lifecycle_identity
-                or self._authenticated_retention_unlink_completion
-                is not scope.completion_binding
-                or scope.completion_binding.capability is not scope.capability
-            ):
-                raise EvidenceSealError("retention replay scope is not active")
-            self._authenticated_retention_replay_scope = None
+        """Require the exact outer retention gate without acquiring a lock."""
+        if (
+            type(scope) is not _AuthenticatedRetentionReplayScope
+            or type(gate) is not _AuthenticatedRetentionReplayGate
+            or self._authenticated_retention_replay_gate is not gate
+            or gate.scope is not scope
+            or gate.completion_binding is not scope.completion_binding
+            or gate.lifecycle_identity is not scope.lifecycle_identity
+            or gate.retained_ranges != scope.retained_ranges
+            or gate.terminal_key != scope.terminal_key
+            or self._authenticated_retention_replay_scope is not scope
+            or self._authenticated_retention_unlink_completion
+            is not scope.completion_binding
+            or self._authenticated_retention_replay_consumed is not None
+        ):
+            raise EvidenceSealError("retention replay gate changed")
+
+    def _prepare_authenticated_retention_replay_consumption_locked(
+        self,
+        scope: _AuthenticatedRetentionReplayScope,
+        gate: _AuthenticatedRetentionReplayGate,
+    ) -> _ConsumedAuthenticatedRetentionReplay:
+        """Prevalidate the final non-raising completion transition."""
+        self._require_authenticated_retention_replay_gate_locked(scope, gate)
+        return _ConsumedAuthenticatedRetentionReplay(
+            completion_binding=gate.completion_binding,
+            lifecycle_identity=gate.lifecycle_identity,
+            completed_state_raw=scope.completed_state_raw,
+            terminal_key=gate.terminal_key,
+        )
+
+    def _commit_prevalidated_retention_replay_consumption_locked(
+        self,
+        consumed: _ConsumedAuthenticatedRetentionReplay,
+    ) -> None:
+        """Persist prevalidated consumption; exact attribute writes cannot fail."""
+        self._authenticated_retention_replay_consumed = consumed
+        self._authenticated_retention_replay_scope = None
 
     def _release_authenticated_retention_replay_scope(
         self,
@@ -3208,60 +3314,39 @@ class SegmentStore:
         self,
         scope: _AuthenticatedRetentionReplayScope,
         source: _ReplaySourceSnapshot,
+        gate: _AuthenticatedRetentionReplayGate,
     ) -> None:
         """Bind an issued scope to the held source snapshot without path I/O."""
-        with self._retention_tombstone_lock:
-            if (
-                type(scope) is not _AuthenticatedRetentionReplayScope
-                or type(source) is not _ReplaySourceSnapshot
-                or self._authenticated_retention_replay_scope is not scope
-                or self._lifecycle_identity is not scope.lifecycle_identity
-                or self._authenticated_retention_unlink_completion
-                is not scope.completion_binding
-                or scope.completion_binding.capability is not scope.capability
-                or source.lifecycle_token != scope.source_lifecycle_token
-                or source.source_revision != scope.source_revision
-                or source.retained_ranges != scope.retained_ranges
-                or source.terminal_ref is None
-                or _exact_coverage_ref_key(source.terminal_ref)
-                != scope.terminal_key
-                or self._source_lifecycle_token != scope.source_lifecycle_token
-                or self._source_revision != scope.source_revision
-                or tuple(self._authenticated_retired_ranges)
-                != scope.retained_ranges
-                or scope.completion_binding.completed_state_raw
-                != scope.completed_state_raw
-            ):
-                raise EvidenceSealError("retention replay scope changed")
+        self._require_authenticated_retention_replay_gate_locked(scope, gate)
+        if (
+            type(source) is not _ReplaySourceSnapshot
+            or source.lifecycle_token != scope.source_lifecycle_token
+            or source.source_revision != scope.source_revision
+            or source.retained_ranges != gate.retained_ranges
+            or source.terminal_ref is None
+            or _exact_coverage_ref_key(source.terminal_ref)
+            != gate.terminal_key
+            or self._source_lifecycle_token != scope.source_lifecycle_token
+            or self._source_revision != scope.source_revision
+        ):
+            raise EvidenceSealError("retention replay scope changed")
 
     def _authenticated_retention_replay_ranges_locked(
         self,
         scope: _AuthenticatedRetentionReplayScope,
+        gate: _AuthenticatedRetentionReplayGate,
         *,
         through_sequence: int,
     ) -> tuple[tuple[int, int], ...]:
         """Return retained gaps only for the exact issued completion scope."""
-        with self._retention_tombstone_lock:
-            if (
-                type(scope) is not _AuthenticatedRetentionReplayScope
-                or type(through_sequence) is not int
-                or not 1 <= through_sequence <= MAX_UINT64
-                or self._authenticated_retention_replay_scope is not scope
-                or scope.terminal_key[6] != through_sequence
-                or self._lifecycle_identity is not scope.lifecycle_identity
-                or self._authenticated_retention_unlink_completion
-                is not scope.completion_binding
-                or scope.completion_binding.capability is not scope.capability
-                or self._source_lifecycle_token
-                != scope.source_lifecycle_token
-                or self._source_revision != scope.source_revision
-                or tuple(self._authenticated_retired_ranges)
-                != scope.retained_ranges
-                or scope.completion_binding.completed_state_raw
-                != scope.completed_state_raw
-            ):
-                raise EvidenceSealError("retention replay range scope changed")
-            return scope.retained_ranges
+        self._require_authenticated_retention_replay_gate_locked(scope, gate)
+        if (
+            type(through_sequence) is not int
+            or not 1 <= through_sequence <= MAX_UINT64
+            or gate.terminal_key[6] != through_sequence
+        ):
+            raise EvidenceSealError("retention replay range scope changed")
+        return gate.retained_ranges
 
     def _revalidate_replay_source_locked(
         self,
@@ -4970,7 +5055,7 @@ class SegmentStore:
             decode_retention_state(binding.commit_uncertain_state_raw)
         )
 
-    @_source_mutation
+    @_retention_source_mutation
     def _execute_authenticated_retention_unlink(
         self,
         capability: object,
@@ -5399,7 +5484,7 @@ class SegmentStore:
             ) from error
         return selected, boundary_raw
 
-    @_source_mutation
+    @_retention_source_mutation
     def _finalize_authenticated_retention_completion(
         self,
         capability: object,
@@ -5597,6 +5682,14 @@ class SegmentStore:
                 self._retention_state_temporary = None
                 self._retention_state_authority = None
                 self._retention_snapshot_binding = None
+                consumed_replay = (
+                    self._authenticated_retention_replay_consumed
+                )
+                if (
+                    consumed_replay is not None
+                    and consumed_replay.completion_binding is binding
+                ):
+                    self._authenticated_retention_replay_consumed = None
                 self._authenticated_retention_unlink_completion = None
                 self._retention_finalization_uncertain_latched = False
                 self._retention_state_namespace_uncertain = False
@@ -5647,7 +5740,7 @@ class SegmentStore:
                 "retention completion finalization is uncertain"
             ) from error
 
-    @_source_mutation
+    @_retention_source_mutation
     def _clear_authenticated_retention_blocked(
         self,
         journal: object,
