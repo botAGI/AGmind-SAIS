@@ -97,6 +97,9 @@ from agmind_immune.evidence.projection import (
     ProjectionUnhealthy,
     ProjectionValidationError,
 )
+from agmind_immune.evidence.retention import (
+    AuthenticatedRetentionUnlinkCompletion,
+)
 from agmind_immune.evidence.segments import (
     MAX_EVIDENCE_RECORD_BYTES,
     MAX_SEGMENT_BYTES,
@@ -107,6 +110,7 @@ from agmind_immune.evidence.segments import (
     SegmentStore,
     StoredEvidenceRecord,
     _AcceptedEnvelopeRecordV1,
+    _AuthenticatedRetentionReplayScope,
     _close_replay_source_snapshot,
     _exact_coverage_record_key,
     _exact_coverage_ref_key,
@@ -386,7 +390,7 @@ class _LateCandidateV2:
 
 @dataclass(frozen=True, slots=True)
 class _UnpublishedV2ReplayReport:
-    cursor: ProjectionCursor
+    cursor: ProjectionCursor | None
     applied_count: int
     prefix_sha256: str
 
@@ -418,7 +422,14 @@ class _ReplayReservation:
     token: object
     base_generation: int
     publish_generation: int
-    through_key: tuple[str, str, int, int, str, str, int, str]
+    through_key: tuple[str, str, int, int, str, str, int, str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _RetentionReplayFacts:
+    completed_state_sha256: bytes
+    retained_ranges: tuple[tuple[int, int], ...]
+    terminal_sequence: int
 
 
 @dataclass(slots=True)
@@ -436,6 +447,7 @@ class _ReplayInputSnapshot:
     schema_domain: bytes
     base_projection_generation: int
     publish_generation: int
+    retention_facts: _RetentionReplayFacts | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1211,6 +1223,114 @@ def _healthy_acceptance_cursor_v2(
     return status.acceptance_cursor
 
 
+def _healthy_replay_acceptance_cursor_v2(
+    store: SegmentStore,
+    lifecycle: object,
+    retention_scope: _AuthenticatedRetentionReplayScope | None,
+) -> int:
+    try:
+        status = store.status()
+    except Exception as error:
+        raise ProjectionAuthorityError(
+            "Projection V2 replay evidence status is unavailable"
+        ) from error
+    if (
+        type(status) is not EvidenceStatus
+        or store._lifecycle_identity is not lifecycle
+        or getattr(store, "_closed", True)
+        or status.healthy is not True
+        or status.repair_pending is not False
+        or status.retention_pending is not (retention_scope is not None)
+        or type(status.acceptance_cursor) is not int
+        or not 0 <= status.acceptance_cursor <= MAX_UINT64
+    ):
+        raise ProjectionAuthorityError(
+            "Projection V2 replay requires exact healthy source scope"
+        )
+    return status.acceptance_cursor
+
+
+def _capture_retention_replay_scope_v2(
+    store: SegmentStore,
+    capability: object,
+    terminal: EvidenceRef | None,
+) -> _AuthenticatedRetentionReplayScope:
+    if (
+        type(store) is not SegmentStore
+        or type(capability) is not AuthenticatedRetentionUnlinkCompletion
+        or type(terminal) is not EvidenceRef
+    ):
+        raise ProjectionAuthorityError(
+            "Projection V2 retention replay requires exact completion authority"
+        )
+    try:
+        return store._capture_authenticated_retention_replay_scope(
+            capability,
+            terminal,
+        )
+    except ProjectionAuthorityError:
+        raise
+    except Exception as error:
+        raise ProjectionAuthorityError(
+            "Projection V2 retention completion cannot be authenticated"
+        ) from error
+
+
+def _bind_retention_replay_scope_v2(
+    store: SegmentStore,
+    scope: _AuthenticatedRetentionReplayScope,
+    source: _ReplaySourceSnapshot,
+) -> _RetentionReplayFacts:
+    if (
+        type(scope) is not _AuthenticatedRetentionReplayScope
+        or type(source) is not _ReplaySourceSnapshot
+        or type(scope.capability) is not AuthenticatedRetentionUnlinkCompletion
+    ):
+        raise ProjectionAuthorityError(
+            "Projection V2 retention replay scope changed"
+        )
+    try:
+        store._bind_authenticated_retention_replay_scope_locked(scope, source)
+    except EvidenceStoreError as error:
+        raise ProjectionAuthorityError(
+            "Projection V2 retention replay scope changed"
+        ) from error
+    terminal_ref = source.terminal_ref
+    if terminal_ref is None:
+        raise ProjectionAuthorityError(
+            "Projection V2 retention replay lost its terminal"
+        )
+    return _RetentionReplayFacts(
+        completed_state_sha256=hashlib.sha256(scope.completed_state_raw).digest(),
+        retained_ranges=scope.retained_ranges,
+        terminal_sequence=terminal_ref.source_sequence,
+    )
+
+
+def _revalidate_retention_replay_scope_v2(
+    store: SegmentStore,
+    scope: _AuthenticatedRetentionReplayScope,
+    terminal: EvidenceRef | None,
+) -> None:
+    current = _capture_retention_replay_scope_v2(
+        store,
+        scope.capability,
+        terminal,
+    )
+    if (
+        current.completion_binding is not scope.completion_binding
+        or current.lifecycle_identity is not scope.lifecycle_identity
+        or current.source_lifecycle_token != scope.source_lifecycle_token
+        or current.source_revision != scope.source_revision
+        or current.completed_state_raw != scope.completed_state_raw
+        or current.retained_ranges != scope.retained_ranges
+        or current.terminal_key != scope.terminal_key
+    ):
+        raise ProjectionAuthorityError(
+            "Projection V2 retention replay scope was substituted"
+        )
+
+
 def _same_stored_record_v2(
     left: StoredEvidenceRecord,
     right: StoredEvidenceRecord,
@@ -1434,7 +1554,10 @@ def _validate_replay_snapshot_shape_v2(
         or len(source.lifecycle_token) != 32
         or type(source.source_revision) is not int
         or source.source_revision < 0
-        or type(source.terminal_ref) is not EvidenceRef
+        or (
+            source.terminal_ref is not None
+            and type(source.terminal_ref) is not EvidenceRef
+        )
         or type(source.retained_ranges) is not tuple
         or type(source.records) is not tuple
         or type(source.segments) is not tuple
@@ -1451,10 +1574,29 @@ def _validate_replay_snapshot_shape_v2(
         for item in source.retained_ranges
     ):
         raise TypeError("Projection V2 replay retained ranges are not exact")
-    try:
-        _exact_coverage_ref_key(source.terminal_ref)
-    except ValueError as error:
-        raise TypeError("Projection V2 replay terminal ref is malformed") from error
+    retention_facts = snapshot.retention_facts
+    if retention_facts is not None and (
+        type(retention_facts) is not _RetentionReplayFacts
+        or type(retention_facts.completed_state_sha256) is not bytes
+        or len(retention_facts.completed_state_sha256) != 32
+        or retention_facts.retained_ranges != source.retained_ranges
+        or type(retention_facts.terminal_sequence) is not int
+        or source.terminal_ref is None
+        or retention_facts.terminal_sequence
+        != source.terminal_ref.source_sequence
+    ):
+        raise TypeError("Projection V2 retention replay facts are not exact")
+    if ack.retention_pending is not (retention_facts is not None):
+        raise ProjectionAuthorityError(
+            "Projection V2 retention pending lacks its exact frozen scope"
+        )
+    if source.terminal_ref is not None:
+        try:
+            _exact_coverage_ref_key(source.terminal_ref)
+        except ValueError as error:
+            raise TypeError("Projection V2 replay terminal ref is malformed") from error
+    elif source.records or source.segments:
+        raise TypeError("Projection V2 empty replay source has persisted facts")
     if (
         type(ack.lifecycle_token) is not bytes
         or len(ack.lifecycle_token) != 32
@@ -1511,10 +1653,17 @@ def _decode_replay_records_v2(
     source: _ReplaySourceSnapshot,
     counters: _ReplayComputeCounters,
 ) -> tuple[StoredEvidenceRecord, ...]:
+    if source.terminal_ref is None:
+        if source.records or source.segments:
+            raise ProjectionConflict("Projection V2 empty replay source changed")
+        return ()
+    retained_ranges = source.retained_ranges
+    retained_index = 0
+    expected_sequence = 1
     records_by_segment: list[list[_ReplayRecordDescriptor]] = [
         [] for _segment in source.segments
     ]
-    for ordinal, record in enumerate(source.records, start=1):
+    for record in source.records:
         counters.administrative_visits += 1
         try:
             _exact_coverage_ref_key(record.ref)
@@ -1528,9 +1677,32 @@ def _decode_replay_records_v2(
             or type(record.canonical_record) is not bytes
             or type(record.segment_index) is not int
             or not 0 <= record.segment_index < len(source.segments)
-            or record.ref.source_sequence != ordinal
         ):
             raise TypeError("Projection V2 replay record descriptor is not exact")
+        sequence = record.ref.source_sequence
+        while retained_index < len(retained_ranges) and (
+            retained_ranges[retained_index][1] < expected_sequence
+        ):
+            raise ProjectionConflict(
+                "Projection V2 replay retained prefix overlaps live evidence"
+            )
+        while expected_sequence < sequence:
+            if retained_index >= len(retained_ranges):
+                raise ProjectionConflict(
+                    "Projection V2 replay source has an unauthenticated gap"
+                )
+            start, end = retained_ranges[retained_index]
+            if start != expected_sequence or end >= sequence:
+                raise ProjectionConflict(
+                    "Projection V2 replay retained range is not an exact gap"
+                )
+            expected_sequence = end + 1
+            retained_index += 1
+        if sequence != expected_sequence:
+            raise ProjectionConflict(
+                "Projection V2 replay live sequence overlaps retention"
+            )
+        expected_sequence += 1
         records_by_segment[record.segment_index].append(record)
     for segment_index, segment in enumerate(source.segments):
         counters.administrative_visits += 1
@@ -1620,7 +1792,8 @@ def _decode_replay_records_v2(
     if (
         not records
         or records[-1].ref != source.terminal_ref
-        or len(records) != source.terminal_ref.source_sequence
+        or expected_sequence != source.terminal_ref.source_sequence + 1
+        or retained_index != len(retained_ranges)
     ):
         raise ProjectionConflict("Projection V2 replay source is not contiguous")
     return tuple(records)
@@ -1647,21 +1820,20 @@ def _exact_replay_ack_identity_v2(
 
 def _verify_replay_ack_v2(
     ack: _AckReplaySnapshot,
-    terminal: EvidenceRef,
+    terminal: EvidenceRef | None,
     counters: _ReplayComputeCounters,
 ) -> None:
-    try:
-        terminal_key = _exact_coverage_ref_key(terminal)
-    except ValueError as error:
-        raise TypeError("Projection V2 replay ACK terminal is malformed") from error
+    terminal_identity: tuple[int, str, str] | None = None
+    if terminal is not None:
+        try:
+            terminal_key = _exact_coverage_ref_key(terminal)
+        except ValueError as error:
+            raise TypeError("Projection V2 replay ACK terminal is malformed") from error
+        terminal_identity = (terminal_key[6], terminal_key[5], terminal_key[7])
     confirmed = _exact_replay_ack_identity_v2(ack.confirmed)
-    pending = _exact_replay_ack_identity_v2(ack.pending)
+    _exact_replay_ack_identity_v2(ack.pending)
     if (
-        confirmed is None
-        or confirmed
-        != (terminal_key[6], terminal_key[5], terminal_key[7])
-        or pending is not None
-        or ack.retention_pending
+        confirmed != terminal_identity
         or not 0 <= ack.committed_prefix_size <= ack.size
     ):
         raise ProjectionAuthorityError("Projection V2 replay ACK boundary is not strict")
@@ -1732,7 +1904,7 @@ def _verify_replay_ack_v2(
         reduced_generation += 1
     if (
         reduced_confirmed != confirmed
-        or reduced_pending != pending
+        or reduced_pending is not None
         or reduced_generation != ack.generation
     ):
         raise ProjectionAuthorityError(
@@ -2242,7 +2414,11 @@ def _compute_replay(snapshot: _ReplayInputSnapshot) -> _ReplayComputation:
                 )
 
         cursor = _current_v2_cursor(connection)
-        if cursor is None or cursor.source_sequence != len(records):
+        terminal_ref = source.terminal_ref
+        if terminal_ref is None:
+            if cursor is not None or records:
+                raise ProjectionConflict("Projection V2 empty replay cursor changed")
+        elif cursor is None or cursor.source_sequence != terminal_ref.source_sequence:
             raise ProjectionConflict("Projection V2 replay terminal cursor changed")
         terminal_predecessor = _predecessor_v2(publish_generation, cursor)
         prefix_sha256 = _v2_snapshot_hash(connection)
@@ -2372,8 +2548,6 @@ def _validate_and_hydrate_replay(
             raise ProjectionConflict("Projection V2 replay image is not integral")
         cursor = _current_v2_cursor(connection)
         cursor_ref = _current_v2_cursor_ref(connection)
-        if cursor is None or cursor_ref is None:
-            raise ProjectionConflict("Projection V2 replay image lost its cursor")
         terminal_ref = source.terminal_ref
         expected_predecessor = _predecessor_v2(publish_generation, cursor)
         invalidations = tuple(
@@ -2385,9 +2559,7 @@ def _validate_and_hydrate_replay(
             ).fetchall()
         )
         if (
-            cursor.source_sequence != terminal_ref.source_sequence
-            or cursor.event_id != terminal_ref.event_id
-            or cursor.content_sha256 != terminal_ref.content_sha256
+            (cursor is None) != (terminal_ref is None)
             or cursor_ref != terminal_ref
             or expected_predecessor != computation.terminal_predecessor
             or _seal_projection_predecessor(expected_predecessor).canonical
@@ -2399,6 +2571,13 @@ def _validate_and_hydrate_replay(
             or connection.serialize() != computation.database_image
         ):
             raise ProjectionConflict("Projection V2 hydrated replay facts changed")
+        if terminal_ref is not None and (
+            cursor is None
+            or cursor.source_sequence != terminal_ref.source_sequence
+            or cursor.event_id != terminal_ref.event_id
+            or cursor.content_sha256 != terminal_ref.content_sha256
+        ):
+            raise ProjectionConflict("Projection V2 hydrated replay cursor changed")
         report = _UnpublishedV2ReplayReport(
             cursor=cursor,
             applied_count=computation.transcript_count,
@@ -3663,14 +3842,20 @@ class _V2ProjectionOwner:
 
     def _replay_unpublished_prefix(
         self,
-        through: EvidenceRef,
+        through: EvidenceRef | None,
         *,
         _factory: object,
+        retention_completion: AuthenticatedRetentionUnlinkCompletion | None = None,
         _fault_phase: _ReplayFaultPhase | None = None,
     ) -> _UnpublishedV2ReplayReport:
         if (
             _factory is not _UNPUBLISHED_REPLAY_FACTORY
-            or type(through) is not EvidenceRef
+            or (through is not None and type(through) is not EvidenceRef)
+            or (
+                retention_completion is not None
+                and type(retention_completion)
+                is not AuthenticatedRetentionUnlinkCompletion
+            )
             or (
                 _fault_phase is not None
                 and type(_fault_phase) is not _ReplayFaultPhase
@@ -3680,11 +3865,22 @@ class _V2ProjectionOwner:
                 "Projection V2 unpublished replay is factory-only"
             )
         try:
-            through_key = _exact_coverage_ref_key(through)
+            through_key = (
+                None if through is None else _exact_coverage_ref_key(through)
+            )
         except ValueError as error:
             raise ProjectionAuthorityError(
                 "Projection V2 unpublished terminal is not exact"
             ) from error
+        retention_scope = (
+            None
+            if retention_completion is None
+            else _capture_retention_replay_scope_v2(
+                self._evidence,
+                retention_completion,
+                through,
+            )
+        )
 
         reservation: _ReplayReservation | None = None
         source_snapshot: _ReplaySourceSnapshot | None = None
@@ -3694,6 +3890,7 @@ class _V2ProjectionOwner:
         primary_error: BaseException | None = None
         published = False
         base_generation = self._generation
+        acceptance_cursor = 0
         try:
             with self._mutex:
                 connection, authority = self._require_usable()
@@ -3702,6 +3899,11 @@ class _V2ProjectionOwner:
                         "Projection V2 replay generation is exhausted"
                     )
                 _verify_v2_schema(connection)
+                acceptance_cursor = _healthy_replay_acceptance_cursor_v2(
+                    self._evidence,
+                    self._evidence_lifecycle,
+                    retention_scope,
+                )
                 if _current_v2_cursor(connection) is not None or any(
                     connection.execute(
                         f"SELECT count(*) FROM {table}"
@@ -3757,23 +3959,36 @@ class _V2ProjectionOwner:
                             through
                         )
                     )
+                    retention_facts = (
+                        None
+                        if retention_scope is None
+                        else _bind_retention_replay_scope_v2(
+                            self._evidence,
+                            retention_scope,
+                            source_snapshot,
+                        )
+                    )
                     ack_snapshot = (
                         self._acknowledgements._capture_replay_ack_locked(
-                            through.source_sequence
+                            acceptance_cursor
                         )
                     )
                     expected_ack = (
-                        through.source_sequence,
-                        through.event_id,
-                        through.content_sha256,
+                        None
+                        if through is None
+                        else (
+                            through.source_sequence,
+                            through.event_id,
+                            through.content_sha256,
+                        )
                     )
                     if (
                         ack_snapshot.confirmed != expected_ack
-                        or ack_snapshot.pending is not None
                         or ack_snapshot.retention_pending
+                        is not (retention_scope is not None)
                     ):
                         raise ProjectionAuthorityError(
-                            "Projection V2 replay requires strict ACK equality"
+                            "Projection V2 replay requires its confirmed ACK boundary"
                         )
                     correlation_snapshot = (
                         _capture_correlation_replay_locked(
@@ -3785,22 +4000,30 @@ class _V2ProjectionOwner:
                     journal_snapshot, issued_proofs = (
                         _capture_correlation_journal_replay_locked(
                             self._journal,
-                            through_sequence=through.source_sequence,
+                            through_sequence=(
+                                0 if through is None else through.source_sequence
+                            ),
+                            retention_scope=retention_scope,
                         )
                     )
-                    pcc_inputs = tuple(
-                        _freeze_replay_pcc_seed(
-                            proof,
-                            detector_bundle_sha256=(
-                                correlation_snapshot.detector_bundle_sha256
-                            ),
-                            registry=correlation_binding.registry,
-                            registry_facts_canonical=(
-                                correlation_snapshot.registry_facts_canonical
-                            ),
+                    try:
+                        pcc_inputs = tuple(
+                            _freeze_replay_pcc_seed(
+                                proof,
+                                detector_bundle_sha256=(
+                                    correlation_snapshot.detector_bundle_sha256
+                                ),
+                                registry=correlation_binding.registry,
+                                registry_facts_canonical=(
+                                    correlation_snapshot.registry_facts_canonical
+                                ),
+                            )
+                            for proof in issued_proofs
                         )
-                        for proof in issued_proofs
-                    )
+                    except (TypeError, ValueError) as error:
+                        raise ProjectionAuthorityError(
+                            "Projection V2 historical PCC pin authority changed"
+                        ) from error
                     issued_proofs = ()
                     snapshot = _ReplayInputSnapshot(
                         source=source_snapshot,
@@ -3813,6 +4036,7 @@ class _V2ProjectionOwner:
                         ),
                         base_projection_generation=base_generation,
                         publish_generation=base_generation + 1,
+                        retention_facts=retention_facts,
                     )
                     if _fault_phase is _ReplayFaultPhase.FREEZE:
                         raise KeyboardInterrupt(
@@ -3845,6 +4069,12 @@ class _V2ProjectionOwner:
                     "Projection V2 replay frozen authority changed"
                 ) from error
 
+            if retention_scope is not None:
+                _revalidate_retention_replay_scope_v2(
+                    self._evidence,
+                    retention_scope,
+                    through,
+                )
             with self._mutex:
                 if (
                     self._closed
@@ -3886,6 +4116,16 @@ class _V2ProjectionOwner:
                     self._evidence._revalidate_replay_source_locked(
                         source_snapshot
                     )
+                    if retention_scope is not None:
+                        current_retention_facts = _bind_retention_replay_scope_v2(
+                            self._evidence,
+                            retention_scope,
+                            source_snapshot,
+                        )
+                        if current_retention_facts != snapshot.retention_facts:
+                            raise ProjectionAuthorityError(
+                                "Projection V2 retention replay facts changed"
+                            )
                     self._acknowledgements._revalidate_replay_ack_locked(
                         ack_snapshot
                     )
@@ -3905,14 +4145,19 @@ class _V2ProjectionOwner:
                     if (
                         computation.terminal_predecessor.generation
                         != base_generation + 1
-                        or report.cursor.source_sequence
-                        != through.source_sequence
-                        or report.cursor.event_id != through.event_id
-                        or report.cursor.content_sha256
-                        != through.content_sha256
+                        or (report.cursor is None) != (through is None)
                     ):
                         raise ProjectionConflict(
                             "Projection V2 replay publication seal changed"
+                        )
+                    if through is not None and (
+                        report.cursor is None
+                        or report.cursor.source_sequence != through.source_sequence
+                        or report.cursor.event_id != through.event_id
+                        or report.cursor.content_sha256 != through.content_sha256
+                    ):
+                        raise ProjectionConflict(
+                            "Projection V2 replay publication cursor changed"
                         )
                     if _fault_phase is _ReplayFaultPhase.PUBLISH:
                         raise KeyboardInterrupt(
@@ -5004,7 +5249,8 @@ def _v2_unpublished_projection_from_prefix_for_test(
     acknowledgements: AckJournal,
     journal: CorrelationRequestJournal,
     registry: SpecialUseRegistry,
-    through: EvidenceRef,
+    through: EvidenceRef | None,
+    retention_completion: AuthenticatedRetentionUnlinkCompletion | None = None,
     step_hook: Callable[[str], None] | None = None,
 ) -> tuple[_V2ProjectionOwner, sqlite3.Connection, _UnpublishedV2ReplayReport]:
     """Build one fresh dormant V2 projection from an exact ACKed source prefix."""
@@ -5013,7 +5259,12 @@ def _v2_unpublished_projection_from_prefix_for_test(
         or type(acknowledgements) is not AckJournal
         or type(journal) is not CorrelationRequestJournal
         or type(registry) is not SpecialUseRegistry
-        or type(through) is not EvidenceRef
+        or (through is not None and type(through) is not EvidenceRef)
+        or (
+            retention_completion is not None
+            and type(retention_completion)
+            is not AuthenticatedRetentionUnlinkCompletion
+        )
     ):
         raise ProjectionAuthorityError(
             "unpublished Projection V2 replay requires exact resources"
@@ -5031,6 +5282,7 @@ def _v2_unpublished_projection_from_prefix_for_test(
         report = owner._replay_unpublished_prefix(
             through,
             _factory=_UNPUBLISHED_REPLAY_FACTORY,
+            retention_completion=retention_completion,
         )
         published_connection = owner._connection
         if not isinstance(published_connection, sqlite3.Connection):

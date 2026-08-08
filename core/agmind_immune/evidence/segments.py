@@ -508,7 +508,7 @@ class _ReplayRecordDescriptor:
 class _ReplaySourceSnapshot:
     lifecycle_token: bytes
     source_revision: int
-    terminal_ref: EvidenceRef
+    terminal_ref: EvidenceRef | None
     retained_ranges: tuple[tuple[int, int], ...]
     records: tuple[_ReplayRecordDescriptor, ...]
     segments: tuple[_ReplaySegmentDescriptor, ...]
@@ -887,6 +887,18 @@ class _AuthenticatedRetentionUnlinkCompletionBinding:
     transient_generation: int
     accepted_authority: _RetentionAcceptedAuthorityBinding
     status: EvidenceStatus
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthenticatedRetentionReplayScope:
+    capability: object
+    completion_binding: _AuthenticatedRetentionUnlinkCompletionBinding
+    lifecycle_identity: object
+    source_lifecycle_token: bytes
+    source_revision: int
+    completed_state_raw: bytes
+    retained_ranges: tuple[tuple[int, int], ...]
+    terminal_key: tuple[str, str, int, int, str, str, int, str]
 
 
 def _retention_accepted_authority_binding(
@@ -2747,13 +2759,15 @@ class SegmentStore:
 
     def _replay_record_descriptors_locked(
         self,
-        terminal_ref: EvidenceRef,
+        terminal_ref: EvidenceRef | None,
     ) -> tuple[
         tuple[_ReplayRecordDescriptor, ...],
         tuple[str, ...],
         tuple[int, ...],
     ]:
         verifier = self._require_authenticated_recovered()
+        if terminal_ref is None:
+            return (), (), ()
         try:
             _exact_coverage_ref_key(terminal_ref)
             terminal = self.resolve_authenticated_ref(terminal_ref)
@@ -2824,7 +2838,7 @@ class SegmentStore:
 
     def _capture_replay_source_locked(
         self,
-        terminal_ref: EvidenceRef,
+        terminal_ref: EvidenceRef | None,
     ) -> _ReplaySourceSnapshot:
         """Freeze authenticated replay facts and owned read-only descriptors."""
         if (
@@ -3036,6 +3050,127 @@ class SegmentStore:
                 primary_error=error,
             )
             raise
+
+    def _capture_authenticated_retention_replay_scope(
+        self,
+        capability: object,
+        terminal_ref: EvidenceRef,
+    ) -> _AuthenticatedRetentionReplayScope:
+        """Authenticate the one exact completed-retention replay scope."""
+        from agmind_immune.evidence.retention import (
+            AuthenticatedRetentionUnlinkCompletion,
+        )
+
+        if (
+            type(capability) is not AuthenticatedRetentionUnlinkCompletion
+            or type(terminal_ref) is not EvidenceRef
+        ):
+            raise EvidenceSealError(
+                "retention replay requires exact completion authority"
+            )
+        try:
+            terminal_key = _exact_coverage_ref_key(terminal_ref)
+        except ValueError as error:
+            raise EvidenceSealError(
+                "retention replay terminal is not exact"
+            ) from error
+        with self._retention_tombstone_lock:
+            binding = self._authenticated_retention_unlink_completion
+            if binding is None or binding.capability is not capability:
+                raise EvidenceSealError(
+                    "retention replay completion is not registered"
+                )
+            selected, _boundary_raw = (
+                self._validate_authenticated_retention_completion(
+                    capability,
+                    binding,
+                )
+            )
+            completed_state_raw = binding.completed_state_raw
+            retained_ranges = tuple(self._authenticated_retired_ranges)
+            source_token = self._source_lifecycle_token
+            source_revision = self._source_revision
+            if (
+                not selected
+                or type(completed_state_raw) is not bytes
+                or not completed_state_raw
+                or type(source_token) is not bytes
+                or len(source_token) != 32
+                or type(source_revision) is not int
+                or source_revision < 0
+                or not retained_ranges
+                or any(
+                    end >= terminal_ref.source_sequence
+                    for _start, end in retained_ranges
+                )
+            ):
+                raise EvidenceSealError(
+                    "retention replay completion does not bind a retained prefix"
+                )
+            return _AuthenticatedRetentionReplayScope(
+                capability=capability,
+                completion_binding=binding,
+                lifecycle_identity=self._lifecycle_identity,
+                source_lifecycle_token=source_token,
+                source_revision=source_revision,
+                completed_state_raw=completed_state_raw,
+                retained_ranges=retained_ranges,
+                terminal_key=terminal_key,
+            )
+
+    def _bind_authenticated_retention_replay_scope_locked(
+        self,
+        scope: _AuthenticatedRetentionReplayScope,
+        source: _ReplaySourceSnapshot,
+    ) -> None:
+        """Bind an issued scope to the held source snapshot without path I/O."""
+        if (
+            type(scope) is not _AuthenticatedRetentionReplayScope
+            or type(source) is not _ReplaySourceSnapshot
+            or self._lifecycle_identity is not scope.lifecycle_identity
+            or self._authenticated_retention_unlink_completion
+            is not scope.completion_binding
+            or scope.completion_binding.capability is not scope.capability
+            or source.lifecycle_token != scope.source_lifecycle_token
+            or source.source_revision != scope.source_revision
+            or source.retained_ranges != scope.retained_ranges
+            or source.terminal_ref is None
+            or _exact_coverage_ref_key(source.terminal_ref)
+            != scope.terminal_key
+            or self._source_lifecycle_token != scope.source_lifecycle_token
+            or self._source_revision != scope.source_revision
+            or tuple(self._authenticated_retired_ranges)
+            != scope.retained_ranges
+            or scope.completion_binding.completed_state_raw
+            != scope.completed_state_raw
+        ):
+            raise EvidenceSealError("retention replay scope changed")
+
+    def _authenticated_retention_replay_ranges_locked(
+        self,
+        scope: _AuthenticatedRetentionReplayScope,
+        *,
+        through_sequence: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return retained gaps only for the exact issued completion scope."""
+        if (
+            type(scope) is not _AuthenticatedRetentionReplayScope
+            or type(through_sequence) is not int
+            or not 1 <= through_sequence <= MAX_UINT64
+            or scope.terminal_key[6] != through_sequence
+            or self._lifecycle_identity is not scope.lifecycle_identity
+            or self._authenticated_retention_unlink_completion
+            is not scope.completion_binding
+            or scope.completion_binding.capability is not scope.capability
+            or self._source_lifecycle_token != scope.source_lifecycle_token
+            or self._source_revision != scope.source_revision
+            or tuple(self._authenticated_retired_ranges)
+            != scope.retained_ranges
+            or scope.completion_binding.completed_state_raw
+            != scope.completed_state_raw
+        ):
+            raise EvidenceSealError("retention replay range scope changed")
+        return scope.retained_ranges
 
     def _revalidate_replay_source_locked(
         self,

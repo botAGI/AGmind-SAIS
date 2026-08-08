@@ -50,6 +50,7 @@ from agmind_immune.evidence.segments import (
     EvidenceSealError,
     SegmentStore,
     _AckAuthorityError,
+    _AuthenticatedRetentionReplayScope,
     _CorrelationJournalLifecycleCorrupt,
     _CorrelationJournalLifecycleIoUncertain,
     _CorrelationJournalLifecycleStateError,
@@ -2101,17 +2102,44 @@ def _completed_replay_facts_locked(
     replay: _AuthenticatedJournalReplay,
     *,
     through_sequence: int,
+    retention_scope: _AuthenticatedRetentionReplayScope | None,
 ) -> tuple[tuple[_CompletedPCCReplayFacts, ...], tuple[AuthenticatedPCCInput, ...]]:
+    retained_ranges = (
+        ()
+        if retention_scope is None
+        else journal._store._authenticated_retention_replay_ranges_locked(
+            retention_scope,
+            through_sequence=through_sequence,
+        )
+    )
     records = tuple(
         journal._store.iter_authenticated_records(through=through_sequence)
     )
+    if through_sequence == 0:
+        if records:
+            raise CorrelationRequestJournalAuthorityError(
+                "empty correlation replay prefix contains evidence"
+            )
+        return (), ()
+    expected_sequence = 1
+    retained_index = 0
+    for record in records:
+        while expected_sequence < record.ref.source_sequence:
+            if retained_index >= len(retained_ranges):
+                break
+            start, end = retained_ranges[retained_index]
+            if start != expected_sequence or end >= record.ref.source_sequence:
+                break
+            expected_sequence = end + 1
+            retained_index += 1
+        if record.ref.source_sequence != expected_sequence:
+            break
+        expected_sequence += 1
     if (
         not records
         or records[-1].ref.source_sequence != through_sequence
-        or any(
-            record.ref.source_sequence != ordinal
-            for ordinal, record in enumerate(records, start=1)
-        )
+        or expected_sequence != through_sequence + 1
+        or retained_index != len(retained_ranges)
     ):
         raise CorrelationRequestJournalAuthorityError(
             "correlation replay terminal is not exact and contiguous"
@@ -2163,12 +2191,17 @@ def _capture_correlation_journal_replay_locked(
     journal: CorrelationRequestJournal,
     *,
     through_sequence: int,
+    retention_scope: _AuthenticatedRetentionReplayScope | None = None,
 ) -> tuple[_CorrelationJournalReplaySnapshot, tuple[AuthenticatedPCCInput, ...]]:
     """Capture immutable durable journal facts and ephemeral issued PCC proofs."""
     if (
         type(journal) is not CorrelationRequestJournal
         or type(through_sequence) is not int
-        or not 1 <= through_sequence <= MAX_UINT64
+        or not 0 <= through_sequence <= MAX_UINT64
+        or (
+            retention_scope is not None
+            and type(retention_scope) is not _AuthenticatedRetentionReplayScope
+        )
     ):
         raise CorrelationRequestJournalAuthorityError(
             "correlation replay capture fields are not exact"
@@ -2193,6 +2226,7 @@ def _capture_correlation_journal_replay_locked(
         journal,
         replay,
         through_sequence=through_sequence,
+        retention_scope=retention_scope,
     )
     replay_after = journal._authenticated_journal_replay()
     if (

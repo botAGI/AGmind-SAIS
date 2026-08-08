@@ -742,6 +742,257 @@ def _close_compute_input(resources: dict[str, object]) -> None:
     resources["store"].close()
 
 
+def test_unpublished_replay_supports_empty_confirmed_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches requiring a non-empty terminal instead of the confirmed prefix."""
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator = _coordinator(tmp_path / "evidence", private_key(11))
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    acknowledgements = AckJournal.create_new(store)
+
+    owner, connection, report = (
+        subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=None,
+        )
+    )
+    try:
+        assert report.cursor is None
+        assert report.applied_count == 0
+        assert report.prefix_sha256 == (
+            "d4fb5609251c092ebf1c26ac0b50e55ce12e6c4cd0e054b2c84d6cf2dc809e7f"
+        )
+        assert report.prefix_sha256 == owner.snapshot_hash()
+        assert owner._generation == 2
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM ingest_cursors").fetchone()[0] == 0
+    finally:
+        owner.close()
+
+
+def test_unpublished_replay_caps_at_lagged_confirmed_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches projecting the acceptance head or authenticated pending ACK."""
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator = _coordinator(tmp_path / "evidence", private_key(11))
+    _accept(coordinator, boot_boundary(private_key(11)))
+    pending_ref = cast(
+        EvidenceRef,
+        _accept(coordinator, envelope_value(private_key(11), sequence=2)),
+    )
+    store = coordinator.segment_store
+    records = tuple(store.iter_authenticated_records())
+    assert len(records) == 2
+    journal = CorrelationRequestJournal.create_new(store)
+    acknowledgements = AckJournal.create_new(store)
+    _confirm_ack(acknowledgements, records[0].ref)
+    acknowledgements.record_pending(pending_ref)
+
+    owner, connection, report = (
+        subject._v2_unpublished_projection_from_prefix_for_test(
+            evidence=store,
+            acknowledgements=acknowledgements,
+            journal=journal,
+            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            through=records[0].ref,
+        )
+    )
+    try:
+        assert report.cursor is not None
+        assert report.cursor.source_sequence == 1
+        assert report.applied_count == 1
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM events WHERE event_id=?",
+            (pending_ref.event_id,),
+        ).fetchone()[0] == 0
+    finally:
+        owner.close()
+
+
+def test_unpublished_replay_requires_exact_retention_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches replacing the one-store completion proof with a pending Boolean."""
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    retention = importlib.import_module("tests.evidence.test_retention")
+    key, acceptance, store, coverage = retention._live_store_with_active_routine(
+        tmp_path / "evidence"
+    )
+    journal = CorrelationRequestJournal.create_new(store)
+    acknowledgements = store._ack_journal_owner
+    assert type(acknowledgements) is AckJournal
+    connection = subject._v2_connection_for_test()
+    owner = subject._v2_projection_owner_for_test(
+        connection,
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+    )
+    selected_snapshot = store._freeze_retention_snapshot(
+        retention._proof_clock(),
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    decision = retention.select_retention(
+        selected_snapshot,
+        request_id=retention.REQUEST_ID,
+    )
+    request = decision.request
+    assert request is not None
+    retention_journal = retention.retention_module._open_retention_state_journal(store)
+    retention_journal.prepare_publication(decision)
+    target_item = retention._item(
+        envelope_value(
+            key,
+            sequence=3,
+            event_type="retention_tombstone",
+            normalized_fields=request.model_dump(mode="python"),
+        )
+    )
+    target_ref = acceptance.accept(target_item)
+    coverage._apply_live_accepted(store, target_ref, None)
+    acknowledgements.record_pending(target_ref)
+    acknowledgements.record_confirmed(target_ref)
+    target = retention.retention_module.RetentionTargetV1(
+        sequence=target_item.sequence,
+        event_id=target_item.event_id,
+        content_sha256=target_item.content_sha256,
+    )
+    retention_journal.bind_target(target)
+    retention_journal.advance_evidence_appended(target)
+    final_snapshot = store._freeze_retention_snapshot(
+        retention._proof_clock(seconds=1),
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    tombstone = store._authenticate_retention_tombstone(
+        retention_journal,
+        final_snapshot,
+        target_ref,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    completion = store._execute_authenticated_retention_unlink(
+        tombstone,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    surviving = tuple(store.iter_authenticated_records(through=target_ref.source_sequence))
+    assert store.status().retention_pending is True
+    assert store._authenticated_retired_ranges
+
+    try:
+        with pytest.raises(ProjectionAuthorityError):
+            owner._replay_unpublished_prefix(
+                target_ref,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+            )
+        assert owner._generation == 1
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+
+        report = owner._replay_unpublished_prefix(
+            target_ref,
+            retention_completion=completion,
+            _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+        )
+        assert report.cursor is not None
+        assert report.cursor.source_sequence == target_ref.source_sequence
+        assert report.applied_count == len(surviving)
+        published = owner._connection
+        assert isinstance(published, sqlite3.Connection)
+        projected_sequences = tuple(
+            int(row[0])
+            for row in published.execute(
+                "SELECT source_sequence FROM events ORDER BY source_sequence"
+            )
+        )
+        assert projected_sequences == tuple(
+            record.ref.source_sequence for record in surviving
+        )
+        assert all(
+            not start <= sequence <= end
+            for sequence in projected_sequences
+            for start, end in store._authenticated_retired_ranges
+        )
+    finally:
+        coverage.close()
+        owner.close()
+
+
+def test_historical_pin_mismatch_returns_no_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches reducing a protected PCC under a replacement detector pin."""
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: _DETECTOR_HASH,
+    )
+    coordinator, proof = _accepted_complete(
+        tmp_path / "evidence",
+        ttl_seconds=120,
+    )
+    store, journal, acknowledgements, records = _unpublished_resources(
+        coordinator,
+        (proof,),
+    )
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        lambda: "2" * 64,
+    )
+    connection = subject._v2_connection_for_test()
+    owner = subject._v2_projection_owner_for_test(
+        connection,
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+    )
+    artifact: object | None = None
+    try:
+        with pytest.raises(ProjectionAuthorityError):
+            artifact = owner._replay_unpublished_prefix(
+                records[-1].ref,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+            )
+        assert artifact is None
+        assert owner._generation == 1
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM incidents").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 0
+    finally:
+        owner.close()
+
+
 def _with_conservative_sequence_gap(
     subject: Any,
     snapshot: object,
