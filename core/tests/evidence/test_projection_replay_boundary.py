@@ -566,9 +566,11 @@ class _ControllerReplay:
         self._through = None
         self._temporary_root = None
 
-        subject = importlib.import_module("agmind_immune.evidence.projection_v2")
         primary_error: BaseException | None = None
         try:
+            subject = importlib.import_module(
+                "agmind_immune.evidence.projection_v2"
+            )
             if owner._connection is not connection:
                 raise AssertionError("controller replay owner lost its connection")
             try:
@@ -738,15 +740,17 @@ def build_controller_replay_with_authenticated_pcc_count(
             "agmind_immune.evidence.projection_v2"
         )
         connection = subject._v2_connection_for_test()
+        registry = load_pinned_special_use_registry(_REGISTRY_PATH)
+        owner_factory = subject._v2_projection_owner_for_test
         # The factory owns all four resources even when its validation raises.
         # Do not close them a second time from this builder's failure path.
         owner_resources_transferred = True
-        owner = subject._v2_projection_owner_for_test(
+        owner = owner_factory(
             connection,
             evidence=store,
             acknowledgements=acknowledgements,
             journal=journal,
-            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+            registry=registry,
         )
         evidence_cursor = subject.ProjectionCursor(
             host_id=HOST_ID,
