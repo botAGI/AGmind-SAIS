@@ -2662,15 +2662,29 @@ class _V2ProjectionOwner:
         registry: SpecialUseRegistry,
         step_hook: Callable[[str], None] | None,
     ) -> _V2ProjectionOwner:
-        return cls._open_owner(
-            connection,
-            evidence=evidence,
-            acknowledgements=acknowledgements,
-            journal=journal,
-            registry=registry,
-            step_hook=step_hook,
-            owns_authorities=False,
-        )
+        try:
+            return cls._open_owner(
+                connection,
+                evidence=evidence,
+                acknowledgements=acknowledgements,
+                journal=journal,
+                registry=registry,
+                step_hook=step_hook,
+                owns_authorities=False,
+            )
+        except BaseException as primary:
+            if isinstance(connection, sqlite3.Connection):
+                for attempt in (1, 2):
+                    try:
+                        connection.close()
+                    except BaseException as error:  # noqa: BLE001 - adopted resource
+                        primary.add_note(
+                            "borrowed Projection V2 connection cleanup failure "
+                            f"(attempt {attempt}): {type(error).__name__}: {error}"
+                        )
+                    else:
+                        break
+            raise
 
     @classmethod
     def _open_owner(

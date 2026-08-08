@@ -129,6 +129,11 @@ def _create_projection_image(
 ) -> None:
     if image == "absent":
         return
+    if image == "orphan-sidecar":
+        sidecar = Path(f"{path}-wal")
+        sidecar.write_bytes(b"orphan-wal-must-remain-byte-identical")
+        sidecar.chmod(0o600)
+        return
     if image == "zero-length":
         path.touch(mode=0o600)
         path.chmod(0o600)
@@ -489,6 +494,7 @@ def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
     ("image", "expected", "v1_verifications", "v2_verifications"),
     (
         ("absent", "new", 0, 0),
+        ("orphan-sidecar", "unknown", 0, 0),
         ("zero-length", "unknown", 0, 0),
         ("v1", "v1", 1, 0),
         ("v2", "v2", 0, 1),

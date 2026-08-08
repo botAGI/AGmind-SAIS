@@ -12,7 +12,10 @@ from typing import Any, cast
 import pytest
 from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.contracts import PCCCorrelationSnapshotV1
-from agmind_immune.correlation.primitives import load_pinned_special_use_registry
+from agmind_immune.correlation.primitives import (
+    load_pinned_special_use_registry,
+    special_use_registry_is_issued,
+)
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.projection import ProjectionAuthorityError
 from agmind_immune.evidence.segments import EvidenceRef, EvidenceSealError
@@ -2878,11 +2881,55 @@ def test_borrowed_v2_owner_close_releases_only_projection_resources(
     acknowledgements = AckJournal.create_new(store)
     registry = load_pinned_special_use_registry(_REGISTRY_PATH)
     connection = subject._v2_connection_for_test()
+    foreign_coordinator = _coordinator(
+        tmp_path / "foreign-evidence",
+        private_key(12),
+    )
+    foreign_store = foreign_coordinator.segment_store
+    foreign_journal = CorrelationRequestJournal.create_new(foreign_store)
+    mismatched_connection = subject._v2_connection_for_test()
+    closed_connection: sqlite3.Connection | None = None
     owner: Any | None = None
     replacement: Any | None = None
     replacement_connection: sqlite3.Connection | None = None
     saved_authority: Any | None = None
     try:
+        with pytest.raises(ProjectionAuthorityError):
+            subject._V2ProjectionOwner._borrow_authorities(
+                mismatched_connection,
+                evidence=store,
+                acknowledgements=acknowledgements,
+                journal=foreign_journal,
+                registry=registry,
+                step_hook=None,
+            )
+        with pytest.raises(sqlite3.ProgrammingError):
+            mismatched_connection.execute("SELECT 1")
+        assert store.acceptance_cursor == 0
+        assert acknowledgements.snapshot().healthy is True
+        assert journal._is_bound_to(store) is True
+        assert foreign_journal._is_bound_to(foreign_store) is True
+        assert special_use_registry_is_issued(registry) is True
+
+        journal.close()
+        closed_connection = subject._v2_connection_for_test()
+        with pytest.raises(ProjectionAuthorityError):
+            subject._V2ProjectionOwner._borrow_authorities(
+                closed_connection,
+                evidence=store,
+                acknowledgements=acknowledgements,
+                journal=journal,
+                registry=registry,
+                step_hook=None,
+            )
+        with pytest.raises(sqlite3.ProgrammingError):
+            closed_connection.execute("SELECT 1")
+        assert store.acceptance_cursor == 0
+        assert acknowledgements.snapshot().healthy is True
+        assert special_use_registry_is_issued(registry) is True
+        journal = CorrelationRequestJournal.open_and_recover(store)
+        assert journal._is_bound_to(store) is True
+
         owner = subject._V2ProjectionOwner._borrow_authorities(
             connection,
             evidence=store,
@@ -2933,10 +2980,17 @@ def test_borrowed_v2_owner_close_releases_only_projection_resources(
             owner.close()
         else:
             connection.close()
+        mismatched_connection.close()
+        if closed_connection is not None:
+            closed_connection.close()
         if not journal._closed:
             journal.close()
+        if not foreign_journal._closed:
+            foreign_journal.close()
         if not acknowledgements._closed:
             acknowledgements.close()
+        if not foreign_store._closed:
+            foreign_store.close()
         if not store._closed:
             store.close()
 

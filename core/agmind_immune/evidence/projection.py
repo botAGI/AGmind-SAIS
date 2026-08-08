@@ -617,11 +617,9 @@ def _classify_projection_image_locked(
     """Classify one stable-lock-bound image without mutating it or its sidecars."""
     current = _lstat_at(parent_fd, path.name)
     if main_binding is None:
-        return (
-            _ProjectionImageKind.NEW
-            if current is None
-            else _ProjectionImageKind.UNKNOWN
-        )
+        if current is not None or _projection_sidecar_exists(parent_fd, path.name):
+            return _ProjectionImageKind.UNKNOWN
+        return _ProjectionImageKind.NEW
     _require_entry_binding(
         parent_fd,
         path.name,
