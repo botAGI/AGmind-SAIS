@@ -201,6 +201,10 @@ def _parser() -> argparse.ArgumentParser:
     rebuild = commands.add_parser("rebuild")
     rebuild.add_argument("evidence_dir", type=Path)
     rebuild.add_argument("projection_db", type=Path)
+    verify_export = commands.add_parser("verify-export")
+    verify_export.add_argument("bundle", type=Path)
+    verify_export.add_argument("--observer-root", required=True, type=Path)
+    verify_export.add_argument("--actuator-public-key", required=True, type=Path)
     return parser
 
 
@@ -219,7 +223,7 @@ def main() -> None:
                 "healthy": snapshot.healthy,
                 "confirmed_through": snapshot.confirmed_through,
             }
-        else:
+        elif arguments.command == "rebuild":
             report = rebuild_projection(
                 arguments.evidence_dir,
                 arguments.projection_db,
@@ -240,6 +244,23 @@ def main() -> None:
                         "frame_sha256": report.cursor.frame_sha256,
                     }
                 ),
+            }
+        else:
+            from agmind_immune.proof import verify_export
+
+            verification_report = verify_export(
+                arguments.bundle,
+                arguments.observer_root,
+                arguments.actuator_public_key,
+            )
+            output = {
+                "integrity_verified": verification_report.integrity_verified,
+                "causal_links_verified": verification_report.causal_links_verified,
+                "bundle_sha256": verification_report.bundle_sha256,
+                "action_id": verification_report.action_id,
+                "candidate_id": verification_report.candidate_id,
+                "intent_id": verification_report.intent_id,
+                "action_state": verification_report.action_state,
             }
     except Exception as error:  # noqa: BLE001 - CLI converts all operational failures
         _fatal(parser, error)
