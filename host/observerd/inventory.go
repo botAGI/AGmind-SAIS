@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -101,12 +102,14 @@ type CorrelationInventorySnapshot struct {
 // NetNSUniquenessV1 records the inventory generation and live namespace inode
 // over which a root-only uniqueness decision was made.
 type NetNSUniquenessV1 struct {
-	FullContainerID         string `json:"full_container_id"`
-	NetworkNamespaceInode   uint64 `json:"network_namespace_inode"`
-	InventoryGeneration     uint64 `json:"inventory_generation"`
-	InventorySnapshotSHA256 string `json:"inventory_snapshot_sha256"`
-	Unique                  bool   `json:"unique"`
-	CheckedAt               string `json:"checked_at"`
+	FullContainerID             string                         `json:"full_container_id"`
+	NetworkNamespaceInode       uint64                         `json:"network_namespace_inode"`
+	InventoryGeneration         uint64                         `json:"inventory_generation"`
+	InventorySnapshotSHA256     string                         `json:"inventory_snapshot_sha256"`
+	DockerNetworks              []contracts.PCCDockerNetworkV1 `json:"docker_networks"`
+	DockerNetworkSnapshotSHA256 string                         `json:"docker_network_snapshot_sha256"`
+	Unique                      bool                           `json:"unique"`
+	CheckedAt                   string                         `json:"checked_at"`
 }
 
 type processIdentity struct {
@@ -310,6 +313,13 @@ func (state inventoryDiskState) Validate() error {
 	); err != nil {
 		return err
 	}
+	networksByID := make(
+		map[string]contracts.PCCDockerNetworkV1,
+		len(state.DockerNetworks),
+	)
+	for _, network := range state.DockerNetworks {
+		networksByID[network.NetworkID] = network
+	}
 	ledgerByID := make(
 		map[string]inventoryRevisionLedgerEntry,
 		len(state.RevisionLedger),
@@ -333,6 +343,19 @@ func (state inventoryDiskState) Validate() error {
 		if record.Identity.InventoryGeneration != state.Generation ||
 			index > 0 && record.Identity.FullContainerID <= priorID {
 			return fmt.Errorf("invalid Docker inventory ordering")
+		}
+		for _, attached := range record.Identity.AttachedNetworks {
+			global, ok := networksByID[attached.NetworkID]
+			if !ok || global.Driver != attached.Driver ||
+				!slices.Equal(global.SubnetCIDRs, attached.SubnetCIDRs) ||
+				!slices.Equal(
+					global.GatewayAddresses,
+					attached.GatewayAddresses,
+				) {
+				return fmt.Errorf(
+					"attached Docker network is absent from global snapshot",
+				)
+			}
 		}
 		ledger, ok := ledgerByID[record.Identity.FullContainerID]
 		if !ok ||
@@ -1182,12 +1205,20 @@ func (inventory *Inventory) CheckNetNSUniqueness(
 	if err != nil {
 		return NetNSUniquenessV1{}, err
 	}
+	dockerNetworks := cloneDockerNetworks(inventory.state.DockerNetworks)
+	dockerNetworkSnapshotSHA256, err :=
+		contracts.PCCDockerNetworkSnapshotSHA256(dockerNetworks)
+	if err != nil {
+		return NetNSUniquenessV1{}, err
+	}
 	return NetNSUniquenessV1{
-		FullContainerID:         fullID,
-		NetworkNamespaceInode:   networkNamespaceInode,
-		InventoryGeneration:     generation,
-		InventorySnapshotSHA256: snapshotSHA256,
-		Unique:                  true,
+		FullContainerID:             fullID,
+		NetworkNamespaceInode:       networkNamespaceInode,
+		InventoryGeneration:         generation,
+		InventorySnapshotSHA256:     snapshotSHA256,
+		DockerNetworks:              dockerNetworks,
+		DockerNetworkSnapshotSHA256: dockerNetworkSnapshotSHA256,
+		Unique:                      true,
 		CheckedAt: inventory.now().UTC().Format(
 			time.RFC3339Nano,
 		),

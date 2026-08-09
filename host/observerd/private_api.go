@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -38,6 +39,52 @@ type ObserverIntegrityV1 struct {
 	KeyEpoch            uint64   `json:"key_epoch"`
 	InventoryGeneration uint64   `json:"inventory_generation"`
 	ObservedAt          string   `json:"observed_at"`
+}
+
+func (integrity ObserverIntegrityV1) Validate() error {
+	if integrity.SchemaVersion != "agmind.observer-integrity.v1" ||
+		!uuid4Pattern.MatchString(integrity.HostID) ||
+		!uuid4Pattern.MatchString(integrity.BootID) ||
+		!regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(integrity.KeyID) ||
+		integrity.KeyEpoch == 0 ||
+		integrity.InventoryGeneration == 0 ||
+		!strictUTCTime(integrity.ObservedAt) ||
+		integrity.Reasons == nil ||
+		integrity.Healthy != (len(integrity.Reasons) == 0) {
+		return fmt.Errorf("invalid observer integrity response")
+	}
+	allowed := map[string]bool{
+		"docker_logging_unavailable": true,
+		"docker_reconcile_gap":       true,
+		"mutation_read_only":         true,
+		"reconcile_required":         true,
+	}
+	for index, reason := range integrity.Reasons {
+		if !allowed[reason] || index > 0 && integrity.Reasons[index-1] >= reason {
+			return fmt.Errorf("invalid observer integrity reason")
+		}
+	}
+	return nil
+}
+
+func (result NetNSUniquenessV1) Validate() error {
+	if !dockerIDPattern.MatchString(result.FullContainerID) ||
+		result.NetworkNamespaceInode == 0 ||
+		result.InventoryGeneration == 0 ||
+		!hex64Pattern.MatchString(result.InventorySnapshotSHA256) ||
+		result.DockerNetworks == nil ||
+		!hex64Pattern.MatchString(result.DockerNetworkSnapshotSHA256) ||
+		!result.Unique ||
+		!strictUTCTime(result.CheckedAt) {
+		return fmt.Errorf("invalid network namespace uniqueness response")
+	}
+	expected, err := contracts.PCCDockerNetworkSnapshotSHA256(
+		result.DockerNetworks,
+	)
+	if err != nil || expected != result.DockerNetworkSnapshotSHA256 {
+		return fmt.Errorf("invalid Docker network snapshot binding")
+	}
+	return nil
 }
 
 type privateAPIBackend interface {
@@ -80,7 +127,8 @@ func containerIntegrityReasons(
 		reasons = append(reasons, "container_privileged")
 	}
 	for _, capability := range identity.ConfiguredCapAdd {
-		if capability == "NET_ADMIN" || capability == "CAP_NET_ADMIN" {
+		normalized := strings.TrimPrefix(strings.ToUpper(capability), "CAP_")
+		if normalized == "NET_ADMIN" || normalized == "ALL" {
 			reasons = append(reasons, "configured_cap_net_admin")
 			break
 		}

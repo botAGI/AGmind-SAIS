@@ -400,8 +400,23 @@ func TestPrivatePayloadHandlersReturnExactIdentityUniquenessAndIntegrity(
 	}
 	if !uniqueness.Unique ||
 		uniqueness.FullContainerID != inventoryTestIDOne ||
-		uniqueness.InventorySnapshotSHA256 == "" {
+		uniqueness.InventorySnapshotSHA256 == "" ||
+		uniqueness.DockerNetworkSnapshotSHA256 == "" ||
+		len(uniqueness.DockerNetworks) == 0 {
 		t.Fatalf("uniqueness=%+v", uniqueness)
+	}
+	dockerNetworkHash, err := contracts.PCCDockerNetworkSnapshotSHA256(
+		uniqueness.DockerNetworks,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dockerNetworkHash != uniqueness.DockerNetworkSnapshotSHA256 {
+		t.Fatalf(
+			"docker network snapshot hash=%s want=%s",
+			uniqueness.DockerNetworkSnapshotSHA256,
+			dockerNetworkHash,
+		)
 	}
 
 	integrityResponse := httptest.NewRecorder()
