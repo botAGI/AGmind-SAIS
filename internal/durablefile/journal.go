@@ -12,10 +12,12 @@ import (
 )
 
 var (
-	ErrJournalFailed = errors.New("journal is permanently failed")
-	ErrJournalLocked = errors.New("journal is exclusively locked")
-	ErrShortWrite    = errors.New("short journal write")
-	ErrJournalClosed = errors.New("journal is closed")
+	ErrJournalFailed           = errors.New("journal is permanently failed")
+	ErrJournalLocked           = errors.New("journal is exclusively locked")
+	ErrShortWrite              = errors.New("short journal write")
+	ErrJournalClosed           = errors.New("journal is closed")
+	ErrJournalPageBounds       = errors.New("invalid journal page bounds")
+	ErrJournalSnapshotMismatch = errors.New("journal snapshot mismatch")
 )
 
 type journalOptions struct {
@@ -66,6 +68,35 @@ type Recovery struct {
 	Records       []Record
 	TailRepaired  bool
 	VerifiedBytes int64
+}
+
+// JournalSnapshot pins one verified prefix of the currently locked journal.
+// RecordCount and VerifiedBytes are exact prefix boundaries; Head is the hash
+// of the final frame, or all zeroes for an empty prefix.
+type JournalSnapshot struct {
+	RecordCount   uint64
+	VerifiedBytes int64
+	Head          [sha256.Size]byte
+}
+
+// JournalPageRequest bounds both the verified snapshot scan and the records
+// copied into one page. After is the 1-based index of the last consumed frame;
+// zero starts at the first frame. A nil Snapshot pins the current journal head.
+type JournalPageRequest struct {
+	After               uint64
+	Limit               int
+	MaxRecords          uint64
+	MaxBytes            int64
+	MaxPagePayloadBytes int64
+	Snapshot            *JournalSnapshot
+}
+
+// JournalPage is a coherent page from one immutable snapshot prefix.
+type JournalPage struct {
+	Snapshot  JournalSnapshot
+	Records   []Record
+	NextAfter uint64
+	More      bool
 }
 
 // TornTailIntent contains the verified prefix and exact unverified suffix
@@ -547,6 +578,155 @@ func (journal *Journal) Append(payload []byte, critical bool) (RecordMeta, error
 	journal.previousHash = meta.Hash
 	journal.offset += int64(meta.Size)
 	return meta, nil
+}
+
+// ReadPage verifies and copies a bounded page from the journal's current file
+// descriptor. The journal mutex remains held for the entire scan, so Append
+// and Checkpoint cannot change the descriptor or prefix during the read.
+func (journal *Journal) ReadPage(request JournalPageRequest) (JournalPage, error) {
+	if journal == nil {
+		return JournalPage{}, ErrJournalClosed
+	}
+	journal.mutex.Lock()
+	defer journal.mutex.Unlock()
+	if journal.closed {
+		return JournalPage{}, ErrJournalClosed
+	}
+	if journal.failed {
+		return JournalPage{}, ErrJournalFailed
+	}
+	if request.Limit < 1 || request.MaxRecords == 0 || request.MaxBytes <= 0 ||
+		request.MaxPagePayloadBytes <= 0 || request.After > request.MaxRecords ||
+		uint64(request.Limit) > request.MaxRecords ||
+		journal.offset < 0 || journal.offset > request.MaxBytes {
+		return JournalPage{}, ErrJournalPageBounds
+	}
+
+	target := JournalSnapshot{
+		VerifiedBytes: journal.offset,
+		Head:          journal.previousHash,
+	}
+	pinned := request.Snapshot != nil
+	if pinned {
+		target = *request.Snapshot
+		if target.VerifiedBytes < 0 || target.VerifiedBytes > journal.offset ||
+			target.VerifiedBytes > request.MaxBytes ||
+			target.RecordCount > request.MaxRecords ||
+			request.After > target.RecordCount {
+			return JournalPage{}, ErrJournalSnapshotMismatch
+		}
+	}
+	info, err := journal.file.Stat()
+	if err != nil {
+		return JournalPage{}, err
+	}
+	if info.Size() != journal.offset {
+		return JournalPage{}, fmt.Errorf(
+			"%w: journal size differs from verified offset",
+			ErrJournalCorrupt,
+		)
+	}
+
+	page := JournalPage{Records: make([]Record, 0, request.Limit)}
+	var expectedPrevious [sha256.Size]byte
+	var offset int64
+	var recordCount uint64
+	var pagePayloadBytes int64
+	pageOpen := true
+	if target.VerifiedBytes == 0 {
+		if target.RecordCount != 0 || target.Head != expectedPrevious ||
+			request.After != 0 {
+			return JournalPage{}, ErrJournalSnapshotMismatch
+		}
+		page.Snapshot = target
+		page.NextAfter = request.After
+		return page, nil
+	}
+
+	for offset < journal.offset {
+		if recordCount == request.MaxRecords {
+			return JournalPage{}, ErrJournalPageBounds
+		}
+		remaining := journal.offset - offset
+		if remaining < frameHeaderSize {
+			return JournalPage{}, fmt.Errorf(
+				"%w: incomplete verified frame header",
+				ErrJournalCorrupt,
+			)
+		}
+		header := make([]byte, frameHeaderSize)
+		if _, err := journal.file.ReadAt(header, offset); err != nil {
+			return JournalPage{}, err
+		}
+		payloadLength := uint32(header[4])<<24 |
+			uint32(header[5])<<16 |
+			uint32(header[6])<<8 |
+			uint32(header[7])
+		if payloadLength > journal.maxFrame {
+			return JournalPage{}, fmt.Errorf(
+				"%w: payload length exceeds limit",
+				ErrJournalCorrupt,
+			)
+		}
+		total := int64(frameOverhead) + int64(payloadLength)
+		if total > remaining {
+			return JournalPage{}, fmt.Errorf(
+				"%w: incomplete verified frame",
+				ErrJournalCorrupt,
+			)
+		}
+		raw := make([]byte, int(total))
+		if _, err := journal.file.ReadAt(raw, offset); err != nil {
+			return JournalPage{}, err
+		}
+		record, err := DecodeFrame(raw, journal.maxFrame, expectedPrevious)
+		if err != nil {
+			return JournalPage{}, err
+		}
+		record.Offset = offset
+		offset += total
+		recordCount++
+		expectedPrevious = record.Hash
+
+		if offset > target.VerifiedBytes {
+			return JournalPage{}, ErrJournalSnapshotMismatch
+		}
+		if recordCount > request.After && len(page.Records) < request.Limit && pageOpen {
+			payloadBytes := int64(len(record.Payload))
+			if payloadBytes > request.MaxPagePayloadBytes-pagePayloadBytes {
+				if len(page.Records) == 0 {
+					return JournalPage{}, ErrJournalPageBounds
+				}
+				pageOpen = false
+			} else {
+				page.Records = append(page.Records, record)
+				pagePayloadBytes += payloadBytes
+			}
+		}
+		if offset == target.VerifiedBytes {
+			if pinned && (recordCount != target.RecordCount ||
+				expectedPrevious != target.Head) {
+				return JournalPage{}, ErrJournalSnapshotMismatch
+			}
+			if !pinned {
+				target.RecordCount = recordCount
+				if expectedPrevious != target.Head {
+					return JournalPage{}, fmt.Errorf(
+						"%w: journal head mismatch",
+						ErrJournalCorrupt,
+					)
+				}
+			}
+			break
+		}
+	}
+	if offset != target.VerifiedBytes || request.After > target.RecordCount {
+		return JournalPage{}, ErrJournalSnapshotMismatch
+	}
+	page.Snapshot = target
+	page.NextAfter = request.After + uint64(len(page.Records))
+	page.More = page.NextAfter < target.RecordCount
+	return page, nil
 }
 
 func (journal *Journal) Failed() bool {
