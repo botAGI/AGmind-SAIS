@@ -442,9 +442,14 @@ def _snapshot_fixture(subject: Any, *, reverse: bool) -> sqlite3.Connection:
     return connection
 
 
-def test_schema_v1_is_the_exact_active_v1_bytes() -> None:
+def test_schema_v1_is_retained_beside_the_promoted_v2_schema() -> None:
     root = Path(__file__).parents[2] / "agmind_immune" / "evidence"
-    assert (root / "schema_v1.sql").read_bytes() == (root / "schema.sql").read_bytes()
+    assert hashlib.sha256((root / "schema_v1.sql").read_bytes()).hexdigest() == (
+        "e27ea065b3659197aae7b58939695a5e79439faeb0b841dc600c6c822b1919f2"
+    )
+    assert hashlib.sha256((root / "schema.sql").read_bytes()).hexdigest() == (
+        "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
+    )
 
 
 def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
@@ -452,7 +457,7 @@ def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
     root = Path(__file__).parents[2] / "agmind_immune" / "evidence"
     expected_schema_hash = "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
     assert subject._SCHEMA_V2_SHA256 == expected_schema_hash
-    assert hashlib.sha256((root / "schema_v2.sql").read_bytes()).hexdigest() == (
+    assert hashlib.sha256((root / "schema.sql").read_bytes()).hexdigest() == (
         expected_schema_hash
     )
     active = importlib.import_module("agmind_immune.evidence.projection")
@@ -472,7 +477,7 @@ def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
         "network_observations",
         "ingest_cursors",
     )
-    assert subject._SCHEMA_V2_PATH.name == "schema_v2.sql"
+    assert subject._SCHEMA_V2_PATH.name == "schema.sql"
     connection = sqlite3.connect(":memory:", isolation_level=None)
     try:
         connection.execute("PRAGMA foreign_keys=ON")

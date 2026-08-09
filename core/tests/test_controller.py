@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -14,6 +15,10 @@ from agmind_immune.controller import (
     CoreControllerAuthorityError,
     CoreControllerClockError,
     CoreControllerClosed,
+)
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    load_pinned_special_use_registry,
 )
 from agmind_immune.coverage import CoverageState
 from agmind_immune.evidence.projection import (
@@ -48,6 +53,12 @@ from tests.phase5b_helpers import (
     private_key,
     root_value,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fixed_detector_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: "1" * 64)
 
 
 class _Clock:
@@ -134,6 +145,7 @@ def _authorities(
     SegmentStore,
     AckJournal,
     CorrelationRequestJournal,
+    SpecialUseRegistry,
     CoverageState,
     ProjectionStore,
     tuple[EvidenceRef, ...],
@@ -152,6 +164,9 @@ def _authorities(
     )
     journal = AckJournal.create_new(store)
     correlation = CorrelationRequestJournal.create_new(store)
+    registry = load_pinned_special_use_registry(
+        Path(__file__).resolve().parents[2] / "contracts/v1/ipv4-special-use.csv"
+    )
     refs = tuple(
         acceptance.accept(
             decode_events_page(canonical_json(page_value(value))).events[0]
@@ -166,8 +181,19 @@ def _authorities(
         path / "projection.sqlite3",
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
-    return acceptance, store, journal, correlation, coverage, projection, refs
+    return (
+        acceptance,
+        store,
+        journal,
+        correlation,
+        registry,
+        coverage,
+        projection,
+        refs,
+    )
 
 
 def _ready_events() -> tuple[dict[str, object], ...]:
@@ -240,6 +266,7 @@ def test_controller_requires_correlation_journal_from_the_same_evidence_root(
         store,
         journal,
         primary_correlation,
+        registry,
         coverage,
         projection,
         _,
@@ -249,6 +276,7 @@ def test_controller_requires_correlation_journal_from_the_same_evidence_root(
         foreign_store,
         foreign_ack,
         foreign_correlation,
+        _foreign_registry,
         foreign_coverage,
         foreign_projection,
         _,
@@ -259,6 +287,7 @@ def test_controller_requires_correlation_journal_from_the_same_evidence_root(
             acceptance,
             journal,
             foreign_correlation,
+            registry,
             coverage,
             projection,
             _Transport(),
@@ -275,6 +304,65 @@ def test_controller_requires_correlation_journal_from_the_same_evidence_root(
     foreign_correlation.close()
     foreign_ack.close()
     foreign_store.close()
+
+
+@pytest.mark.parametrize("substitution", ("correlation", "registry", "projection"))
+def test_controller_requires_projection_correlation_and_registry_from_same_root(
+    tmp_path: Path,
+    substitution: str,
+) -> None:
+    primary = _authorities(tmp_path / "primary-exact")
+    foreign = _authorities(tmp_path / "foreign-exact")
+    (
+        acceptance,
+        store,
+        acknowledgements,
+        correlation,
+        registry,
+        coverage,
+        projection,
+        _,
+    ) = primary
+    (
+        _foreign_acceptance,
+        foreign_store,
+        foreign_acknowledgements,
+        foreign_correlation,
+        foreign_registry,
+        foreign_coverage,
+        foreign_projection,
+        _,
+    ) = foreign
+    selected_correlation = (
+        foreign_correlation if substitution == "correlation" else correlation
+    )
+    selected_registry = foreign_registry if substitution == "registry" else registry
+    selected_projection = (
+        foreign_projection if substitution == "projection" else projection
+    )
+    try:
+        with pytest.raises(CoreControllerAuthorityError):
+            CoreController.create(
+                acceptance,
+                acknowledgements,
+                selected_correlation,
+                selected_registry,
+                coverage,
+                selected_projection,
+                _Transport(),
+                _Clock(),
+            )
+    finally:
+        projection.close()
+        coverage.close()
+        correlation.close()
+        acknowledgements.close()
+        store.close()
+        foreign_projection.close()
+        foreign_coverage.close()
+        foreign_correlation.close()
+        foreign_acknowledgements.close()
+        foreign_store.close()
 
 
 @pytest.mark.parametrize(
@@ -299,13 +387,14 @@ async def test_controller_maps_evidence_pending_without_collapsing_health(
     pending_changes: dict[str, bool],
     expected_reason: str,
 ) -> None:
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "runtime"
     )
     controller = CoreController.create(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         _Transport([_page(*_ready_events(), reserved=5)], ack_count=5),
@@ -351,6 +440,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         _lag_store,
         lag_journal,
         lag_correlation,
+        lag_registry,
         lag_coverage,
         lag_projection,
         lag_refs,
@@ -359,6 +449,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         lag_acceptance,
         lag_journal,
         lag_correlation,
+        lag_registry,
         lag_coverage,
         lag_projection,
         _Transport([_page(acked=1, reserved=1)]),
@@ -370,7 +461,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
     assert lag_projection.status().cursor.source_sequence == lag_refs[-1].source_sequence
     await lag_controller.close()
 
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "ready"
     )
     applied: list[int] = []
@@ -387,6 +478,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -558,6 +650,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         _capped_store,
         capped_journal,
         capped_correlation,
+        capped_registry,
         capped_coverage,
         capped_projection,
         capped_refs,
@@ -582,6 +675,7 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         capped_acceptance,
         capped_journal,
         capped_correlation,
+        capped_registry,
         capped_coverage,
         capped_projection,
         _Transport(),
@@ -600,7 +694,7 @@ async def test_controller_projection_failure_and_shutdown_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "failure"
     )
     transport = _Transport(
@@ -622,6 +716,7 @@ async def test_controller_projection_failure_and_shutdown_order(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         transport,

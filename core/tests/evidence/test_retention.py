@@ -4,6 +4,7 @@ import copy
 import hashlib
 import os
 import pickle
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -408,6 +409,7 @@ def _retention_proof_case(
     path: Path,
     *,
     acknowledge: bool = True,
+    before_retention_prepare: Callable[[SegmentStore], None] | None = None,
 ) -> _RetentionProofCase:
     key, acceptance, store, coverage = _live_store_with_active_routine(
         path,
@@ -425,6 +427,8 @@ def _retention_proof_case(
         assert type(decision.request) is RetentionTombstoneV2
         request = decision.request
         journal = retention_module._open_retention_state_journal(store)
+        if before_retention_prepare is not None:
+            before_retention_prepare(store)
         journal.prepare_publication(decision)
         target_item = _item(
             envelope_value(

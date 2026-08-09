@@ -12,8 +12,13 @@ from typing import Any, cast
 import pytest
 from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.contracts import ObserverTrustRootV1
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    load_pinned_special_use_registry,
+)
 from agmind_immune.evidence.segments import EvidenceRef, SegmentStore
 from agmind_immune.ingest.ack_journal import AckJournal
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
     EnvelopeVerifier,
@@ -39,7 +44,21 @@ def _projection() -> Any:
         pytest.fail("projection/rebuild slice is not implemented")
 
 
-def _system(path: Path) -> tuple[AcceptanceCoordinator, SegmentStore, AckJournal]:
+@pytest.fixture(autouse=True)
+def _fixed_detector_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: "1" * 64)
+
+
+def _system(
+    path: Path,
+) -> tuple[
+    AcceptanceCoordinator,
+    SegmentStore,
+    AckJournal,
+    CorrelationRequestJournal,
+    SpecialUseRegistry,
+]:
     path.parent.mkdir(parents=True, mode=0o700)
     path.parent.chmod(0o700)
     key = private_key(11)
@@ -49,7 +68,12 @@ def _system(path: Path) -> tuple[AcceptanceCoordinator, SegmentStore, AckJournal
     chain = AnchoredPublicKeyChain.from_value(root, metadata_value(key))
     store = SegmentStore(path)
     coordinator = AcceptanceCoordinator.create_empty(EnvelopeVerifier(root, chain), store)
-    return coordinator, store, AckJournal.create_new(store)
+    acknowledgements = AckJournal.create_new(store)
+    correlation_requests = CorrelationRequestJournal.create_new(store)
+    registry = load_pinned_special_use_registry(
+        Path(__file__).resolve().parents[2] / "contracts/v1/ipv4-special-use.csv"
+    )
+    return coordinator, store, acknowledgements, correlation_requests, registry
 
 
 def _accept(coordinator: AcceptanceCoordinator, value: dict[str, object]) -> EvidenceRef:
@@ -71,13 +95,106 @@ def _fixture_refs(coordinator: AcceptanceCoordinator) -> list[EvidenceRef]:
     ]
 
 
+def test_public_rebuild_projection_persists_completed_pcc_and_requires_fixed_pins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay = importlib.import_module("agmind_immune.replay")
+    pcc = importlib.import_module("tests.correlation.test_pcc")
+    pcc_projection = importlib.import_module("tests.evidence.test_projection_pcc")
+    correlation_module = importlib.import_module(
+        "agmind_immune.ingest.correlation_journal"
+    )
+    evidence_dir = tmp_path / "evidence"
+    coordinator, proof = pcc._accepted_complete(evidence_dir, ttl_seconds=120)
+    store = coordinator.segment_store
+    acknowledgements = AckJournal.create_new(store)
+    records = tuple(store.iter_authenticated_records())
+    _confirm(acknowledgements, *[record.ref for record in records])
+    correlation_requests = correlation_module.CorrelationRequestJournal.create_new(store)
+    pcc_projection._complete_journal(correlation_requests, proof)
+    correlation_requests.close()
+    acknowledgements.close()
+    store.close()
+
+    registry = Path(__file__).resolve().parents[2] / "contracts/v1/ipv4-special-use.csv"
+
+    def recovered_verifier() -> EnvelopeVerifier:
+        key = private_key(11)
+        root = PinnedObserverRoot.from_validated_contract_for_test(
+            ObserverTrustRootV1.model_validate(root_value(key))
+        )
+        return EnvelopeVerifier(
+            root,
+            AnchoredPublicKeyChain.from_value(root, metadata_value(key)),
+        )
+
+    monkeypatch.setattr(replay, "_verifier", recovered_verifier)
+    monkeypatch.setattr(
+        replay,
+        "_DEFAULT_SPECIAL_USE_REGISTRY",
+        tmp_path / "missing-fixed-registry.csv",
+        raising=False,
+    )
+    missing_projection = tmp_path / "missing.sqlite3"
+    with pytest.raises(FileNotFoundError):
+        replay.rebuild_projection(evidence_dir, missing_projection)
+    assert not missing_projection.exists()
+    assert not any(
+        Path(f"{missing_projection}{suffix}").exists()
+        for suffix in ("-wal", "-shm", "-journal")
+    )
+
+    monkeypatch.setattr(replay, "_DEFAULT_SPECIAL_USE_REGISTRY", registry, raising=False)
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+
+    legacy_projection = tmp_path / "legacy.sqlite3"
+    projection = _projection()
+    with sqlite3.connect(legacy_projection, isolation_level=None) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        projection._create_v1_schema(connection)
+    legacy_projection.chmod(0o600)
+    legacy_before = legacy_projection.read_bytes()
+    legacy_info = legacy_projection.stat()
+    legacy_identity = legacy_info.st_dev, legacy_info.st_ino
+    detector_calls = 0
+
+    def changing_detector() -> str:
+        nonlocal detector_calls
+        detector_calls += 1
+        return ("1" if detector_calls % 2 else "2") * 64
+
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", changing_detector)
+    with pytest.raises(projection.ProjectionAuthorityError):
+        replay.rebuild_projection(evidence_dir, legacy_projection)
+    legacy_after = legacy_projection.stat()
+    assert (legacy_after.st_dev, legacy_after.st_ino) == legacy_identity
+    assert legacy_projection.read_bytes() == legacy_before
+    assert not any(
+        Path(f"{legacy_projection}{suffix}").exists()
+        for suffix in ("-wal", "-shm", "-journal")
+    )
+    assert not tuple(tmp_path.glob(f".{legacy_projection.name}.projection.*.tmp*"))
+
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: "1" * 64)
+    report = replay.rebuild_projection(evidence_dir, tmp_path / "projection.sqlite3")
+    assert report.cursor is not None
+    assert report.cursor.source_sequence == records[-1].ref.source_sequence
+    with sqlite3.connect(tmp_path / "projection.sqlite3") as connection:
+        assert connection.execute("SELECT result_kind FROM incidents").fetchall() == [
+            ("candidate",)
+        ]
+        assert connection.execute("SELECT count(*) FROM candidates").fetchone() == (1,)
+
+
 @pytest.mark.parametrize("recovery", ["apply", "rebuild"])
 def test_existing_legal_projection_lag_opens_and_catches_up(
     tmp_path: Path,
     recovery: str,
 ) -> None:
     projection = _projection()
-    coordinator, store, journal = _system(tmp_path / recovery / "evidence")
+    coordinator, store, journal, correlation, registry = _system(tmp_path / recovery / "evidence")
     key = private_key(11)
     refs = [
         _accept(coordinator, boot_boundary(key)),
@@ -97,6 +214,8 @@ def test_existing_legal_projection_lag_opens_and_catches_up(
         path,
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     cache.apply(refs[0])
     cache.close()
@@ -106,6 +225,8 @@ def test_existing_legal_projection_lag_opens_and_catches_up(
         path,
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     if recovery == "apply":
         assert reopened.apply(refs[1]).cursor.source_sequence == 2
@@ -123,7 +244,7 @@ def test_persistent_pre_rename_substitution_never_crosses_replace(
     substitution: str,
 ) -> None:
     projection = _projection()
-    coordinator, store, journal = _system(tmp_path / substitution / "evidence")
+    coordinator, store, journal, correlation, registry = _system(tmp_path / substitution / "evidence")
     refs = _fixture_refs(coordinator)
     _confirm(journal, *refs)
     path = tmp_path / substitution / "projection.sqlite3"
@@ -131,6 +252,8 @@ def test_persistent_pre_rename_substitution_never_crosses_replace(
         path,
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     baseline.rebuild()
     baseline.close()
@@ -166,6 +289,8 @@ def test_persistent_pre_rename_substitution_never_crosses_replace(
         path,
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
         step_hook=substitute_at_last_pre_rename_seam,
     )
     with pytest.raises(projection.ProjectionConflict):
@@ -196,7 +321,7 @@ def test_existing_cache_must_match_authenticated_confirmed_prefix(
     forgery: str,
 ) -> None:
     projection = _projection()
-    coordinator, store, journal = _system(tmp_path / forgery / "evidence")
+    coordinator, store, journal, correlation, registry = _system(tmp_path / forgery / "evidence")
     refs = _fixture_refs(coordinator)
     _confirm(journal, *refs)
     path = tmp_path / forgery / "projection.sqlite3"
@@ -204,6 +329,8 @@ def test_existing_cache_must_match_authenticated_confirmed_prefix(
         path,
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     cache.rebuild()
     cache.close()
@@ -235,6 +362,8 @@ def test_existing_cache_must_match_authenticated_confirmed_prefix(
             path,
             evidence=store,
             acknowledgements=journal,
+            correlation_requests=correlation,
+            registry=registry,
         )
     store.close()
 
@@ -249,7 +378,7 @@ def test_projection_namespace_is_bound_and_no_follow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     projection = _projection()
-    coordinator, store, journal = _system(tmp_path / namespace_case / "evidence")
+    coordinator, store, journal, correlation, registry = _system(tmp_path / namespace_case / "evidence")
     ref = _accept(coordinator, boot_boundary(private_key(11)))
     _confirm(journal, ref)
     parent = tmp_path / namespace_case
@@ -261,6 +390,8 @@ def test_projection_namespace_is_bound_and_no_follow(
                 relative,
                 evidence=store,
                 acknowledgements=journal,
+                correlation_requests=correlation,
+                registry=registry,
             )
         store.close()
         return
@@ -271,6 +402,8 @@ def test_projection_namespace_is_bound_and_no_follow(
                 path,
                 evidence=store,
                 acknowledgements=journal,
+                correlation_requests=correlation,
+                registry=registry,
             )
         store.close()
         return
@@ -279,6 +412,8 @@ def test_projection_namespace_is_bound_and_no_follow(
             path,
             evidence=store,
             acknowledgements=journal,
+            correlation_requests=correlation,
+            registry=registry,
         )
         moved = parent.with_name(f"{parent.name}-moved")
         parent.rename(moved)
@@ -294,6 +429,8 @@ def test_projection_namespace_is_bound_and_no_follow(
         path,
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     baseline.rebuild()
     baseline.close()
@@ -321,6 +458,8 @@ def test_projection_namespace_is_bound_and_no_follow(
                 path,
                 evidence=store,
                 acknowledgements=journal,
+                correlation_requests=correlation,
+                registry=registry,
             )
     finally:
         if namespace_case == "parent_swap" and moved.exists():
@@ -334,7 +473,7 @@ def test_rebuild_is_capped_by_frozen_ack_authority(
     tmp_path: Path, confirmed_count: int
 ) -> None:
     projection = _projection()
-    coordinator, store, journal = _system(tmp_path / str(confirmed_count) / "evidence")
+    coordinator, store, journal, correlation, registry = _system(tmp_path / str(confirmed_count) / "evidence")
     refs = _fixture_refs(coordinator)
     _confirm(journal, *refs[:confirmed_count])
     hook = None
@@ -353,6 +492,8 @@ def test_rebuild_is_capped_by_frozen_ack_authority(
         tmp_path / str(confirmed_count) / "projection.sqlite3",
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
         step_hook=hook,
     )
     report = cache.rebuild()
@@ -373,7 +514,7 @@ def test_rebuild_is_capped_by_frozen_ack_authority(
 @pytest.mark.parametrize("history", ["two_rebuilds", "delete_rebuild"])
 def test_logical_snapshot_hash_ignores_sqlite_history(tmp_path: Path, history: str) -> None:
     projection = _projection()
-    coordinator, store, journal = _system(tmp_path / history / "evidence")
+    coordinator, store, journal, correlation, registry = _system(tmp_path / history / "evidence")
     key = private_key(11)
     refs = [
         _accept(coordinator, boot_boundary(key)),
@@ -385,7 +526,11 @@ def test_logical_snapshot_hash_ignores_sqlite_history(tmp_path: Path, history: s
     _confirm(journal, *refs)
     path = tmp_path / history / "projection.sqlite3"
     cache = projection.ProjectionStore.open(
-        path, evidence=store, acknowledgements=journal
+        path,
+        evidence=store,
+        acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     first = cache.rebuild()
     ack_before = journal.snapshot()
@@ -393,7 +538,11 @@ def test_logical_snapshot_hash_ignores_sqlite_history(tmp_path: Path, history: s
         cache.close()
         path.unlink()
         cache = projection.ProjectionStore.open(
-            path, evidence=store, acknowledgements=journal
+            path,
+            evidence=store,
+            acknowledgements=journal,
+            correlation_requests=correlation,
+            registry=registry,
         )
     second = cache.rebuild()
     assert (second.snapshot_hash, second.table_counts) == (
@@ -423,12 +572,16 @@ def test_swap_failures_preserve_authority_and_fence_ambiguity(
     tmp_path: Path, failure_step: str, post_rename: bool
 ) -> None:
     projection = _projection()
-    coordinator, store, journal = _system(tmp_path / failure_step / "evidence")
+    coordinator, store, journal, correlation, registry = _system(tmp_path / failure_step / "evidence")
     ref = _accept(coordinator, boot_boundary(private_key(11)))
     _confirm(journal, ref)
     path = tmp_path / failure_step / "projection.sqlite3"
     baseline = projection.ProjectionStore.open(
-        path, evidence=store, acknowledgements=journal
+        path,
+        evidence=store,
+        acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     baseline.rebuild()
     old_hash = baseline.snapshot_hash()
@@ -447,7 +600,12 @@ def test_swap_failures_preserve_authority_and_fence_ambiguity(
             raise OSError(f"injected {step}")
 
     cache = projection.ProjectionStore.open(
-        path, evidence=store, acknowledgements=journal, step_hook=hook
+        path,
+        evidence=store,
+        acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
+        step_hook=hook,
     )
     with pytest.raises(OSError, match="injected"):
         cache.rebuild()
@@ -485,7 +643,7 @@ def test_operation_failures_recover_or_latch_without_touching_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     projection = _projection()
-    coordinator, store, journal = _system(tmp_path / operation / "evidence")
+    coordinator, store, journal, correlation, registry = _system(tmp_path / operation / "evidence")
     ref = _accept(coordinator, boot_boundary(private_key(11)))
     _confirm(journal, ref)
     path = tmp_path / operation / "projection.sqlite3"
@@ -493,6 +651,8 @@ def test_operation_failures_recover_or_latch_without_touching_source(
         path,
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     baseline.rebuild()
     expected_hash = baseline.snapshot_hash()
@@ -506,6 +666,8 @@ def test_operation_failures_recover_or_latch_without_touching_source(
         path,
         evidence=store,
         acknowledgements=journal,
+        correlation_requests=correlation,
+        registry=registry,
     )
     original_connect = projection._connect
     original_verify = projection._verify_schema

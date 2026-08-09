@@ -5,7 +5,7 @@ import copy
 import hashlib
 import os
 import pickle
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal
@@ -431,6 +431,12 @@ def _selected_blocked_retention_state(
 
 def _bound_blocked_evidence_appended(
     path: Path,
+    *,
+    before_retention_prepare: Callable[
+        [DeliveryCoordinator, SegmentStore, AckJournal],
+        None,
+    ]
+    | None = None,
 ) -> tuple[
     DeliveryCoordinator,
     SegmentStore,
@@ -446,6 +452,8 @@ def _bound_blocked_evidence_appended(
         path,
         transport,
     )
+    if before_retention_prepare is not None:
+        before_retention_prepare(delivery, store, acknowledgements)
     request = _production_blocked(store)
     authority = store._open_retention_state_authority(
         _factory=segments_module._RETENTION_STATE_AUTHORITY_FACTORY,

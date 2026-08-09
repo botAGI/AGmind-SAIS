@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from agmind_immune import controller as controller_module
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    load_pinned_special_use_registry,
+)
 from agmind_immune.evidence import retention as retention_module
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.projection import ProjectionError, ProjectionStore
+from agmind_immune.evidence.segments import SegmentStore
 from agmind_immune.ingest import service as service_module
 from agmind_immune.ingest.ack_journal import (
     AckJournal,
@@ -18,6 +24,7 @@ from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import EnvelopeVerifier
 from agmind_immune.ingest.service import (
     AcceptanceCoordinator,
+    DeliveryCoordinator,
     DeliveryRetryableError,
 )
 
@@ -47,6 +54,59 @@ from tests.phase5b_helpers import (
     private_key,
 )
 from tests.test_controller import _authorities, _Clock
+
+
+@pytest.fixture(autouse=True)
+def _fixed_detector_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: "1" * 64)
+
+
+def _issued_registry() -> SpecialUseRegistry:
+    return load_pinned_special_use_registry(
+        Path(__file__).resolve().parents[2] / "contracts/v1/ipv4-special-use.csv"
+    )
+
+
+class _ProjectionBeforeRetention:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._authorities: tuple[
+            AckJournal,
+            CorrelationRequestJournal,
+            SpecialUseRegistry,
+            ProjectionStore,
+        ] | None = None
+
+    def __call__(self, store: SegmentStore) -> None:
+        acknowledgements = store._ack_journal_owner
+        assert type(acknowledgements) is AckJournal
+        correlation = CorrelationRequestJournal.create_new(store)
+        registry = _issued_registry()
+        projection = ProjectionStore.open(
+            self._path.absolute(),
+            evidence=store,
+            acknowledgements=acknowledgements,
+            correlation_requests=correlation,
+            registry=registry,
+        )
+        self._authorities = (
+            acknowledgements,
+            correlation,
+            registry,
+            projection,
+        )
+
+    def authorities(
+        self,
+    ) -> tuple[
+        AckJournal,
+        CorrelationRequestJournal,
+        SpecialUseRegistry,
+        ProjectionStore,
+    ]:
+        assert self._authorities is not None
+        return self._authorities
 
 
 class _CountingClock(_Clock):
@@ -113,7 +173,7 @@ async def test_retention_rejects_unbound_confirmed_ack_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = private_key(11)
-    acceptance, _store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, _store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "forged-ack",
         boot_boundary(key),
     )
@@ -131,6 +191,7 @@ async def test_retention_rejects_unbound_confirmed_ack_identity(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         _RetentionTransport(),
@@ -150,7 +211,7 @@ async def test_retention_rejects_unbound_pending_ack_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "forged-pending",
         boot_boundary(key),
     )
@@ -179,6 +240,7 @@ async def test_retention_rejects_unbound_pending_ack_identity(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         _RetentionTransport(),
@@ -197,7 +259,7 @@ async def test_retention_pending_ack_precedes_selection_state_and_post(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "pending",
         boot_boundary(key),
     )
@@ -218,6 +280,7 @@ async def test_retention_pending_ack_precedes_selection_state_and_post(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -253,7 +316,7 @@ async def test_retention_pending_ack_hides_preexisting_durable_request(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "pending-with-state",
         boot_boundary(key),
     )
@@ -279,6 +342,7 @@ async def test_retention_pending_ack_hides_preexisting_durable_request(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -312,7 +376,7 @@ async def test_retention_not_due_is_one_exact_noop(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "not-due",
         boot_boundary(key),
     )
@@ -321,6 +385,7 @@ async def test_retention_not_due_is_one_exact_noop(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -354,7 +419,7 @@ async def test_retention_reuses_authenticated_blocked_episode_without_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "reused-blocked",
         boot_boundary(key),
     )
@@ -389,6 +454,7 @@ async def test_retention_reuses_authenticated_blocked_episode_without_state(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -419,6 +485,25 @@ async def test_retention_reuses_authenticated_blocked_episode_without_state(
 async def test_retention_clears_authenticated_blocked_state_in_same_scope(
     tmp_path: Path,
 ) -> None:
+    registry = _issued_registry()
+    projection: ProjectionStore | None = None
+
+    def open_projection_before_retention(
+        delivery: DeliveryCoordinator,
+        evidence: SegmentStore,
+        acknowledgements: AckJournal,
+    ) -> None:
+        nonlocal projection
+        correlation = delivery.correlation_requests
+        assert type(correlation) is CorrelationRequestJournal
+        projection = ProjectionStore.open(
+            (tmp_path / "blocked-projection.sqlite3").absolute(),
+            evidence=evidence,
+            acknowledgements=acknowledgements,
+            correlation_requests=correlation,
+            registry=registry,
+        )
+
     (
         seed_delivery,
         store,
@@ -427,22 +512,22 @@ async def test_retention_clears_authenticated_blocked_state_in_same_scope(
         journal,
         target_ref,
         _seed_transport,
-    ) = _bound_blocked_evidence_appended(tmp_path / "blocked-clear")
+    ) = _bound_blocked_evidence_appended(
+        tmp_path / "blocked-clear",
+        before_retention_prepare=open_projection_before_retention,
+    )
     acceptance = seed_delivery.acceptance
     correlation = seed_delivery.correlation_requests
     assert type(correlation) is CorrelationRequestJournal
+    assert projection is not None
     coverage = seed_delivery._coverage_adapter._coverage
     await seed_delivery.close()
-    projection = ProjectionStore.open(
-        (tmp_path / "blocked-projection.sqlite3").absolute(),
-        evidence=store,
-        acknowledgements=acknowledgements,
-    )
     transport = _RetentionTransport()
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -477,33 +562,48 @@ async def test_retention_evidence_appended_retryable_propagates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    registry = _issued_registry()
+    projection: ProjectionStore | None = None
+
+    def open_projection_before_retention(
+        delivery: DeliveryCoordinator,
+        evidence: SegmentStore,
+        acknowledgements: AckJournal,
+    ) -> None:
+        nonlocal projection
+        correlation = delivery.correlation_requests
+        assert type(correlation) is CorrelationRequestJournal
+        projection = ProjectionStore.open(
+            (tmp_path / "evidence-appended-retry.sqlite3").absolute(),
+            evidence=evidence,
+            acknowledgements=acknowledgements,
+            correlation_requests=correlation,
+            registry=registry,
+        )
+
     (
         seed_delivery,
-        store,
+        _store,
         _verifier,
         acknowledgements,
         journal,
         _target_ref,
         _seed_transport,
     ) = _bound_blocked_evidence_appended(
-        tmp_path / "evidence-appended-retry"
+        tmp_path / "evidence-appended-retry",
+        before_retention_prepare=open_projection_before_retention,
     )
     acceptance = seed_delivery.acceptance
     correlation = seed_delivery.correlation_requests
     assert type(correlation) is CorrelationRequestJournal
+    assert projection is not None
     coverage = seed_delivery._coverage_adapter._coverage
     await seed_delivery.close()
-    projection = ProjectionStore.open(
-        (
-            tmp_path / "evidence-appended-retry.sqlite3"
-        ).absolute(),
-        evidence=store,
-        acknowledgements=acknowledgements,
-    )
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
         correlation,
+        registry,
         coverage,
         projection,
         _RetentionTransport(),
@@ -543,19 +643,41 @@ async def test_retention_requires_selected_prefix_then_one_surviving_ack(
     tmp_path: Path,
     confirmed_through: int,
 ) -> None:
+    acknowledgements: AckJournal | None = None
+    correlation: CorrelationRequestJournal | None = None
+    projection: ProjectionStore | None = None
+    registry = _issued_registry()
+
+    def open_projection_before_retention(store: SegmentStore) -> None:
+        nonlocal acknowledgements, correlation, projection
+        acknowledgements = AckJournal.create_new(store)
+        correlation = CorrelationRequestJournal.create_new(store)
+        for ref in store.authenticated_refs(
+            after_sequence=0,
+            through_sequence=confirmed_through,
+            limit=100,
+        ):
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
+        projection = ProjectionStore.open(
+            (
+                tmp_path
+                / f"ack-prefix-{confirmed_through}.sqlite3"
+            ).absolute(),
+            evidence=store,
+            acknowledgements=acknowledgements,
+            correlation_requests=correlation,
+            registry=registry,
+        )
+
     case = _retention_proof_case(
         tmp_path / f"ack-prefix-{confirmed_through}",
         acknowledge=False,
+        before_retention_prepare=open_projection_before_retention,
     )
-    acknowledgements = AckJournal.create_new(case.store)
-    correlation = CorrelationRequestJournal.create_new(case.store)
-    for ref in case.store.authenticated_refs(
-        after_sequence=0,
-        through_sequence=confirmed_through,
-        limit=100,
-    ):
-        acknowledgements.record_pending(ref)
-        acknowledgements.record_confirmed(ref)
+    assert type(acknowledgements) is AckJournal
+    assert type(correlation) is CorrelationRequestJournal
+    assert projection is not None
     verifier = case.store._bound_verifier
     assert type(verifier) is EnvelopeVerifier
     acceptance = AcceptanceCoordinator(
@@ -563,19 +685,12 @@ async def test_retention_requires_selected_prefix_then_one_surviving_ack(
         case.store,
         _factory=service_module._COORDINATOR_FACTORY,
     )
-    projection = ProjectionStore.open(
-        (
-            tmp_path
-            / f"ack-prefix-{confirmed_through}.sqlite3"
-        ).absolute(),
-        evidence=case.store,
-        acknowledgements=acknowledgements,
-    )
     clock = _CountingClock(sample=_proof_clock(seconds=2))
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
         correlation,
+        registry,
         case.coverage,
         projection,
         _RetentionTransport(),
@@ -632,9 +747,9 @@ async def test_retention_selected_prefix_lag_blocks_post(
     retention_journal = retention_module._open_retention_state_journal(
         store
     )
-    retention_journal.prepare_publication(decision)
     acknowledgements = AckJournal.create_new(store)
     correlation = CorrelationRequestJournal.create_new(store)
+    registry = _issued_registry()
     first_ref = store.authenticated_refs(
         after_sequence=0,
         through_sequence=1,
@@ -646,12 +761,16 @@ async def test_retention_selected_prefix_lag_blocks_post(
         (tmp_path / "selected-prefix-lag.sqlite3").absolute(),
         evidence=store,
         acknowledgements=acknowledgements,
+        correlation_requests=correlation,
+        registry=registry,
     )
+    retention_journal.prepare_publication(decision)
     transport = _RetentionTransport()
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -676,7 +795,7 @@ async def test_retention_maps_retryable_only_after_durable_request(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "retryable",
         boot_boundary(key),
     )
@@ -691,6 +810,7 @@ async def test_retention_maps_retryable_only_after_durable_request(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -724,7 +844,7 @@ async def test_retention_retryable_rejects_cache_that_differs_from_durable_raw(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / "retryable-corrupt-cache",
         boot_boundary(key),
     )
@@ -751,6 +871,7 @@ async def test_retention_retryable_rejects_cache_that_differs_from_durable_raw(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         _CorruptingRetryableBlockedTransport(durable, altered),
@@ -785,15 +906,9 @@ async def test_retention_cancellation_propagates_with_selected_state_intact(
         request_id="11111111-1111-4111-8111-111111111111",
     )
     state_journal = retention_module._open_retention_state_journal(store)
-    state_journal.prepare_publication(decision)
-    state = state_journal.state
-    assert type(state) is retention_module.RetentionStateV1
-    selected_paths = tuple(
-        store.root / entry.segment_relative_path
-        for entry in state.entries
-    )
     acknowledgements = AckJournal.create_new(store)
     correlation = CorrelationRequestJournal.create_new(store)
+    registry = _issued_registry()
     for ref in store.authenticated_refs(
         after_sequence=0,
         through_sequence=2,
@@ -805,12 +920,22 @@ async def test_retention_cancellation_propagates_with_selected_state_intact(
         (tmp_path / "cancelled-selected.sqlite3").absolute(),
         evidence=store,
         acknowledgements=acknowledgements,
+        correlation_requests=correlation,
+        registry=registry,
+    )
+    state_journal.prepare_publication(decision)
+    state = state_journal.state
+    assert type(state) is retention_module.RetentionStateV1
+    selected_paths = tuple(
+        store.root / entry.segment_relative_path
+        for entry in state.entries
     )
     transport = _CancellingTombstoneTransport()
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
         correlation,
+        registry,
         coverage,
         projection,
         transport,
@@ -842,7 +967,7 @@ async def test_retention_restart_only_phases_propagate(
     restart_phase: str,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
         tmp_path / restart_phase,
         boot_boundary(key),
     )
@@ -867,6 +992,7 @@ async def test_retention_restart_only_phases_propagate(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         _RetentionTransport(),
@@ -887,29 +1013,29 @@ async def test_retention_aborts_before_unlink_when_projection_catchup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    preopened = _ProjectionBeforeRetention(
+        tmp_path / "projection-prefix.sqlite3"
+    )
     case = _retention_proof_case(
         tmp_path / "projection-prefix-evidence",
         acknowledge=True,
+        before_retention_prepare=preopened,
     )
-    acknowledgements = case.store._ack_journal_owner
+    acknowledgements, correlation, registry, projection = (
+        preopened.authorities()
+    )
     verifier = case.store._bound_verifier
-    assert type(acknowledgements) is AckJournal
     assert type(verifier) is EnvelopeVerifier
-    correlation = CorrelationRequestJournal.create_new(case.store)
     acceptance = AcceptanceCoordinator(
         verifier,
         case.store,
         _factory=service_module._COORDINATOR_FACTORY,
     )
-    projection = ProjectionStore.open(
-        (tmp_path / "projection-prefix.sqlite3").absolute(),
-        evidence=case.store,
-        acknowledgements=acknowledgements,
-    )
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
         correlation,
+        registry,
         case.coverage,
         projection,
         _RetentionTransport(),
@@ -922,10 +1048,10 @@ async def test_retention_aborts_before_unlink_when_projection_catchup_fails(
         for entry in state.entries
     )
 
-    def fail_apply(_ref: object) -> object:
+    def fail_status() -> object:
         raise ProjectionError("injected prefix failure")
 
-    monkeypatch.setattr(projection, "apply", fail_apply)
+    monkeypatch.setattr(projection, "status", fail_status)
     try:
         with pytest.raises(
             controller_module.CoreControllerAuthorityError,
@@ -944,30 +1070,28 @@ async def test_retention_aborts_before_unlink_when_projection_catchup_fails(
 async def test_retention_completes_unlink_rebuild_and_finalization(
     tmp_path: Path,
 ) -> None:
+    preopened = _ProjectionBeforeRetention(tmp_path / "projection.sqlite3")
     case = _retention_proof_case(
         tmp_path / "evidence",
         acknowledge=True,
+        before_retention_prepare=preopened,
     )
-    acknowledgements = case.store._ack_journal_owner
+    acknowledgements, correlation, registry, projection = (
+        preopened.authorities()
+    )
     verifier = case.store._bound_verifier
-    assert type(acknowledgements) is AckJournal
     assert type(verifier) is EnvelopeVerifier
-    correlation = CorrelationRequestJournal.create_new(case.store)
     acceptance = AcceptanceCoordinator(
         verifier,
         case.store,
         _factory=service_module._COORDINATOR_FACTORY,
-    )
-    projection = ProjectionStore.open(
-        (tmp_path / "projection.sqlite3").absolute(),
-        evidence=case.store,
-        acknowledgements=acknowledgements,
     )
     transport = _RetentionTransport()
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
         correlation,
+        registry,
         case.coverage,
         projection,
         transport,
@@ -996,7 +1120,7 @@ async def test_retention_completes_unlink_rebuild_and_finalization(
             unlinked_bytes=case.request.removed_bytes,
             projection_rebuilt=True,
         )
-        assert execution.projected == 3
+        assert execution.projected == 0
         assert all(not path.exists() for path in selected_paths)
         assert not (case.store.root / "retention-state.json").exists()
         cursor = projection.status().cursor
@@ -1012,29 +1136,29 @@ async def test_retention_rebuild_failure_latches_and_does_not_finalize(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    preopened = _ProjectionBeforeRetention(
+        tmp_path / "rebuild-failure.sqlite3"
+    )
     case = _retention_proof_case(
         tmp_path / "rebuild-failure-evidence",
         acknowledge=True,
+        before_retention_prepare=preopened,
     )
-    acknowledgements = case.store._ack_journal_owner
+    acknowledgements, correlation, registry, projection = (
+        preopened.authorities()
+    )
     verifier = case.store._bound_verifier
-    assert type(acknowledgements) is AckJournal
     assert type(verifier) is EnvelopeVerifier
-    correlation = CorrelationRequestJournal.create_new(case.store)
     acceptance = AcceptanceCoordinator(
         verifier,
         case.store,
         _factory=service_module._COORDINATOR_FACTORY,
     )
-    projection = ProjectionStore.open(
-        (tmp_path / "rebuild-failure.sqlite3").absolute(),
-        evidence=case.store,
-        acknowledgements=acknowledgements,
-    )
     controller = controller_module.CoreController.create(
         acceptance,
         acknowledgements,
         correlation,
+        registry,
         case.coverage,
         projection,
         _RetentionTransport(),

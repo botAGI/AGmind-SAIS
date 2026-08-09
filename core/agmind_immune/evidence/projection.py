@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from threading import RLock
+from typing import Any, cast
 
 from cryptography.exceptions import InvalidSignature
 from pydantic import ValidationError
@@ -34,6 +35,10 @@ from agmind_immune.contracts import (
     CoverageEventV1,
     EventEnvelopeV1,
     FalcoConnectV1,
+)
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    special_use_registry_is_issued,
 )
 from agmind_immune.evidence.dedup import _logical_primary_identity_v1
 from agmind_immune.evidence.segments import (
@@ -48,6 +53,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournal,
     AckJournalSnapshot,
 )
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import EnvelopeVerifier, KeyMetadataError
 
 _UINT64 = re.compile(r"^[0-9]{20}$")
@@ -472,7 +478,7 @@ def _verify_pragmas(
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    _create_v1_schema(connection)
 
 
 def _create_v1_schema(connection: sqlite3.Connection) -> None:
@@ -999,7 +1005,7 @@ def _retired_record_from_projection_event(
     return record
 
 
-class ProjectionStore:
+class _LegacyProjectionStore:
     """Factory-opened projection bound to one recovered evidence/ACK lifecycle."""
 
     _path: Path
@@ -1027,7 +1033,7 @@ class ProjectionStore:
         evidence: SegmentStore,
         acknowledgements: AckJournal,
         step_hook: Callable[[str], None] | None = None,
-    ) -> ProjectionStore:
+    ) -> _LegacyProjectionStore:
         if (
             not path.is_absolute()
             or Path(os.path.normpath(path)) != path
@@ -2120,7 +2126,7 @@ class ProjectionStore:
     ) -> RebuildReport:
         if (
             _factory is not _RETENTION_REBUILD_FACTORY
-            or type(self) is not ProjectionStore
+            or type(self) is not _LegacyProjectionStore
         ):
             raise TypeError(
                 "retention projection rebuild requires its exact factory"
@@ -2430,3 +2436,505 @@ class ProjectionStore:
             if parent_fd >= 0:
                 os.close(parent_fd)
                 self._parent_fd = -1
+
+
+def _confirmed_projection_ref(
+    evidence: SegmentStore,
+    acknowledgements: AckJournal,
+) -> EvidenceRef | None:
+    snapshot = acknowledgements.snapshot()
+    if not snapshot.healthy:
+        raise ProjectionAuthorityError("ACK journal is unhealthy at projection open")
+    confirmed = snapshot.confirmed_through
+    if confirmed == 0:
+        return None
+    refs = evidence.authenticated_refs(
+        after_sequence=confirmed - 1,
+        through_sequence=confirmed,
+        limit=1,
+    )
+    if len(refs) != 1 or refs[0].source_sequence != confirmed:
+        raise ProjectionAuthorityError(
+            "ACK boundary is not backed by exact authenticated evidence"
+        )
+    return refs[0]
+
+
+class ProjectionStore:
+    """Authority-bound public facade over the sole Projection V2 runtime."""
+
+    _path: Path
+    _evidence: SegmentStore
+    _acknowledgements: AckJournal
+    _correlation_requests: CorrelationRequestJournal
+    _registry: SpecialUseRegistry
+    _owner: Any
+    _mutex: RLockType
+    _closed: bool
+    _parent_fd: int
+    _parent_binding: _FileBinding
+    _lock_fd: int
+    _lock_name: str
+    _main_binding: _FileBinding
+
+    def __init__(self) -> None:
+        raise TypeError("use ProjectionStore.open()")
+
+    @classmethod
+    def open(
+        cls,
+        path: Path,
+        *,
+        evidence: SegmentStore,
+        acknowledgements: AckJournal,
+        correlation_requests: CorrelationRequestJournal,
+        registry: SpecialUseRegistry,
+        step_hook: Callable[[str], None] | None = None,
+    ) -> ProjectionStore:
+        if (
+            not isinstance(path, Path)
+            or not path.is_absolute()
+            or Path(os.path.normpath(path)) != path
+            or not path.name
+            or path.name in {".", ".."}
+        ):
+            raise ProjectionConflict("projection database name is invalid")
+        if (
+            type(evidence) is not SegmentStore
+            or type(acknowledgements) is not AckJournal
+            or type(correlation_requests) is not CorrelationRequestJournal
+            or type(registry) is not SpecialUseRegistry
+            or getattr(acknowledgements, "_store", None) is not evidence
+            or not correlation_requests._is_bound_to(evidence)
+            or not special_use_registry_is_issued(registry)
+            or (step_hook is not None and not callable(step_hook))
+        ):
+            raise ProjectionAuthorityError(
+                "projection requires exact same-lifecycle issued authorities"
+            )
+        _ = evidence.acceptance_cursor
+        _confirmed_projection_ref(evidence, acknowledgements)
+
+        from agmind_immune.evidence import projection_publication, projection_v2
+
+        store = object.__new__(cls)
+        store._path = path
+        store._evidence = evidence
+        store._acknowledgements = acknowledgements
+        store._correlation_requests = correlation_requests
+        store._registry = registry
+        store._owner = None
+        store._mutex = RLock()
+        store._closed = False
+        store._parent_fd = -1
+        store._lock_fd = -1
+        store._lock_name = f".{path.name}.projection.lock"
+        connection: sqlite3.Connection | None = None
+        try:
+            store._parent_fd = _validate_parent(path.parent)
+            store._parent_binding = _binding(os.fstat(store._parent_fd))
+            store._lock_fd = _open_stable_lock(store._parent_fd, store._lock_name)
+            projection_publication._recover_v2_publication_locked(
+                path,
+                parent_fd=store._parent_fd,
+                lock_fd=store._lock_fd,
+                _factory=projection_publication._PUBLICATION_FACTORY,
+            )
+            existing = _lstat_at(store._parent_fd, path.name)
+            main_binding = (
+                None
+                if existing is None
+                else _bind_regular_at(
+                    store._parent_fd,
+                    path.name,
+                    label="projection database",
+                )
+            )
+            image_kind = _classify_projection_image_locked(
+                path,
+                parent_fd=store._parent_fd,
+                main_binding=main_binding,
+            )
+            if image_kind is _ProjectionImageKind.UNKNOWN:
+                raise ProjectionConflict("projection image is not exact V1 or V2")
+
+            if image_kind is _ProjectionImageKind.V2:
+                connection = projection_publication._open_existing_sqlite(
+                    path,
+                    configure_v2=True,
+                )
+                owner = projection_v2._V2ProjectionOwner._borrow_authorities(
+                    connection,
+                    evidence=evidence,
+                    acknowledgements=acknowledgements,
+                    journal=correlation_requests,
+                    registry=registry,
+                    step_hook=step_hook,
+                )
+                connection = None
+                store._owner = owner
+                assert main_binding is not None
+                store._main_binding = main_binding
+            else:
+                connection = projection_v2._new_v2_connection()
+                owner = projection_v2._V2ProjectionOwner._borrow_authorities(
+                    connection,
+                    evidence=evidence,
+                    acknowledgements=acknowledgements,
+                    journal=correlation_requests,
+                    registry=registry,
+                    step_hook=step_hook,
+                )
+                connection = None
+                store._owner = owner
+                through = _confirmed_projection_ref(evidence, acknowledgements)
+                stage = owner._stage_unpublished_prefix(
+                    through,
+                    _factory=projection_v2._STAGED_REPLAY_FACTORY,
+                )
+                projection_publication._publish_staged_v2_filesystem(
+                    owner,
+                    stage,
+                    path,
+                    parent_fd=store._parent_fd,
+                    lock_fd=store._lock_fd,
+                    image_kind=image_kind,
+                    main_binding=main_binding,
+                    _factory=projection_publication._PUBLICATION_FACTORY,
+                )
+                store._main_binding = _bind_regular_at(
+                    store._parent_fd,
+                    path.name,
+                    label="projection database",
+                )
+            store._verify_namespace_binding()
+            return store
+        except BaseException as primary:
+            if connection is not None:
+                for attempt in (1, 2):
+                    try:
+                        connection.close()
+                    except BaseException as cleanup_error:  # noqa: BLE001
+                        primary.add_note(
+                            "projection connection cleanup failure "
+                            f"(attempt {attempt}): "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    else:
+                        connection = None
+                        break
+            for attempt in (1, 2):
+                try:
+                    store.close()
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    primary.add_note(
+                        "projection facade open cleanup failure "
+                        f"(attempt {attempt}): "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                else:
+                    break
+            raise
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def _connection(self) -> sqlite3.Connection | None:
+        owner = self._owner
+        return None if owner is None else owner._connection
+
+    @_connection.setter
+    def _connection(self, value: sqlite3.Connection | None) -> None:
+        owner = self._owner
+        if owner is None:
+            raise ProjectionUnhealthy("projection owner is unavailable")
+        owner._connection = value
+
+    @property
+    def _healthy(self) -> bool:
+        owner = self._owner
+        return owner is not None and owner._healthy
+
+    @_healthy.setter
+    def _healthy(self, value: bool) -> None:
+        owner = self._owner
+        if owner is None or type(value) is not bool:
+            raise ProjectionUnhealthy("projection owner is unavailable")
+        owner._healthy = value
+
+    def _verify_namespace_binding(self) -> None:
+        opened_parent = os.fstat(self._parent_fd)
+        named_parent = os.stat(self._path.parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or not stat.S_ISDIR(named_parent.st_mode)
+            or opened_parent.st_uid != os.geteuid()
+            or named_parent.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_parent.st_mode) != 0o700
+            or stat.S_IMODE(named_parent.st_mode) != 0o700
+            or _binding(opened_parent) != self._parent_binding
+            or _binding(named_parent) != self._parent_binding
+        ):
+            raise ProjectionConflict("projection parent path identity changed")
+        opened_lock = os.fstat(self._lock_fd)
+        named_lock = _lstat_at(self._parent_fd, self._lock_name)
+        if named_lock is None:
+            raise ProjectionConflict("projection lock entry disappeared")
+        _validate_regular(opened_lock, label="projection lock")
+        _validate_regular(named_lock, label="projection lock")
+        if (
+            _binding(opened_lock) != _binding(named_lock)
+            or fcntl.fcntl(self._lock_fd, fcntl.F_GETFL) & os.O_ACCMODE
+            != os.O_RDWR
+        ):
+            raise ProjectionConflict("projection stable lock changed")
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise ProjectionConflict("projection stable lock was lost") from error
+        _require_entry_binding(
+            self._parent_fd,
+            self._path.name,
+            self._main_binding,
+            label="projection database",
+        )
+
+    def _verify_namespace_binding_or_latch(self) -> None:
+        try:
+            self._verify_namespace_binding()
+        except (OSError, ProjectionError):
+            owner = self._owner
+            if owner is not None:
+                owner._healthy = False
+            raise
+
+    def _is_bound_to(
+        self,
+        evidence: SegmentStore,
+        acknowledgements: AckJournal,
+        correlation_requests: CorrelationRequestJournal,
+        registry: SpecialUseRegistry,
+    ) -> bool:
+        with self._mutex:
+            owner = self._owner
+            bound = (
+                not self._closed
+                and owner is not None
+                and self._evidence is evidence
+                and self._acknowledgements is acknowledgements
+                and self._correlation_requests is correlation_requests
+                and self._registry is registry
+                and owner._evidence is evidence
+                and owner._acknowledgements is acknowledgements
+                and owner._journal is correlation_requests
+                and owner._registry is registry
+                and owner._healthy is True
+                and owner._closed is False
+                and isinstance(owner._connection, sqlite3.Connection)
+                and owner._authority is not None
+            )
+            if not bound:
+                return False
+            try:
+                self._verify_namespace_binding()
+            except (OSError, ProjectionError):
+                owner._healthy = False
+                return False
+            return True
+
+    def status(self) -> ProjectionStatus:
+        with self._mutex:
+            if self._closed or self._owner is None:
+                return ProjectionStatus(False, None)
+            try:
+                self._verify_namespace_binding()
+            except (OSError, ProjectionError):
+                self._owner._healthy = False
+                return ProjectionStatus(False, None)
+            result = self._owner.status()
+            try:
+                self._verify_namespace_binding()
+            except (OSError, ProjectionError):
+                self._owner._healthy = False
+                return ProjectionStatus(False, None)
+            return cast(ProjectionStatus, result)
+
+    def apply(self, ref: EvidenceRef) -> ProjectionApplyResult:
+        with self._mutex:
+            if self._closed or self._owner is None:
+                raise ProjectionUnhealthy("projection is closed")
+            self._verify_namespace_binding_or_latch()
+            result = self._owner.apply(ref)
+            self._verify_namespace_binding_or_latch()
+            return cast(ProjectionApplyResult, result)
+
+    def snapshot_hash(self) -> str:
+        with self._mutex:
+            if self._closed or self._owner is None:
+                raise ProjectionUnhealthy("projection is closed")
+            self._verify_namespace_binding_or_latch()
+            result = self._owner.snapshot_hash()
+            self._verify_namespace_binding_or_latch()
+            return cast(str, result)
+
+    def _rebuild_report(self, replay_report: Any | None) -> RebuildReport:
+        from agmind_immune.evidence import projection_v2
+
+        owner = self._owner
+        connection = None if owner is None else owner._connection
+        if not isinstance(connection, sqlite3.Connection):
+            raise ProjectionUnhealthy("projection connection is unavailable")
+        cursor = owner.status().cursor
+        source_count = int(connection.execute("SELECT count(*) FROM events").fetchone()[0])
+        duplicate_count = int(
+            connection.execute(
+                "SELECT count(*) FROM events WHERE duplicate_of_event_id IS NOT NULL"
+            ).fetchone()[0]
+        )
+        if replay_report is not None:
+            cursor = replay_report.cursor
+            source_count = replay_report.applied_count
+        return RebuildReport(
+            snapshot_hash=owner.snapshot_hash(),
+            table_counts=projection_v2._v2_table_counts(connection),
+            source_record_count=source_count,
+            duplicate_count=duplicate_count,
+            cursor=cursor,
+        )
+
+    def _publish_rebuild(
+        self,
+        through: EvidenceRef,
+        *,
+        retention_completion: object | None = None,
+    ) -> RebuildReport:
+        from agmind_immune.evidence import projection_publication, projection_v2
+
+        owner = self._owner
+        if owner is None:
+            raise ProjectionUnhealthy("projection owner is unavailable")
+        self._verify_namespace_binding_or_latch()
+        stage = owner._stage_v2_rebuild_prefix(
+            through,
+            retention_completion=retention_completion,
+            _factory=projection_v2._STAGED_REPLAY_FACTORY,
+        )
+        report = projection_publication._publish_staged_v2_rebuild_filesystem(
+            owner,
+            stage,
+            self._path,
+            parent_fd=self._parent_fd,
+            lock_fd=self._lock_fd,
+            main_binding=self._main_binding,
+            _factory=projection_publication._PUBLICATION_FACTORY,
+        )
+        try:
+            refreshed_binding = _bind_regular_at(
+                self._parent_fd,
+                self._path.name,
+                label="projection database",
+            )
+        except (OSError, ProjectionError):
+            owner._healthy = False
+            raise
+        self._main_binding = refreshed_binding
+        self._verify_namespace_binding_or_latch()
+        rebuilt = self._rebuild_report(report)
+        self._verify_namespace_binding_or_latch()
+        return rebuilt
+
+    def rebuild(self) -> RebuildReport:
+        with self._mutex:
+            if self._closed:
+                raise ProjectionUnhealthy("projection is closed")
+            owner = self._owner
+            if owner is None:
+                raise ProjectionUnhealthy("projection owner is unavailable")
+            self._verify_namespace_binding_or_latch()
+            through = _confirmed_projection_ref(
+                self._evidence,
+                self._acknowledgements,
+            )
+            if through is None:
+                report = self._rebuild_report(None)
+                self._verify_namespace_binding_or_latch()
+                return report
+            return self._publish_rebuild(through)
+
+    def _rebuild_after_authenticated_retention(
+        self,
+        completion: object,
+        *,
+        _factory: object,
+    ) -> RebuildReport:
+        if _factory is not _RETENTION_REBUILD_FACTORY or type(self) is not ProjectionStore:
+            raise TypeError(
+                "retention projection rebuild requires its exact factory"
+            )
+        with self._mutex:
+            through = _confirmed_projection_ref(
+                self._evidence,
+                self._acknowledgements,
+            )
+            if through is None:
+                raise ProjectionAuthorityError(
+                    "retention projection rebuild lacks a confirmed terminal"
+                )
+            return self._publish_rebuild(
+                through,
+                retention_completion=completion,
+            )
+
+    def close(self) -> None:
+        with getattr(self, "_mutex", RLock()):
+            if (
+                getattr(self, "_closed", False)
+                and getattr(self, "_owner", None) is None
+                and getattr(self, "_lock_fd", -1) < 0
+                and getattr(self, "_parent_fd", -1) < 0
+            ):
+                return
+            self._closed = True
+            owner = getattr(self, "_owner", None)
+            if owner is not None:
+                try:
+                    owner.close()
+                except BaseException as error:
+                    raise ProjectionUnhealthy(
+                        "projection owner close could not be proven"
+                    ) from error
+                self._owner = None
+
+            errors: list[BaseException] = []
+            lock_fd = getattr(self, "_lock_fd", -1)
+            if lock_fd >= 0:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except BaseException as error:  # noqa: BLE001 - drain close
+                    errors.append(error)
+                try:
+                    os.close(lock_fd)
+                except BaseException as error:  # noqa: BLE001 - retryable fd
+                    errors.append(error)
+                else:
+                    self._lock_fd = -1
+            parent_fd = getattr(self, "_parent_fd", -1)
+            if parent_fd >= 0:
+                try:
+                    os.close(parent_fd)
+                except BaseException as error:  # noqa: BLE001
+                    errors.append(error)
+                else:
+                    self._parent_fd = -1
+            if errors:
+                primary = errors[0]
+                for secondary in errors[1:]:
+                    primary.add_note(
+                        "secondary projection facade close failure: "
+                        f"{type(secondary).__name__}: {secondary}"
+                    )
+                raise ProjectionUnhealthy(
+                    "projection facade close could not be proven"
+                ) from primary

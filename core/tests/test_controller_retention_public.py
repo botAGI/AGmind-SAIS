@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
@@ -37,6 +38,12 @@ _FIELDS = (
 _REQUEST_ID = "11111111-1111-4111-8111-111111111111"
 _EVENT_ID = "evt_" + "1" * 64
 _CONTENT_SHA256 = "2" * 64
+
+
+@pytest.fixture(autouse=True)
+def _fixed_detector_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: "1" * 64)
 
 
 def _readiness() -> MutationReadiness:
@@ -435,6 +442,7 @@ async def test_public_retention_serializes_controller_operations(
         _store,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         _refs,
@@ -444,6 +452,7 @@ async def test_public_retention_serializes_controller_operations(
         acceptance,
         journal,
         correlation,
+        registry,
         coverage,
         projection,
         transport,

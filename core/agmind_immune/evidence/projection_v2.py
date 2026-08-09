@@ -155,7 +155,7 @@ from agmind_immune.ingest.correlation_journal import (
 )
 from agmind_immune.ingest.envelope import AuthenticatedPCCInput
 
-_SCHEMA_V2_PATH = Path(__file__).with_name("schema_v2.sql")
+_SCHEMA_V2_PATH = Path(__file__).with_name("schema.sql")
 _SCHEMA_V2_SHA256 = "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
 _SCHEMA_META_V2 = {
     "schema_version": "agmind.projection-schema.v2",
@@ -641,7 +641,7 @@ class _ReopenedV2Old:
 @dataclass(slots=True)
 class _V2RebuildBinding:
     guard: _V2RebuildGuard
-    old_cursor: ProjectionCursor
+    old_cursor: ProjectionCursor | None
     old_prefix_sha256: str
     old_table_counts: tuple[tuple[str, int], ...]
     old_physical: _StagedV2PhysicalBinding
@@ -1089,7 +1089,7 @@ def _verify_v2_schema(
         raise ProjectionConflict("Projection V2 schema verification failed") from error
 
 
-def _v2_connection_for_test(path: Path | None = None) -> sqlite3.Connection:
+def _new_v2_connection(path: Path | None = None) -> sqlite3.Connection:
     connection = sqlite3.connect(
         ":memory:" if path is None else path,
         isolation_level=None,
@@ -1104,10 +1104,24 @@ def _v2_connection_for_test(path: Path | None = None) -> sqlite3.Connection:
         if existing_tables == 0:
             _create_v2_schema(connection)
         _verify_v2_schema(connection)
-    except BaseException:
-        connection.close()
+    except BaseException as primary:
+        for attempt in (1, 2):
+            try:
+                connection.close()
+            except BaseException as cleanup_error:  # noqa: BLE001
+                primary.add_note(
+                    "Projection V2 connection cleanup failure "
+                    f"(attempt {attempt}): {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}"
+                )
+            else:
+                break
         raise
     return connection
+
+
+def _v2_connection_for_test(path: Path | None = None) -> sqlite3.Connection:
+    return _new_v2_connection(path)
 
 
 def _ordered_v2_rows_unverified(
@@ -2163,16 +2177,24 @@ def _validate_replay_snapshot_shape_v2(
         predecessor_seal = _seal_projection_predecessor(predecessor)
     except (AttributeError, TypeError, ValueError) as error:
         raise TypeError("Projection V2 replay predecessor is malformed") from error
+    empty_predecessor = _ProjectionPredecessor(
+        base_generation,
+        None,
+        0,
+        None,
+        None,
+        None,
+    )
     if (
         predecessor_seal.canonical != correlation.predecessor_canonical
         or predecessor.generation != base_generation
         or (
             purpose is _ReplayPurpose.INITIAL
-            and predecessor
-            != _ProjectionPredecessor(base_generation, None, 0, None, None, None)
+            and predecessor != empty_predecessor
         )
         or (
             purpose is _ReplayPurpose.V2_REBUILD
+            and predecessor != empty_predecessor
             and (
                 predecessor.source_sequence == 0
                 or predecessor.host_id is None
@@ -4619,9 +4641,9 @@ class _V2ProjectionOwner:
                         raise ProjectionConflict(
                             "Projection V2 unpublished replay requires an empty database"
                         )
-                elif live_cursor is None or through is None:
+                elif through is None:
                     raise ProjectionConflict(
-                        "Projection V2 rebuild requires a nonempty exact V2 base"
+                        "Projection V2 rebuild requires an exact terminal"
                     )
                 base_generation = self._generation
                 reservation = _ReplayReservation(
@@ -4659,13 +4681,13 @@ class _V2ProjectionOwner:
                         live_cursor,
                         retention_scope,
                     )
-                    verified_old_cursor = cast(ProjectionCursor, live_cursor)
+                    verified_old_cursor = live_cursor
                     retained_records = (
                         None
                         if retention_scope is None
                         else _authenticated_retained_prefix_records_v2(
                             retention_scope,
-                            verified_old_cursor,
+                            cast(ProjectionCursor, verified_old_cursor),
                         )
                     )
                     verified_old_prefix_sha256 = self._validate_persisted_prefix(
@@ -4717,8 +4739,7 @@ class _V2ProjectionOwner:
                         )
                     )
                     if purpose is _ReplayPurpose.V2_REBUILD and (
-                        verified_old_cursor is None
-                        or verified_old_prefix_sha256 is None
+                        verified_old_prefix_sha256 is None
                         or verified_old_table_counts is None
                         or _current_v2_cursor(connection) != verified_old_cursor
                         or _v2_snapshot_hash(connection)
@@ -4911,8 +4932,7 @@ class _V2ProjectionOwner:
                     )
                     if purpose is _ReplayPurpose.V2_REBUILD:
                         if (
-                            verified_old_cursor is None
-                            or verified_old_prefix_sha256 is None
+                            verified_old_prefix_sha256 is None
                             or verified_old_table_counts is None
                         ):
                             raise ProjectionAuthorityError(
@@ -5197,10 +5217,6 @@ class _V2ProjectionOwner:
                     )
                 connection = binding.live_connection
                 cursor = _current_v2_cursor(connection)
-                if cursor is None:
-                    raise ProjectionConflict(
-                        "Projection V2 rebuild lost its old cursor"
-                    )
                 _verify_v2_schema(connection)
                 self._validate_v2_rebuild_cursor_evidence(
                     connection,
@@ -5210,8 +5226,7 @@ class _V2ProjectionOwner:
                 prefix_sha256 = _v2_snapshot_hash(connection)
                 table_counts = _v2_table_counts(connection)
                 if (
-                    binding.verified_old_cursor is None
-                    or binding.verified_old_prefix_sha256 is None
+                    binding.verified_old_prefix_sha256 is None
                     or binding.verified_old_table_counts is None
                     or cursor != binding.verified_old_cursor
                     or prefix_sha256 != binding.verified_old_prefix_sha256

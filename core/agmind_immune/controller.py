@@ -18,6 +18,10 @@ from agmind_immune.contracts import (
     RetentionBlockedV1,
     RetentionTombstoneV2,
 )
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    special_use_registry_is_issued,
+)
 from agmind_immune.coverage import (
     CoverageState,
     MutationReadiness,
@@ -311,6 +315,7 @@ class CoreController:
         acceptance: AcceptanceCoordinator,
         acknowledgements: AckJournal,
         correlation_requests: CorrelationRequestJournal,
+        registry: SpecialUseRegistry,
         coverage: CoverageState,
         projection: ProjectionStore,
         clock: CoreClockProvider,
@@ -327,6 +332,7 @@ class CoreController:
         self._verifier = verifier
         self._acknowledgements = acknowledgements
         self._correlation_requests = correlation_requests
+        self._registry = registry
         self._coverage = coverage
         self._projection = projection
         self._clock = clock
@@ -341,6 +347,7 @@ class CoreController:
         acceptance: AcceptanceCoordinator,
         acknowledgements: AckJournal,
         correlation_requests: CorrelationRequestJournal,
+        registry: SpecialUseRegistry,
         coverage: CoverageState,
         projection: ProjectionStore,
         transport: ObserverCoreTransport,
@@ -356,6 +363,11 @@ class CoreController:
             raise TypeError(
                 "controller requires exact correlation-request authority"
             )
+        if (
+            type(registry) is not SpecialUseRegistry
+            or not special_use_registry_is_issued(registry)
+        ):
+            raise TypeError("controller requires exact issued registry authority")
         if type(coverage) is not CoverageState:
             raise TypeError("controller requires exact coverage authority")
         if type(projection) is not ProjectionStore:
@@ -376,7 +388,12 @@ class CoreController:
             raise CoreControllerAuthorityError(
                 "correlation-request authority binding is invalid"
             )
-        if not projection._is_bound_to(store, acknowledgements):
+        if not projection._is_bound_to(
+            store,
+            acknowledgements,
+            correlation_requests,
+            registry,
+        ):
             raise CoreControllerAuthorityError(
                 "projection authority binding is invalid"
             )
@@ -400,7 +417,12 @@ class CoreController:
                 or acceptance.verifier is not verifier
                 or not store._is_bound_verifier(verifier)
                 or not correlation_requests._is_bound_to(store)
-                or not projection._is_bound_to(store, acknowledgements)
+                or not projection._is_bound_to(
+                    store,
+                    acknowledgements,
+                    correlation_requests,
+                    registry,
+                )
                 or delivery._store is not store
                 or delivery._verifier is not verifier
                 or not delivery._is_bound_to(
@@ -418,6 +440,7 @@ class CoreController:
                 acceptance,
                 acknowledgements,
                 correlation_requests,
+                registry,
                 coverage,
                 projection,
                 clock,
@@ -704,6 +727,24 @@ class CoreController:
         ):
             self._latch_projection_failure()
         return applied
+
+    def _catch_up_projection_for_retention(self) -> int:
+        evidence = self._store.status()
+        self._validate_evidence_status(evidence)
+        if not evidence.healthy or evidence.repair_pending:
+            raise CoreControllerAuthorityError(
+                "retention requires healthy evidence authority"
+            )
+        if not evidence.retention_pending:
+            return self._catch_up_projection()
+        try:
+            projection = self._projection.status()
+        except (ProjectionError, OSError):
+            self._latch_projection_failure()
+            return 0
+        if type(projection) is not ProjectionStatus or not projection.healthy:
+            self._latch_projection_failure()
+        return 0
 
     def _read_ack_for_readiness(self) -> AckJournalSnapshot:
         try:
@@ -1181,6 +1222,8 @@ class CoreController:
                 or not self._projection._is_bound_to(
                     self._store,
                     self._acknowledgements,
+                    self._correlation_requests,
+                    self._registry,
                 )
             ):
                 raise CoreControllerAuthorityError(
@@ -1212,7 +1255,7 @@ class CoreController:
     async def _run_retention_once(self) -> _RetentionExecution:
         async with self._lock:
             self._require_open()
-            projected = self._catch_up_projection()
+            projected = self._catch_up_projection_for_retention()
             if not self._projection_healthy:
                 raise CoreControllerAuthorityError(
                     "retention requires complete projection catch-up"
@@ -1223,7 +1266,7 @@ class CoreController:
                 observation = await self._execute_retention_locked(
                     _lock_authority=lock_authority,
                 )
-            projected += self._catch_up_projection()
+            projected += self._catch_up_projection_for_retention()
             if not self._projection_healthy:
                 raise CoreControllerAuthorityError(
                     "retention projection catch-up failed"

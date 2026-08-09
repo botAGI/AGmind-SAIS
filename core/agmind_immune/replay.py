@@ -6,12 +6,18 @@ import argparse
 import json
 import os
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
 
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    load_pinned_special_use_registry,
+)
 from agmind_immune.evidence.projection import ProjectionStore, RebuildReport
 from agmind_immune.evidence.segments import SegmentStore
 from agmind_immune.ingest.ack_journal import AckJournal, AckJournalSnapshot
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
     EnvelopeVerifier,
@@ -23,7 +29,40 @@ _DEFAULT_TRUST_ROOT = Path("/etc/agmind-sais/observer-trust-root.json")
 _DEFAULT_PUBLIC_KEYS = Path(
     "/var/lib/agmind-sais/observer/observer-public-keys.json"
 )
+_DEFAULT_SPECIAL_USE_REGISTRY = Path(
+    "/usr/share/agmind-sais/ipv4-special-use.csv"
+)
 _MAX_PUBLIC_KEYS_BYTES = 64 * 1024
+
+
+def _drain_cleanup(
+    steps: tuple[tuple[str, Callable[[], None]], ...],
+    *,
+    primary: BaseException | None,
+) -> None:
+    errors: list[tuple[str, BaseException]] = []
+    for label, step in steps:
+        try:
+            step()
+        except BaseException as error:  # noqa: BLE001 - cleanup boundary
+            errors.append((label, error))
+    if not errors:
+        return
+    if primary is not None:
+        for label, cleanup_error in errors:
+            primary.add_note(
+                f"offline {label} cleanup failure: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        return
+    label, failure = errors[0]
+    failure.add_note(f"offline cleanup failed at {label}")
+    for secondary_label, secondary in errors[1:]:
+        failure.add_note(
+            f"secondary offline {secondary_label} cleanup failure: "
+            f"{type(secondary).__name__}: {secondary}"
+        )
+    raise failure
 
 
 def _bounded_regular_file(path: Path, limit: int) -> bytes:
@@ -68,45 +107,90 @@ def _verifier() -> EnvelopeVerifier:
 
 def _open_authorities(
     evidence_dir: Path,
-) -> tuple[AcceptanceCoordinator, SegmentStore, AckJournal]:
+) -> tuple[
+    AcceptanceCoordinator,
+    SegmentStore,
+    AckJournal,
+    CorrelationRequestJournal,
+    SpecialUseRegistry,
+]:
     store = SegmentStore(evidence_dir)
+    journal: AckJournal | None = None
+    correlation_requests: CorrelationRequestJournal | None = None
     try:
         coordinator = AcceptanceCoordinator.open_and_recover(_verifier(), store)
         journal = AckJournal.open_and_recover(store)
-    except BaseException:
-        store.close(flush=False)
+        correlation_requests = CorrelationRequestJournal.open_and_recover(store)
+        registry = load_pinned_special_use_registry(
+            _DEFAULT_SPECIAL_USE_REGISTRY
+        )
+    except BaseException as primary:
+        cleanup: list[tuple[str, Callable[[], None]]] = []
+        if correlation_requests is not None:
+            cleanup.append(("correlation", correlation_requests.close))
+        if journal is not None:
+            cleanup.append(("ACK", journal.close))
+        cleanup.append(("evidence", lambda: store.close(flush=False)))
+        _drain_cleanup(tuple(cleanup), primary=primary)
         raise
-    return coordinator, store, journal
+    return coordinator, store, journal, correlation_requests, registry
 
 
 def verify_evidence(evidence_dir: Path) -> AckJournalSnapshot:
     """Reverify every segment and recover the bound ACK journal without mutation."""
-    _coordinator, store, journal = _open_authorities(evidence_dir)
+    _coordinator, store, journal, correlation_requests, _registry = (
+        _open_authorities(evidence_dir)
+    )
+    primary: BaseException | None = None
     try:
         snapshot = journal.snapshot()
         tuple(store.iter_authenticated_records(after=0, through=store.acceptance_cursor))
         return snapshot
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        journal.close()
-        store.close(flush=False)
+        _drain_cleanup(
+            (
+                ("correlation", correlation_requests.close),
+                ("ACK", journal.close),
+                ("evidence", lambda: store.close(flush=False)),
+            ),
+            primary=primary,
+        )
 
 
 def rebuild_projection(evidence_dir: Path, projection_db: Path) -> RebuildReport:
     """Rebuild one SQLite cache from the frozen authenticated ACK prefix."""
-    _coordinator, store, journal = _open_authorities(evidence_dir)
+    _coordinator, store, journal, correlation_requests, registry = (
+        _open_authorities(evidence_dir)
+    )
     projection: ProjectionStore | None = None
+    primary: BaseException | None = None
     try:
         projection = ProjectionStore.open(
             projection_db,
             evidence=store,
             acknowledgements=journal,
+            correlation_requests=correlation_requests,
+            registry=registry,
         )
         return projection.rebuild()
+    except BaseException as error:
+        primary = error
+        raise
     finally:
+        cleanup: list[tuple[str, Callable[[], None]]] = []
         if projection is not None:
-            projection.close()
-        journal.close()
-        store.close(flush=False)
+            cleanup.append(("projection", projection.close))
+        cleanup.extend(
+            (
+                ("correlation", correlation_requests.close),
+                ("ACK", journal.close),
+                ("evidence", lambda: store.close(flush=False)),
+            )
+        )
+        _drain_cleanup(tuple(cleanup), primary=primary)
 
 
 def _parser() -> argparse.ArgumentParser:

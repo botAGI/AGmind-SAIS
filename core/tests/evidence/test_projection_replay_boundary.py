@@ -253,7 +253,7 @@ def _build_complete_replay_input_snapshot(
             pcc_inputs=(),
             schema_domain=(
                 b"AGMIND_PROJECTION_SCHEMA_V2\0"
-                + Path("core/agmind_immune/evidence/schema_v2.sql").read_bytes()
+                + Path("core/agmind_immune/evidence/schema.sql").read_bytes()
             ),
             base_projection_generation=base_projection_generation,
             publish_generation=(

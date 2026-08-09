@@ -9,6 +9,10 @@ from pathlib import Path
 import pytest
 from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.contracts import ZERO_SHA256, ObserverTrustRootV1
+from agmind_immune.correlation.primitives import (
+    SpecialUseRegistry,
+    load_pinned_special_use_registry,
+)
 from agmind_immune.evidence import retention as retention_module
 from agmind_immune.evidence import segments as segments_module
 from agmind_immune.evidence.manifest import (
@@ -29,6 +33,7 @@ from agmind_immune.evidence.segments import (
 )
 from agmind_immune.ingest import envelope as envelope_module
 from agmind_immune.ingest.ack_journal import AckJournal
+from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import EnvelopeVerifier, VerifierCommitError
 from agmind_immune.ingest.service import AcceptanceCoordinator
 from tests.evidence.test_retention import (
@@ -39,6 +44,7 @@ from tests.evidence.test_retention import (
     _live_store_with_active_routine,
     _manifest,
     _record_outer,
+    _retention_proof_case,
 )
 from tests.evidence.test_retention_unlink import (
     _completed_case,
@@ -57,6 +63,28 @@ def _fresh_verifier() -> EnvelopeVerifier:
         metadata_value(key),
     )
     return EnvelopeVerifier(root, chain)
+
+
+@pytest.fixture(autouse=True)
+def _fixed_detector_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: "1" * 64)
+
+
+def _projection_authorities(
+    store: SegmentStore,
+    *,
+    recover: bool = False,
+) -> tuple[CorrelationRequestJournal, SpecialUseRegistry]:
+    correlation_requests = (
+        CorrelationRequestJournal.open_and_recover(store)
+        if recover
+        else CorrelationRequestJournal.create_new(store)
+    )
+    registry = load_pinned_special_use_registry(
+        Path(__file__).resolve().parents[3] / "contracts/v1/ipv4-special-use.csv"
+    )
+    return correlation_requests, registry
 
 
 def test_finalized_retention_run_restarts_with_fresh_verifier(
@@ -351,12 +379,46 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
     )
     evidence_path = tmp_path / "evidence"
     projection_path = tmp_path / "projection.sqlite3"
-    case, capability = _issued_case(
+    acknowledgements: AckJournal | None = None
+    correlation_requests: CorrelationRequestJournal | None = None
+    registry: SpecialUseRegistry | None = None
+    cache = None
+
+    def open_projection_before_retention(store: SegmentStore) -> None:
+        nonlocal acknowledgements, correlation_requests, registry, cache
+        acknowledgements = AckJournal.create_new(store)
+        correlation_requests, registry = _projection_authorities(store)
+        refs = tuple(
+            record.ref for record in store.iter_authenticated_records()
+        )
+        for ref in refs:
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
+        cache = projection.ProjectionStore.open(
+            projection_path,
+            evidence=store,
+            acknowledgements=acknowledgements,
+            correlation_requests=correlation_requests,
+            registry=registry,
+        )
+        for ref in refs:
+            cache.apply(ref)
+
+    case = _retention_proof_case(
         evidence_path,
         acknowledge=False,
+        before_retention_prepare=open_projection_before_retention,
     )
-    acknowledgements = AckJournal.create_new(case.store)
-    cache = None
+    capability = case.store._authenticate_retention_tombstone(
+        case.journal,
+        case.final_snapshot,
+        case.target_ref,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    assert type(acknowledgements) is AckJournal
+    assert type(correlation_requests) is CorrelationRequestJournal
+    assert type(registry) is SpecialUseRegistry
+    assert cache is not None
     reopened = None
     try:
         refs = tuple(
@@ -364,18 +426,11 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
             for record in case.store.iter_authenticated_records()
         )
         assert [ref.source_sequence for ref in refs] == [1, 2, 3]
-        for ref in refs:
+        for ref in refs[2:]:
             acknowledgements.record_pending(ref)
             acknowledgements.record_confirmed(ref)
         confirmed_before = acknowledgements.snapshot()
 
-        cache = projection.ProjectionStore.open(
-            projection_path,
-            evidence=case.store,
-            acknowledgements=acknowledgements,
-        )
-        for ref in refs:
-            cache.apply(ref)
         with closing(sqlite3.connect(projection_path)) as connection:
             assert connection.execute(
                 "SELECT source_sequence FROM events "
@@ -383,7 +438,6 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
             ).fetchall() == [
                 (projection._uint64(1),),
                 (projection._uint64(2),),
-                (projection._uint64(3),),
             ]
             assert connection.execute(
                 "SELECT count(*) FROM network_observations"
@@ -423,12 +477,18 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
                 "SELECT count(*) FROM network_observations"
             ).fetchone() == (0,)
 
+        case.store._finalize_authenticated_retention_completion(
+            completion,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
         cache.close()
         cache = None
         reopened = projection.ProjectionStore.open(
             projection_path,
             evidence=case.store,
             acknowledgements=acknowledgements,
+            correlation_requests=correlation_requests,
+            registry=registry,
         )
         reopened_status = reopened.status()
         assert reopened_status.healthy is True
@@ -440,12 +500,13 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
             reopened.close()
         if cache is not None:
             cache.close()
+        correlation_requests.close()
         acknowledgements.close()
         case.coverage.close()
         case.store.close(flush=False)
 
 
-def test_projection_open_reconciles_authenticated_retention_crash_window(
+def test_projection_open_rejects_stale_v2_retention_crash_window_without_repair(
     tmp_path: Path,
 ) -> None:
     projection = importlib.import_module(
@@ -453,27 +514,54 @@ def test_projection_open_reconciles_authenticated_retention_crash_window(
     )
     evidence_path = tmp_path / "evidence"
     projection_path = tmp_path / "projection.sqlite3"
-    case, capability = _issued_case(
-        evidence_path,
-        acknowledge=False,
-    )
-    acknowledgements = AckJournal.create_new(case.store)
+    acknowledgements: AckJournal | None = None
+    correlation_requests: CorrelationRequestJournal | None = None
+    registry: SpecialUseRegistry | None = None
     cache = None
-    try:
+
+    def open_projection_before_retention(store: SegmentStore) -> None:
+        nonlocal acknowledgements, correlation_requests, registry, cache
+        acknowledgements = AckJournal.create_new(store)
+        correlation_requests, registry = _projection_authorities(store)
         refs = tuple(
-            record.ref
-            for record in case.store.iter_authenticated_records()
+            record.ref for record in store.iter_authenticated_records()
         )
         for ref in refs:
             acknowledgements.record_pending(ref)
             acknowledgements.record_confirmed(ref)
         cache = projection.ProjectionStore.open(
             projection_path,
-            evidence=case.store,
+            evidence=store,
             acknowledgements=acknowledgements,
+            correlation_requests=correlation_requests,
+            registry=registry,
         )
         for ref in refs:
             cache.apply(ref)
+
+    case = _retention_proof_case(
+        evidence_path,
+        acknowledge=False,
+        before_retention_prepare=open_projection_before_retention,
+    )
+    capability = case.store._authenticate_retention_tombstone(
+        case.journal,
+        case.final_snapshot,
+        case.target_ref,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    assert type(acknowledgements) is AckJournal
+    assert type(correlation_requests) is CorrelationRequestJournal
+    assert type(registry) is SpecialUseRegistry
+    assert cache is not None
+    try:
+        refs = tuple(
+            record.ref
+            for record in case.store.iter_authenticated_records()
+        )
+        for ref in refs[2:]:
+            acknowledgements.record_pending(ref)
+            acknowledgements.record_confirmed(ref)
         case.store._execute_authenticated_retention_unlink(
             capability,
             _factory=segments_module._RETENTION_PROOF_FACTORY,
@@ -483,12 +571,14 @@ def test_projection_open_reconciles_authenticated_retention_crash_window(
     finally:
         if cache is not None:
             cache.close()
+        correlation_requests.close()
+        acknowledgements.close()
         case.coverage.close()
         case.store.close(flush=False)
 
     restarted_store = SegmentStore(evidence_path)
     restarted_acknowledgements = None
-    restarted_projection = None
+    restarted_correlation = None
     try:
         AcceptanceCoordinator.open_and_recover(
             _fresh_verifier(),
@@ -497,33 +587,63 @@ def test_projection_open_reconciles_authenticated_retention_crash_window(
         restarted_acknowledgements = AckJournal.open_and_recover(
             restarted_store
         )
-        restarted_projection = projection.ProjectionStore.open(
-            projection_path,
-            evidence=restarted_store,
-            acknowledgements=restarted_acknowledgements,
+        restarted_correlation, restarted_registry = _projection_authorities(
+            restarted_store,
+            recover=True,
         )
+        before_info = projection_path.stat()
+        before_bytes = projection_path.read_bytes()
+        before_files = {
+            entry.name: (
+                entry.stat().st_dev,
+                entry.stat().st_ino,
+                entry.stat().st_size,
+            )
+            for entry in projection_path.parent.iterdir()
+            if entry.is_file()
+        }
 
-        status = restarted_projection.status()
-        assert status.healthy is True
-        assert status.cursor is not None
-        assert status.cursor.source_sequence == 3
-        with closing(sqlite3.connect(projection_path)) as connection:
-            assert connection.execute(
-                "SELECT source_sequence FROM events "
-                "ORDER BY source_sequence"
-            ).fetchall() == [
-                (projection._uint64(1),),
-                (projection._uint64(3),),
-            ]
+        with pytest.raises(projection.ProjectionAuthorityError):
+            projection.ProjectionStore.open(
+                projection_path,
+                evidence=restarted_store,
+                acknowledgements=restarted_acknowledgements,
+                correlation_requests=restarted_correlation,
+                registry=restarted_registry,
+            )
+
+        after_info = projection_path.stat()
+        assert (
+            after_info.st_dev,
+            after_info.st_ino,
+            after_info.st_size,
+        ) == (
+            before_info.st_dev,
+            before_info.st_ino,
+            before_info.st_size,
+        )
+        assert projection_path.read_bytes() == before_bytes
+        assert {
+            entry.name: (
+                entry.stat().st_dev,
+                entry.stat().st_ino,
+                entry.stat().st_size,
+            )
+            for entry in projection_path.parent.iterdir()
+            if entry.is_file()
+        } == before_files
+        assert restarted_store.status().healthy is True
+        assert restarted_acknowledgements.snapshot().healthy is True
+        assert restarted_correlation._is_bound_to(restarted_store) is True
     finally:
-        if restarted_projection is not None:
-            restarted_projection.close()
+        if restarted_correlation is not None:
+            restarted_correlation.close()
         if restarted_acknowledgements is not None:
             restarted_acknowledgements.close()
         restarted_store.close(flush=False)
 
 
-def test_projection_open_reconciles_retired_projection_cursor(
+def test_authenticated_rebuild_repairs_retired_projection_cursor_before_reopen(
     tmp_path: Path,
 ) -> None:
     from tests.evidence.test_projection import (
@@ -537,41 +657,54 @@ def test_projection_open_reconciles_retired_projection_cursor(
     evidence_path = case_path / "evidence"
     projection_path = case_path / "projection.sqlite3"
     raw_hash = hashlib.sha256(b"survivor after retired cursor").hexdigest()
-    case, capability, acknowledgements, refs = (
+    (
+        case,
+        capability,
+        acknowledgements,
+        correlation_requests,
+        _registry,
+        refs,
+        cache,
+    ) = (
         _retention_case_with_surviving_falco(
             evidence_path,
             raw_hash=raw_hash,
         )
     )
-    cache = None
     try:
         assert [ref.source_sequence for ref in refs] == [1, 2, 3, 4]
-        cache = projection.ProjectionStore.open(
-            projection_path,
-            evidence=case.store,
-            acknowledgements=acknowledgements,
-        )
-        for ref in refs[:2]:
-            cache.apply(ref)
         status = cache.status()
         assert status.cursor is not None
         assert status.cursor.source_sequence == 2
 
-        case.store._execute_authenticated_retention_unlink(
+        completion = case.store._execute_authenticated_retention_unlink(
             capability,
             _factory=segments_module._RETENTION_PROOF_FACTORY,
         )
+        cache._rebuild_after_authenticated_retention(
+            completion,
+            _factory=projection._RETENTION_REBUILD_FACTORY,
+        )
+        case.store._finalize_authenticated_retention_completion(
+            completion,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        acknowledgements.record_pending(refs[3])
+        acknowledgements.record_confirmed(refs[3])
+        cache.apply(refs[3])
         cache.close()
         cache = None
     finally:
         if cache is not None:
             cache.close()
+        correlation_requests.close()
         acknowledgements.close()
         case.coverage.close()
         case.store.close(flush=False)
 
     restarted_store = SegmentStore(evidence_path)
     restarted_acknowledgements = None
+    restarted_correlation = None
     restarted_projection = None
     try:
         AcceptanceCoordinator.open_and_recover(
@@ -581,10 +714,16 @@ def test_projection_open_reconciles_retired_projection_cursor(
         restarted_acknowledgements = AckJournal.open_and_recover(
             restarted_store
         )
+        restarted_correlation, restarted_registry = _projection_authorities(
+            restarted_store,
+            recover=True,
+        )
         restarted_projection = projection.ProjectionStore.open(
             projection_path,
             evidence=restarted_store,
             acknowledgements=restarted_acknowledgements,
+            correlation_requests=restarted_correlation,
+            registry=restarted_registry,
         )
 
         status = restarted_projection.status()
@@ -603,6 +742,8 @@ def test_projection_open_reconciles_retired_projection_cursor(
     finally:
         if restarted_projection is not None:
             restarted_projection.close()
+        if restarted_correlation is not None:
+            restarted_correlation.close()
         if restarted_acknowledgements is not None:
             restarted_acknowledgements.close()
         restarted_store.close(flush=False)

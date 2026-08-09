@@ -55,6 +55,32 @@ def test_runtime_image_installs_fixed_rule_before_non_root_default() -> None:
     assert dockerfile.rfind('CMD ["python3", "main.py"]') > user_offset
 
 
+def test_runtime_image_packages_fixed_v2_pin_inputs_before_non_root() -> None:
+    dockerfile = _read("Dockerfile")
+    makefile = _read("Makefile")
+    user_offset = dockerfile.index("USER sais")
+    registry_copy = (
+        "COPY --chown=0:0 --chmod=0444 contracts/v1/ipv4-special-use.csv "
+        "\\\n  /usr/share/agmind-sais/ipv4-special-use.csv"
+    )
+    assert registry_copy in dockerfile
+    assert dockerfile.index(registry_copy) < user_offset
+    assert "/etc/falco/rules.d/agmind-pcc.yaml" in dockerfile
+
+    schema = _REPOSITORY_ROOT / "core/agmind_immune/evidence/schema.sql"
+    assert sorted(path.name for path in schema.parent.glob("schema_*.sql")) == [
+        "schema_v1.sql"
+    ]
+    import hashlib
+
+    assert hashlib.sha256(schema.read_bytes()).hexdigest() == (
+        "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
+    )
+    target = _make_target(makefile, "test-core-detector-pin-image")
+    assert "/app/core/agmind_immune/evidence/schema.sql" in target
+    assert "/usr/share/agmind-sais/ipv4-special-use.csv" in target
+
+
 def test_requirements_pin_core_and_preserve_legacy_app_dependencies() -> None:
     requirements = {
         line.strip()

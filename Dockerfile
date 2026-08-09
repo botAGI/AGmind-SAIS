@@ -53,6 +53,11 @@ RUN install -d -o root -g root -m 0755 /etc/falco /etc/falco/rules.d
 COPY --chown=0:0 --chmod=0444 deploy/falco/rules.d/agmind-pcc.yaml \
   /etc/falco/rules.d/agmind-pcc.yaml
 
+# Фиксированный root-owned special-use registry для PCC authority
+RUN install -d -o root -g root -m 0755 /usr/share/agmind-sais
+COPY --chown=0:0 --chmod=0444 contracts/v1/ipv4-special-use.csv \
+  /usr/share/agmind-sais/ipv4-special-use.csv
+
 # Копируем приложение
 COPY --chown=sais:sais . /app/
 WORKDIR /app
