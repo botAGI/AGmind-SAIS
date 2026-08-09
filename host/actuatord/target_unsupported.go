@@ -21,6 +21,14 @@ func (unsupportedTargetResolver) ResolveForPrepare(
 	return nil, ErrUnsupportedPlatform
 }
 
+func (unsupportedTargetResolver) OpenForApply(
+	context.Context,
+	string,
+	uint64,
+) (ApplyTargetHandle, error) {
+	return nil, ErrUnsupportedPlatform
+}
+
 func platformClockSample() (ClockSample, error) {
 	return ClockSample{Wall: time.Now().UTC()}, ErrUnsupportedPlatform
 }

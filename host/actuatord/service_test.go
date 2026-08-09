@@ -229,6 +229,9 @@ func TestPrepareCommitsOnlyAfterLiveTargetCloseAndFsync(t *testing.T) {
 		},
 		"unsafe destination": func(candidate *prepareFixture) { candidate.intent.DestinationIPv4 = "172.18.0.9" },
 		"privileged target":  func(candidate *prepareFixture) { candidate.observer.identity.Privileged = true },
+		"namespace escape capability": func(candidate *prepareFixture) {
+			candidate.observer.identity.ConfiguredCapAdd = []string{"SYS_ADMIN"}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			candidate := newPrepareFixture(t)

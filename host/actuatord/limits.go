@@ -96,10 +96,10 @@ func parsedDeniedDestinations(snapshot SafetySnapshot) ([]netip.Prefix, []netip.
 	return networks, addresses, nil
 }
 
-func configuredNetAdmin(capabilities []string) bool {
+func configuredNamespaceMutationCapability(capabilities []string) bool {
 	for _, capability := range capabilities {
 		normalized := strings.TrimPrefix(strings.ToUpper(capability), "CAP_")
-		if normalized == "NET_ADMIN" || normalized == "ALL" {
+		if normalized == "NET_ADMIN" || normalized == "SYS_ADMIN" || normalized == "ALL" {
 			return true
 		}
 	}
@@ -183,6 +183,27 @@ func validateHardLimits(
 	safety SafetySnapshot,
 	now time.Time,
 ) error {
+	return validateHardLimitsForPhase(intent, identity, networks, safety, now, true)
+}
+
+func validateApplyHardLimits(
+	intent contracts.TemporaryEgressDenyIntentV1,
+	identity observerd.ContainerIdentityV1,
+	networks []contracts.PCCDockerNetworkV1,
+	safety SafetySnapshot,
+	now time.Time,
+) error {
+	return validateHardLimitsForPhase(intent, identity, networks, safety, now, false)
+}
+
+func validateHardLimitsForPhase(
+	intent contracts.TemporaryEgressDenyIntentV1,
+	identity observerd.ContainerIdentityV1,
+	networks []contracts.PCCDockerNetworkV1,
+	safety SafetySnapshot,
+	now time.Time,
+	requireFreshIntent bool,
+) error {
 	if err := intent.Validate(); err != nil {
 		return errors.Join(ErrIntentRejected, err)
 	}
@@ -194,12 +215,13 @@ func validateHardLimits(
 		return err
 	}
 	created, err := time.Parse(time.RFC3339Nano, intent.CreatedAt)
-	if err != nil || created.After(now) || now.Sub(created) > maxAcceptedIntentAge {
+	if err != nil || created.After(now) ||
+		(requireFreshIntent && now.Sub(created) > maxAcceptedIntentAge) {
 		return fmt.Errorf("%w: stale intent", ErrIntentRejected)
 	}
 	if intent.TTLSeconds < MinTTLSeconds || intent.TTLSeconds > MaxTTLSeconds ||
 		!identity.Running || identity.Privileged ||
-		configuredNetAdmin(identity.ConfiguredCapAdd) ||
+		configuredNamespaceMutationCapability(identity.ConfiguredCapAdd) ||
 		identity.EffectiveCapNetAdmin || !supportedNetworkIdentity(identity) ||
 		!attachedNetworksMatchGlobal(identity.AttachedNetworks, networks) {
 		return fmt.Errorf("%w: target exceeds hard limits", ErrIntentRejected)

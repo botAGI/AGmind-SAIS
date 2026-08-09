@@ -51,3 +51,23 @@ type PrepareTargetHandle interface {
 	Snapshot() PrepareTargetSnapshot
 	Close() error
 }
+
+// ApplyTargetResolver opens the fresh PID returned by the observer. Callers
+// must never pass the PID stored in a prepared plan as an addressable target.
+type ApplyTargetResolver interface {
+	OpenForApply(
+		context.Context,
+		string,
+		uint64,
+	) (ApplyTargetHandle, error)
+}
+
+// ApplyTargetHandle keeps the exact process generation and network namespace
+// alive through the single nftables transaction and its readback.
+type ApplyTargetHandle interface {
+	Snapshot() PrepareTargetSnapshot
+	NetNSFD() int
+	HostNetworkNamespaceInode() uint64
+	Recheck(context.Context) error
+	Close() error
+}

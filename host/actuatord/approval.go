@@ -107,11 +107,25 @@ var systemExpiryAuthority = AdminAuthority{
 }
 
 func uintDetail(value any, bits int) (uint64, bool) {
-	number, ok := value.(json.Number)
-	if !ok {
+	var raw string
+	switch number := value.(type) {
+	case json.Number:
+		raw = number.String()
+	case uint64:
+		raw = strconv.FormatUint(number, 10)
+	case uint32:
+		raw = strconv.FormatUint(uint64(number), 10)
+	case uint:
+		raw = strconv.FormatUint(uint64(number), 10)
+	case int:
+		if number < 0 {
+			return 0, false
+		}
+		raw = strconv.FormatUint(uint64(number), 10)
+	default:
 		return 0, false
 	}
-	parsed, err := strconv.ParseUint(number.String(), 10, bits)
+	parsed, err := strconv.ParseUint(raw, 10, bits)
 	return parsed, err == nil
 }
 
@@ -244,11 +258,6 @@ func (journal *actionJournal) appendDecision(
 		state != "EXPIRED_UNAPPLIED" {
 		return contracts.ActionRecordV1{}, fmt.Errorf("system authority cannot decide a plan")
 	}
-	openOutcomes := journal.openOutcomeCount()
-	if openOutcomes < 1 ||
-		journal.recordCount+openOutcomes > actionJournalMaxRecords {
-		return contracts.ActionRecordV1{}, ErrPendingLimit
-	}
 	actionID, err := contracts.ActionID(prepared.Plan.PlanHashValue)
 	if err != nil {
 		return contracts.ActionRecordV1{}, err
@@ -294,10 +303,13 @@ func (journal *actionJournal) appendDecision(
 		return contracts.ActionRecordV1{}, err
 	}
 	frameSize := int64(len(payload)) + actionFrameOverhead
-	remainingOutcomeCapacity := int64(openOutcomes-1) *
-		(int64(actionJournalMaxFrame) + actionFrameOverhead)
-	if frameSize+remainingOutcomeCapacity > actionJournalMaxBytes-journal.byteCount {
-		return contracts.ActionRecordV1{}, ErrPendingLimit
+	newBudget := lifecycleFutureFrames(state, false)
+	if err := journal.ensureTransitionCapacity(
+		prepared.Plan.PlanID,
+		frameSize,
+		newBudget,
+	); err != nil {
+		return contracts.ActionRecordV1{}, err
 	}
 	meta, err := journal.stream.Append(payload, true)
 	if err != nil {
@@ -402,7 +414,9 @@ func (service *Service) ExpireDue(ctx context.Context) (int, error) {
 	if service.journal.failed() {
 		return 0, durablefile.ErrJournalFailed
 	}
-	if service.journal.openOutcomeCount() == 0 {
+	hasPendingApprovals := service.journal.openOutcomeCount() != 0
+	hasVerifiedActions := service.journal.hasVerifiedActions()
+	if !hasPendingApprovals && !hasVerifiedActions {
 		return 0, nil
 	}
 	sample, err := service.dependencies.clock()
@@ -413,9 +427,11 @@ func (service *Service) ExpireDue(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	planIDs := make([]string, 0, service.journal.openOutcomeCount())
-	for planID := range service.journal.byPlan {
-		if _, terminal := service.journal.outcomes[planID]; !terminal {
-			planIDs = append(planIDs, planID)
+	if hasPendingApprovals {
+		for planID := range service.journal.byPlan {
+			if _, decided := service.journal.outcomes[planID]; !decided {
+				planIDs = append(planIDs, planID)
+			}
 		}
 	}
 	slices.Sort(planIDs)
@@ -445,7 +461,8 @@ func (service *Service) ExpireDue(ctx context.Context) (int, error) {
 		}
 		expired++
 	}
-	return expired, nil
+	audited, err := service.auditDueLocked(ctx, sample)
+	return expired + audited, err
 }
 
 func (service *Service) decide(

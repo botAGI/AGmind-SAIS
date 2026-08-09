@@ -35,6 +35,18 @@ type linuxPrepareTargetHandle struct {
 	closed   bool
 }
 
+type linuxApplyTargetHandle struct {
+	mutex        sync.Mutex
+	snapshot     PrepareTargetSnapshot
+	fullID       string
+	pid          int
+	pidfd        int
+	pidDirectory int
+	netns        int
+	hostNetNS    uint64
+	closed       bool
+}
+
 func (handle *linuxPrepareTargetHandle) Snapshot() PrepareTargetSnapshot {
 	if handle == nil {
 		return PrepareTargetSnapshot{}
@@ -64,6 +76,98 @@ func (handle *linuxPrepareTargetHandle) Close() error {
 		pidfdErr = unix.Close(pidfd)
 	}
 	return errors.Join(netnsErr, pidfdErr)
+}
+
+func (handle *linuxApplyTargetHandle) Snapshot() PrepareTargetSnapshot {
+	if handle == nil {
+		return PrepareTargetSnapshot{}
+	}
+	return handle.snapshot
+}
+
+func (handle *linuxApplyTargetHandle) NetNSFD() int {
+	if handle == nil {
+		return -1
+	}
+	handle.mutex.Lock()
+	defer handle.mutex.Unlock()
+	if handle.closed || handle.netns < 3 {
+		return -1
+	}
+	return handle.netns
+}
+
+func (handle *linuxApplyTargetHandle) HostNetworkNamespaceInode() uint64 {
+	if handle == nil {
+		return 0
+	}
+	return handle.hostNetNS
+}
+
+func (handle *linuxApplyTargetHandle) Recheck(ctx context.Context) error {
+	if handle == nil {
+		return ErrTargetStale
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	handle.mutex.Lock()
+	defer handle.mutex.Unlock()
+	if handle.closed || handle.pidDirectory < 3 || handle.netns < 3 {
+		return ErrTargetStale
+	}
+	if err := pidfdAlive(handle.pidfd); err != nil {
+		return err
+	}
+	facts, err := readLinuxProcessFacts(handle.pidDirectory, handle.pid, handle.fullID)
+	if err != nil {
+		return err
+	}
+	currentNetNS, err := currentNetworkNamespaceInode(handle.pidDirectory)
+	if err != nil {
+		return err
+	}
+	cgroupDigest := sha256.Sum256([]byte(facts.cgroupPath))
+	var stat unix.Stat_t
+	if err := unix.Fstat(handle.netns, &stat); err != nil || stat.Ino == 0 ||
+		stat.Ino != handle.snapshot.NetworkNamespaceInode ||
+		currentNetNS != handle.snapshot.NetworkNamespaceInode ||
+		handle.snapshot.NetworkNamespaceInode == handle.hostNetNS ||
+		facts.startTicks != handle.snapshot.PIDStartTicks ||
+		hex.EncodeToString(cgroupDigest[:]) != handle.snapshot.CgroupPathSHA256 ||
+		facts.capNetAdmin != handle.snapshot.EffectiveCapNetAdmin {
+		return errors.Join(ErrTargetStale, err)
+	}
+	currentHost, err := platformHostNetworkNamespaceInode()
+	if err != nil || currentHost != handle.hostNetNS {
+		return errors.Join(ErrTargetStale, err)
+	}
+	return ctx.Err()
+}
+
+func (handle *linuxApplyTargetHandle) Close() error {
+	if handle == nil {
+		return nil
+	}
+	handle.mutex.Lock()
+	defer handle.mutex.Unlock()
+	if handle.closed {
+		return nil
+	}
+	handle.closed = true
+	netns, pidDirectory, pidfd := handle.netns, handle.pidDirectory, handle.pidfd
+	handle.netns, handle.pidDirectory, handle.pidfd = -1, -1, -1
+	var netnsErr, directoryErr, pidfdErr error
+	if netns >= 0 {
+		netnsErr = unix.Close(netns)
+	}
+	if pidDirectory >= 0 {
+		directoryErr = unix.Close(pidDirectory)
+	}
+	if pidfd >= 0 {
+		pidfdErr = unix.Close(pidfd)
+	}
+	return errors.Join(netnsErr, directoryErr, pidfdErr)
 }
 
 type linuxProcessFacts struct {
@@ -282,6 +386,41 @@ func openNetworkNamespace(nsDirectory int) (int, uint64, error) {
 	return fd, stat.Ino, nil
 }
 
+func currentNetworkNamespaceInode(pidDirectory int) (uint64, error) {
+	nsDirectory, err := openProcDirectory(pidDirectory, "ns")
+	if err != nil {
+		return 0, err
+	}
+	defer closeFD(nsDirectory)
+	netns, inode, err := openNetworkNamespace(nsDirectory)
+	if err != nil {
+		return 0, err
+	}
+	closeFD(netns)
+	return inode, nil
+}
+
+func platformHostNetworkNamespaceInode() (uint64, error) {
+	fd, err := unix.Open("/proc/self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer closeFD(fd)
+	var stat unix.Stat_t
+	var statfs unix.Statfs_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Ino == 0 {
+		return 0, errors.Join(ErrTargetStale, err)
+	}
+	if err := unix.Fstatfs(fd, &statfs); err != nil || statfs.Type != unix.NSFS_MAGIC {
+		return 0, errors.Join(ErrTargetStale, err)
+	}
+	namespaceType, err := unix.IoctlRetInt(fd, unix.NS_GET_NSTYPE)
+	if err != nil || namespaceType != unix.CLONE_NEWNET {
+		return 0, errors.Join(ErrTargetStale, err)
+	}
+	return stat.Ino, nil
+}
+
 func (linuxTargetResolver) ResolveForPrepare(
 	ctx context.Context,
 	fullID string,
@@ -293,6 +432,10 @@ func (linuxTargetResolver) ResolveForPrepare(
 	if !fullDockerIDPattern.MatchString(fullID) || initPID == 0 ||
 		initPID > uint64(math.MaxInt) {
 		return nil, ErrTargetStale
+	}
+	hostNetNS, err := platformHostNetworkNamespaceInode()
+	if err != nil {
+		return nil, err
 	}
 	pid := int(initPID)
 	pidfd, err := unix.PidfdOpen(pid, 0)
@@ -336,6 +479,9 @@ func (linuxTargetResolver) ResolveForPrepare(
 		return nil, err
 	}
 	defer func() { closeFD(netns) }()
+	if inode == hostNetNS {
+		return nil, errors.Join(ErrTargetStale, fmt.Errorf("host network namespace is forbidden"))
+	}
 	after, err := readLinuxProcessFacts(pidDirectory, pid, fullID)
 	if err != nil || before != after {
 		return nil, errors.Join(
@@ -368,5 +514,110 @@ func (linuxTargetResolver) ResolveForPrepare(
 	}
 	pidfd = -1
 	netns = -1
+	return handle, nil
+}
+
+func (linuxTargetResolver) OpenForApply(
+	ctx context.Context,
+	fullID string,
+	initPID uint64,
+) (ApplyTargetHandle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !fullDockerIDPattern.MatchString(fullID) || initPID == 0 ||
+		initPID > uint64(math.MaxInt) {
+		return nil, ErrTargetStale
+	}
+	hostNetNS, err := platformHostNetworkNamespaceInode()
+	if err != nil {
+		return nil, err
+	}
+	pid := int(initPID)
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if errors.Is(err, unix.ENOSYS) {
+		pidfd = -1
+	} else if err != nil {
+		return nil, errors.Join(ErrTargetStale, err)
+	}
+	defer func() { closeFD(pidfd) }()
+	if err := pidfdAlive(pidfd); err != nil {
+		return nil, err
+	}
+	proc, err := unix.Open(
+		"/proc",
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer closeFD(proc)
+	var procfs unix.Statfs_t
+	if err := unix.Fstatfs(proc, &procfs); err != nil ||
+		procfs.Type != unix.PROC_SUPER_MAGIC {
+		return nil, errors.Join(ErrTargetStale, err)
+	}
+	pidDirectory, err := openProcDirectory(proc, strconv.Itoa(pid))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { closeFD(pidDirectory) }()
+	nsDirectory, err := openProcDirectory(pidDirectory, "ns")
+	if err != nil {
+		return nil, err
+	}
+	defer closeFD(nsDirectory)
+	before, err := readLinuxProcessFacts(pidDirectory, pid, fullID)
+	if err != nil {
+		return nil, err
+	}
+	netns, inode, err := openNetworkNamespace(nsDirectory)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { closeFD(netns) }()
+	if netns < 3 {
+		return nil, errors.Join(ErrTargetStale, fmt.Errorf("unsafe network namespace descriptor"))
+	}
+	if inode == hostNetNS {
+		return nil, errors.Join(ErrTargetStale, fmt.Errorf("host network namespace is forbidden"))
+	}
+	after, err := readLinuxProcessFacts(pidDirectory, pid, fullID)
+	if err != nil || before != after {
+		return nil, errors.Join(
+			ErrTargetStale,
+			err,
+			fmt.Errorf("process identity changed during apply resolution"),
+		)
+	}
+	if err := pidfdAlive(pidfd); err != nil {
+		return nil, err
+	}
+	cgroupDigest := sha256.Sum256([]byte(before.cgroupPath))
+	snapshot := PrepareTargetSnapshot{
+		InitPID:               initPID,
+		PIDStartTicks:         before.startTicks,
+		CgroupPathSHA256:      hex.EncodeToString(cgroupDigest[:]),
+		NetworkNamespaceInode: inode,
+		EffectiveCapNetAdmin:  before.capNetAdmin,
+	}
+	if err := snapshot.validate(); err != nil {
+		return nil, err
+	}
+	handle := &linuxApplyTargetHandle{
+		snapshot:     snapshot,
+		fullID:       fullID,
+		pid:          pid,
+		pidfd:        pidfd,
+		pidDirectory: pidDirectory,
+		netns:        netns,
+		hostNetNS:    hostNetNS,
+	}
+	pidfd, pidDirectory, netns = -1, -1, -1
+	if err := handle.Recheck(ctx); err != nil {
+		_ = handle.Close()
+		return nil, err
+	}
 	return handle, nil
 }

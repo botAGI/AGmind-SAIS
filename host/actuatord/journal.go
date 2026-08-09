@@ -189,6 +189,9 @@ type actionJournal struct {
 	reservations map[string]rateReservationState
 	rateHistory  []rateReservationState
 	outcomes     map[string]PlanOutcome
+	attempts     map[string]applyAttemptState
+	applied      map[string]appliedActionState
+	verified     map[string]verifiedActionState
 	recordCount  int
 	byteCount    int64
 	closed       bool
@@ -201,6 +204,9 @@ type recoveredActionState struct {
 	reservations map[string]rateReservationState
 	rateHistory  []rateReservationState
 	outcomes     map[string]PlanOutcome
+	attempts     map[string]applyAttemptState
+	applied      map[string]appliedActionState
+	verified     map[string]verifiedActionState
 	recordCount  int
 }
 
@@ -325,6 +331,9 @@ func recoverPreparedStates(
 		reservations: make(map[string]rateReservationState),
 		rateHistory:  make([]rateReservationState, 0, len(records)),
 		outcomes:     make(map[string]PlanOutcome),
+		attempts:     make(map[string]applyAttemptState),
+		applied:      make(map[string]appliedActionState),
+		verified:     make(map[string]verifiedActionState),
 	}
 	for _, framed := range records {
 		schema, err := journalRecordSchema(framed.Payload)
@@ -357,6 +366,36 @@ func recoverPreparedStates(
 			}
 			recovered.reservations[record.IntentID] = state
 			recovered.rateHistory = append(recovered.rateHistory, state)
+			recovered.previous = record.RecordSHA256
+
+		case "agmind.apply-attempt.v1":
+			record, err := contracts.DecodeStrict[applyAttemptV1](
+				bytes.NewReader(framed.Payload),
+				int64(actionJournalMaxFrame),
+			)
+			if err != nil {
+				return recoveredActionState{}, err
+			}
+			prepared, preparedOK := recovered.byPlan[record.PlanID]
+			approved, approvedOK := recovered.outcomes[record.PlanID]
+			if !preparedOK || !approvedOK {
+				return recoveredActionState{}, fmt.Errorf("apply attempt lacks approved plan")
+			}
+			if _, duplicate := recovered.attempts[record.PlanID]; duplicate {
+				return recoveredActionState{}, fmt.Errorf("duplicate apply attempt")
+			}
+			attempt, err := validateRecoveredApplyAttempt(
+				framed.Payload,
+				record,
+				publicKey,
+				recovered.previous,
+				prepared,
+				approved,
+			)
+			if err != nil {
+				return recoveredActionState{}, err
+			}
+			recovered.attempts[record.PlanID] = attempt
 			recovered.previous = record.RecordSHA256
 
 		case "agmind.action-record.v1":
@@ -404,20 +443,76 @@ func recoverPreparedStates(
 				if !ok {
 					return recoveredActionState{}, fmt.Errorf("decision lacks PREPARED plan")
 				}
-				if _, duplicate := recovered.outcomes[record.PlanID]; duplicate {
-					return recoveredActionState{}, fmt.Errorf("duplicate durable plan outcome")
+				prior, hasPrior := recovered.outcomes[record.PlanID]
+				attempt, attempted := recovered.attempts[record.PlanID]
+				var outcome PlanOutcome
+				if !hasPrior {
+					outcome, err = validateRecoveredDecisionRecord(
+						framed.Payload,
+						record,
+						publicKey,
+						recovered.previous,
+						prepared,
+					)
+				} else {
+					outcome, err = validateRecoveredLifecycleRecord(
+						framed.Payload,
+						record,
+						publicKey,
+						recovered.previous,
+						prepared,
+						prior,
+						attempt,
+						attempted,
+					)
 				}
-				outcome, err := validateRecoveredDecisionRecord(
+				if err != nil {
+					return recoveredActionState{}, err
+				}
+				recovered.outcomes[record.PlanID] = outcome
+
+			case "APPLIED", "VERIFIED", "EXPIRED", "STALE_ABORT", "FAILED_DIRTY":
+				prepared, ok := recovered.byPlan[record.PlanID]
+				if !ok {
+					return recoveredActionState{}, fmt.Errorf("lifecycle action lacks PREPARED plan")
+				}
+				prior, ok := recovered.outcomes[record.PlanID]
+				if !ok {
+					return recoveredActionState{}, fmt.Errorf("lifecycle action lacks prior state")
+				}
+				attempt, attempted := recovered.attempts[record.PlanID]
+				outcome, err := validateRecoveredLifecycleRecord(
 					framed.Payload,
 					record,
 					publicKey,
 					recovered.previous,
 					prepared,
+					prior,
+					attempt,
+					attempted,
 				)
 				if err != nil {
 					return recoveredActionState{}, err
 				}
 				recovered.outcomes[record.PlanID] = outcome
+				if record.State == "APPLIED" {
+					observation, observationErr := decodeAppliedObservation(record.Details)
+					if observationErr != nil {
+						return recoveredActionState{}, observationErr
+					}
+					recovered.applied[record.PlanID] = appliedActionState{
+						Observation: observation,
+					}
+				}
+				if record.State == "VERIFIED" {
+					deadline, deadlineErr := decodeVerifiedAuditDeadline(record.Details)
+					if deadlineErr != nil {
+						return recoveredActionState{}, deadlineErr
+					}
+					recovered.verified[record.PlanID] = verifiedActionState{
+						AuditDeadlineBootTimeNS: deadline,
+					}
+				}
 
 			default:
 				return recoveredActionState{}, fmt.Errorf("unsupported durable action state %q", record.State)
@@ -436,12 +531,16 @@ func validateRecoveredCapacity(
 	recovered recoveredActionState,
 	verifiedBytes int64,
 ) error {
-	openOutcomes := len(recovered.byPlan) - len(recovered.outcomes)
-	if openOutcomes < 0 || verifiedBytes < 0 ||
-		recovered.recordCount+openOutcomes > actionJournalMaxRecords ||
-		verifiedBytes+int64(openOutcomes)*
+	futureFrames := futureFrameBudget(
+		recovered.byPlan,
+		recovered.outcomes,
+		recovered.attempts,
+	)
+	if futureFrames < 0 || verifiedBytes < 0 ||
+		recovered.recordCount+futureFrames > actionJournalMaxRecords ||
+		verifiedBytes+int64(futureFrames)*
 			(int64(actionJournalMaxFrame)+actionFrameOverhead) > actionJournalMaxBytes {
-		return fmt.Errorf("action journal lacks reserved terminal capacity")
+		return fmt.Errorf("action journal lacks reserved lifecycle capacity")
 	}
 	return nil
 }
@@ -519,6 +618,9 @@ func openActionJournal(
 		reservations: recovered.reservations,
 		rateHistory:  recovered.rateHistory,
 		outcomes:     recovered.outcomes,
+		attempts:     recovered.attempts,
+		applied:      recovered.applied,
+		verified:     recovered.verified,
 		recordCount:  recovered.recordCount,
 		byteCount:    recovery.VerifiedBytes,
 	}
@@ -598,11 +700,11 @@ func (journal *actionJournal) reserveIntent(
 	if _, err := journal.reservation(intentID, intentSHA256); err != nil {
 		return err
 	}
-	// Preserve one terminal outcome slot for every open plan, plus PREPARED and
-	// its future outcome for this attempt.
-	openOutcomes := journal.openOutcomeCount()
-	if openOutcomes < 0 ||
-		journal.recordCount+openOutcomes+3 > actionJournalMaxRecords ||
+	// Preserve PREPARED plus the complete worst-case lifecycle through native
+	// expiry before accepting another intent.
+	futureFrames := futureFrameBudget(journal.byPlan, journal.outcomes, journal.attempts)
+	if futureFrames < 0 ||
+		journal.recordCount+futureFrames+2+maxLifecycleFramesPerPlan > actionJournalMaxRecords ||
 		journal.byteCount >= actionJournalMaxBytes {
 		return ErrPendingLimit
 	}
@@ -635,7 +737,7 @@ func (journal *actionJournal) reserveIntent(
 		return err
 	}
 	reservationFrameSize := int64(len(payload)) + actionFrameOverhead
-	futureFrameCapacity := int64(openOutcomes+2) *
+	futureFrameCapacity := int64(futureFrames+1+maxLifecycleFramesPerPlan) *
 		(int64(actionJournalMaxFrame) + actionFrameOverhead)
 	if reservationFrameSize+futureFrameCapacity >
 		actionJournalMaxBytes-journal.byteCount {
@@ -678,9 +780,9 @@ func (journal *actionJournal) appendPrepared(
 	if journal.closed {
 		return durablefile.ErrJournalClosed
 	}
-	openOutcomes := journal.openOutcomeCount()
-	if openOutcomes < 0 ||
-		journal.recordCount+openOutcomes+2 > actionJournalMaxRecords ||
+	futureFrames := futureFrameBudget(journal.byPlan, journal.outcomes, journal.attempts)
+	if futureFrames < 0 ||
+		journal.recordCount+futureFrames+1+maxLifecycleFramesPerPlan > actionJournalMaxRecords ||
 		journal.byteCount >= actionJournalMaxBytes {
 		return ErrPendingLimit
 	}
@@ -744,9 +846,9 @@ func (journal *actionJournal) appendPrepared(
 		return err
 	}
 	frameSize := int64(len(payload)) + actionFrameOverhead
-	reservedOutcomes := openOutcomes + 1
-	if reservedOutcomes < 1 ||
-		frameSize+int64(reservedOutcomes)*
+	reservedFrames := futureFrames + maxLifecycleFramesPerPlan
+	if reservedFrames < maxLifecycleFramesPerPlan ||
+		frameSize+int64(reservedFrames)*
 			(int64(actionJournalMaxFrame)+actionFrameOverhead) >
 			actionJournalMaxBytes-journal.byteCount {
 		return ErrPendingLimit

@@ -14,6 +14,8 @@ import (
 
 type serviceOptions struct {
 	dependencies   planDependencies
+	applyTarget    ApplyTargetResolver
+	nftBackend     NftBackend
 	journalOptions []durablefile.Option
 }
 
@@ -28,6 +30,21 @@ func WithObserver(observer Observer) ServiceOption {
 func WithTargetResolver(target TargetResolver) ServiceOption {
 	return func(options *serviceOptions) {
 		options.dependencies.target = target
+		if applyTarget, ok := target.(ApplyTargetResolver); ok {
+			options.applyTarget = applyTarget
+		}
+	}
+}
+
+func WithApplyTargetResolver(target ApplyTargetResolver) ServiceOption {
+	return func(options *serviceOptions) {
+		options.applyTarget = target
+	}
+}
+
+func WithNftBackend(backend NftBackend) ServiceOption {
+	return func(options *serviceOptions) {
+		options.nftBackend = backend
 	}
 }
 
@@ -60,9 +77,12 @@ type Service struct {
 	mutex          sync.Mutex
 	journal        *actionJournal
 	dependencies   planDependencies
+	applyTarget    ApplyTargetResolver
+	nftBackend     NftBackend
 	expiryStop     chan struct{}
 	expiryDone     chan struct{}
 	expiryStopOnce sync.Once
+	auditUncertain bool
 	closed         bool
 }
 
@@ -73,7 +93,14 @@ func OpenService(
 	privateKey ed25519.PrivateKey,
 	values ...ServiceOption,
 ) (*Service, error) {
-	options := serviceOptions{dependencies: defaultPlanDependencies()}
+	dependencies := defaultPlanDependencies()
+	options := serviceOptions{
+		dependencies: dependencies,
+		nftBackend:   NewPlatformNftBackend(),
+	}
+	if target, ok := dependencies.target.(ApplyTargetResolver); ok {
+		options.applyTarget = target
+	}
 	for _, value := range values {
 		if value == nil {
 			return nil, fmt.Errorf("nil actuator service option")
@@ -94,8 +121,14 @@ func OpenService(
 	service := &Service{
 		journal:      journal,
 		dependencies: options.dependencies,
+		applyTarget:  options.applyTarget,
+		nftBackend:   options.nftBackend,
 		expiryStop:   make(chan struct{}),
 		expiryDone:   make(chan struct{}),
+	}
+	if _, err := service.ReconcileIncomplete(context.Background()); err != nil {
+		_ = journal.close()
+		return nil, err
 	}
 	if _, err := service.ExpireDue(context.Background()); err != nil {
 		_ = journal.close()
@@ -141,6 +174,9 @@ func (service *Service) Prepare(
 	}
 	if service.journal.failed() {
 		return contracts.PreparedTemporaryEgressDenyPlanV1{}, durablefile.ErrJournalFailed
+	}
+	if service.auditUncertain || service.journal.mutationLocked() {
+		return contracts.PreparedTemporaryEgressDenyPlanV1{}, ErrKillSwitchActive
 	}
 	if existing, ok, err := service.journal.existing(
 		intent.IntentID,
