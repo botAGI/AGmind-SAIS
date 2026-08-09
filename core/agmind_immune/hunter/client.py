@@ -62,7 +62,7 @@ class HunterConfigV1(BaseModel):
 
     schema_version: Literal["agmind.hunter-config.v1"]
     base_url: str
-    model: Literal["deepseek-v4-flash"]
+    model: Literal["deepseek-v4-flash", "dspark"]
     api_token_file: str
     max_input_bytes: Literal[32_768]
     max_output_bytes: Literal[16_384]

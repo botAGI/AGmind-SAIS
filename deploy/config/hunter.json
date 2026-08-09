@@ -1,7 +1,7 @@
 {
   "schema_version": "agmind.hunter-config.v1",
   "base_url": "http://dgx-relay:8000/v1",
-  "model": "deepseek-v4-flash",
+  "model": "dspark",
   "api_token_file": "/run/secrets/dgx-api-token",
   "max_input_bytes": 32768,
   "max_output_bytes": 16384,
