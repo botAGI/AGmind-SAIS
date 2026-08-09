@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Never
 
+from agmind_immune.canonicaljson import candidate_facts_sha256, canonical_json
 from agmind_immune.clock import (
     CoreClockProvider,
     CoreClockSample,
@@ -28,6 +29,7 @@ from agmind_immune.coverage import (
     MutationReadinessContext,
 )
 from agmind_immune.evidence.projection import (
+    _CANDIDATE_ADMISSION_GATE_FACTORY,
     _RETENTION_REBUILD_FACTORY,
     ProjectionApplyResult,
     ProjectionCursor,
@@ -35,6 +37,7 @@ from agmind_immune.evidence.projection import (
     ProjectionStatus,
     ProjectionStore,
     RebuildReport,
+    _CandidateAdmissionSnapshot,
 )
 from agmind_immune.evidence.retention import (
     AcceptedRetentionBlocked,
@@ -52,6 +55,12 @@ from agmind_immune.evidence.segments import (
     SegmentStore,
     StoredEvidenceRecord,
 )
+from agmind_immune.incidents.admission import (
+    CandidateAdmissionError,
+    CandidateAdmissionView,
+    _issue_candidate_admission_view,
+)
+from agmind_immune.incidents.models import ContainmentCandidateV1
 from agmind_immune.ingest.ack_journal import (
     AckIdentity,
     AckJournal,
@@ -162,6 +171,24 @@ class _RetentionExecution:
     observation: _RetentionObservation
     projected: int
     readiness: MutationReadiness
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateAdmissionBinding:
+    view: CandidateAdmissionView
+    nonce: object
+    candidate_id: str
+    candidate_bytes: bytes
+    candidate_facts_sha256: str
+    authority_snapshot_event_id: str
+    projection_cursor: ProjectionCursor
+    terminal_ref: EvidenceRef
+    admission_rebuild_epoch: int
+    authority_revision: int
+    readiness: MutationReadiness
+    controller_lifecycle: object
+    projection_lifecycle: object
+    evidence_lifecycle: object
 
 
 def _invalid_retention_result(message: str) -> Never:
@@ -339,6 +366,8 @@ class CoreController:
         self._delivery = delivery
         self._lock = asyncio.Lock()
         self._projection_healthy = True
+        self._admission_lifecycle = object()
+        self._candidate_admission_binding: _CandidateAdmissionBinding | None = None
         self._closed = False
 
     @classmethod
@@ -890,6 +919,435 @@ class CoreController:
         self._require_open()
         return self._mutation_readiness()
 
+    @staticmethod
+    def _candidate_copy(candidate: ContainmentCandidateV1) -> ContainmentCandidateV1:
+        if type(candidate) is not ContainmentCandidateV1:
+            raise CandidateAdmissionError("candidate admission facts are not exact")
+        try:
+            copied = ContainmentCandidateV1.model_validate(
+                candidate.model_dump(mode="python"),
+                strict=True,
+            )
+        except Exception as error:
+            raise CandidateAdmissionError(
+                "candidate admission facts cannot be reconstructed"
+            ) from error
+        if type(copied) is not ContainmentCandidateV1 or copied != candidate:
+            raise CandidateAdmissionError("candidate admission facts changed")
+        return copied
+
+    @classmethod
+    def _candidate_bytes(cls, candidate: ContainmentCandidateV1) -> bytes:
+        copied = cls._candidate_copy(candidate)
+        try:
+            return canonical_json(copied.model_dump(mode="json"))
+        except Exception as error:
+            raise CandidateAdmissionError(
+                "candidate admission facts are not canonical"
+            ) from error
+
+    @staticmethod
+    def _readiness_cursors(
+        readiness: MutationReadiness,
+    ) -> tuple[int, int, int, int]:
+        if (
+            type(readiness) is not MutationReadiness
+            or readiness.ready is not True
+            or type(readiness.reason_codes) is not tuple
+            or readiness.reason_codes != ()
+            or not (
+                type(readiness.observer_reconcile_generation) is int
+                and 1
+                <= readiness.observer_reconcile_generation
+                <= MAX_UINT64
+            )
+            or type(readiness.coverage_snapshot_sha256) is not str
+            or HEX64.fullmatch(readiness.coverage_snapshot_sha256) is None
+        ):
+            raise CandidateAdmissionError(
+                "candidate admission requires exact ready mutation authority"
+            )
+        cursors = (
+            readiness.evidence_head,
+            readiness.acceptance_cursor,
+            readiness.confirmed_through,
+            readiness.projection_cursor,
+        )
+        if (
+            any(
+                type(cursor) is not int or not 0 <= cursor <= MAX_UINT64
+                for cursor in cursors
+            )
+            or len(set(cursors)) != 1
+        ):
+            raise CandidateAdmissionError(
+                "candidate admission cursors are not independently equal"
+            )
+        return cursors
+
+    def _require_admission_composition(self) -> None:
+        if (
+            self._acceptance.segment_store is not self._store
+            or self._acceptance.verifier is not self._verifier
+            or not self._store._is_bound_verifier(self._verifier)
+            or not self._correlation_requests._is_bound_to(self._store)
+            or self._coverage._evidence is not self._store
+            or self._coverage._lifecycle_identity
+            is not self._store._lifecycle_identity
+            or not self._projection._is_bound_to(
+                self._store,
+                self._acknowledgements,
+                self._correlation_requests,
+                self._registry,
+            )
+        ):
+            raise CandidateAdmissionError(
+                "candidate admission authorities do not share one lifecycle"
+            )
+
+    def _admission_terminal(
+        self,
+        cursors: tuple[int, int, int, int],
+    ) -> tuple[ProjectionCursor, EvidenceRef, str, str]:
+        acknowledgements = self._acknowledgements.snapshot()
+        self._validate_ack_snapshot(acknowledgements)
+        status = self._projection.status()
+        cursor_sequence, terminal = self._projection_boundary(
+            acknowledgements,
+            status,
+        )
+        cursor = status.cursor
+        if (
+            not acknowledgements.healthy
+            or terminal is None
+            or type(cursor) is not ProjectionCursor
+            or cursor_sequence != cursors[3]
+            or cursor.source_sequence != cursors[3]
+            or not self._cursor_matches_ref(cursor, terminal)
+        ):
+            raise CandidateAdmissionError(
+                "candidate admission terminal is not exact"
+            )
+        record = self._store.resolve_authenticated_ref(terminal)
+        if (
+            type(record) is not StoredEvidenceRecord
+            or record.ref != terminal
+            or type(record.envelope) is not dict
+        ):
+            raise CandidateAdmissionError(
+                "candidate admission terminal is not authenticated"
+            )
+        host_id = record.envelope.get("host_id")
+        boot_id = record.envelope.get("boot_id")
+        if type(host_id) is not str or type(boot_id) is not str:
+            raise CandidateAdmissionError(
+                "candidate admission terminal lost host lifecycle"
+            )
+        return cursor, terminal, host_id, boot_id
+
+    @classmethod
+    def _view_matches_binding(
+        cls,
+        view: object,
+        binding: _CandidateAdmissionBinding,
+    ) -> bool:
+        if type(view) is not CandidateAdmissionView or view is not binding.view:
+            return False
+        try:
+            return (
+                view._nonce is binding.nonce
+                and view._controller_lifecycle is binding.controller_lifecycle
+                and view._projection_lifecycle is binding.projection_lifecycle
+                and view._evidence_lifecycle is binding.evidence_lifecycle
+                and view.candidate.candidate_id == binding.candidate_id
+                and cls._candidate_bytes(view.candidate) == binding.candidate_bytes
+                and candidate_facts_sha256(view.candidate)
+                == binding.candidate_facts_sha256
+                and view.candidate_facts_sha256
+                == binding.candidate_facts_sha256
+                and view.authority_snapshot_event_id
+                == binding.authority_snapshot_event_id
+                and view.projection_cursor == binding.projection_cursor
+                and view.terminal_ref == binding.terminal_ref
+                and view.admission_rebuild_epoch
+                == binding.admission_rebuild_epoch
+                and view.authority_revision == binding.authority_revision
+                and view.readiness == binding.readiness
+            )
+        except (AttributeError, CandidateAdmissionError, TypeError, ValueError):
+            return False
+
+    def _latch_admission_projection_if_unhealthy(self) -> None:
+        try:
+            status = self._projection.status()
+        except (ProjectionError, OSError):
+            self._latch_projection_failure()
+            return
+        if type(status) is not ProjectionStatus or status.healthy is not True:
+            self._latch_projection_failure()
+
+    async def issue_candidate_admission(
+        self,
+        candidate_id: str,
+    ) -> CandidateAdmissionView:
+        """Issue one fresh, local, single-use candidate admission authority."""
+        async with self._lock:
+            self._candidate_admission_binding = None
+            try:
+                self._require_open()
+                with self._projection._candidate_admission_scope(
+                    _factory=_CANDIDATE_ADMISSION_GATE_FACTORY,
+                ):
+                    self._require_admission_composition()
+                    self._catch_up_projection()
+                    if not self._projection_healthy:
+                        raise CandidateAdmissionError(
+                            "candidate admission projection catch-up failed"
+                        )
+                    before = self._mutation_readiness()
+                    before_cursors = self._readiness_cursors(before)
+                    _cursor, terminal, host_id, boot_id = self._admission_terminal(
+                        before_cursors
+                    )
+                    snapshot = self._projection._issue_candidate_admission_snapshot(
+                        candidate_id,
+                        _factory=_CANDIDATE_ADMISSION_GATE_FACTORY,
+                    )
+                    if type(snapshot) is not _CandidateAdmissionSnapshot:
+                        raise CandidateAdmissionError(
+                            "candidate admission candidate is unknown"
+                        )
+                    candidate = snapshot.candidate
+                    if (
+                        type(candidate) is not ContainmentCandidateV1
+                        or snapshot.cursor != _cursor
+                        or snapshot.terminal_ref != terminal
+                        or candidate.host_id != host_id
+                        or candidate.boot_id != boot_id
+                        or snapshot.invalidation_event_ids
+                    ):
+                        raise CandidateAdmissionError(
+                            "candidate admission candidate is stale or invalidated"
+                        )
+                    after = self._mutation_readiness()
+                    after_cursors = self._readiness_cursors(after)
+                    if after_cursors != before_cursors:
+                        raise CandidateAdmissionError(
+                            "candidate admission cursors changed during issuance"
+                        )
+                    final_cursor, final_terminal, final_host, final_boot = (
+                        self._admission_terminal(after_cursors)
+                    )
+                    if (
+                        final_cursor != snapshot.cursor
+                        or final_terminal != snapshot.terminal_ref
+                        or final_host != candidate.host_id
+                        or final_boot != candidate.boot_id
+                        or after.coverage_snapshot_sha256
+                        != candidate.coverage_snapshot_sha256
+                        or snapshot.candidate_facts_sha256
+                        != candidate_facts_sha256(candidate)
+                        or snapshot.authority_snapshot_event_id
+                        != candidate.correlation_snapshot_event_id
+                    ):
+                        raise CandidateAdmissionError(
+                            "candidate admission authority changed during issuance"
+                        )
+                    candidate_copy = self._candidate_copy(candidate)
+                    candidate_bytes = self._candidate_bytes(candidate_copy)
+                    nonce = object()
+                    view = _issue_candidate_admission_view(
+                        candidate=candidate_copy,
+                        candidate_facts_sha256=snapshot.candidate_facts_sha256,
+                        authority_snapshot_event_id=(
+                            snapshot.authority_snapshot_event_id
+                        ),
+                        projection_cursor=replace(snapshot.cursor),
+                        terminal_ref=replace(snapshot.terminal_ref),
+                        admission_rebuild_epoch=(
+                            snapshot.admission_rebuild_epoch
+                        ),
+                        authority_revision=snapshot.authority_revision,
+                        readiness=replace(after),
+                        controller_lifecycle=self._admission_lifecycle,
+                        projection_lifecycle=snapshot.projection_lifecycle,
+                        evidence_lifecycle=snapshot.evidence_lifecycle,
+                        nonce=nonce,
+                    )
+                    binding = _CandidateAdmissionBinding(
+                        view=view,
+                        nonce=nonce,
+                        candidate_id=candidate.candidate_id,
+                        candidate_bytes=candidate_bytes,
+                        candidate_facts_sha256=(
+                            snapshot.candidate_facts_sha256
+                        ),
+                        authority_snapshot_event_id=(
+                            snapshot.authority_snapshot_event_id
+                        ),
+                        projection_cursor=replace(snapshot.cursor),
+                        terminal_ref=replace(snapshot.terminal_ref),
+                        admission_rebuild_epoch=(
+                            snapshot.admission_rebuild_epoch
+                        ),
+                        authority_revision=snapshot.authority_revision,
+                        readiness=replace(after),
+                        controller_lifecycle=self._admission_lifecycle,
+                        projection_lifecycle=snapshot.projection_lifecycle,
+                        evidence_lifecycle=snapshot.evidence_lifecycle,
+                    )
+                    if not self._view_matches_binding(view, binding):
+                        raise CandidateAdmissionError(
+                            "candidate admission view could not be sealed"
+                        )
+                    self._candidate_admission_binding = binding
+                    return view
+            except CandidateAdmissionError:
+                self._latch_admission_projection_if_unhealthy()
+                raise
+            except (
+                CoreControllerError,
+                ProjectionError,
+                EvidenceStoreError,
+                AckJournalError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as error:
+                self._latch_admission_projection_if_unhealthy()
+                raise CandidateAdmissionError(
+                    "candidate admission issuance was denied"
+                ) from error
+
+    async def consume_candidate_admission(
+        self,
+        view: object,
+    ) -> ContainmentCandidateV1:
+        """Consume exactly one unchanged authority and return observation facts."""
+        async with self._lock:
+            binding = self._candidate_admission_binding
+            self._candidate_admission_binding = None
+            try:
+                self._require_open()
+                with self._projection._candidate_admission_scope(
+                    _factory=_CANDIDATE_ADMISSION_GATE_FACTORY,
+                ):
+                    if (
+                        binding is None
+                        or not self._view_matches_binding(view, binding)
+                        or binding.controller_lifecycle
+                        is not self._admission_lifecycle
+                        or binding.evidence_lifecycle
+                        is not self._store._lifecycle_identity
+                    ):
+                        raise CandidateAdmissionError(
+                            "candidate admission view is foreign, stale, or mutated"
+                        )
+                    self._require_admission_composition()
+                    self._catch_up_projection()
+                    if not self._projection_healthy:
+                        raise CandidateAdmissionError(
+                            "candidate admission projection catch-up failed"
+                        )
+                    readiness = self._mutation_readiness()
+                    cursors = self._readiness_cursors(readiness)
+                    bound_cursors = (
+                        binding.readiness.evidence_head,
+                        binding.readiness.acceptance_cursor,
+                        binding.readiness.confirmed_through,
+                        binding.readiness.projection_cursor,
+                    )
+                    if cursors != bound_cursors:
+                        raise CandidateAdmissionError(
+                            "candidate admission boundary is stale"
+                        )
+                    cursor, terminal, host_id, boot_id = self._admission_terminal(
+                        cursors
+                    )
+                    if (
+                        cursor != binding.projection_cursor
+                        or terminal != binding.terminal_ref
+                    ):
+                        raise CandidateAdmissionError(
+                            "candidate admission terminal changed"
+                        )
+                    snapshot = (
+                        self._projection._reauthenticate_candidate_admission_snapshot(
+                            binding.candidate_id,
+                            admission_rebuild_epoch=(
+                                binding.admission_rebuild_epoch
+                            ),
+                            authority_revision=binding.authority_revision,
+                            projection_lifecycle=binding.projection_lifecycle,
+                            _factory=_CANDIDATE_ADMISSION_GATE_FACTORY,
+                        )
+                    )
+                    if type(snapshot) is not _CandidateAdmissionSnapshot:
+                        raise CandidateAdmissionError(
+                            "candidate admission candidate disappeared"
+                        )
+                    candidate = snapshot.candidate
+                    if (
+                        type(candidate) is not ContainmentCandidateV1
+                        or snapshot.invalidation_event_ids
+                        or snapshot.cursor != binding.projection_cursor
+                        or snapshot.terminal_ref != binding.terminal_ref
+                        or snapshot.admission_rebuild_epoch
+                        != binding.admission_rebuild_epoch
+                        or snapshot.authority_revision
+                        != binding.authority_revision
+                        or snapshot.projection_lifecycle
+                        is not binding.projection_lifecycle
+                        or snapshot.evidence_lifecycle
+                        is not binding.evidence_lifecycle
+                        or candidate.host_id != host_id
+                        or candidate.boot_id != boot_id
+                        or candidate.candidate_id != binding.candidate_id
+                        or snapshot.candidate_facts_sha256
+                        != binding.candidate_facts_sha256
+                        or candidate_facts_sha256(candidate)
+                        != binding.candidate_facts_sha256
+                        or self._candidate_bytes(candidate)
+                        != binding.candidate_bytes
+                        or snapshot.authority_snapshot_event_id
+                        != binding.authority_snapshot_event_id
+                    ):
+                        raise CandidateAdmissionError(
+                            "candidate admission facts changed"
+                        )
+                    final = self._mutation_readiness()
+                    final_cursors = self._readiness_cursors(final)
+                    final_cursor, final_terminal, final_host, final_boot = (
+                        self._admission_terminal(final_cursors)
+                    )
+                    if (
+                        final_cursors != bound_cursors
+                        or final_cursor != binding.projection_cursor
+                        or final_terminal != binding.terminal_ref
+                        or final_host != candidate.host_id
+                        or final_boot != candidate.boot_id
+                    ):
+                        raise CandidateAdmissionError(
+                            "candidate admission authority changed before consume"
+                        )
+                    return self._candidate_copy(candidate)
+            except CandidateAdmissionError:
+                self._latch_admission_projection_if_unhealthy()
+                raise
+            except (
+                CoreControllerError,
+                ProjectionError,
+                EvidenceStoreError,
+                AckJournalError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as error:
+                self._latch_admission_projection_if_unhealthy()
+                raise CandidateAdmissionError(
+                    "candidate admission consume was denied"
+                ) from error
+
     async def _execute_retention_locked(
         self,
         *,
@@ -1305,6 +1763,8 @@ class CoreController:
         async with self._lock:
             if self._closed:
                 return
+            self._candidate_admission_binding = None
+            self._admission_lifecycle = object()
             self._closed = True
             primary: BaseException | None = None
 

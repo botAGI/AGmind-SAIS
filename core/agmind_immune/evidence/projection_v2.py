@@ -400,6 +400,16 @@ class _LateCandidateV2:
 
 
 @dataclass(frozen=True, slots=True)
+class _CandidateAdmissionProjectionSnapshot:
+    candidate: ContainmentCandidateV1
+    candidate_facts_sha256: str
+    authority_snapshot_event_id: str
+    invalidation_event_ids: tuple[str, ...]
+    cursor: ProjectionCursor
+    terminal_ref: EvidenceRef
+
+
+@dataclass(frozen=True, slots=True)
 class _UnpublishedV2ReplayReport:
     cursor: ProjectionCursor | None
     applied_count: int
@@ -7851,6 +7861,218 @@ class _V2ProjectionOwner:
             ),
         )
         self._step_hook(_CANDIDATE_STEPS_V2[3])
+
+    def _candidate_admission_snapshot(
+        self,
+        candidate_id: str,
+    ) -> _CandidateAdmissionProjectionSnapshot | None:
+        """Reauthenticate one candidate against one coherent persisted prefix."""
+        with self._mutex:
+            connection, authority = self._require_usable()
+            if (
+                type(candidate_id) is not str
+                or _CANDIDATE_ID_V2.fullmatch(candidate_id) is None
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 candidate admission ID is invalid"
+                )
+            if connection.in_transaction:
+                error = ProjectionConflict(
+                    "Projection V2 candidate admission found an active transaction"
+                )
+                self._latch_unhealthy(error)
+                raise error
+
+            evidence_lifecycle = self._evidence._lifecycle_identity
+            ack_lifecycle = self._acknowledgements._lifecycle_identity
+            journal_lifecycle = self._journal._lifecycle_identity
+            journal_revision = self._journal._mutation_revision
+            verifier = self._evidence._bound_verifier
+            verifier_authority = (
+                None if verifier is None else getattr(verifier, "_authority", None)
+            )
+            verifier_generation = (
+                None
+                if verifier_authority is None
+                else getattr(verifier_authority, "generation", None)
+            )
+            generation = self._generation
+            acceptance_cursor = self._healthy_acceptance_cursor()
+            ack_boundary = self._freeze_ack_boundary(acceptance_cursor)
+            if (
+                evidence_lifecycle is not self._evidence_lifecycle
+                or ack_lifecycle is not self._ack_lifecycle
+                or journal_lifecycle is not self._evidence_lifecycle
+                or verifier is None
+                or type(verifier_generation) is not int
+                or verifier_generation < 0
+                or not self._journal._is_bound_to(self._evidence)
+            ):
+                lifecycle_error = ProjectionAuthorityError(
+                    "Projection V2 candidate admission lifecycle is unavailable"
+                )
+                self._latch_unhealthy(lifecycle_error)
+                raise lifecycle_error
+
+            transaction_started = False
+            commit_attempted = False
+            try:
+                connection.execute("BEGIN")
+                transaction_started = True
+                _verify_v2_schema(connection)
+                cursor = _current_v2_cursor(connection)
+                cursor_ref = _current_v2_cursor_ref(connection)
+                self._validate_cursor_evidence(connection, cursor)
+                predecessor = _predecessor_v2(generation, cursor)
+                _validate_correlation_projection_predecessor(
+                    authority,
+                    predecessor,
+                )
+                prefix_sha256 = self._validate_persisted_prefix(
+                    connection,
+                    authority,
+                    predecessor,
+                    cursor,
+                )
+
+                candidate_snapshot = None
+                rows = connection.execute(
+                    f"SELECT {','.join(_CANDIDATE_COLUMNS)} FROM candidates "
+                    "WHERE candidate_id=? LIMIT 2",
+                    (candidate_id,),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise ProjectionConflict(
+                        "Projection V2 candidate admission identity is ambiguous"
+                    )
+                if rows:
+                    candidate = _decode_candidate(rows[0])
+                    stored_hash = rows[0]["candidate_facts_sha256"]
+                    if (
+                        cursor is None
+                        or cursor_ref is None
+                        or type(stored_hash) is not str
+                        or candidate.candidate_id != candidate_id
+                        or candidate_facts_sha256(candidate) != stored_hash
+                    ):
+                        raise ProjectionConflict(
+                            "Projection V2 candidate admission facts changed"
+                        )
+                    evidence_rows = connection.execute(
+                        "SELECT candidate_id,evidence_event_id,"
+                        "evidence_source_sequence,evidence_content_sha256,role,"
+                        "authority_snapshot_event_id FROM candidate_evidence "
+                        "WHERE candidate_id=? ORDER BY evidence_event_id "
+                        "COLLATE BINARY,role COLLATE BINARY",
+                        (candidate_id,),
+                    ).fetchall()
+                    decoded_evidence = tuple(
+                        _decode_candidate_evidence(row) for row in evidence_rows
+                    )
+                    if (
+                        any(row[0] != candidate_id for row in decoded_evidence)
+                        or not any(
+                            row[1] == candidate.primary_event_id
+                            and row[4] == "primary_trigger"
+                            and row[5] == candidate.correlation_snapshot_event_id
+                            for row in decoded_evidence
+                        )
+                        or not any(
+                            row[1] == candidate.correlation_snapshot_event_id
+                            and row[4] == "correlation_snapshot"
+                            and row[5] == candidate.correlation_snapshot_event_id
+                            for row in decoded_evidence
+                        )
+                    ):
+                        raise ProjectionConflict(
+                            "Projection V2 candidate admission proof changed"
+                        )
+                    invalidation_rows = connection.execute(
+                        "SELECT candidate_id,coverage_event_id,"
+                        "coverage_source_sequence,coverage_content_sha256,"
+                        "reason_code FROM candidate_invalidations "
+                        "WHERE candidate_id=? ORDER BY coverage_event_id "
+                        "COLLATE BINARY",
+                        (candidate_id,),
+                    ).fetchall()
+                    invalidations = tuple(
+                        _decode_candidate_invalidation(row)
+                        for row in invalidation_rows
+                    )
+                    if any(row[0] != candidate_id for row in invalidations):
+                        raise ProjectionConflict(
+                            "Projection V2 candidate admission invalidation changed"
+                        )
+                    candidate_snapshot = _CandidateAdmissionProjectionSnapshot(
+                        candidate=candidate,
+                        candidate_facts_sha256=stored_hash,
+                        authority_snapshot_event_id=(
+                            candidate.correlation_snapshot_event_id
+                        ),
+                        invalidation_event_ids=tuple(row[1] for row in invalidations),
+                        cursor=cursor,
+                        terminal_ref=cursor_ref,
+                    )
+
+                _verify_v2_schema(connection)
+                if (
+                    _current_v2_cursor(connection) != cursor
+                    or _current_v2_cursor_ref(connection) != cursor_ref
+                    or _v2_snapshot_hash(connection) != prefix_sha256
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 candidate admission prefix changed"
+                    )
+                commit_attempted = True
+                connection.execute("COMMIT")
+                transaction_started = False
+
+                if (
+                    self._generation != generation
+                    or self._evidence._lifecycle_identity is not evidence_lifecycle
+                    or self._acknowledgements._lifecycle_identity
+                    is not ack_lifecycle
+                    or self._journal._lifecycle_identity is not journal_lifecycle
+                    or self._journal._mutation_revision is not journal_revision
+                    or self._evidence._bound_verifier is not verifier
+                    or verifier._authority is not verifier_authority
+                    or verifier._authority.generation != verifier_generation
+                    or self._healthy_acceptance_cursor() != acceptance_cursor
+                    or self._freeze_ack_boundary(acceptance_cursor) != ack_boundary
+                    or not self._journal._is_bound_to(self._evidence)
+                    or _current_v2_cursor(connection) != cursor
+                    or _current_v2_cursor_ref(connection) != cursor_ref
+                    or _v2_snapshot_hash(connection) != prefix_sha256
+                ):
+                    raise ProjectionAuthorityError(
+                        "Projection V2 candidate admission authority changed"
+                    )
+                _verify_v2_schema(connection)
+                _validate_correlation_projection_predecessor(
+                    authority,
+                    predecessor,
+                )
+                return candidate_snapshot
+            except BaseException as error:
+                if transaction_started or connection.in_transaction:
+                    self._settle_failed_transaction(
+                        connection,
+                        error,
+                        transaction_started=transaction_started,
+                        commit_attempted=commit_attempted,
+                    )
+                self._latch_unhealthy(error)
+                if isinstance(error, ProjectionConflict):
+                    raise
+                if isinstance(error, sqlite3.DatabaseError):
+                    raise ProjectionConflict(
+                        "Projection V2 candidate admission database changed"
+                    ) from error
+                if isinstance(error, ProjectionAuthorityError):
+                    raise
+                raise ProjectionAuthorityError(
+                    "Projection V2 candidate admission could not be reauthenticated"
+                ) from error
 
     def status(self) -> ProjectionStatus:
         with self._mutex:

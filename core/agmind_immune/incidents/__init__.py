@@ -1,5 +1,10 @@
 """Immutable incident and containment-candidate facts."""
 
+from .admission import (
+    CandidateAdmissionError,
+    CandidateAdmissionView,
+    CandidateStatusObservation,
+)
 from .models import (
     CORRELATION_REASON_CODES,
     ContainmentCandidateV1,
@@ -9,6 +14,9 @@ from .models import (
 
 __all__ = [
     "CORRELATION_REASON_CODES",
+    "CandidateAdmissionError",
+    "CandidateAdmissionView",
+    "CandidateStatusObservation",
     "ContainmentCandidateV1",
     "CorrelationReasonCode",
     "IncidentV1",

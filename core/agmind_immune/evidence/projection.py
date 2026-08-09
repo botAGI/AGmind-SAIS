@@ -18,7 +18,8 @@ import sqlite3
 import stat
 import uuid
 from _thread import RLock as RLockType
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -31,6 +32,7 @@ from pydantic import ValidationError
 from agmind_immune.canonicaljson import canonical_json, verify_event_signature
 from agmind_immune.contracts import (
     HEX64,
+    MAX_UINT64,
     UUID4,
     CoverageEventV1,
     EventEnvelopeV1,
@@ -58,6 +60,7 @@ from agmind_immune.ingest.envelope import EnvelopeVerifier, KeyMetadataError
 
 _UINT64 = re.compile(r"^[0-9]{20}$")
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
+_CANDIDATE_ADMISSION_GATE_FACTORY = object()
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 _SCHEMA_V1_PATH = Path(__file__).with_name("schema_v1.sql")
 _SCHEMA_V1_SHA256 = "e27ea065b3659197aae7b58939695a5e79439faeb0b841dc600c6c822b1919f2"
@@ -276,6 +279,20 @@ class RebuildReport:
     source_record_count: int
     duplicate_count: int
     cursor: ProjectionCursor | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateAdmissionSnapshot:
+    candidate: Any
+    candidate_facts_sha256: str
+    authority_snapshot_event_id: str
+    invalidation_event_ids: tuple[str, ...]
+    cursor: ProjectionCursor
+    terminal_ref: EvidenceRef
+    admission_rebuild_epoch: int
+    authority_revision: int
+    projection_lifecycle: object
+    evidence_lifecycle: object
 
 
 @dataclass(frozen=True)
@@ -2476,6 +2493,9 @@ class ProjectionStore:
     _lock_fd: int
     _lock_name: str
     _main_binding: _FileBinding
+    _admission_rebuild_epoch: int
+    _admission_revision: int
+    _admission_lifecycle: object
 
     def __init__(self) -> None:
         raise TypeError("use ProjectionStore.open()")
@@ -2526,6 +2546,9 @@ class ProjectionStore:
         store._owner = None
         store._mutex = RLock()
         store._closed = False
+        store._admission_rebuild_epoch = 1
+        store._admission_revision = 0
+        store._admission_lifecycle = object()
         store._parent_fd = -1
         store._lock_fd = -1
         store._lock_name = f".{path.name}.projection.lock"
@@ -2710,6 +2733,141 @@ class ProjectionStore:
                 owner._healthy = False
             raise
 
+    @contextmanager
+    def _candidate_admission_scope(
+        self,
+        *,
+        _factory: object,
+    ) -> Iterator[None]:
+        if _factory is not _CANDIDATE_ADMISSION_GATE_FACTORY:
+            raise TypeError("candidate admission scope requires its exact factory")
+        with self._mutex:
+            yield
+
+    def _burn_admission_revision_locked(self) -> int:
+        if self._admission_revision >= MAX_UINT64:
+            owner = self._owner
+            if owner is not None:
+                owner._healthy = False
+            raise ProjectionUnhealthy("projection admission revision is exhausted")
+        self._admission_revision += 1
+        return self._admission_revision
+
+    def _burn_admission_rebuild_locked(self) -> None:
+        if (
+            self._admission_rebuild_epoch >= MAX_UINT64
+            or self._admission_revision >= MAX_UINT64
+        ):
+            owner = self._owner
+            if owner is not None:
+                owner._healthy = False
+            raise ProjectionUnhealthy("projection admission epoch is exhausted")
+        self._admission_rebuild_epoch += 1
+        self._admission_revision += 1
+
+    def _candidate_snapshot_locked(
+        self,
+        candidate_id: str,
+        *,
+        rotate_issue: bool,
+        expected_epoch: int | None = None,
+        expected_revision: int | None = None,
+        expected_lifecycle: object | None = None,
+    ) -> _CandidateAdmissionSnapshot | None:
+        from agmind_immune.evidence import projection_v2
+
+        if self._closed or self._owner is None:
+            raise ProjectionUnhealthy("projection is closed")
+        if rotate_issue:
+            revision = self._burn_admission_revision_locked()
+        else:
+            if (
+                type(expected_epoch) is not int
+                or type(expected_revision) is not int
+                or expected_epoch != self._admission_rebuild_epoch
+                or expected_revision != self._admission_revision
+                or expected_lifecycle is not self._admission_lifecycle
+            ):
+                raise ProjectionAuthorityError(
+                    "projection candidate admission authority is stale"
+                )
+            revision = expected_revision
+        epoch = self._admission_rebuild_epoch
+        lifecycle = self._admission_lifecycle
+        evidence_lifecycle = self._evidence._lifecycle_identity
+        self._verify_namespace_binding_or_latch()
+        snapshot = self._owner._candidate_admission_snapshot(candidate_id)
+        self._verify_namespace_binding_or_latch()
+        if (
+            self._closed
+            or self._owner is None
+            or self._admission_rebuild_epoch != epoch
+            or self._admission_revision != revision
+            or self._admission_lifecycle is not lifecycle
+            or self._evidence._lifecycle_identity is not evidence_lifecycle
+        ):
+            owner = self._owner
+            if owner is not None:
+                owner._healthy = False
+            raise ProjectionAuthorityError(
+                "projection candidate admission changed during reauthentication"
+            )
+        if snapshot is None:
+            return None
+        if type(snapshot) is not projection_v2._CandidateAdmissionProjectionSnapshot:
+            self._owner._healthy = False
+            raise ProjectionAuthorityError(
+                "projection candidate admission snapshot is not exact"
+            )
+        return _CandidateAdmissionSnapshot(
+            candidate=snapshot.candidate,
+            candidate_facts_sha256=snapshot.candidate_facts_sha256,
+            authority_snapshot_event_id=snapshot.authority_snapshot_event_id,
+            invalidation_event_ids=snapshot.invalidation_event_ids,
+            cursor=snapshot.cursor,
+            terminal_ref=snapshot.terminal_ref,
+            admission_rebuild_epoch=epoch,
+            authority_revision=revision,
+            projection_lifecycle=lifecycle,
+            evidence_lifecycle=evidence_lifecycle,
+        )
+
+    def _issue_candidate_admission_snapshot(
+        self,
+        candidate_id: str,
+        *,
+        _factory: object,
+    ) -> _CandidateAdmissionSnapshot | None:
+        if _factory is not _CANDIDATE_ADMISSION_GATE_FACTORY:
+            raise TypeError("candidate admission issuance requires its exact factory")
+        with self._mutex:
+            return self._candidate_snapshot_locked(
+                candidate_id,
+                rotate_issue=True,
+            )
+
+    def _reauthenticate_candidate_admission_snapshot(
+        self,
+        candidate_id: str,
+        *,
+        admission_rebuild_epoch: int,
+        authority_revision: int,
+        projection_lifecycle: object,
+        _factory: object,
+    ) -> _CandidateAdmissionSnapshot | None:
+        if _factory is not _CANDIDATE_ADMISSION_GATE_FACTORY:
+            raise TypeError(
+                "candidate admission reauthentication requires its exact factory"
+            )
+        with self._mutex:
+            return self._candidate_snapshot_locked(
+                candidate_id,
+                rotate_issue=False,
+                expected_epoch=admission_rebuild_epoch,
+                expected_revision=authority_revision,
+                expected_lifecycle=projection_lifecycle,
+            )
+
     def _is_bound_to(
         self,
         evidence: SegmentStore,
@@ -2765,6 +2923,7 @@ class ProjectionStore:
         with self._mutex:
             if self._closed or self._owner is None:
                 raise ProjectionUnhealthy("projection is closed")
+            self._burn_admission_revision_locked()
             self._verify_namespace_binding_or_latch()
             result = self._owner.apply(ref)
             self._verify_namespace_binding_or_latch()
@@ -2852,6 +3011,7 @@ class ProjectionStore:
             owner = self._owner
             if owner is None:
                 raise ProjectionUnhealthy("projection owner is unavailable")
+            self._burn_admission_rebuild_locked()
             self._verify_namespace_binding_or_latch()
             through = _confirmed_projection_ref(
                 self._evidence,
@@ -2874,6 +3034,7 @@ class ProjectionStore:
                 "retention projection rebuild requires its exact factory"
             )
         with self._mutex:
+            self._burn_admission_rebuild_locked()
             through = _confirmed_projection_ref(
                 self._evidence,
                 self._acknowledgements,
@@ -2896,6 +3057,14 @@ class ProjectionStore:
                 and getattr(self, "_parent_fd", -1) < 0
             ):
                 return
+            if not getattr(self, "_closed", False):
+                self._admission_lifecycle = object()
+                if self._admission_revision < MAX_UINT64:
+                    self._admission_revision += 1
+                else:
+                    owner = getattr(self, "_owner", None)
+                    if owner is not None:
+                        owner._healthy = False
             self._closed = True
             owner = getattr(self, "_owner", None)
             if owner is not None:
