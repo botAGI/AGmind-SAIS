@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -570,14 +570,13 @@ def _capture_view(view: object) -> _ViewSnapshot:
     return _ViewSnapshot(candidate=detached, public_seal=seal)
 
 
-def _policy_input(
-    snapshot: _ViewSnapshot,
+def _evidence_age_ms(
+    created_at: str,
     sample: CoreClockSample,
     uncertainty_ns: int,
-) -> PolicyInputV1:
-    candidate = snapshot.candidate
+) -> int:
     decision_ns = _datetime_ns(sample.decision_utc)
-    created_ns = _timestamp_ns(candidate.created_at)
+    created_ns = _timestamp_ns(created_at)
     if decision_ns < created_ns:
         raise PolicyError("policy candidate creation time is in the future")
     age_ns = decision_ns - created_ns + uncertainty_ns
@@ -586,6 +585,21 @@ def _policy_input(
     )
     if not 0 <= age_ms <= MAX_UINT64:
         raise PolicyError("policy evidence age is outside uint64")
+    return age_ms
+
+
+def _policy_input_for_candidate(
+    candidate: object,
+    evidence_age_ms: int,
+) -> PolicyInputV1:
+    from agmind_immune.incidents.models import ContainmentCandidateV1
+
+    if (
+        type(candidate) is not ContainmentCandidateV1
+        or type(evidence_age_ms) is not int
+        or not 0 <= evidence_age_ms <= MAX_UINT64
+    ):
+        raise PolicyError("policy input requires exact candidate facts and age")
     base: dict[str, object] = {
         "schema_version": "agmind.policy-input.v1",
         "candidate_id": candidate.candidate_id,
@@ -615,7 +629,7 @@ def _policy_input(
         "operator_denylist_sha256": candidate.operator_denylist_sha256,
         "management_denylist_sha256": candidate.management_denylist_sha256,
         "evidence_ids": candidate.evidence_ids,
-        "evidence_age_ms": age_ms,
+        "evidence_age_ms": evidence_age_ms,
         "policy_bundle_version": POLICY_BUNDLE.version,
         "policy_bundle_sha256": POLICY_BUNDLE.sha256,
     }
@@ -627,6 +641,16 @@ def _policy_input(
     if type(value) is not PolicyInputV1:
         raise PolicyError("policy input construction returned an inexact value")
     return value
+
+
+def _policy_input(
+    snapshot: _ViewSnapshot,
+    sample: CoreClockSample,
+    uncertainty_ns: int,
+) -> PolicyInputV1:
+    candidate = snapshot.candidate
+    age_ms = _evidence_age_ms(candidate.created_at, sample, uncertainty_ns)
+    return _policy_input_for_candidate(candidate, age_ms)
 
 
 def _new_http_client(
@@ -749,13 +773,96 @@ def _narrow_decision(
     ):
         raise PolicyResponseInvalid("OPA response changed policy bindings")
     if decision.effect == "manual_approval_required" and (
-        policy_input.evidence_age_ms > _MAX_EVIDENCE_AGE_MS
+        policy_input.l4_protocol != "tcp"
+        or policy_input.evidence_age_ms > _MAX_EVIDENCE_AGE_MS
         or not 30
         <= decision.max_ttl_seconds
         <= min(policy_input.requested_ttl_seconds, 120)
         or decision.allowed_evidence_ids != policy_input.evidence_ids
     ):
         raise PolicyResponseInvalid("OPA response widened manual policy authority")
+
+
+def _exact_model_state(
+    value: object,
+    model_type: type[PolicyInputV1 | PolicyDecisionV1 | PolicyEvaluation],
+) -> bool:
+    return (
+        type(value) is model_type
+        and set(value.__dict__) == set(model_type.model_fields)
+        and value.model_fields_set == set(model_type.model_fields)
+        and value.__pydantic_extra__ in (None, {})
+    )
+
+
+def _detach_policy_evaluation(value: object) -> PolicyEvaluation:
+    if not _exact_model_state(value, PolicyEvaluation):
+        raise PolicyResponseInvalid("policy evaluation runtime shape is not exact")
+    evaluation = cast(PolicyEvaluation, value)
+    if (
+        not _exact_model_state(evaluation.policy_input, PolicyInputV1)
+        or not _exact_model_state(evaluation.decision, PolicyDecisionV1)
+        or type(evaluation.policy_bundle) is not PolicyBundleIdentity
+    ):
+        raise PolicyResponseInvalid("policy evaluation runtime shape is not exact")
+    try:
+        policy_input = PolicyInputV1.model_validate(
+            evaluation.policy_input.model_dump(mode="python"),
+            strict=True,
+        )
+        decision = PolicyDecisionV1.model_validate(
+            evaluation.decision.model_dump(mode="python"),
+            strict=True,
+        )
+        bundle = PolicyBundleIdentity(
+            version=evaluation.policy_bundle.version,
+            sha256=evaluation.policy_bundle.sha256,
+        )
+        detached = PolicyEvaluation.model_validate(
+            {
+                "policy_input": policy_input,
+                "decision": decision,
+                "candidate_id": evaluation.candidate_id,
+                "candidate_facts_sha256": evaluation.candidate_facts_sha256,
+                "policy_input_sha256": evaluation.policy_input_sha256,
+                "policy_decision_sha256": evaluation.policy_decision_sha256,
+                "policy_bundle": bundle,
+                "evaluated_at": evaluation.evaluated_at,
+                "evidence_age_ms": evaluation.evidence_age_ms,
+            },
+            strict=True,
+        )
+    except Exception as error:
+        raise PolicyResponseInvalid("policy evaluation cannot be detached") from error
+    if (
+        type(detached) is not PolicyEvaluation
+        or not hmac.compare_digest(
+            canonical_json(detached),
+            canonical_json(evaluation),
+        )
+    ):
+        raise PolicyResponseInvalid("policy evaluation changed while detaching")
+    return detached
+
+
+def _validate_policy_evaluation_for_candidate(
+    value: object,
+    candidate: object,
+) -> PolicyEvaluation:
+    detached = _detach_policy_evaluation(value)
+    expected_input = _policy_input_for_candidate(
+        candidate,
+        detached.evidence_age_ms,
+    )
+    if not hmac.compare_digest(
+        canonical_json(detached.policy_input),
+        canonical_json(expected_input),
+    ):
+        raise PolicyResponseInvalid(
+            "policy evaluation does not bind the reauthenticated candidate"
+        )
+    _narrow_decision(detached.decision, detached.policy_input)
+    return detached
 
 
 class PolicyClient:

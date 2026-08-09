@@ -139,6 +139,7 @@ _HEALTH_FINAL_TEMP_NAME = re.compile(
     rf"^\.health\.json\.{_UUID4_TEXT}\.tmp$"
 )
 _CORRELATION_JOURNAL_NAME = "correlation-requests.agf"
+_DECISION_INTENT_JOURNAL_NAME = "decision-intents.agf"
 _ACK_COMMITMENT_NAME = "ack-commitment.json"
 _ACK_COMMITMENT_TEMP_NAME = re.compile(
     rf"^\.ack-commitment\.json\.{_UUID4_TEXT}\.tmp$"
@@ -296,6 +297,18 @@ class _CorrelationJournalLifecycleCorrupt(EvidenceStoreError):
 
 class _CorrelationJournalLifecycleIoUncertain(EvidenceStoreError):
     """Correlation-journal I/O could not be authenticated conclusively."""
+
+
+class _DecisionIntentJournalLifecycleStateError(EvidenceStoreError):
+    """The requested decision-intent operation is illegal in this lifecycle."""
+
+
+class _DecisionIntentJournalLifecycleCorrupt(EvidenceStoreError):
+    """An expected decision-intent artifact disappeared or was substituted."""
+
+
+class _DecisionIntentJournalLifecycleIoUncertain(EvidenceStoreError):
+    """Decision-intent I/O could not be authenticated conclusively."""
 
 
 class TornTailRepairRequired(EvidenceStoreError):
@@ -778,6 +791,25 @@ class _FileIdentity:
     link_count: int
     modified_ns: int
     changed_ns: int
+
+
+class _SourceTerminalLease:
+    __slots__ = ("finalized", "lifecycle", "revision", "token")
+
+    def __init__(
+        self,
+        *,
+        lifecycle: object,
+        revision: int,
+        token: object,
+        _factory: object,
+    ) -> None:
+        if _factory is not _SOURCE_TERMINAL_FACTORY:
+            raise TypeError("source terminal lease requires its exact factory")
+        self.lifecycle = lifecycle
+        self.revision = revision
+        self.token = token
+        self.finalized = False
 
 
 @dataclass(frozen=True)
@@ -2625,6 +2657,23 @@ class SegmentStore:
         ) = None
         self._correlation_journal_identity: _FileIdentity | None = None
         self._correlation_journal_digest: bytes | None = None
+        self._decision_intent_journal_owner: object | None = None
+        self._decision_intent_journal_state: Literal[
+            "unknown",
+            "fresh",
+            "present",
+            "creating",
+            "recovering",
+            "initialization_uncertain",
+            "initialized",
+            "append_uncertain",
+            "io_uncertain",
+        ] = "unknown"
+        self._decision_intent_journal_operation: (
+            Literal["create", "recover"] | None
+        ) = None
+        self._decision_intent_journal_identity: _FileIdentity | None = None
+        self._decision_intent_journal_digest: bytes | None = None
         self._ack_journal_owner: object | None = None
         self._retention_ack_recovery_permitted = False
         self._ack_journal_is_retention_recovery = False
@@ -2790,6 +2839,122 @@ class SegmentStore:
         if not valid:
             raise EvidenceStoreError("source changed during terminal evaluation")
         return result
+
+    @contextmanager
+    def _source_terminal_scope(
+        self,
+        lifecycle: object,
+        *,
+        _factory: object,
+    ) -> Iterator[_SourceTerminalLease]:
+        """Exclude all sanctioned source writers without invoking a callback."""
+        if (
+            _factory is not _SOURCE_TERMINAL_FACTORY
+            or lifecycle is not self._lifecycle_identity
+        ):
+            raise EvidenceStoreError("source terminal scope lacks exact authority")
+        terminal_token = object()
+        with self._source_gate:
+            if (
+                self._source_terminal_token is not None
+                or type(self._source_active_writers) is not int
+                or self._source_active_writers != 0
+                or type(self._source_revision) is not int
+                or self._source_revision < 0
+            ):
+                raise EvidenceStoreError("source terminal scope conflicts with a writer")
+            revision = self._source_revision
+            self._source_terminal_token = terminal_token
+        lease = _SourceTerminalLease(
+            lifecycle=lifecycle,
+            revision=revision,
+            token=terminal_token,
+            _factory=_SOURCE_TERMINAL_FACTORY,
+        )
+        try:
+            yield lease
+        except BaseException as primary:
+            with self._source_gate:
+                if lease.finalized:
+                    valid = True
+                else:
+                    valid = self._source_terminal_lease_valid_locked(lease)
+                    if self._source_terminal_token is lease.token:
+                        self._source_terminal_token = None
+                    lease.finalized = True
+            if not valid:
+                primary.add_note("source terminal scope changed during failure")
+            raise
+        with self._source_gate:
+            if lease.finalized:
+                valid = True
+            else:
+                valid = self._source_terminal_lease_valid_locked(lease)
+                if self._source_terminal_token is lease.token:
+                    self._source_terminal_token = None
+                lease.finalized = True
+        if not valid:
+            raise EvidenceStoreError("source changed during terminal scope")
+
+    def _source_terminal_lease_valid_locked(
+        self,
+        lease: _SourceTerminalLease,
+    ) -> bool:
+        return (
+            type(lease) is _SourceTerminalLease
+            and lease.lifecycle is self._lifecycle_identity
+            and lease.finalized is False
+            and self._source_terminal_token is lease.token
+            and type(self._source_active_writers) is int
+            and self._source_active_writers == 0
+            and type(self._source_revision) is int
+            and self._source_revision == lease.revision
+        )
+
+    @contextmanager
+    def _source_terminal_commit_scope(
+        self,
+        lease: _SourceTerminalLease,
+        lifecycle: object,
+        *,
+        _factory: object,
+    ) -> Iterator[None]:
+        """Linearize a terminal durable commit against every source mutation."""
+        if (
+            _factory is not _SOURCE_TERMINAL_FACTORY
+            or type(lease) is not _SourceTerminalLease
+            or lifecycle is not self._lifecycle_identity
+            or lease.lifecycle is not lifecycle
+        ):
+            raise EvidenceStoreError("source terminal commit lacks exact authority")
+        with self._source_gate:
+            if not self._source_terminal_lease_valid_locked(lease):
+                if self._source_terminal_token is lease.token:
+                    self._source_terminal_token = None
+                lease.finalized = True
+                raise EvidenceStoreError(
+                    "source changed before terminal durable commit"
+                )
+            try:
+                yield
+            except BaseException as primary:
+                valid = self._source_terminal_lease_valid_locked(lease)
+                if self._source_terminal_token is lease.token:
+                    self._source_terminal_token = None
+                lease.finalized = True
+                if not valid:
+                    primary.add_note(
+                        "source changed during failed terminal durable commit"
+                    )
+                raise
+            valid = self._source_terminal_lease_valid_locked(lease)
+            if self._source_terminal_token is lease.token:
+                self._source_terminal_token = None
+            lease.finalized = True
+            if not valid:
+                raise EvidenceStoreError(
+                    "source changed during terminal durable commit"
+                )
 
     @contextmanager
     def _replay_source_snapshot_gate(self) -> Iterator[None]:
@@ -8136,6 +8301,518 @@ class SegmentStore:
         self._correlation_journal_owner = None
         self._correlation_journal_operation = None
 
+    def _decision_intent_journal_artifact_identity(
+        self,
+    ) -> _FileIdentity | None:
+        try:
+            if (
+                _entry_stat_at(
+                    self._root_descriptor,
+                    _DECISION_INTENT_JOURNAL_NAME,
+                )
+                is None
+            ):
+                return None
+            return _file_identity(
+                _regular_stat_at(
+                    self._root_descriptor,
+                    _DECISION_INTENT_JOURNAL_NAME,
+                    self.root / _DECISION_INTENT_JOURNAL_NAME,
+                )
+            )
+        except EvidenceCorrupt as error:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent root artifact is unsafe or unstable"
+            ) from error
+        except OSError as error:
+            raise _DecisionIntentJournalLifecycleIoUncertain(
+                "decision-intent root artifact I/O is uncertain"
+            ) from error
+
+    def _decision_intent_journal_prefix_digest(
+        self,
+        prefix_size: int,
+    ) -> tuple[_FileIdentity, bytes]:
+        if (
+            isinstance(prefix_size, bool)
+            or not isinstance(prefix_size, int)
+            or prefix_size < 0
+        ):
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent prefix size is invalid"
+            )
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                _DECISION_INTENT_JOURNAL_NAME,
+                flags,
+                dir_fd=self._root_descriptor,
+            )
+        except FileNotFoundError as error:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent authority disappeared during content binding"
+            ) from error
+        except OSError as error:
+            raise _DecisionIntentJournalLifecycleIoUncertain(
+                "decision-intent content binding I/O is uncertain"
+            ) from error
+        primary_error: BaseException | None = None
+        try:
+            try:
+                opened_identity = _file_identity(os.fstat(descriptor))
+                published_identity = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        _DECISION_INTENT_JOURNAL_NAME,
+                        self.root / _DECISION_INTENT_JOURNAL_NAME,
+                    )
+                )
+                if (
+                    opened_identity != published_identity
+                    or opened_identity.size < prefix_size
+                ):
+                    raise _DecisionIntentJournalLifecycleCorrupt(
+                        "decision-intent prefix identity changed"
+                    )
+                digest = hashlib.sha256()
+                offset = 0
+                while offset < prefix_size:
+                    chunk = os.pread(
+                        descriptor,
+                        min(1024 * 1024, prefix_size - offset),
+                        offset,
+                    )
+                    if not chunk:
+                        raise _DecisionIntentJournalLifecycleCorrupt(
+                            "decision-intent prefix shortened during hashing"
+                        )
+                    digest.update(chunk)
+                    offset += len(chunk)
+                after_identity = _file_identity(os.fstat(descriptor))
+                published_after = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        _DECISION_INTENT_JOURNAL_NAME,
+                        self.root / _DECISION_INTENT_JOURNAL_NAME,
+                    )
+                )
+                if (
+                    after_identity != opened_identity
+                    or published_after != opened_identity
+                ):
+                    raise _DecisionIntentJournalLifecycleCorrupt(
+                        "decision-intent identity changed during hashing"
+                    )
+                return opened_identity, digest.digest()
+            except FileNotFoundError as error:
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "decision-intent prefix disappeared during binding"
+                ) from error
+            except EvidenceCorrupt as error:
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "decision-intent prefix is unsafe or unstable"
+                ) from error
+            except OSError as error:
+                raise _DecisionIntentJournalLifecycleIoUncertain(
+                    "decision-intent prefix I/O is uncertain"
+                ) from error
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                if primary_error is None:
+                    raise _DecisionIntentJournalLifecycleIoUncertain(
+                        "decision-intent prefix close became uncertain"
+                    ) from close_error
+                primary_error.add_note(
+                    "secondary decision-intent prefix close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+
+    @staticmethod
+    def _same_decision_intent_journal_inode(
+        actual: _FileIdentity,
+        expected: _FileIdentity,
+    ) -> bool:
+        return actual.device == expected.device and actual.inode == expected.inode
+
+    def _acquire_decision_intent_journal(
+        self,
+        owner: object,
+    ) -> tuple[int, object, Literal["create", "recover"]]:
+        self._require_ack_mutation_ready()
+        if self._decision_intent_journal_owner is not None:
+            raise EvidenceStoreBusy(
+                "evidence root already has one decision-intent owner"
+            )
+        state = self._decision_intent_journal_state
+        if state == "unknown":
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent startup presence was not authenticated"
+            )
+        if state == "initialization_uncertain":
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent initialization is uncertain until store restart"
+            )
+        if state in {"append_uncertain", "io_uncertain"}:
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent publication is uncertain until store restart"
+            )
+        if state in {"creating", "recovering", "initialized"}:
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent journal already has a lifecycle owner"
+            )
+
+        actual_identity = self._decision_intent_journal_artifact_identity()
+        if state == "present":
+            expected_identity = self._decision_intent_journal_identity
+            if actual_identity is None:
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "expected decision-intent authority disappeared"
+                )
+            if expected_identity is None or actual_identity != expected_identity:
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "expected decision-intent authority changed identity"
+                )
+            operation: Literal["create", "recover"] = "recover"
+            next_state: Literal["creating", "recovering"] = "recovering"
+        elif state == "fresh":
+            if actual_identity is not None:
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "unexpected decision-intent authority appeared"
+                )
+            operation = "create"
+            next_state = "creating"
+        else:
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent lifecycle state is invalid"
+            )
+
+        duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
+        if duplicate_command is None:
+            root_descriptor = os.dup(self._root_descriptor)
+            try:
+                os.set_inheritable(root_descriptor, False)
+            except BaseException as error:
+                try:
+                    os.close(root_descriptor)
+                except OSError as cleanup_error:
+                    error.add_note(
+                        "secondary decision-intent root descriptor cleanup "
+                        f"failure: {cleanup_error}"
+                    )
+                raise
+        else:
+            root_descriptor = fcntl.fcntl(
+                self._root_descriptor,
+                duplicate_command,
+                0,
+            )
+        self._decision_intent_journal_owner = owner
+        self._decision_intent_journal_operation = operation
+        self._decision_intent_journal_state = next_state
+        return root_descriptor, self._lifecycle_identity, operation
+
+    def _decision_intent_journal_final_name_created(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._decision_intent_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._decision_intent_journal_operation != "create"
+            or self._decision_intent_journal_state
+            not in {"creating", "initialization_uncertain"}
+        ):
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent create publication has the wrong lifecycle"
+            )
+        self._decision_intent_journal_state = "initialization_uncertain"
+
+    def _validate_decision_intent_journal_opened(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result,
+    ) -> None:
+        if (
+            owner is not self._decision_intent_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent opened binding has the wrong lifecycle"
+            )
+        operation = self._decision_intent_journal_operation
+        state = self._decision_intent_journal_state
+        if not (
+            (operation == "create" and state == "initialization_uncertain")
+            or (operation == "recover" and state == "recovering")
+        ):
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent opened binding was not expected"
+            )
+        authenticated_identity = _file_identity(authenticated)
+        actual_identity = self._decision_intent_journal_artifact_identity()
+        if actual_identity is None or actual_identity != authenticated_identity:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent path changed while opening"
+            )
+        expected_identity = self._decision_intent_journal_identity
+        if operation == "recover" and (
+            expected_identity is None
+            or authenticated_identity != expected_identity
+        ):
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "opened decision-intent authority differs from startup identity"
+            )
+
+    def _complete_decision_intent_journal_initialization(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result,
+        authenticated_digest: bytes,
+        *,
+        repaired_torn_tail: bool,
+    ) -> None:
+        if (
+            owner is not self._decision_intent_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent completion has the wrong lifecycle"
+            )
+        operation = self._decision_intent_journal_operation
+        state = self._decision_intent_journal_state
+        if not (
+            (operation == "create" and state == "initialization_uncertain")
+            or (operation == "recover" and state == "recovering")
+        ):
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent completion did not follow create or recovery"
+            )
+        authenticated_identity = _file_identity(authenticated)
+        actual_identity = self._decision_intent_journal_artifact_identity()
+        if actual_identity is None or actual_identity != authenticated_identity:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent authority changed before completion"
+            )
+        if len(authenticated_digest) != hashlib.sha256().digest_size:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent authenticated digest is invalid"
+            )
+        expected_identity = self._decision_intent_journal_identity
+        if type(repaired_torn_tail) is not bool:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent repair disposition is invalid"
+            )
+        if operation == "create" and repaired_torn_tail:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "new decision-intent authority cannot require tail repair"
+            )
+        if operation == "recover":
+            if expected_identity is None:
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "recovered decision-intent authority violates startup binding"
+                )
+            if repaired_torn_tail:
+                repaired_identity_is_valid = (
+                    self._same_decision_intent_journal_inode(
+                        authenticated_identity,
+                        expected_identity,
+                    )
+                    and authenticated_identity.mode == expected_identity.mode
+                    and authenticated_identity.owner == expected_identity.owner
+                    and authenticated_identity.link_count
+                    == expected_identity.link_count
+                    and authenticated_identity.size < expected_identity.size
+                )
+                if not repaired_identity_is_valid:
+                    raise _DecisionIntentJournalLifecycleCorrupt(
+                        "decision-intent tail repair exceeded its authority"
+                    )
+            elif authenticated_identity != expected_identity:
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "decision-intent changed during exact recovery"
+                )
+        self._decision_intent_journal_identity = authenticated_identity
+        self._decision_intent_journal_digest = bytes(authenticated_digest)
+        self._decision_intent_journal_state = "initialized"
+
+    def _validate_decision_intent_journal_owner(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        self._require_ack_mutation_ready()
+        if (
+            owner is not self._decision_intent_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._decision_intent_journal_state != "initialized"
+        ):
+            raise EvidenceSealError(
+                "decision-intent journal is outside this evidence lifecycle"
+            )
+
+    def _seal_decision_intent_journal_identity(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result,
+        authenticated_digest: bytes,
+    ) -> None:
+        if (
+            owner is not self._decision_intent_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._decision_intent_journal_state != "initialized"
+        ):
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent seal has the wrong lifecycle"
+            )
+        authenticated_identity = _file_identity(authenticated)
+        if len(authenticated_digest) != hashlib.sha256().digest_size:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent seal digest is invalid"
+            )
+        actual_identity = self._decision_intent_journal_artifact_identity()
+        expected_identity = self._decision_intent_journal_identity
+        if (
+            actual_identity is None
+            or actual_identity != authenticated_identity
+            or expected_identity is None
+            or not self._same_decision_intent_journal_inode(
+                authenticated_identity,
+                expected_identity,
+            )
+        ):
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent authority changed before seal"
+            )
+        self._decision_intent_journal_identity = authenticated_identity
+        self._decision_intent_journal_digest = bytes(authenticated_digest)
+
+    def _mark_decision_intent_journal_append_uncertain(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated_before: os.stat_result,
+        authenticated_digest_before: bytes,
+    ) -> None:
+        if (
+            owner is not self._decision_intent_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._decision_intent_journal_state
+            not in {"initialized", "append_uncertain"}
+        ):
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent uncertainty has the wrong lifecycle"
+            )
+        retained_identity = _file_identity(authenticated_before)
+        if len(authenticated_digest_before) != hashlib.sha256().digest_size:
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent pre-append digest is invalid"
+            )
+        expected_identity = self._decision_intent_journal_identity
+        if (
+            expected_identity is None
+            or not self._same_decision_intent_journal_inode(
+                retained_identity,
+                expected_identity,
+            )
+        ):
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent pre-append identity changed"
+            )
+        self._decision_intent_journal_identity = retained_identity
+        self._decision_intent_journal_digest = bytes(
+            authenticated_digest_before
+        )
+        self._decision_intent_journal_state = "append_uncertain"
+
+    def _mark_decision_intent_journal_io_uncertain(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+        authenticated: os.stat_result | None,
+        authenticated_digest: bytes | None,
+    ) -> None:
+        if (
+            owner is not self._decision_intent_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+            or self._decision_intent_journal_state
+            not in {
+                "recovering",
+                "initialization_uncertain",
+                "initialized",
+                "io_uncertain",
+            }
+        ):
+            raise _DecisionIntentJournalLifecycleStateError(
+                "decision-intent I/O uncertainty has the wrong lifecycle"
+            )
+        if (authenticated is None) != (authenticated_digest is None):
+            raise _DecisionIntentJournalLifecycleCorrupt(
+                "decision-intent I/O uncertainty has an incomplete anchor"
+            )
+        if authenticated is not None and authenticated_digest is not None:
+            retained_identity = _file_identity(authenticated)
+            if len(authenticated_digest) != hashlib.sha256().digest_size:
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "decision-intent I/O uncertainty digest is invalid"
+                )
+            expected_identity = self._decision_intent_journal_identity
+            if expected_identity is not None and (
+                not self._same_decision_intent_journal_inode(
+                    retained_identity,
+                    expected_identity,
+                )
+            ):
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "decision-intent I/O uncertainty identity changed"
+                )
+            actual_identity = self._decision_intent_journal_artifact_identity()
+            if (
+                actual_identity is None
+                or not self._same_decision_intent_journal_inode(
+                    actual_identity,
+                    retained_identity,
+                )
+                or actual_identity.size < retained_identity.size
+            ):
+                raise _DecisionIntentJournalLifecycleCorrupt(
+                    "decision-intent I/O uncertainty lost its content anchor"
+                )
+            self._decision_intent_journal_identity = retained_identity
+            self._decision_intent_journal_digest = bytes(authenticated_digest)
+        if self._decision_intent_journal_state != "initialization_uncertain":
+            self._decision_intent_journal_state = "io_uncertain"
+
+    def _release_decision_intent_journal(
+        self,
+        owner: object,
+        lifecycle_identity: object,
+    ) -> None:
+        if (
+            owner is not self._decision_intent_journal_owner
+            or lifecycle_identity is not self._lifecycle_identity
+        ):
+            raise EvidenceSealError(
+                "decision-intent release has the wrong lifecycle"
+            )
+        state = self._decision_intent_journal_state
+        if state == "creating":
+            self._decision_intent_journal_state = "fresh"
+        elif state in {"recovering", "initialized"}:
+            self._decision_intent_journal_state = "present"
+        self._decision_intent_journal_owner = None
+        self._decision_intent_journal_operation = None
+
     def _ack_journal_artifact_identity(self) -> _FileIdentity | None:
         name = "ack-journal.agf"
         try:
@@ -9601,6 +10278,77 @@ class SegmentStore:
         """Persist a root-wide fence without rewriting corrupt correlation bytes."""
         self._trip_read_only("segment_corrupt")
 
+    def _trip_decision_intent_journal_corrupt(self) -> None:
+        """Persist a root-wide fence without rewriting decision-intent bytes."""
+        self._trip_read_only("segment_corrupt")
+
+    def _fence_missing_expected_decision_intent_journal(self) -> None:
+        state = self._decision_intent_journal_state
+        if state not in {
+            "present",
+            "initialized",
+            "append_uncertain",
+            "io_uncertain",
+        }:
+            return
+        try:
+            actual_identity = self._decision_intent_journal_artifact_identity()
+        except (
+            _DecisionIntentJournalLifecycleCorrupt,
+            _DecisionIntentJournalLifecycleIoUncertain,
+        ):
+            actual_identity = None
+        expected_identity = self._decision_intent_journal_identity
+        identity_changed = actual_identity is None or expected_identity is None
+        if (
+            not identity_changed
+            and actual_identity is not None
+            and expected_identity is not None
+        ):
+            if state in {"append_uncertain", "io_uncertain"}:
+                identity_changed = (
+                    not self._same_decision_intent_journal_inode(
+                        actual_identity,
+                        expected_identity,
+                    )
+                    or actual_identity.size < expected_identity.size
+                )
+            else:
+                identity_changed = actual_identity != expected_identity
+
+        content_changed = False
+        expected_digest = self._decision_intent_journal_digest
+        if (
+            not identity_changed
+            and expected_identity is not None
+            and expected_digest is not None
+        ):
+            try:
+                hashed_identity, actual_digest = (
+                    self._decision_intent_journal_prefix_digest(
+                        expected_identity.size
+                    )
+                )
+            except (
+                _DecisionIntentJournalLifecycleCorrupt,
+                _DecisionIntentJournalLifecycleIoUncertain,
+            ):
+                content_changed = True
+            else:
+                content_changed = (
+                    actual_identity is None
+                    or not self._same_decision_intent_journal_inode(
+                        hashed_identity,
+                        actual_identity,
+                    )
+                    or actual_digest != expected_digest
+                )
+        elif state in {"initialized", "append_uncertain"}:
+            content_changed = True
+
+        if identity_changed or content_changed:
+            self._trip_read_only("segment_corrupt")
+
     def _fence_missing_expected_correlation_journal(self) -> None:
         state = self._correlation_journal_state
         if state not in {
@@ -9917,6 +10665,7 @@ class SegmentStore:
         allowed_root = {
             "ack-journal.agf",
             _CORRELATION_JOURNAL_NAME,
+            _DECISION_INTENT_JOURNAL_NAME,
             _ACK_COMMITMENT_NAME,
             "chain-head.json",
             "health.intent.json",
@@ -9926,6 +10675,7 @@ class SegmentStore:
         }
         root_entries = tuple(os.listdir(self._root_descriptor))
         correlation_journal_identity: _FileIdentity | None = None
+        decision_intent_journal_identity: _FileIdentity | None = None
         ack_journal_identity: _FileIdentity | None = None
         ack_commitment: _AckCommitmentV1 | None = None
         ack_commitment_raw: bytes | None = None
@@ -9942,6 +10692,15 @@ class SegmentStore:
         retention_boundary_names: list[str] = []
         retention_boundary_temporary_names: list[str] = []
         for name in root_entries:
+            if name == _DECISION_INTENT_JOURNAL_NAME:
+                decision_intent_journal_identity = _file_identity(
+                    _regular_stat_at(
+                        self._root_descriptor,
+                        name,
+                        self.root / name,
+                    )
+                )
+                continue
             if name == _CORRELATION_JOURNAL_NAME:
                 correlation_journal_identity = _file_identity(
                     _regular_stat_at(
@@ -10136,6 +10895,15 @@ class SegmentStore:
         self._correlation_journal_state = (
             "fresh"
             if correlation_journal_identity is None
+            else "present"
+        )
+        self._decision_intent_journal_identity = (
+            decision_intent_journal_identity
+        )
+        self._decision_intent_journal_digest = None
+        self._decision_intent_journal_state = (
+            "fresh"
+            if decision_intent_journal_identity is None
             else "present"
         )
         self._ack_journal_identity = ack_journal_identity
@@ -13322,6 +14090,44 @@ class SegmentStore:
         finally:
             try:
                 try:
+                    decision_close_error: BaseException | None = None
+                    decision_owner = self._decision_intent_journal_owner
+                    if decision_owner is not None:
+                        try:
+                            close_from_store = getattr(
+                                decision_owner,
+                                "_close_from_segment_store",
+                                None,
+                            )
+                            if not callable(close_from_store):
+                                raise EvidenceStoreError(
+                                    "decision-intent owner cannot close "
+                                    "before evidence unlock"
+                                )
+                            cast(Callable[[object], None], close_from_store)(
+                                self._lifecycle_identity
+                            )
+                        except BaseException as error:  # noqa: BLE001
+                            decision_close_error = error
+                    if self._decision_intent_journal_owner is not None:
+                        survivor_error = EvidenceStoreError(
+                            "decision-intent owner survived evidence shutdown"
+                        )
+                        if decision_close_error is not None:
+                            survivor_error.__cause__ = decision_close_error
+                        decision_close_error = survivor_error
+                    else:
+                        try:
+                            self._fence_missing_expected_decision_intent_journal()
+                        except BaseException as error:  # noqa: BLE001
+                            if decision_close_error is None:
+                                decision_close_error = error
+                            else:
+                                decision_close_error.add_note(
+                                    "secondary decision-intent shutdown fence "
+                                    f"failure: {type(error).__name__}: {error}"
+                                )
+
                     coverage_close_error: BaseException | None = None
                     coverage_owner = self._coverage_state_owner
                     if coverage_owner is not None:
@@ -13350,7 +14156,15 @@ class SegmentStore:
                             raise survivor_error from coverage_close_error
                         raise survivor_error
                     if coverage_close_error is not None:
+                        if decision_close_error is not None:
+                            coverage_close_error.add_note(
+                                "secondary decision-intent shutdown failure: "
+                                f"{type(decision_close_error).__name__}: "
+                                f"{decision_close_error}"
+                            )
                         raise coverage_close_error
+                    if decision_close_error is not None:
+                        raise decision_close_error
                 finally:
                     try:
                         correlation_owner = self._correlation_journal_owner
