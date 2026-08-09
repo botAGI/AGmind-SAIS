@@ -250,13 +250,7 @@ func (journal *actionJournal) mutationLocked() bool {
 }
 
 func (service *Service) KillSwitchActive() bool {
-	if service == nil {
-		return true
-	}
-	service.mutex.Lock()
-	defer service.mutex.Unlock()
-	return service.closed || service.journal == nil || service.journal.failed() ||
-		service.auditUncertain || service.journal.mutationLocked()
+	return service.KillSwitchStatus().EffectiveActive
 }
 
 func (journal *actionJournal) nextApprovedPlan() (preparedState, bool) {
@@ -389,7 +383,8 @@ func (service *Service) ApplyNext(
 	if service.journal.failed() {
 		return contracts.ActionRecordV1{}, durablefile.ErrJournalFailed
 	}
-	if service.auditUncertain || service.journal.mutationLocked() {
+	if service.manualKillSwitch || service.auditUncertain ||
+		service.journal.mutationLocked() {
 		return contracts.ActionRecordV1{}, ErrKillSwitchActive
 	}
 	prepared, ok := service.journal.nextApprovedPlan()

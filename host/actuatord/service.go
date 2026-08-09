@@ -74,16 +74,19 @@ func withJournalOptions(values ...durablefile.Option) ServiceOption {
 }
 
 type Service struct {
-	mutex          sync.Mutex
-	journal        *actionJournal
-	dependencies   planDependencies
-	applyTarget    ApplyTargetResolver
-	nftBackend     NftBackend
-	expiryStop     chan struct{}
-	expiryDone     chan struct{}
-	expiryStopOnce sync.Once
-	auditUncertain bool
-	closed         bool
+	mutex                 sync.Mutex
+	journal               *actionJournal
+	dependencies          planDependencies
+	applyTarget           ApplyTargetResolver
+	nftBackend            NftBackend
+	expiryStop            chan struct{}
+	expiryDone            chan struct{}
+	expiryStopOnce        sync.Once
+	manualKillSwitchPath  string
+	manualKillSwitch      bool
+	manualKillSwitchExact bool
+	auditUncertain        bool
+	closed                bool
 }
 
 const expirySweepInterval = time.Second
@@ -118,13 +121,18 @@ func OpenService(
 	if err != nil {
 		return nil, err
 	}
+	manualPath := manualKillSwitchPath(stateDir)
+	manualEnabled, manualExact := loadManualKillSwitch(manualPath)
 	service := &Service{
-		journal:      journal,
-		dependencies: options.dependencies,
-		applyTarget:  options.applyTarget,
-		nftBackend:   options.nftBackend,
-		expiryStop:   make(chan struct{}),
-		expiryDone:   make(chan struct{}),
+		journal:               journal,
+		dependencies:          options.dependencies,
+		applyTarget:           options.applyTarget,
+		nftBackend:            options.nftBackend,
+		expiryStop:            make(chan struct{}),
+		expiryDone:            make(chan struct{}),
+		manualKillSwitchPath:  manualPath,
+		manualKillSwitch:      manualEnabled,
+		manualKillSwitchExact: manualExact,
 	}
 	if _, err := service.ReconcileIncomplete(context.Background()); err != nil {
 		_ = journal.close()
@@ -175,7 +183,8 @@ func (service *Service) Prepare(
 	if service.journal.failed() {
 		return contracts.PreparedTemporaryEgressDenyPlanV1{}, durablefile.ErrJournalFailed
 	}
-	if service.auditUncertain || service.journal.mutationLocked() {
+	if service.manualKillSwitch || service.auditUncertain ||
+		service.journal.mutationLocked() {
 		return contracts.PreparedTemporaryEgressDenyPlanV1{}, ErrKillSwitchActive
 	}
 	if existing, ok, err := service.journal.existing(

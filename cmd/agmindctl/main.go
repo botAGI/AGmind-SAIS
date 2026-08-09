@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"agmind.local/sais/host/actuatord"
 	"agmind.local/sais/internal/contracts"
 )
 
@@ -70,6 +71,73 @@ func boundedResponse(response *http.Response) ([]byte, error) {
 		return nil, fmt.Errorf("actuator response exceeds bound")
 	}
 	return raw, nil
+}
+
+func decodeKillSwitchStatus(raw []byte) (actuatord.KillSwitchStatusV1, error) {
+	status, err := contracts.DecodeStrict[actuatord.KillSwitchStatusV1](
+		bytes.NewReader(raw),
+		maxResponseBody,
+	)
+	if err != nil {
+		return actuatord.KillSwitchStatusV1{}, err
+	}
+	canonical, err := contracts.CanonicalJSON(status)
+	if err != nil || !bytes.Equal(canonical, raw) {
+		return actuatord.KillSwitchStatusV1{}, fmt.Errorf(
+			"actuator returned a non-canonical kill-switch status",
+		)
+	}
+	return status, nil
+}
+
+func requestKillSwitch(
+	ctx context.Context,
+	client *http.Client,
+	method string,
+	path string,
+) (actuatord.KillSwitchStatusV1, []byte, error) {
+	if client == nil ||
+		(method != http.MethodGet && method != http.MethodPost) ||
+		(path != "/v1/admin/kill-switch" &&
+			path != "/v1/admin/kill-switch/enable" &&
+			path != "/v1/admin/kill-switch/disable") {
+		return actuatord.KillSwitchStatusV1{}, nil, fmt.Errorf(
+			"invalid kill-switch request",
+		)
+	}
+	request, err := http.NewRequestWithContext(
+		ctx,
+		method,
+		"http://unix"+path,
+		nil,
+	)
+	if err != nil {
+		return actuatord.KillSwitchStatusV1{}, nil, err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Close = true
+	response, err := client.Do(request)
+	if err != nil {
+		return actuatord.KillSwitchStatusV1{}, nil, err
+	}
+	raw, readErr := boundedResponse(response)
+	if readErr != nil {
+		return actuatord.KillSwitchStatusV1{}, nil, readErr
+	}
+	if response.StatusCode != http.StatusOK {
+		return actuatord.KillSwitchStatusV1{}, nil, fmt.Errorf(
+			"actuator rejected kill-switch request with status %d",
+			response.StatusCode,
+		)
+	}
+	if err := exactJSONResponse(response); err != nil {
+		return actuatord.KillSwitchStatusV1{}, nil, err
+	}
+	status, err := decodeKillSwitchStatus(raw)
+	if err != nil {
+		return actuatord.KillSwitchStatusV1{}, nil, err
+	}
+	return status, raw, nil
 }
 
 func getPlan(
@@ -277,15 +345,19 @@ func confirmDecision(
 	verb string,
 	planHash string,
 ) error {
-	if stdin == nil {
-		return fmt.Errorf("interactive TTY is required")
-	}
-	if !isTerminal(stdin) {
-		return fmt.Errorf("interactive TTY is required")
-	}
 	expected, err := confirmationText(verb, planHash)
 	if err != nil {
 		return err
+	}
+	return confirmExact(stdin, stdout, expected)
+}
+
+func confirmExact(stdin *os.File, stdout io.Writer, expected string) error {
+	if stdin == nil || !isTerminal(stdin) {
+		return fmt.Errorf("interactive TTY is required")
+	}
+	if expected == "" || len(expected) > 96 || strings.ContainsAny(expected, "\r\n") {
+		return fmt.Errorf("invalid confirmation")
 	}
 	if _, err := fmt.Fprintf(stdout, "Type %q to continue: ", expected); err != nil {
 		return err
@@ -308,6 +380,9 @@ func usage(writer io.Writer) {
 	fmt.Fprintln(writer, "       agmindctl proposal approve <plan-id>")
 	fmt.Fprintln(writer, "       agmindctl proposal reject <plan-id>")
 	fmt.Fprintln(writer, "       agmindctl plans pending --json --limit <1..100>")
+	fmt.Fprintln(writer, "       agmindctl kill-switch status --json")
+	fmt.Fprintln(writer, "       agmindctl kill-switch enable")
+	fmt.Fprintln(writer, "       agmindctl kill-switch disable")
 }
 
 func run(
@@ -316,6 +391,76 @@ func run(
 	stdout io.Writer,
 	client *http.Client,
 ) error {
+	if len(arguments) == 3 && arguments[0] == "kill-switch" &&
+		arguments[1] == "status" && arguments[2] == "--json" {
+		if client == nil {
+			return fmt.Errorf("admin client is unavailable")
+		}
+		requestContext, cancelRequest := context.WithTimeout(
+			context.Background(),
+			2*time.Second,
+		)
+		_, raw, err := requestKillSwitch(
+			requestContext,
+			client,
+			http.MethodGet,
+			"/v1/admin/kill-switch",
+		)
+		cancelRequest()
+		if err != nil {
+			return err
+		}
+		raw = append(raw, '\n')
+		_, err = stdout.Write(raw)
+		return err
+	}
+	if len(arguments) == 2 && arguments[0] == "kill-switch" &&
+		(arguments[1] == "enable" || arguments[1] == "disable") {
+		if client == nil {
+			return fmt.Errorf("admin client is unavailable")
+		}
+		if err := confirmExact(
+			stdin,
+			stdout,
+			arguments[1]+" kill-switch",
+		); err != nil {
+			return err
+		}
+		requestContext, cancelRequest := context.WithTimeout(
+			context.Background(),
+			2*time.Second,
+		)
+		status, _, err := requestKillSwitch(
+			requestContext,
+			client,
+			http.MethodPost,
+			"/v1/admin/kill-switch/"+arguments[1],
+		)
+		cancelRequest()
+		if err != nil {
+			return err
+		}
+		wantManual := arguments[1] == "enable"
+		if status.Manual != wantManual {
+			return fmt.Errorf("actuator returned a mismatched kill-switch status")
+		}
+		state := "disabled"
+		if status.Manual {
+			state = "enabled"
+		}
+		reasons := "none"
+		if len(status.ReasonCodes) != 0 {
+			reasons = strings.Join(status.ReasonCodes, ",")
+		}
+		_, err = fmt.Fprintf(
+			stdout,
+			"Manual kill switch: %s\nEffective active: %t\nReasons: %s\n",
+			state,
+			status.EffectiveActive,
+			reasons,
+		)
+		return err
+	}
 	if len(arguments) == 5 && arguments[0] == "plans" &&
 		arguments[1] == "pending" && arguments[2] == "--json" &&
 		arguments[3] == "--limit" {

@@ -123,8 +123,56 @@ func pendingPlanLimit(request *http.Request) (int, bool) {
 	return limit, true
 }
 
+func exactEmptyAdminRequest(request *http.Request) bool {
+	if request.URL.RawQuery != "" || request.ContentLength != 0 ||
+		len(request.TransferEncoding) != 0 ||
+		request.Header.Get("Content-Type") != "" ||
+		request.Header.Get("Content-Encoding") != "" ||
+		request.Header.Get("Expect") != "" {
+		return false
+	}
+	if request.Body == nil {
+		return true
+	}
+	var probe [1]byte
+	count, err := request.Body.Read(probe[:])
+	return count == 0 && errors.Is(err, io.EOF)
+}
+
 func newAdminRoutes(service *Service, adminGID uint32) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc(
+		"GET /v1/admin/kill-switch",
+		func(writer http.ResponseWriter, request *http.Request) {
+			if !exactEmptyAdminRequest(request) {
+				writeAdminError(writer, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			writeAdminJSON(writer, http.StatusOK, service.KillSwitchStatus())
+		},
+	)
+	setKillSwitch := func(enabled bool) http.HandlerFunc {
+		return func(writer http.ResponseWriter, request *http.Request) {
+			if !exactEmptyAdminRequest(request) {
+				writeAdminError(writer, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			var status KillSwitchStatusV1
+			var err error
+			if enabled {
+				status, err = service.EnableManualKillSwitch()
+			} else {
+				status, err = service.DisableManualKillSwitch()
+			}
+			if err != nil {
+				adminAPIError(writer, err)
+				return
+			}
+			writeAdminJSON(writer, http.StatusOK, status)
+		}
+	}
+	mux.Handle("POST /v1/admin/kill-switch/enable", setKillSwitch(true))
+	mux.Handle("POST /v1/admin/kill-switch/disable", setKillSwitch(false))
 	mux.HandleFunc(
 		"GET /v1/plans",
 		func(writer http.ResponseWriter, request *http.Request) {
