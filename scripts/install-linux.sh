@@ -365,6 +365,7 @@ if [[ "$repo_root" != "$install_root" ]]; then
   done
   copy_file scripts/preflight-linux.sh
   copy_file scripts/smoke-containment-linux.sh
+  copy_file scripts/export-proof-linux.sh
   copy_file scripts/install-linux.sh
 fi
 
@@ -376,7 +377,8 @@ for required_source in \
   deploy/images/core.Dockerfile \
   deploy/images/falco-adapter.Dockerfile \
   scripts/preflight-linux.sh \
-  scripts/smoke-containment-linux.sh; do
+  scripts/smoke-containment-linux.sh \
+  scripts/export-proof-linux.sh; do
   [[ -f "${install_root}/${required_source}" && ! -L "${install_root}/${required_source}" ]] ||
     die "installed build tree is incomplete: $required_source"
 done
