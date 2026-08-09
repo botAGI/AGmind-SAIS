@@ -346,6 +346,69 @@ func (service *Service) GetPlan(
 	return clonePlan(state.Plan), nil
 }
 
+func (service *Service) PendingPlans(
+	limit int,
+) (contracts.PendingPlanListV1, error) {
+	listing := contracts.PendingPlanListV1{
+		SchemaVersion: "agmind.pending-plan-list.v1",
+		State:         "PENDING_APPROVAL",
+		Plans:         make([]contracts.PendingPlanSummaryV1, 0),
+	}
+	if service == nil || limit < 1 || limit > 100 {
+		return contracts.PendingPlanListV1{}, fmt.Errorf("invalid pending plan limit")
+	}
+	service.mutex.Lock()
+	defer service.mutex.Unlock()
+	if service.closed {
+		return contracts.PendingPlanListV1{}, durablefile.ErrJournalClosed
+	}
+	if service.journal.failed() {
+		return contracts.PendingPlanListV1{}, durablefile.ErrJournalFailed
+	}
+	if service.journal.openOutcomeCount() == 0 {
+		return listing, nil
+	}
+	sample, err := service.dependencies.clock()
+	if err != nil {
+		return contracts.PendingPlanListV1{}, err
+	}
+	if err := sample.validate(); err != nil {
+		return contracts.PendingPlanListV1{}, err
+	}
+	planIDs := make([]string, 0, service.journal.openOutcomeCount())
+	for planID := range service.journal.byPlan {
+		if _, decided := service.journal.outcomes[planID]; !decided {
+			planIDs = append(planIDs, planID)
+		}
+	}
+	slices.Sort(planIDs)
+	for _, planID := range planIDs {
+		prepared := service.journal.byPlan[planID]
+		expiryBasis, err := planExpiryBasis(prepared, sample)
+		if err != nil {
+			return contracts.PendingPlanListV1{}, err
+		}
+		if expiryBasis != "" {
+			continue
+		}
+		plan := prepared.Plan
+		listing.Plans = append(listing.Plans, contracts.PendingPlanSummaryV1{
+			PlanID:            plan.PlanID,
+			DockerContainerID: plan.DockerContainerID,
+			DestinationIPv4:   plan.DestinationIPv4,
+			PreparedAt:        plan.PreparedAt,
+			ApprovalExpiresAt: plan.ApprovalExpiresAt,
+		})
+		if len(listing.Plans) == limit {
+			break
+		}
+	}
+	if err := listing.Validate(); err != nil {
+		return contracts.PendingPlanListV1{}, err
+	}
+	return listing, nil
+}
+
 func (service *Service) Outcome(planID string) (PlanOutcome, bool) {
 	if service == nil || !planIDPattern.MatchString(planID) {
 		return PlanOutcome{}, false

@@ -364,6 +364,7 @@ if [[ "$repo_root" != "$install_root" ]]; then
     copy_tree "$relative_tree"
   done
   copy_file scripts/preflight-linux.sh
+  copy_file scripts/smoke-containment-linux.sh
   copy_file scripts/install-linux.sh
 fi
 
@@ -374,7 +375,8 @@ for required_source in \
   host/actuatord/cmd/agmind-actuatord/main.go \
   deploy/images/core.Dockerfile \
   deploy/images/falco-adapter.Dockerfile \
-  scripts/preflight-linux.sh; do
+  scripts/preflight-linux.sh \
+  scripts/smoke-containment-linux.sh; do
   [[ -f "${install_root}/${required_source}" && ! -L "${install_root}/${required_source}" ]] ||
     die "installed build tree is incomplete: $required_source"
 done

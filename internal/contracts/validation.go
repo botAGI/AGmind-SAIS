@@ -17,9 +17,40 @@ import (
 var (
 	hex64          = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	hex32          = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	planID         = regexp.MustCompile(`^plan_[0-9a-f]{32}$`)
 	uuid4          = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	utcRFC3339Nano = regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$`)
 )
+
+func (summary PendingPlanSummaryV1) validate() error {
+	prepared, preparedErr := time.Parse(time.RFC3339Nano, summary.PreparedAt)
+	expires, expiresErr := time.Parse(time.RFC3339Nano, summary.ApprovalExpiresAt)
+	if !planID.MatchString(summary.PlanID) ||
+		!hex64.MatchString(summary.DockerContainerID) ||
+		!canonicalIPv4(summary.DestinationIPv4) ||
+		!validUTC(summary.PreparedAt) || !validUTC(summary.ApprovalExpiresAt) ||
+		preparedErr != nil || expiresErr != nil || !prepared.Before(expires) {
+		return fmt.Errorf("invalid pending plan summary")
+	}
+	return nil
+}
+
+func (listing PendingPlanListV1) Validate() error {
+	if listing.SchemaVersion != "agmind.pending-plan-list.v1" ||
+		listing.State != "PENDING_APPROVAL" || listing.Plans == nil ||
+		len(listing.Plans) > 100 {
+		return fmt.Errorf("invalid pending plan list")
+	}
+	for index, summary := range listing.Plans {
+		if err := summary.validate(); err != nil {
+			return err
+		}
+		if index > 0 && listing.Plans[index-1].PlanID >= summary.PlanID {
+			return fmt.Errorf("pending plan summaries are not unique and sorted")
+		}
+	}
+	return nil
+}
 
 func validUTC(value string) bool {
 	if !utcRFC3339Nano.MatchString(value) || value[:4] == "0000" {

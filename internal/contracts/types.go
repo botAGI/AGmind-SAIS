@@ -262,6 +262,24 @@ type PreparedTemporaryEgressDenyPlanV1 struct {
 	PlanHashValue               string `json:"plan_hash"`
 }
 
+// PendingPlanSummaryV1 is the minimum read-only locator exposed on the local
+// actuator admin socket. The complete immutable plan remains available only by
+// its exact plan ID.
+type PendingPlanSummaryV1 struct {
+	PlanID            string `json:"plan_id"`
+	DockerContainerID string `json:"docker_container_id"`
+	DestinationIPv4   string `json:"destination_ipv4"`
+	PreparedAt        string `json:"prepared_at"`
+	ApprovalExpiresAt string `json:"approval_expires_at"`
+}
+
+// PendingPlanListV1 is a bounded local-admin discovery response.
+type PendingPlanListV1 struct {
+	SchemaVersion string                 `json:"schema_version"`
+	State         string                 `json:"state"`
+	Plans         []PendingPlanSummaryV1 `json:"plans"`
+}
+
 type HunterOutputV1 struct {
 	SchemaVersion         string   `json:"schema_version"`
 	Hypotheses            []string `json:"hypotheses"`

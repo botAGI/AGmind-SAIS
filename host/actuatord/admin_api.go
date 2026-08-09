@@ -5,7 +5,9 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 
 	"agmind.local/sais/internal/contracts"
 	"agmind.local/sais/internal/durablefile"
@@ -103,8 +105,42 @@ func adminAuthorityFromRequest(
 	}
 }
 
+func pendingPlanLimit(request *http.Request) (int, bool) {
+	if request.ContentLength != 0 {
+		return 0, false
+	}
+	values, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil || len(values) != 2 || len(values["state"]) != 1 ||
+		len(values["limit"]) != 1 || values["state"][0] != "PENDING_APPROVAL" {
+		return 0, false
+	}
+	raw := values["limit"][0]
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 1 || limit > 100 || strconv.Itoa(limit) != raw ||
+		request.URL.RawQuery != "state=PENDING_APPROVAL&limit="+raw {
+		return 0, false
+	}
+	return limit, true
+}
+
 func newAdminRoutes(service *Service, adminGID uint32) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc(
+		"GET /v1/plans",
+		func(writer http.ResponseWriter, request *http.Request) {
+			limit, ok := pendingPlanLimit(request)
+			if !ok {
+				writeAdminError(writer, http.StatusBadRequest, "invalid_query")
+				return
+			}
+			listing, err := service.PendingPlans(limit)
+			if err != nil {
+				adminAPIError(writer, err)
+				return
+			}
+			writeAdminJSON(writer, http.StatusOK, listing)
+		},
+	)
 	mux.HandleFunc(
 		"GET /v1/admin/plans/{plan_id}",
 		func(writer http.ResponseWriter, request *http.Request) {

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -119,6 +120,48 @@ func getPlan(
 		)
 	}
 	return plan, nil
+}
+
+func getPendingPlans(
+	ctx context.Context,
+	client *http.Client,
+	limit int,
+) (contracts.PendingPlanListV1, error) {
+	if limit < 1 || limit > 100 {
+		return contracts.PendingPlanListV1{}, fmt.Errorf("invalid pending plan limit")
+	}
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		"http://unix/v1/plans?state=PENDING_APPROVAL&limit="+strconv.Itoa(limit),
+		nil,
+	)
+	if err != nil {
+		return contracts.PendingPlanListV1{}, err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Close = true
+	response, err := client.Do(request)
+	if err != nil {
+		return contracts.PendingPlanListV1{}, err
+	}
+	raw, readErr := boundedResponse(response)
+	if readErr != nil {
+		return contracts.PendingPlanListV1{}, readErr
+	}
+	if response.StatusCode != http.StatusOK {
+		return contracts.PendingPlanListV1{}, fmt.Errorf(
+			"actuator rejected pending plan lookup with status %d",
+			response.StatusCode,
+		)
+	}
+	if err := exactJSONResponse(response); err != nil {
+		return contracts.PendingPlanListV1{}, err
+	}
+	return contracts.DecodeStrict[contracts.PendingPlanListV1](
+		bytes.NewReader(raw),
+		maxResponseBody,
+	)
 }
 
 func submitDecision(
@@ -264,6 +307,7 @@ func usage(writer io.Writer) {
 	fmt.Fprintln(writer, "usage: agmindctl proposal show <plan-id>")
 	fmt.Fprintln(writer, "       agmindctl proposal approve <plan-id>")
 	fmt.Fprintln(writer, "       agmindctl proposal reject <plan-id>")
+	fmt.Fprintln(writer, "       agmindctl plans pending --json --limit <1..100>")
 }
 
 func run(
@@ -272,6 +316,34 @@ func run(
 	stdout io.Writer,
 	client *http.Client,
 ) error {
+	if len(arguments) == 5 && arguments[0] == "plans" &&
+		arguments[1] == "pending" && arguments[2] == "--json" &&
+		arguments[3] == "--limit" {
+		if client == nil {
+			return fmt.Errorf("admin client is unavailable")
+		}
+		limit, err := strconv.Atoi(arguments[4])
+		if err != nil || limit < 1 || limit > 100 ||
+			strconv.Itoa(limit) != arguments[4] {
+			return fmt.Errorf("invalid pending plan limit")
+		}
+		lookupContext, cancelLookup := context.WithTimeout(
+			context.Background(),
+			2*time.Second,
+		)
+		listing, err := getPendingPlans(lookupContext, client, limit)
+		cancelLookup()
+		if err != nil {
+			return err
+		}
+		payload, err := contracts.CanonicalJSON(listing)
+		if err != nil {
+			return err
+		}
+		payload = append(payload, '\n')
+		_, err = stdout.Write(payload)
+		return err
+	}
 	if len(arguments) != 3 || arguments[0] != "proposal" ||
 		(arguments[1] != "show" && arguments[1] != "approve" && arguments[1] != "reject") ||
 		!cliPlanIDPattern.MatchString(arguments[2]) {

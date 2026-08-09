@@ -84,3 +84,59 @@ func TestRenderAndConfirmationStayExactAndNonAutomatable(t *testing.T) {
 		t.Fatal("mismatched response plan ID was accepted")
 	}
 }
+
+func TestPendingPlanListCommandIsBoundedAndCanonical(t *testing.T) {
+	raw, err := os.ReadFile("../../contracts/fixtures/v1/plan.valid.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := contracts.DecodeStrict[contracts.PreparedTemporaryEgressDenyPlanV1](
+		bytes.NewReader(raw),
+		65_536,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listing := contracts.PendingPlanListV1{
+		SchemaVersion: "agmind.pending-plan-list.v1",
+		State:         "PENDING_APPROVAL",
+		Plans: []contracts.PendingPlanSummaryV1{{
+			PlanID:            plan.PlanID,
+			DockerContainerID: plan.DockerContainerID,
+			DestinationIPv4:   plan.DestinationIPv4,
+			PreparedAt:        plan.PreparedAt,
+			ApprovalExpiresAt: plan.ApprovalExpiresAt,
+		}},
+	}
+	payload, err := contracts.CanonicalJSON(listing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(
+		func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodGet ||
+				request.URL.RequestURI() != "/v1/plans?state=PENDING_APPROVAL&limit=7" {
+				t.Fatalf("unexpected request: %s %s", request.Method, request.URL.RequestURI())
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"application/json"},
+				},
+				Body: io.NopCloser(bytes.NewReader(payload)),
+			}, nil
+		},
+	)}
+	var output bytes.Buffer
+	if err := run(
+		[]string{"plans", "pending", "--json", "--limit", "7"},
+		nil,
+		&output,
+		client,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != string(payload)+"\n" {
+		t.Fatalf("pending JSON is not canonical: %q", output.String())
+	}
+}
