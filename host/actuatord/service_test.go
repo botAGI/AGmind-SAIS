@@ -177,6 +177,7 @@ func newPrepareFixture(t *testing.T) prepareFixture {
 			return ClockSample{
 				Wall:       time.Date(2026, 7, 27, 12, 0, 2, 0, time.UTC),
 				BootTimeNS: 1_000_000_000_000,
+				BootID:     "123e4567-e89b-42d3-a456-426614174001",
 			}, nil
 		},
 		key: ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize)),

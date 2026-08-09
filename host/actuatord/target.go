@@ -14,6 +14,10 @@ var (
 
 var fullDockerIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+var bootIDPattern = regexp.MustCompile(
+	`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+)
+
 // PrepareTargetSnapshot contains only independently observed kernel facts.
 // The caller-owned handle keeps pidfd/netns alive only through uniqueness and
 // must be closed before nonce generation or durable PREPARED publication.

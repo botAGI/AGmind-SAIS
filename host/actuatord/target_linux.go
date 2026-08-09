@@ -77,6 +77,17 @@ func NewPlatformTargetResolver() TargetResolver {
 }
 
 func platformClockSample() (ClockSample, error) {
+	bootIDRaw, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ClockSample{}, fmt.Errorf("read kernel boot ID: %w", err)
+	}
+	if len(bootIDRaw) != 37 || bootIDRaw[36] != '\n' {
+		return ClockSample{}, fmt.Errorf("invalid kernel boot ID")
+	}
+	bootID := string(bootIDRaw[:36])
+	if !bootIDPattern.MatchString(bootID) {
+		return ClockSample{}, fmt.Errorf("invalid kernel boot ID")
+	}
 	var boot unix.Timespec
 	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &boot); err != nil {
 		return ClockSample{}, err
@@ -91,6 +102,7 @@ func platformClockSample() (ClockSample, error) {
 	return ClockSample{
 		Wall:       time.Now().UTC(),
 		BootTimeNS: seconds*uint64(time.Second) + uint64(boot.Nsec),
+		BootID:     bootID,
 	}, nil
 }
 

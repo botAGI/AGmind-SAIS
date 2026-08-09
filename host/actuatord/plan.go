@@ -31,10 +31,12 @@ type SafetyProvider interface {
 type ClockSample struct {
 	Wall       time.Time
 	BootTimeNS uint64
+	BootID     string
 }
 
 func (sample ClockSample) validate() error {
-	if sample.Wall.Location() != time.UTC || sample.Wall.IsZero() || sample.BootTimeNS == 0 {
+	if sample.Wall.Location() != time.UTC || sample.Wall.IsZero() ||
+		sample.BootTimeNS == 0 || !bootIDPattern.MatchString(sample.BootID) {
 		return fmt.Errorf("invalid actuator clock sample")
 	}
 	return nil
@@ -299,6 +301,9 @@ func buildPreparedPlan(
 	}
 	if err := clock.validate(); err != nil {
 		return preparedBuild{}, err
+	}
+	if clock.BootID != integrity.BootID {
+		return preparedBuild{}, ErrTargetStale
 	}
 	if err := validateObservationOrder(
 		clock.Wall,

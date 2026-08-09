@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"agmind.local/sais/internal/contracts"
 	"agmind.local/sais/internal/durablefile"
@@ -56,11 +57,16 @@ func withJournalOptions(values ...durablefile.Option) ServiceOption {
 }
 
 type Service struct {
-	mutex        sync.Mutex
-	journal      *actionJournal
-	dependencies planDependencies
-	closed       bool
+	mutex          sync.Mutex
+	journal        *actionJournal
+	dependencies   planDependencies
+	expiryStop     chan struct{}
+	expiryDone     chan struct{}
+	expiryStopOnce sync.Once
+	closed         bool
 }
+
+const expirySweepInterval = time.Second
 
 func OpenService(
 	stateDir string,
@@ -85,10 +91,32 @@ func OpenService(
 	if err != nil {
 		return nil, err
 	}
-	return &Service{
+	service := &Service{
 		journal:      journal,
 		dependencies: options.dependencies,
-	}, nil
+		expiryStop:   make(chan struct{}),
+		expiryDone:   make(chan struct{}),
+	}
+	if _, err := service.ExpireDue(context.Background()); err != nil {
+		_ = journal.close()
+		return nil, err
+	}
+	go service.runExpirySweeper()
+	return service, nil
+}
+
+func (service *Service) runExpirySweeper() {
+	defer close(service.expiryDone)
+	ticker := time.NewTicker(expirySweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-service.expiryStop:
+			return
+		case <-ticker.C:
+			_, _ = service.ExpireDue(context.Background())
+		}
+	}
 }
 
 func (service *Service) Prepare(
@@ -174,12 +202,16 @@ func (service *Service) Pending() int {
 	if service.journal == nil {
 		return 0
 	}
-	return len(service.journal.byIntent)
+	return service.journal.openOutcomeCount()
 }
 
 func (service *Service) Close() error {
 	if service == nil {
 		return nil
+	}
+	if service.expiryStop != nil {
+		service.expiryStopOnce.Do(func() { close(service.expiryStop) })
+		<-service.expiryDone
 	}
 	service.mutex.Lock()
 	defer service.mutex.Unlock()

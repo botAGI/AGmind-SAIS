@@ -28,6 +28,7 @@ const (
 	intentHashDomain        = "AGMIND_ACTUATOR_INTENT_V1\x00"
 	rateRecordHashDomain    = "AGMIND_RATE_RESERVATION_HASH_V1\x00"
 	rateRecordSigningDomain = "AGMIND_RATE_RESERVATION_V1\x00"
+	actionFrameOverhead     = int64(76)
 )
 
 var ErrActionJournalCorrupt = errors.New("actuator action journal corrupt")
@@ -173,6 +174,7 @@ type preparedState struct {
 	Plan                       contracts.PreparedTemporaryEgressDenyPlanV1
 	IntentSHA256               string
 	ApprovalDeadlineBootTimeNS uint64
+	PreparedRecordSHA256       string
 }
 
 type actionJournal struct {
@@ -186,6 +188,7 @@ type actionJournal struct {
 	byPlan       map[string]preparedState
 	reservations map[string]rateReservationState
 	rateHistory  []rateReservationState
+	outcomes     map[string]PlanOutcome
 	recordCount  int
 	byteCount    int64
 	closed       bool
@@ -197,6 +200,7 @@ type recoveredActionState struct {
 	byPlan       map[string]preparedState
 	reservations map[string]rateReservationState
 	rateHistory  []rateReservationState
+	outcomes     map[string]PlanOutcome
 	recordCount  int
 }
 
@@ -320,6 +324,7 @@ func recoverPreparedStates(
 		byPlan:       make(map[string]preparedState),
 		reservations: make(map[string]rateReservationState),
 		rateHistory:  make([]rateReservationState, 0, len(records)),
+		outcomes:     make(map[string]PlanOutcome),
 	}
 	for _, framed := range records {
 		schema, err := journalRecordSchema(framed.Payload)
@@ -362,34 +367,61 @@ func recoverPreparedStates(
 			if err != nil {
 				return recoveredActionState{}, err
 			}
-			state, err := validateRecoveredPreparedRecord(
-				framed.Payload,
-				record,
-				publicKey,
-				recovered.previous,
-			)
-			if err != nil {
-				return recoveredActionState{}, err
+			switch record.State {
+			case "PREPARED":
+				state, err := validateRecoveredPreparedRecord(
+					framed.Payload,
+					record,
+					publicKey,
+					recovered.previous,
+				)
+				if err != nil {
+					return recoveredActionState{}, err
+				}
+				reservation, ok := recovered.reservations[state.Plan.IntentID]
+				if !ok || reservation.IntentSHA256 != state.IntentSHA256 ||
+					reservation.RecordSHA256 != record.PreviousRecordSHA256 {
+					return recoveredActionState{}, fmt.Errorf("PREPARED record lacks exact rate reservation")
+				}
+				reservedAt, _ := time.Parse(time.RFC3339Nano, reservation.ReservedAt)
+				preparedAt, err := time.Parse(time.RFC3339Nano, state.Plan.PreparedAt)
+				if err != nil || preparedAt.Before(reservedAt) {
+					return recoveredActionState{}, fmt.Errorf("PREPARED predates rate reservation")
+				}
+				if _, duplicate := recovered.byIntent[state.Plan.IntentID]; duplicate {
+					return recoveredActionState{}, fmt.Errorf("duplicate durable intent ID")
+				}
+				if _, duplicate := recovered.byPlan[state.Plan.PlanID]; duplicate {
+					return recoveredActionState{}, fmt.Errorf("duplicate durable plan ID")
+				}
+				state.Plan = clonePlan(state.Plan)
+				state.PreparedRecordSHA256 = record.RecordSHA256
+				recovered.byIntent[state.Plan.IntentID] = state
+				recovered.byPlan[state.Plan.PlanID] = state
+
+			case "APPROVED", "REJECTED", "EXPIRED_UNAPPLIED":
+				prepared, ok := recovered.byPlan[record.PlanID]
+				if !ok {
+					return recoveredActionState{}, fmt.Errorf("decision lacks PREPARED plan")
+				}
+				if _, duplicate := recovered.outcomes[record.PlanID]; duplicate {
+					return recoveredActionState{}, fmt.Errorf("duplicate durable plan outcome")
+				}
+				outcome, err := validateRecoveredDecisionRecord(
+					framed.Payload,
+					record,
+					publicKey,
+					recovered.previous,
+					prepared,
+				)
+				if err != nil {
+					return recoveredActionState{}, err
+				}
+				recovered.outcomes[record.PlanID] = outcome
+
+			default:
+				return recoveredActionState{}, fmt.Errorf("unsupported durable action state %q", record.State)
 			}
-			reservation, ok := recovered.reservations[state.Plan.IntentID]
-			if !ok || reservation.IntentSHA256 != state.IntentSHA256 ||
-				reservation.RecordSHA256 != record.PreviousRecordSHA256 {
-				return recoveredActionState{}, fmt.Errorf("PREPARED record lacks exact rate reservation")
-			}
-			reservedAt, _ := time.Parse(time.RFC3339Nano, reservation.ReservedAt)
-			preparedAt, err := time.Parse(time.RFC3339Nano, state.Plan.PreparedAt)
-			if err != nil || preparedAt.Before(reservedAt) {
-				return recoveredActionState{}, fmt.Errorf("PREPARED predates rate reservation")
-			}
-			if _, duplicate := recovered.byIntent[state.Plan.IntentID]; duplicate {
-				return recoveredActionState{}, fmt.Errorf("duplicate durable intent ID")
-			}
-			if _, duplicate := recovered.byPlan[state.Plan.PlanID]; duplicate {
-				return recoveredActionState{}, fmt.Errorf("duplicate durable plan ID")
-			}
-			state.Plan = clonePlan(state.Plan)
-			recovered.byIntent[state.Plan.IntentID] = state
-			recovered.byPlan[state.Plan.PlanID] = state
 			recovered.previous = record.RecordSHA256
 
 		default:
@@ -398,6 +430,20 @@ func recoverPreparedStates(
 		recovered.recordCount++
 	}
 	return recovered, nil
+}
+
+func validateRecoveredCapacity(
+	recovered recoveredActionState,
+	verifiedBytes int64,
+) error {
+	openOutcomes := len(recovered.byPlan) - len(recovered.outcomes)
+	if openOutcomes < 0 || verifiedBytes < 0 ||
+		recovered.recordCount+openOutcomes > actionJournalMaxRecords ||
+		verifiedBytes+int64(openOutcomes)*
+			(int64(actionJournalMaxFrame)+actionFrameOverhead) > actionJournalMaxBytes {
+		return fmt.Errorf("action journal lacks reserved terminal capacity")
+	}
+	return nil
 }
 
 func openActionJournal(
@@ -442,8 +488,11 @@ func openActionJournal(
 			if intent.VerifiedBytes > actionJournalMaxBytes {
 				return fmt.Errorf("action journal prefix exceeds byte bound")
 			}
-			_, validateErr := recoverPreparedStates(intent.Records, publicKey)
-			return validateErr
+			recovered, validateErr := recoverPreparedStates(intent.Records, publicKey)
+			if validateErr != nil {
+				return validateErr
+			}
+			return validateRecoveredCapacity(recovered, intent.VerifiedBytes)
 		},
 		streamOptions...,
 	)
@@ -452,6 +501,10 @@ func openActionJournal(
 	}
 	recovered, err := recoverPreparedStates(recovery.Records, publicKey)
 	if err != nil {
+		_ = stream.Close()
+		return nil, errors.Join(ErrActionJournalCorrupt, err)
+	}
+	if err := validateRecoveredCapacity(recovered, recovery.VerifiedBytes); err != nil {
 		_ = stream.Close()
 		return nil, errors.Join(ErrActionJournalCorrupt, err)
 	}
@@ -465,6 +518,7 @@ func openActionJournal(
 		byPlan:       recovered.byPlan,
 		reservations: recovered.reservations,
 		rateHistory:  recovered.rateHistory,
+		outcomes:     recovered.outcomes,
 		recordCount:  recovered.recordCount,
 		byteCount:    recovery.VerifiedBytes,
 	}
@@ -529,6 +583,10 @@ func (journal *actionJournal) rateAllowed(now time.Time) error {
 	return nil
 }
 
+func (journal *actionJournal) openOutcomeCount() int {
+	return len(journal.byPlan) - len(journal.outcomes)
+}
+
 func (journal *actionJournal) reserveIntent(
 	intentID string,
 	intentSHA256 string,
@@ -540,8 +598,11 @@ func (journal *actionJournal) reserveIntent(
 	if _, err := journal.reservation(intentID, intentSHA256); err != nil {
 		return err
 	}
-	// Keep one record slot and one maximum-sized frame available for PREPARED.
-	if journal.recordCount >= actionJournalMaxRecords-1 ||
+	// Preserve one terminal outcome slot for every open plan, plus PREPARED and
+	// its future outcome for this attempt.
+	openOutcomes := journal.openOutcomeCount()
+	if openOutcomes < 0 ||
+		journal.recordCount+openOutcomes+3 > actionJournalMaxRecords ||
 		journal.byteCount >= actionJournalMaxBytes {
 		return ErrPendingLimit
 	}
@@ -573,9 +634,10 @@ func (journal *actionJournal) reserveIntent(
 	if err != nil {
 		return err
 	}
-	reservationFrameSize := int64(len(payload)) + 76
-	preparedFrameCapacity := int64(actionJournalMaxFrame) + 76
-	if reservationFrameSize+preparedFrameCapacity >
+	reservationFrameSize := int64(len(payload)) + actionFrameOverhead
+	futureFrameCapacity := int64(openOutcomes+2) *
+		(int64(actionJournalMaxFrame) + actionFrameOverhead)
+	if reservationFrameSize+futureFrameCapacity >
 		actionJournalMaxBytes-journal.byteCount {
 		return ErrPendingLimit
 	}
@@ -599,6 +661,9 @@ func (journal *actionJournal) reserveIntent(
 func (journal *actionJournal) pendingAt(now time.Time) int {
 	count := 0
 	for _, state := range journal.byIntent {
+		if _, terminal := journal.outcomes[state.Plan.PlanID]; terminal {
+			continue
+		}
 		expires, err := time.Parse(time.RFC3339Nano, state.Plan.ApprovalExpiresAt)
 		if err == nil && now.Before(expires) {
 			count++
@@ -613,7 +678,9 @@ func (journal *actionJournal) appendPrepared(
 	if journal.closed {
 		return durablefile.ErrJournalClosed
 	}
-	if journal.recordCount >= actionJournalMaxRecords ||
+	openOutcomes := journal.openOutcomeCount()
+	if openOutcomes < 0 ||
+		journal.recordCount+openOutcomes+2 > actionJournalMaxRecords ||
 		journal.byteCount >= actionJournalMaxBytes {
 		return ErrPendingLimit
 	}
@@ -676,8 +743,12 @@ func (journal *actionJournal) appendPrepared(
 	if err != nil {
 		return err
 	}
-	frameSize := int64(len(payload)) + 76
-	if frameSize > actionJournalMaxBytes-journal.byteCount {
+	frameSize := int64(len(payload)) + actionFrameOverhead
+	reservedOutcomes := openOutcomes + 1
+	if reservedOutcomes < 1 ||
+		frameSize+int64(reservedOutcomes)*
+			(int64(actionJournalMaxFrame)+actionFrameOverhead) >
+			actionJournalMaxBytes-journal.byteCount {
 		return ErrPendingLimit
 	}
 	meta, err := journal.stream.Append(payload, true)
@@ -685,6 +756,7 @@ func (journal *actionJournal) appendPrepared(
 		return err
 	}
 	journal.previous = record.RecordSHA256
+	state.PreparedRecordSHA256 = record.RecordSHA256
 	journal.byIntent[state.Plan.IntentID] = state
 	journal.byPlan[state.Plan.PlanID] = state
 	journal.recordCount++
