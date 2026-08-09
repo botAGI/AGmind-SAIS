@@ -1,5 +1,21 @@
 """Durable, non-approved containment decision and intent observations."""
 
+from .actuator_mirror import (
+    ActuatorMirror,
+    ActuatorMirrorBusy,
+    ActuatorMirrorConflict,
+    ActuatorMirrorError,
+    ActuatorMirrorFatal,
+    ActuatorMirrorSnapshot,
+)
+from .actuator_protocol import (
+    ActuatorIntentNotFound,
+    ActuatorIntentStatusV1,
+    ActuatorJournalClient,
+    ActuatorJournalError,
+    ActuatorJournalFatal,
+    ActuatorJournalRetryable,
+)
 from .client import (
     ActuatorIntentClient,
     IntentDeliveryError,
@@ -27,6 +43,18 @@ from .state_machine import (
 
 __all__ = [
     "ActuatorIntentClient",
+    "ActuatorIntentNotFound",
+    "ActuatorIntentStatusV1",
+    "ActuatorJournalClient",
+    "ActuatorJournalError",
+    "ActuatorJournalFatal",
+    "ActuatorJournalRetryable",
+    "ActuatorMirror",
+    "ActuatorMirrorBusy",
+    "ActuatorMirrorConflict",
+    "ActuatorMirrorError",
+    "ActuatorMirrorFatal",
+    "ActuatorMirrorSnapshot",
     "DecisionIntentCommit",
     "DecisionIntentError",
     "DecisionIntentJournal",
