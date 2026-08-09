@@ -495,7 +495,7 @@ class _StagedV2Replay:
 
 @final
 class _StagedV2ImageSeal:
-    """Sealed, non-resource facts for one exact caller-owned target connection."""
+    """Immutable facts retained after the owner closes its staged target."""
 
     __slots__ = ("applied_count", "cursor", "prefix_sha256", "table_counts")
 
@@ -1198,7 +1198,12 @@ def _capture_staged_v2_physical_binding(
         if (
             not stat.S_ISREG(info.st_mode)
             or not stat.S_ISREG(path_info.st_mode)
-            or info.st_nlink < 1
+            or info.st_nlink != 1
+            or path_info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or path_info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or stat.S_IMODE(path_info.st_mode) != 0o600
             or (info.st_dev, info.st_ino)
             != (path_info.st_dev, path_info.st_ino)
             or fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
@@ -1253,7 +1258,12 @@ def _revalidate_staged_v2_physical_binding(
     if (
         not stat.S_ISREG(descriptor_info.st_mode)
         or not stat.S_ISREG(path_info.st_mode)
-        or descriptor_info.st_nlink < 1
+        or descriptor_info.st_nlink != 1
+        or path_info.st_nlink != 1
+        or descriptor_info.st_uid != os.geteuid()
+        or path_info.st_uid != os.geteuid()
+        or stat.S_IMODE(descriptor_info.st_mode) != 0o600
+        or stat.S_IMODE(path_info.st_mode) != 0o600
         or (descriptor_info.st_dev, descriptor_info.st_ino)
         != (binding.device, binding.inode)
         or (path_info.st_dev, path_info.st_ino)
@@ -5096,6 +5106,113 @@ class _V2ProjectionOwner:
                 "Projection V2 staged materialization seal changed"
             )
 
+    def _validate_prepared_replay_locked(
+        self,
+        binding: _StagedReplayBinding,
+        seal: _StagedV2ImageSeal,
+    ) -> None:
+        hydrated = binding.hydrated_connection
+        physical = binding.materialized_physical
+        if (
+            type(seal) is not _StagedV2ImageSeal
+            or binding.materialized_seal is not seal
+            or binding.materialized_connection is not None
+            or hydrated is None
+            or physical is None
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 staged image is not prepared for publication"
+            )
+        _revalidate_staged_v2_physical_binding(physical)
+        expected_counts = _v2_table_counts(hydrated)
+        if (
+            seal.cursor != binding.report.cursor
+            or seal.applied_count != binding.report.applied_count
+            or seal.prefix_sha256 != binding.report.prefix_sha256
+            or seal.table_counts != expected_counts
+            or _current_v2_cursor(hydrated) != seal.cursor
+            or _v2_snapshot_hash(hydrated) != seal.prefix_sha256
+        ):
+            raise ProjectionConflict(
+                "Projection V2 prepared materialization seal changed"
+            )
+
+    def _prepare_staged_replay_for_publication(
+        self,
+        capability: _StagedV2Replay,
+        seal: _StagedV2ImageSeal,
+        *,
+        _factory: object,
+    ) -> None:
+        if (
+            _factory is not _STAGED_REPLAY_FACTORY
+            or type(seal) is not _StagedV2ImageSeal
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 staged preparation is factory-only"
+            )
+        binding: _StagedReplayBinding | None = None
+        target: sqlite3.Connection | None = None
+        target_handoff_started = False
+        target_close_attempted = False
+        with self._mutex:
+            try:
+                binding = self._require_staged_replay_locked(capability)
+                self._validate_materialized_replay_locked(binding, seal)
+                target = binding.materialized_connection
+                if target is None or target.in_transaction:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 staged target is not transaction-free"
+                    )
+                checkpoint = target.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if (
+                    type(checkpoint) not in (tuple, sqlite3.Row)
+                    or len(checkpoint) != 3
+                    or any(type(value) is not int for value in checkpoint)
+                    or tuple(checkpoint) != (0, 0, 0)
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 staged checkpoint did not truncate exactly"
+                    )
+                self._validate_materialized_replay_locked(binding, seal)
+                target = binding.materialized_connection
+                if target is None:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 staged target disappeared before close"
+                    )
+                # From this marker onward any interruption is conservative. Keep
+                # the local owner alias until either the binding or this frame has
+                # made the target's single close attempt.
+                target_handoff_started = True
+                binding.materialized_connection = None
+                target_close_attempted = True
+                target.close()
+                self._validate_prepared_replay_locked(binding, seal)
+            except BaseException as primary:
+                if binding is not None and self._staged_replay is binding:
+                    if (
+                        target_handoff_started
+                        and not target_close_attempted
+                        and binding.materialized_connection is None
+                        and target is not None
+                    ):
+                        target_close_attempted = True
+                        try:
+                            target.close()
+                        except BaseException as cleanup_error:  # noqa: BLE001
+                            primary.add_note(
+                                "Projection V2 detached target cleanup failure: "
+                                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                            )
+                    self._discard_staged_replay_locked(
+                        binding,
+                        primary,
+                        unhealthy=target_handoff_started,
+                    )
+                raise
+
     def _validate_reopened_replay_locked(
         self,
         binding: _StagedReplayBinding,
@@ -5211,7 +5328,7 @@ class _V2ProjectionOwner:
                             raise ProjectionAuthorityError(
                                 "Projection V2 durable publisher is incomplete"
                             )
-                        self._validate_materialized_replay_locked(binding, seal)
+                        self._validate_prepared_replay_locked(binding, seal)
                     if _fault_phase is _ReplayFaultPhase.PUBLISH:
                         raise KeyboardInterrupt("injected replay publish failure")
                     if _fault_phase is _ReplayFaultPhase.PRE_COMMIT:
@@ -5292,10 +5409,6 @@ class _V2ProjectionOwner:
                     _close_replay_source_snapshot(source_snapshot)
                     binding.source_snapshot = None
                     if not direct:
-                        materialized = binding.materialized_connection
-                        if materialized is not None:
-                            materialized.close()
-                            binding.materialized_connection = None
                         hydrated = binding.hydrated_connection
                         if hydrated is not None:
                             hydrated.close()
