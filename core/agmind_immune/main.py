@@ -28,7 +28,11 @@ from agmind_immune.coverage import CoverageState
 from agmind_immune.evidence.projection import ProjectionStore
 from agmind_immune.evidence.segments import SegmentStore
 from agmind_immune.health import HealthServer
-from agmind_immune.hunter import HunterClient
+from agmind_immune.hunter import (
+    HunterClient,
+    HunterInvestigationStore,
+    HunterInvestigationStoreError,
+)
 from agmind_immune.ingest.ack_journal import AckJournal
 from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
@@ -89,6 +93,7 @@ async def _open_runtime(config: CoreConfigV1) -> CoreRuntime:
     actuator: ActuatorIntentClient | None = None
     delivery: IntentDeliveryStateMachine | None = None
     hunter: HunterClient | None = None
+    hunter_investigations: HunterInvestigationStore | None = None
     transport: HTTPXObserverCoreTransport | None = None
     try:
         root = PinnedObserverRoot.load(Path(config.observer_trust_root_file))
@@ -137,7 +142,17 @@ async def _open_runtime(config: CoreConfigV1) -> CoreRuntime:
             config.intent_delivery_db,
             actuator,
         )
-        if config.hunter_config_file is not None:
+        try:
+            hunter_investigations = HunterInvestigationStore.open(
+                config.hunter_investigations_db
+            )
+        except HunterInvestigationStoreError as error:
+            _LOG.warning("hunter persistence disabled outside authority: %s", error)
+        if config.hunter_config_file is not None and hunter_investigations is None:
+            _LOG.warning(
+                "hunter disabled because durable persistence is unavailable outside authority"
+            )
+        elif config.hunter_config_file is not None:
             try:
                 hunter = HunterClient.create(
                     load_hunter_config(Path(config.hunter_config_file))
@@ -150,6 +165,7 @@ async def _open_runtime(config: CoreConfigV1) -> CoreRuntime:
             delivery,
             actuator,
             hunter=hunter,
+            hunter_investigations=hunter_investigations,
         )
     except BaseException as primary:
         async_steps = []
@@ -171,6 +187,14 @@ async def _open_runtime(config: CoreConfigV1) -> CoreRuntime:
             except BaseException as cleanup_error:  # noqa: BLE001 - preserve primary
                 primary.add_note(
                     f"secondary Core bootstrap cleanup failure ({type(cleanup_error).__name__})"
+                )
+        if hunter_investigations is not None:
+            try:
+                hunter_investigations.close()
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve primary
+                primary.add_note(
+                    "secondary Hunter persistence cleanup failure "
+                    f"({type(cleanup_error).__name__})"
                 )
         if controller is None:
             for resource in (projection, coverage, correlation, acknowledgements, store):

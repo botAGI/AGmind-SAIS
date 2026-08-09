@@ -41,6 +41,10 @@ class CoreConfigV1(BaseModel):
     def intent_delivery_db(self) -> Path:
         return Path(self.projection_db).parent / "intent-delivery.sqlite3"
 
+    @property
+    def hunter_investigations_db(self) -> Path:
+        return Path(self.projection_db).parent / "hunter-investigations.sqlite3"
+
 
 def _read_root_owned(path: Path, maximum: int) -> bytes:
     nofollow = getattr(os, "O_NOFOLLOW", 0)

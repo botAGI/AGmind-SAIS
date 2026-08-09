@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from pathlib import Path
 
+import agmind_immune.hunter as hunter_module
 import httpx
 import pytest
 from agmind_immune.canonicaljson import canonical_json, incident_id
+from agmind_immune.contracts import HunterOutputV1
 from agmind_immune.hunter import (
     HUNTER_SYSTEM_V1,
     HunterClient,
@@ -17,6 +20,7 @@ from agmind_immune.hunter import (
 )
 from agmind_immune.hunter.client import _hunter_client_for_test
 from agmind_immune.incidents.models import IncidentV1
+from agmind_immune.runtime import CoreRuntime
 from pydantic import ValidationError
 
 PRIMARY_EVENT_ID = "evt_" + "1" * 64
@@ -374,3 +378,113 @@ async def test_client_returns_only_strict_evidence_bound_annotation(
             assert breaker_calls == 5
     finally:
         await breaker_client.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_hunter_result_is_durably_bound_to_candidate(
+    tmp_path: Path,
+) -> None:
+    assert hasattr(hunter_module, "HunterInvestigationStore")
+    store_type = hunter_module.HunterInvestigationStore
+    state = tmp_path / "core"
+    state.mkdir(mode=0o700)
+    path = state / "hunter-investigations.sqlite3"
+    store = store_type.open(path)
+    candidate_id = "cand_" + "7" * 64
+    output = HunterOutputV1(
+        schema_version="agmind.hunter-output.v1",
+        hypotheses=["Unexpected public egress"],
+        supporting_evidence_ids=[PRIMARY_EVENT_ID],
+        refuting_questions=["Is this destination approved?"],
+        narrative="Bounded read-only investigation.",
+        limitations=["No authority to act"],
+    )
+    available = HunterResult(
+        status="available",
+        output=output,
+        bundle_sha256="a" * 64,
+        reason_code="available",
+    )
+
+    runtime = object.__new__(CoreRuntime)
+    runtime._hunter_tasks = {}
+    runtime._hunter_scheduled = set()
+    runtime._hunter_investigations = store
+    runtime._last_hunter_status = None
+    runtime._hunter_persistence_status = "ready"
+    runtime._commits = {}
+
+    class RecoveredCommit:
+        candidate_id = "cand_" + "7" * 64
+        effect = "deny"
+
+    recovered_commit = RecoveredCommit()
+
+    class RecoveredController:
+        async def decision_intent_commits(self) -> tuple[RecoveredCommit, ...]:
+            return (recovered_commit,)
+
+        async def hunter_bundle(self, recovered_candidate_id: str) -> object:
+            assert recovered_candidate_id == candidate_id
+            return object()
+
+    class RecoveredHunter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def investigate(self, bundle: object) -> HunterResult:
+            assert type(bundle) is object
+            self.calls += 1
+            return available
+
+    recovered_hunter = RecoveredHunter()
+    runtime._controller = RecoveredController()
+    runtime._hunter = recovered_hunter
+
+    async def complete(result: HunterResult) -> HunterResult:
+        return result
+
+    async def deliver(result: HunterResult) -> None:
+        task = asyncio.create_task(complete(result))
+        runtime._hunter_tasks[task] = candidate_id
+        task.add_done_callback(runtime._hunter_done)
+        await task
+        await asyncio.sleep(0)
+
+    await runtime._refresh_commits()
+    recovered_tasks = tuple(runtime._hunter_tasks)
+    assert len(recovered_tasks) == 1
+    await asyncio.gather(*recovered_tasks)
+    await asyncio.sleep(0)
+    await runtime._refresh_commits()
+    assert recovered_hunter.calls == 1
+    first = store.get(candidate_id)
+    assert first is not None
+    assert first.bundle_sha256 == "a" * 64
+    assert first.status == "available"
+    assert first.reason_code == "available"
+    assert first.output_canonical == canonical_json(output)
+    assert store.page(after=None, limit=10) == (first,)
+    assert runtime._hunter_persistence_status == "durable"
+
+    await deliver(available)
+    assert store.page(after=None, limit=10) == (first,)
+
+    await deliver(
+        HunterResult(
+            status="unavailable",
+            output=None,
+            bundle_sha256="a" * 64,
+            reason_code="transport_unavailable",
+        )
+    )
+    assert runtime._last_hunter_status == "unavailable"
+    assert runtime._hunter_persistence_status == "equivocation"
+    assert store.get(candidate_id) == first
+    store.close()
+
+    reopened = store_type.open(path)
+    try:
+        assert reopened.get(candidate_id) == first
+    finally:
+        reopened.close()
