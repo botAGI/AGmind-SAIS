@@ -97,7 +97,7 @@ done
 ((EUID == 0)) || die "EUID 0 is required"
 
 required_commands=(
-  chmod chown dirname docker env find getent go id install mktemp mv python3 rm
+  chmod chown dirname docker find getent id install mktemp mv python3 rm
   stat systemd-sysusers systemd-tmpfiles uname usermod
 )
 if ((prepare_only == 0)); then
@@ -176,17 +176,17 @@ print(value)
 PY
 }
 
-go_version="$(version_value GO_VERSION)"
+go_image="$(version_value GO_IMAGE)"
 python_image="$(version_value PYTHON_IMAGE)"
 uv_image="$(version_value UV_IMAGE)"
 falco_image="$(version_value FALCO_IMAGE)"
 opa_image="$(version_value OPA_IMAGE)"
 haproxy_image="$(version_value HAPROXY_IMAGE)"
 
-for pinned_image in "$python_image" "$uv_image" "$falco_image" "$opa_image" "$haproxy_image"; do
+for pinned_image in \
+  "$go_image" "$python_image" "$uv_image" "$falco_image" "$opa_image" "$haproxy_image"; do
   [[ "$pinned_image" =~ @sha256:[0-9a-f]{64}$ ]] || die "versions.env contains an unpinned image reference"
 done
-[[ "$(GOENV=off GOWORK=off go env GOVERSION)" == "go${go_version}" ]] || die "Go ${go_version} is required"
 
 dgx_ipv4="$(python3 - "$dgx_url" <<'PY'
 from __future__ import annotations
@@ -429,17 +429,44 @@ ensure_directory "$share_root" 0755 root root
 ensure_directory /etc/falco 0755 root root
 ensure_directory /etc/falco/rules.d 0755 root root
 ensure_directory "$libexec_root" 0755 root root
+ensure_directory /var/cache/agmind-sais 0700 root root
+ensure_directory /var/cache/agmind-sais/go-build 0700 root root
+ensure_directory /var/cache/agmind-sais/go-mod 0700 root root
 
-status "building and atomically installing four Go executables"
+docker_rootful() {
+  DOCKER_CONFIG="${runtime_root}/docker-config" docker --host "$docker_endpoint" "$@"
+}
+
+status "pulling the pinned Go builder image"
+docker_rootful pull "$go_image"
+
+status "building and atomically installing four Go executables in the pinned builder"
 build_go_binary() {
   local package="$1"
   local output_name="$2"
-  (
-    cd "$install_root"
-    env CGO_ENABLED=0 GOENV=off GOWORK=off \
-      go build -mod=readonly -buildvcs=false -trimpath \
-      -o "${work_dir}/${output_name}" "$package"
-  )
+  docker_rootful run --rm \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --pids-limit 512 \
+    --memory 2g \
+    --cpus 2 \
+    --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+    --mount "type=bind,src=${install_root},dst=/src,readonly" \
+    --mount "type=bind,src=${work_dir},dst=/out" \
+    --mount "type=bind,src=/var/cache/agmind-sais/go-build,dst=/var/cache/go-build" \
+    --mount "type=bind,src=/var/cache/agmind-sais/go-mod,dst=/var/cache/go-mod" \
+    --workdir /src \
+    --env CGO_ENABLED=0 \
+    --env GOENV=off \
+    --env GOWORK=off \
+    --env GOTELEMETRY=off \
+    --env HOME=/tmp \
+    --env GOCACHE=/var/cache/go-build \
+    --env GOMODCACHE=/var/cache/go-mod \
+    "$go_image" \
+    go build -mod=readonly -buildvcs=false -trimpath \
+      -o "/out/${output_name}" "$package"
 }
 build_go_binary ./host/observerd/cmd/agmind-observerd agmind-observerd
 build_go_binary ./host/actuatord/cmd/agmind-actuatord agmind-actuatord
@@ -514,10 +541,6 @@ secure_artifact "${secrets_root}/dgx-api.token" 0640 root agmind-core
 
 usermod -a -G agmind-admin "$admin_user"
 
-docker_rootful() {
-  DOCKER_CONFIG="${runtime_root}/docker-config" docker --host "$docker_endpoint" "$@"
-}
-
 status "pulling pinned runtime images"
 docker_rootful pull "$falco_image"
 docker_rootful pull "$opa_image"
@@ -543,6 +566,13 @@ DOCKER_CONFIG="${runtime_root}/docker-config" \
   --dgx-url "$dgx_url" \
   --runtime-env "${config_root}/runtime.env" \
   --management-denylist "${config_root}/management-destinations.json"
+
+status "validating the isolated Docker Compose v2 runtime and rendered topology"
+docker_rootful compose version >/dev/null
+docker_rootful compose \
+  --env-file "${config_root}/runtime.env" \
+  --file "${install_root}/deploy/compose/compose.yaml" \
+  config --quiet
 
 status "installing systemd units"
 for unit_name in \

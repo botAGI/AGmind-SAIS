@@ -38,112 +38,76 @@ The Compose profile expects tracefs at `/sys/kernel/tracing`. If the host expose
 only `/sys/kernel/debug/tracing`, change only the source of that Falco bind mount
 after validating the same filesystem.
 
-## Install assets
+## Install and start
 
-Run from the repository checkout as root. Replace `agmindops` with the existing
-local operator account.
-
-```sh
-install -d -o root -g root -m 0755 /opt/agmind-sais
-cp -a . /opt/agmind-sais/
-
-systemd-sysusers /opt/agmind-sais/deploy/sysusers.d/agmind-sais.conf
-systemd-tmpfiles --create /opt/agmind-sais/deploy/tmpfiles.d/agmind-sais.conf
-usermod -aG agmind-admin agmindops
-
-install -d -o root -g root -m 0755 /usr/local/libexec/agmind-sais
-go build -trimpath -o /usr/local/libexec/agmind-sais/agmind-observerd ./host/observerd/cmd/agmind-observerd
-go build -trimpath -o /usr/local/libexec/agmind-sais/agmind-actuatord ./host/actuatord/cmd/agmind-actuatord
-go build -trimpath -o /usr/local/bin/agmindctl ./cmd/agmindctl
-
-install -o root -g root -m 0444 deploy/config/observer.json /etc/agmind-sais/observer.json
-install -o root -g root -m 0444 deploy/config/actuator.json /etc/agmind-sais/actuator.json
-install -o root -g root -m 0444 deploy/config/core.json /etc/agmind-sais/core.json
-install -o root -g root -m 0444 deploy/config/hunter.json /etc/agmind-sais/hunter.json
-install -o root -g root -m 0444 deploy/config/operator-denylist.json /etc/agmind-sais/operator-denylist.json
-install -d -o root -g root -m 0755 /etc/falco/rules.d /usr/share/agmind-sais
-install -o root -g root -m 0444 deploy/falco/rules.d/agmind-pcc.yaml /etc/falco/rules.d/agmind-pcc.yaml
-install -o root -g root -m 0444 contracts/v1/ipv4-special-use.csv /usr/share/agmind-sais/ipv4-special-use.csv
-```
-
-Provision these installation-unique files before starting any unit:
-
-```text
-/var/lib/agmind-sais/identity/host-id                 root:root 0400, lowercase UUIDv4
-/etc/agmind-sais/secrets/observer-ed25519.key         root:root 0400, raw Ed25519 private key (64 bytes)
-/etc/agmind-sais/secrets/actuator-ed25519.key         root:root 0400, raw Ed25519 private key (64 bytes)
-/etc/agmind-sais/public/actuator-ed25519.pub           root:root 0444, matching raw public key (32 bytes)
-/etc/agmind-sais/observer-trust-root.json              root:root 0444, matching observer key/host ID
-/etc/agmind-sais/secrets/core-api.token                root:agmind-core 0640
-/etc/agmind-sais/secrets/dgx-api.token                 root:agmind-core 0640
-```
-
-Never copy fixture keys into those paths. Key generation must be local and
-non-destructive: if a key already exists, stop instead of replacing it.
-
-Resolve `dgx-spark.agmind.lan` to exactly one approved management IPv4. Write a
-canonical denylist using that address; the checked-in placeholder is
-intentionally invalid so the actuator fails closed until this is done.
+Run the installer from the repository checkout as root. The operator must be an
+existing login account. The DGX URL must be canonical and resolve to exactly one
+safe IPv4 address. This lab currently exposes DeepSeek as model `dspark` at
+`192.168.1.45:8000`:
 
 ```sh
-install -o root -g root -m 0444 /dev/stdin /etc/agmind-sais/management-destinations.json <<'EOF'
-{"denied_addresses":["10.0.0.50"],"denied_networks":[]}
-EOF
-
-core_uid="$(id -u agmind-core)"
-core_gid="$(getent group agmind-core | cut -d: -f3)"
-sensor_uid="$(id -u agmind-sensor)"
-sensor_gid="$(getent group agmind-sensor | cut -d: -f3)"
-install -o root -g root -m 0444 /dev/stdin /etc/agmind-sais/runtime.env <<EOF
-AGMIND_CORE_UID=${core_uid}
-AGMIND_CORE_GID=${core_gid}
-AGMIND_SENSOR_UID=${sensor_uid}
-AGMIND_SENSOR_GID=${sensor_gid}
-AGMIND_CORE_IMAGE=agmind-sais-core:0.1.0
-AGMIND_ADAPTER_IMAGE=agmind-sais-falco-adapter:0.1.0
-AGMIND_FALCO_IMAGE=falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
-AGMIND_OPA_IMAGE=openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da
-AGMIND_HAPROXY_IMAGE=haproxy:3.2.21-alpine3.24@sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a
-AGMIND_DGX_IPV4=10.0.0.50
-EOF
+sudo ./scripts/install-linux.sh \
+  --admin-user testbot \
+  --dgx-url http://192.168.1.45:8000/v1
 ```
 
-Replace `10.0.0.50` in both documents with the same verified DGX address. For a
-release, replace the local Core tag with its content-digest reference.
-
-## Build and start
+If the DGX endpoint requires an API token, import it from a root-owned,
+single-link file with mode `0400`, `0440`, `0600`, or `0640`:
 
 ```sh
-docker build -f deploy/images/core.Dockerfile -t agmind-sais-core:0.1.0 .
-docker build -f deploy/images/falco-adapter.Dockerfile -t agmind-sais-falco-adapter:0.1.0 .
-docker pull falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b
-docker pull openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da
-docker pull haproxy:3.2.21-alpine3.24@sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a
-
-/opt/agmind-sais/scripts/preflight-linux.sh \
-  --dgx-url http://dgx-spark.agmind.lan:8000/v1 \
-  --runtime-env /etc/agmind-sais/runtime.env \
-  --management-denylist /etc/agmind-sais/management-destinations.json || exit 1
-
-install -o root -g root -m 0644 deploy/systemd/*.service deploy/systemd/agmind-sais.target /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now agmind-sais.target
+sudo ./scripts/install-linux.sh \
+  --admin-user testbot \
+  --dgx-url http://192.168.1.45:8000/v1 \
+  --dgx-token-file /root/dgx-api.token
 ```
 
-Check only the runtime boundaries and mutation readiness:
+The installer copies only the production source/runtime allowlist, creates the
+fixed users and directories, builds the four host binaries in the pinned Go
+container, builds the two Python images, pulls the pinned runtime images,
+creates or validates the installation identity, writes the exact DGX denylist,
+runs the read-only preflight, installs the units, and waits for `/ready`.
+
+Re-running is an update operation: it preserves the host ID, keys, tokens, and
+journals, rebuilds the runtime, and restarts the target. It never rotates an
+identity implicitly. `--prepare-only` performs installation and preflight but
+does not reload, enable, or start systemd units.
+
+Start a new login session after the first install so supplementary membership
+in `agmind-admin` is visible. Then inspect readiness:
 
 ```sh
-systemctl --no-pager --full status agmind-observerd agmind-actuatord agmind-core-compose
-docker compose --env-file /etc/agmind-sais/runtime.env -f /opt/agmind-sais/deploy/compose/compose.yaml ps
-test -S /run/agmind-sais/observer-core/socket
-test -S /run/agmind-sais/observer-ingest/socket
-test -S /run/agmind-sais/actuator-intent/socket
-test -S /run/agmind-sais/actuator-admin/socket
+systemctl --no-pager --full status \
+  agmind-observerd agmind-actuatord agmind-core-compose
+docker compose \
+  --env-file /etc/agmind-sais/runtime.env \
+  -f /opt/agmind-sais/deploy/compose/compose.yaml ps
 curl --fail --silent http://127.0.0.1:8787/ready
+agmindctl plans pending --json --limit 10
 ```
 
-Local approval remains host-only through `agmindctl`; Core and DeepSeek cannot
-approve or apply a plan.
+Local approval remains host-only and interactive through `agmindctl`; Core and
+DeepSeek cannot approve or apply a plan.
+
+## Native target-only TTL smoke
+
+Run this only on a dedicated Beelink test host. It creates two exact-labelled,
+unprivileged containers on one temporary bridge. It proves the target loses
+access to `1.1.1.1:443`, the control remains reachable, the host namespace is
+untouched, and the target rule expires in the kernel while Core and actuator
+are stopped. Approval still requires typing the hash suffix shown by the real
+CLI. Cleanup removes only resources carrying the current run ID and restores
+the services.
+
+```sh
+sudo env \
+  AGMIND_DEDICATED_TEST_HOST=1 \
+  AGMIND_DGX_URL=http://192.168.1.45:8000/v1 \
+  /opt/agmind-sais/scripts/smoke-containment-linux.sh
+```
+
+Only a final JSON object with `"status":"PASS"` is native containment evidence.
+Darwin, Docker Desktop, OrbStack, WSL, rootless Docker, a degraded preflight, or
+a non-interactive invocation cannot satisfy this gate.
 
 ## Kubernetes migration boundary
 

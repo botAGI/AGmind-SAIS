@@ -93,6 +93,7 @@ readonly target_image
 
 for required_unit in \
   docker.service \
+  agmind-sais.target \
   agmind-observerd.service \
   agmind-actuatord.service \
   agmind-core-compose.service; do
@@ -176,11 +177,15 @@ services_need_restore=0
 restore_services() {
   local failed=0
   if ((services_need_restore == 1)); then
-    systemctl start agmind-actuatord.service || failed=1
-    systemctl start agmind-core-compose.service || failed=1
+    systemctl restart agmind-sais.target || failed=1
     if ((failed == 0)); then
-      systemctl is-active --quiet agmind-actuatord.service || failed=1
-      systemctl is-active --quiet agmind-core-compose.service || failed=1
+      for restored_unit in \
+        agmind-sais.target \
+        agmind-observerd.service \
+        agmind-actuatord.service \
+        agmind-core-compose.service; do
+        systemctl is-active --quiet "${restored_unit}" || failed=1
+      done
     fi
   fi
   return "${failed}"
@@ -582,6 +587,10 @@ if ! systemctl stop agmind-core-compose.service; then
 fi
 if ! systemctl stop agmind-actuatord.service; then
   block "actuator_stop_failed"
+fi
+if systemctl is-active --quiet agmind-core-compose.service ||
+  systemctl is-active --quiet agmind-actuatord.service; then
+  block "control_plane_stop_incomplete"
 fi
 
 expiry_deadline="$((SECONDS + ttl_seconds + 15))"
