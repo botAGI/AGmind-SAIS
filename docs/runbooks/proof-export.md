@@ -49,11 +49,19 @@ The script trusts neither the bundle manifest alone nor exporter output. It
 runs `python -m agmind_immune.replay verify-export` in the installed Core image
 with the host's observer trust root and actuator public key supplied as external
 pins. Success requires the verifier to report both `integrity_verified=true`
-and `causal_links_verified=true`. The final two lines are:
+and `causal_links_verified=true`, bind the exact requested `action_id`, and
+report terminal `action_state="EXPIRED"`. This installed M1 workflow therefore
+exports proof only after the native TTL has elapsed and the restarted actuator
+has durably observed expiry. The lower-level offline verifier may still inspect
+non-success lifecycle states for forensics, but they are not accepted as an M1
+containment proof. The final five machine-readable lines are:
 
 ```text
 bundle_path=/absolute/path/chosen/by/operator
 bundle_sha256=<64 lowercase hex>
+candidate_id=cand_<64 lowercase hex>
+intent_id=int_<32 lowercase hex>
+action_state=EXPIRED
 ```
 
 Store the bundle and its printed digest together. Verification on another host

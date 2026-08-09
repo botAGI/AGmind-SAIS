@@ -483,6 +483,54 @@ for value in runtime_parents:
 if installed_parents != len(runtime_parents):
     degraded.add("runtime_socket_parents_not_installed")
 
+if arguments.runtime_env is not None:
+    core_gid_text = runtime_values.get("AGMIND_CORE_GID", "")
+    try:
+        core_gid = int(core_gid_text)
+    except ValueError:
+        core_gid = -1
+    secret_boundary_valid = core_gid > 0 and str(core_gid) == core_gid_text
+    try:
+        secret_parent = Path("/etc/agmind-sais/secrets").lstat()
+        secret_boundary_valid = secret_boundary_valid and (
+            stat.S_ISDIR(secret_parent.st_mode)
+            and secret_parent.st_uid == 0
+            and secret_parent.st_gid == core_gid
+            and stat.S_IMODE(secret_parent.st_mode) == 0o710
+        )
+    except OSError:
+        secret_boundary_valid = False
+    for token_name in ("core-api.token", "dgx-api.token"):
+        try:
+            token_info = (Path("/etc/agmind-sais/secrets") / token_name).lstat()
+            secret_boundary_valid = secret_boundary_valid and (
+                stat.S_ISREG(token_info.st_mode)
+                and token_info.st_uid == 0
+                and token_info.st_gid == core_gid
+                and token_info.st_nlink == 1
+                and stat.S_IMODE(token_info.st_mode) == 0o640
+                and 1 <= token_info.st_size <= 4097
+            )
+        except OSError:
+            secret_boundary_valid = False
+    for private_key_name in ("observer-ed25519.key", "actuator-ed25519.key"):
+        try:
+            private_key_info = (
+                Path("/etc/agmind-sais/secrets") / private_key_name
+            ).lstat()
+            secret_boundary_valid = secret_boundary_valid and (
+                stat.S_ISREG(private_key_info.st_mode)
+                and private_key_info.st_uid == 0
+                and private_key_info.st_gid == 0
+                and private_key_info.st_nlink == 1
+                and stat.S_IMODE(private_key_info.st_mode) == 0o400
+                and 1 <= private_key_info.st_size <= 4096
+            )
+        except OSError:
+            secret_boundary_valid = False
+    facts["core_secret_directory_mode"] = "0710" if secret_boundary_valid else ""
+    require(secret_boundary_valid, "core_secret_boundary_unsafe")
+
 if all(dgx_inputs):
     assert arguments.dgx_url is not None
     assert arguments.runtime_env is not None

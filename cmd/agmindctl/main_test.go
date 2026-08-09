@@ -85,6 +85,55 @@ func TestRenderAndConfirmationStayExactAndNonAutomatable(t *testing.T) {
 	}
 }
 
+func TestDecisionReceiptRequiresAndPrintsDerivedActionID(t *testing.T) {
+	raw, err := os.ReadFile("../../contracts/fixtures/v1/plan.valid.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := contracts.DecodeStrict[contracts.PreparedTemporaryEgressDenyPlanV1](
+		bytes.NewReader(raw),
+		65_536,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionID := "act_594bbfc8240be724b6e3454db809559c"
+	record := contracts.ActionRecordV1{
+		RecordID:      "ar_2d567703a577e321df8a3c8046b97cc3",
+		ActionID:      &actionID,
+		PlanID:        plan.PlanID,
+		PlanHashValue: plan.PlanHashValue,
+		State:         "APPROVED",
+	}
+	var output bytes.Buffer
+	if err := renderDecisionReceipt(&output, plan, "approve", record); err != nil {
+		t.Fatal(err)
+	}
+	want := "Decision: APPROVED\nAction ID: act_594bbfc8240be724b6e3454db809559c\nRecord ID: ar_2d567703a577e321df8a3c8046b97cc3\n"
+	if output.String() != want {
+		t.Fatalf("decision receipt=%q want=%q", output.String(), want)
+	}
+
+	record.State = "REJECTED"
+	output.Reset()
+	if err := renderDecisionReceipt(&output, plan, "reject", record); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Action ID: "+actionID+"\n") {
+		t.Fatalf("reject receipt hid action ID: %q", output.String())
+	}
+
+	record.ActionID = nil
+	if err := renderDecisionReceipt(io.Discard, plan, "reject", record); err == nil {
+		t.Fatal("decision receipt without action ID was accepted")
+	}
+	mismatchedActionID := "act_00000000000000000000000000000000"
+	record.ActionID = &mismatchedActionID
+	if err := renderDecisionReceipt(io.Discard, plan, "reject", record); err == nil {
+		t.Fatal("decision receipt with mismatched action ID was accepted")
+	}
+}
+
 func TestPendingPlanListCommandIsBoundedAndCanonical(t *testing.T) {
 	raw, err := os.ReadFile("../../contracts/fixtures/v1/plan.valid.json")
 	if err != nil {

@@ -177,11 +177,7 @@ services:
       - /etc/agmind-sais/hunter.json:/etc/agmind-sais/hunter.json:ro
       - /etc/agmind-sais/observer-trust-root.json:/etc/agmind-sais/observer-trust-root.json:ro
       - /etc/agmind-sais/public/actuator-ed25519.pub:/etc/agmind-sais/public/actuator-ed25519.pub:ro
-    secrets:
-      - source: core_api_token
-        target: core-api.token
-      - source: dgx_api_token
-        target: dgx-api-token
+      - /etc/agmind-sais/secrets:/run/secrets:ro
     ports:
       - "127.0.0.1:8787:8787"
     networks:
@@ -215,9 +211,3 @@ networks:
     driver: bridge
   inference:
     driver: bridge
-
-secrets:
-  core_api_token:
-    file: /etc/agmind-sais/secrets/core-api.token
-  dgx_api_token:
-    file: /etc/agmind-sais/secrets/dgx-api.token

@@ -375,7 +375,7 @@ verify_report="$(
     --actuator-public-key "$actuator_public_key"
 )" || die "offline proof verification failed"
 
-bundle_sha256="$(python3 - "$verify_report" <<'PY'
+verification_fields="$(python3 - "$verify_report" "$action_id" <<'PY'
 from __future__ import annotations
 
 import json
@@ -402,12 +402,29 @@ if report.get("integrity_verified") is not True:
     raise SystemExit("verifier did not prove integrity")
 if report.get("causal_links_verified") is not True:
     raise SystemExit("verifier did not prove causal links")
+if report.get("action_id") != sys.argv[2]:
+    raise SystemExit("verifier report does not bind the requested action_id")
+if report.get("action_state") != "EXPIRED":
+    raise SystemExit("M1 proof requires a terminal EXPIRED action")
 digest = report.get("bundle_sha256")
 if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
     raise SystemExit("verifier returned an invalid bundle_sha256")
+candidate_id = report.get("candidate_id")
+if not isinstance(candidate_id, str) or re.fullmatch(r"cand_[0-9a-f]{64}", candidate_id) is None:
+    raise SystemExit("verifier returned an invalid candidate_id")
+intent_id = report.get("intent_id")
+if not isinstance(intent_id, str) or re.fullmatch(r"int_[0-9a-f]{32}", intent_id) is None:
+    raise SystemExit("verifier returned an invalid intent_id")
 print(digest)
+print(candidate_id)
+print(intent_id)
 PY
 )" || die "verifier report did not satisfy the proof contract"
+mapfile -t verified_values <<<"$verification_fields"
+[[ "${#verified_values[@]}" -eq 3 ]] || die "verifier returned an invalid field set"
+bundle_sha256="${verified_values[0]}"
+candidate_id="${verified_values[1]}"
+intent_id="${verified_values[2]}"
 
 mv -- "$staging_dir/bundle" "$output" || die "cannot publish verified bundle"
 rmdir -- "$staging_dir" || die "isolated export staging is not empty"
@@ -422,3 +439,6 @@ recovery_armed=0
 
 printf 'bundle_path=%s\n' "$output"
 printf 'bundle_sha256=%s\n' "$bundle_sha256"
+printf 'candidate_id=%s\n' "$candidate_id"
+printf 'intent_id=%s\n' "$intent_id"
+printf 'action_state=EXPIRED\n'

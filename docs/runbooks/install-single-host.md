@@ -88,6 +88,19 @@ agmindctl plans pending --json --limit 10
 Local approval remains host-only and interactive through `agmindctl`; Core and
 DeepSeek cannot approve or apply a plan.
 
+The Core management API token is read afresh for every protected request. Rotate
+it locally as root without restarting the stack:
+
+```sh
+sudo agmindctl token rotate
+```
+
+Rotation publishes a new mode-`0640` `root:agmind-core` file atomically and
+prints only `/etc/agmind-sais/secrets/core-api.token` plus its SHA-256 key ID,
+never the bearer value. Core receives the parent secrets directory read-only so
+the rename is immediately visible; its process can traverse that directory but
+cannot list it or read the root-only observer/actuator private keys.
+
 ## Native target-only TTL smoke
 
 Run this only on a dedicated Beelink test host. It creates two exact-labelled,

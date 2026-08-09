@@ -285,6 +285,34 @@ func submitDecision(
 	)
 }
 
+func renderDecisionReceipt(
+	writer io.Writer,
+	plan contracts.PreparedTemporaryEgressDenyPlanV1,
+	verb string,
+	record contracts.ActionRecordV1,
+) error {
+	expectedState := "APPROVED"
+	if verb == "reject" {
+		expectedState = "REJECTED"
+	} else if verb != "approve" {
+		return fmt.Errorf("invalid local plan decision")
+	}
+	expectedActionID, err := contracts.ActionID(plan.PlanHashValue)
+	if err != nil || record.ActionID == nil || *record.ActionID != expectedActionID ||
+		record.PlanID != plan.PlanID || record.PlanHashValue != plan.PlanHashValue ||
+		record.State != expectedState {
+		return fmt.Errorf("actuator returned a mismatched decision receipt")
+	}
+	_, err = fmt.Fprintf(
+		writer,
+		"Decision: %s\nAction ID: %s\nRecord ID: %s\n",
+		record.State,
+		expectedActionID,
+		record.RecordID,
+	)
+	return err
+}
+
 func renderPlan(writer io.Writer, plan contracts.PreparedTemporaryEgressDenyPlanV1) error {
 	if err := plan.Validate(); err != nil {
 		return err
@@ -380,6 +408,7 @@ func usage(writer io.Writer) {
 	fmt.Fprintln(writer, "       agmindctl proposal approve <plan-id>")
 	fmt.Fprintln(writer, "       agmindctl proposal reject <plan-id>")
 	fmt.Fprintln(writer, "       agmindctl plans pending --json --limit <1..100>")
+	fmt.Fprintln(writer, "       agmindctl token rotate")
 	fmt.Fprintln(writer, "       agmindctl kill-switch status --json")
 	fmt.Fprintln(writer, "       agmindctl kill-switch enable")
 	fmt.Fprintln(writer, "       agmindctl kill-switch disable")
@@ -391,6 +420,9 @@ func run(
 	stdout io.Writer,
 	client *http.Client,
 ) error {
+	if len(arguments) == 2 && arguments[0] == "token" && arguments[1] == "rotate" {
+		return rotateCoreAPITokenCommand(stdout)
+	}
 	if len(arguments) == 3 && arguments[0] == "kill-switch" &&
 		arguments[1] == "status" && arguments[2] == "--json" {
 		if client == nil {
@@ -529,16 +561,7 @@ func run(
 	if err != nil {
 		return err
 	}
-	expectedState := "APPROVED"
-	if arguments[1] == "reject" {
-		expectedState = "REJECTED"
-	}
-	if record.PlanID != plan.PlanID || record.PlanHashValue != plan.PlanHashValue ||
-		record.State != expectedState {
-		return fmt.Errorf("actuator returned a mismatched decision receipt")
-	}
-	_, err = fmt.Fprintf(stdout, "Decision: %s\nRecord ID: %s\n", record.State, record.RecordID)
-	return err
+	return renderDecisionReceipt(stdout, plan, arguments[1], record)
 }
 
 func main() {

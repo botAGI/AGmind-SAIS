@@ -82,6 +82,16 @@ agmindctl kill-switch disable
 `enable` и `disable` требуют точного интерактивного подтверждения. Отключение
 ручного режима не снимает автоматические fail-closed блокировки actuator.
 
+## Ротация Core API token
+
+```sh
+sudo agmindctl token rotate
+```
+
+Команда атомарно заменяет root-owned token и выводит только его фиксированный
+путь и SHA-256 key ID. Старый bearer перестаёт приниматься без перезапуска Core;
+сам token в терминал не печатается.
+
 ## Нативная проверка
 
 Smoke создаёт отдельные target/control контейнеры, требует реальное локальное

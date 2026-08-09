@@ -413,7 +413,7 @@ done
 ((core_uid != sensor_uid)) || die "Core and sensor users must have distinct UIDs"
 
 ensure_directory "$config_root" 0755 root root
-ensure_directory "$secrets_root" 0700 root root
+ensure_directory "$secrets_root" 0710 root agmind-core
 ensure_directory "$public_root" 0755 root root
 ensure_directory "$state_root" 0755 root root
 ensure_directory "${state_root}/identity" 0700 root root
