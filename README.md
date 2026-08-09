@@ -32,8 +32,8 @@ kernel timeout и исчезает без участия control plane.
 
 - `agmind-observerd` — host-сенсор, Docker inventory и подписанные события.
 - Falco + redacting adapter — monitor-only detection без доступа к секретам.
-- Core — evidence, correlation, OPA, durable intents и проверяемое зеркало
-  действий; без Docker socket и `CAP_NET_ADMIN`.
+- Core — evidence, correlation, OPA, durable intents, проверяемое зеркало
+  действий и authenticated read-only API; без Docker socket и `CAP_NET_ADMIN`.
 - OPA — единственная policy admission boundary. Она может потребовать ручное
   подтверждение, но не сформировать команду исполнения.
 - Hunter — изолированный запрос к DeepSeek V4 Flash через фиксированный relay;
@@ -46,9 +46,11 @@ kernel timeout и исчезает без участия control plane.
 
 M1 ориентирован на один выделенный Linux Docker-хост. Рабочий вертикальный
 контур evidence → policy → intent → local approval → target-only TTL уже
-реализован вместе с hardened Compose/systemd installer. Сейчас завершаются
-Core action mirror, proof export/offline verification и нативный acceptance на
-Beelink. До успешного Linux smoke проект не заявляет production-ready статус.
+реализован вместе с hardened Compose/systemd installer, проверяемым Core
+actuator mirror, authenticated read-only API, постоянным ручным kill switch и
+quiesced proof export с offline replay. Единственный незакрытый release gate —
+нативный acceptance на Beelink. До его успешного прохождения проект не является
+production-ready.
 
 Kubernetes, multi-node coordination и DaemonSet actuator относятся к следующей
 фазе. M1 специально сохраняет границы, которые можно перенести: Core/OPA как
@@ -69,6 +71,17 @@ sudo ./scripts/install-linux.sh \
 Полные prerequisites, фиксированные пути и безопасное обновление описаны в
 [`docs/runbooks/install-single-host.md`](docs/runbooks/install-single-host.md).
 
+## Ручной kill switch
+
+```sh
+agmindctl kill-switch status --json
+agmindctl kill-switch enable
+agmindctl kill-switch disable
+```
+
+`enable` и `disable` требуют точного интерактивного подтверждения. Отключение
+ручного режима не снимает автоматические fail-closed блокировки actuator.
+
 ## Нативная проверка
 
 Smoke создаёт отдельные target/control контейнеры, требует реальное локальное
@@ -85,6 +98,18 @@ sudo env \
 
 Только финальный отчёт со `"status":"PASS"` считается нативным доказательством
 M1. Инструкции: [`docs/runbooks/install-single-host.md`](docs/runbooks/install-single-host.md).
+
+## Экспорт доказательства действия
+
+```sh
+sudo /opt/agmind-sais/scripts/export-proof-linux.sh \
+  --action-id act_0123456789abcdef0123456789abcdef \
+  --output /var/lib/agmind-sais/exports/act_0123456789abcdef0123456789abcdef
+```
+
+Экспорт кратко приостанавливает AGmind-сервисы для согласованного снимка, затем
+делает offline verification и восстанавливает ранее активные units. Полная
+процедура: [`docs/runbooks/proof-export.md`](docs/runbooks/proof-export.md).
 
 ## Что проект намеренно не делает
 
