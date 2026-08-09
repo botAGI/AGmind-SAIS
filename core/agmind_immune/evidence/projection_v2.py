@@ -18,7 +18,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from threading import Condition, Lock, RLock
-from typing import cast
+from typing import Never, SupportsIndex, cast, final
 
 from pydantic import ValidationError
 
@@ -39,6 +39,7 @@ from agmind_immune.correlation.authority import (
     _CorrelationReplaySnapshot,
     _create_correlation_projection_authority,
     _issue_correlation_context,
+    _ProjectionAuthorityBinding,
     _ProjectionPredecessor,
     _rebuild_correlation_projection_authority,
     _revalidate_correlation_replay_locked,
@@ -160,6 +161,7 @@ _REPLAY_SCHEMA_DOMAIN_V2 = b"AGMIND_PROJECTION_SCHEMA_V2\0"
 _REPLAY_TRANSCRIPT_DOMAIN_V2 = b"AGMIND_PROJECTION_REPLAY_TRANSCRIPT_V2\0"
 _REPLAY_REPORT_DOMAIN_V2 = b"AGMIND_PROJECTION_REPLAY_REPORT_V2\0"
 _UNPUBLISHED_REPLAY_FACTORY = object()
+_STAGED_REPLAY_FACTORY = object()
 _UINT64_V2 = re.compile(r"^[0-9]{20}$")
 _EVENT_ID_V2 = re.compile(r"^evt_[0-9a-f]{64}$")
 _CANDIDATE_ID_V2 = re.compile(r"^cand_[0-9a-f]{64}$")
@@ -402,6 +404,7 @@ class _ReplayPhase(StrEnum):
     FREEZING = "freezing"
     COMPUTING = "computing"
     VALIDATING = "validating"
+    STAGED = "staged"
     PUBLISHED = "published"
     FAILED = "failed"
 
@@ -409,7 +412,9 @@ class _ReplayPhase(StrEnum):
 class _ReplayFaultPhase(StrEnum):
     FREEZE = "freeze"
     COMPUTE = "compute"
+    STAGE_HANDOFF = "stage_handoff"
     PUBLISH = "publish"
+    POST_CALLBACK = "post_callback"
     PRE_COMMIT = "pre_commit"
 
 
@@ -467,6 +472,120 @@ class _ReplayComputation:
     semantic_prefix_visits: int
     report_bytes: bytes
     prefix_sha256: str
+
+
+@final
+class _StagedV2Replay:
+    """Identity-only owner capability; staged resources never escape through it."""
+
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        raise TypeError("staged Projection V2 capabilities are owner-issued")
+
+    def __copy__(self) -> Never:
+        raise TypeError("staged Projection V2 capabilities cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise TypeError("staged Projection V2 capabilities cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise TypeError("staged Projection V2 capabilities cannot be serialized")
+
+
+@final
+class _StagedV2ImageSeal:
+    """Sealed, non-resource facts for one exact caller-owned target connection."""
+
+    __slots__ = ("applied_count", "cursor", "prefix_sha256", "table_counts")
+
+    cursor: ProjectionCursor | None
+    applied_count: int
+    prefix_sha256: str
+    table_counts: tuple[tuple[str, int], ...]
+
+    def __init__(self) -> None:
+        raise TypeError("staged Projection V2 image seals are owner-issued")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise TypeError("staged Projection V2 image seals are immutable")
+
+    def __copy__(self) -> Never:
+        raise TypeError("staged Projection V2 image seals cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise TypeError("staged Projection V2 image seals cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise TypeError("staged Projection V2 image seals cannot be serialized")
+
+
+@dataclass(slots=True)
+class _NamespacePublicationState:
+    latch: _NamespacePublicationLatch | None = None
+    marked: bool = False
+
+
+@final
+class _NamespacePublicationLatch:
+    """Non-raising one-shot signal for the publisher's irreversible syscall."""
+
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        raise TypeError("namespace publication latches are owner-issued")
+
+    def _arm_namespace_publication(self) -> None:
+        state = _NAMESPACE_PUBLICATION_STATES.get(self)
+        if type(state) is _NamespacePublicationState and state.latch is self:
+            # Arm immediately before the namespace syscall. Once armed, every
+            # failure is conservatively irreversible even if the syscall failed.
+            state.marked = True
+
+    def __copy__(self) -> Never:
+        raise TypeError("namespace publication latches cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise TypeError("namespace publication latches cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise TypeError("namespace publication latches cannot be serialized")
+
+
+_NAMESPACE_PUBLICATION_STATES: dict[
+    _NamespacePublicationLatch,
+    _NamespacePublicationState,
+] = {}
+
+
+@dataclass(slots=True)
+class _StagedReplayBinding:
+    capability: _StagedV2Replay
+    through: EvidenceRef | None
+    through_key: tuple[str, str, int, int, str, str, int, str] | None
+    retention_scope: _AuthenticatedRetentionReplayScope | None
+    reservation: _ReplayReservation
+    live_connection: sqlite3.Connection
+    authority: CorrelationProjectionAuthority
+    acceptance_cursor: int
+    source_snapshot: _ReplaySourceSnapshot | None
+    ack_snapshot: _AckReplaySnapshot | None
+    journal_snapshot: _CorrelationJournalReplaySnapshot
+    snapshot: _ReplayInputSnapshot
+    computation: _ReplayComputation
+    hydrated_connection: sqlite3.Connection | None
+    report: _UnpublishedV2ReplayReport
+    materialized_connection: sqlite3.Connection | None = None
+    materialized_seal: _StagedV2ImageSeal | None = None
+    materialized_physical: _StagedV2PhysicalBinding | None = None
+
+
+@dataclass(slots=True)
+class _StagedV2PhysicalBinding:
+    descriptor: int
+    path: str
+    device: int
+    inode: int
 
 
 @dataclass(slots=True)
@@ -993,6 +1112,158 @@ def _v2_snapshot_hash(connection: sqlite3.Connection) -> str:
             connection.execute("ROLLBACK")
         raise ProjectionConflict("Projection V2 logical snapshot is invalid") from error
     return digest.hexdigest()
+
+
+def _v2_table_counts(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[str, int], ...]:
+    _verify_v2_schema(connection)
+    try:
+        return tuple(
+            (
+                table,
+                int(
+                    connection.execute(
+                        f"SELECT count(*) FROM {table}"
+                    ).fetchone()[0]
+                ),
+            )
+            for table, _columns, _primary_key in _TABLE_LAYOUT_V2
+        )
+    except (sqlite3.DatabaseError, TypeError, ValueError) as error:
+        raise ProjectionConflict(
+            "Projection V2 table counts are unavailable"
+        ) from error
+
+
+def _v2_exact_main_database_path(
+    connection: sqlite3.Connection,
+    *,
+    require_file_backed: bool,
+) -> str:
+    try:
+        rows = tuple(
+            tuple(row) for row in connection.execute("PRAGMA database_list")
+        )
+        temp_schema = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type,name,tbl_name,sql FROM temp.sqlite_schema "
+                "ORDER BY type,name,tbl_name"
+            )
+        )
+    except sqlite3.DatabaseError as error:
+        raise ProjectionConflict(
+            "Projection V2 database binding is unavailable"
+        ) from error
+    if (
+        len(rows) not in (1, 2)
+        or len(rows[0]) != 3
+        or rows[0][0] != 0
+        or rows[0][1] != "main"
+        or type(rows[0][2]) is not str
+        or (
+            len(rows) == 2
+            and rows[1] != (1, "temp", "")
+        )
+        or temp_schema
+        or (require_file_backed and not rows[0][2])
+    ):
+        raise ProjectionConflict(
+            "Projection V2 connection is not bound to one exact main database"
+        )
+    return rows[0][2]
+
+
+def _capture_staged_v2_physical_binding(
+    database_path: str,
+) -> _StagedV2PhysicalBinding:
+    if (
+        type(database_path) is not str
+        or not database_path
+        or not Path(database_path).is_absolute()
+        or Path(os.path.normpath(database_path)) != Path(database_path)
+    ):
+        raise ProjectionConflict(
+            "Projection V2 materialized database path is not exact"
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(database_path, flags)
+        info = os.fstat(descriptor)
+        path_info = os.lstat(database_path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or not stat.S_ISREG(path_info.st_mode)
+            or info.st_nlink < 1
+            or (info.st_dev, info.st_ino)
+            != (path_info.st_dev, path_info.st_ino)
+            or fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+            != os.O_RDONLY
+        ):
+            raise ProjectionConflict(
+                "Projection V2 materialized database binding is not exact"
+            )
+        binding = _StagedV2PhysicalBinding(
+            descriptor=descriptor,
+            path=database_path,
+            device=info.st_dev,
+            inode=info.st_ino,
+        )
+        descriptor = -1
+        return binding
+    except ProjectionConflict:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise ProjectionConflict(
+            "Projection V2 materialized database binding is unavailable"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _revalidate_staged_v2_physical_binding(
+    binding: _StagedV2PhysicalBinding,
+    *,
+    published_path: str | None = None,
+) -> None:
+    if (
+        type(binding) is not _StagedV2PhysicalBinding
+        or type(binding.descriptor) is not int
+        or binding.descriptor < 0
+        or type(binding.path) is not str
+        or type(binding.device) is not int
+        or type(binding.inode) is not int
+    ):
+        raise ProjectionConflict(
+            "Projection V2 materialized physical binding changed"
+        )
+    try:
+        descriptor_info = os.fstat(binding.descriptor)
+        path = binding.path if published_path is None else published_path
+        path_info = os.lstat(path)
+    except OSError as error:
+        raise ProjectionConflict(
+            "Projection V2 materialized physical binding is unavailable"
+        ) from error
+    if (
+        not stat.S_ISREG(descriptor_info.st_mode)
+        or not stat.S_ISREG(path_info.st_mode)
+        or descriptor_info.st_nlink < 1
+        or (descriptor_info.st_dev, descriptor_info.st_ino)
+        != (binding.device, binding.inode)
+        or (path_info.st_dev, path_info.st_ino)
+        != (binding.device, binding.inode)
+        or fcntl.fcntl(binding.descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+        != os.O_RDONLY
+    ):
+        raise ProjectionConflict(
+            "Projection V2 materialized physical binding changed"
+        )
 
 
 def _prepare_v2(record: StoredEvidenceRecord) -> _PreparedV2Record:
@@ -2621,6 +2892,7 @@ class _V2ProjectionOwner:
     _replay_state_lock: LockType
     _replay_state_condition: Condition
     _replay_reservation: _ReplayReservation | None
+    _staged_replay: _StagedReplayBinding | None
     _replay_status: _ReplayStatus
     _replay_test_barrier: _ReplayTestBarrier | None
     _healthy: bool
@@ -2738,6 +3010,7 @@ class _V2ProjectionOwner:
         owner._replay_state_lock = Lock()
         owner._replay_state_condition = Condition(owner._replay_state_lock)
         owner._replay_reservation = None
+        owner._staged_replay = None
         owner._replay_status = _ReplayStatus(
             generation=generation,
             phase=_ReplayPhase.IDLE,
@@ -3914,16 +4187,16 @@ class _V2ProjectionOwner:
                 ack_boundary,
             )
 
-    def _replay_unpublished_prefix(
+    def _stage_unpublished_prefix(
         self,
         through: EvidenceRef | None,
         *,
         _factory: object,
         retention_completion: AuthenticatedRetentionUnlinkCompletion | None = None,
         _fault_phase: _ReplayFaultPhase | None = None,
-    ) -> _UnpublishedV2ReplayReport:
+    ) -> _StagedV2Replay:
         if (
-            _factory is not _UNPUBLISHED_REPLAY_FACTORY
+            _factory is not _STAGED_REPLAY_FACTORY
             or (through is not None and type(through) is not EvidenceRef)
             or (
                 retention_completion is not None
@@ -3932,7 +4205,15 @@ class _V2ProjectionOwner:
             )
             or (
                 _fault_phase is not None
-                and type(_fault_phase) is not _ReplayFaultPhase
+                and (
+                    type(_fault_phase) is not _ReplayFaultPhase
+                    or _fault_phase
+                    not in (
+                        _ReplayFaultPhase.FREEZE,
+                        _ReplayFaultPhase.COMPUTE,
+                        _ReplayFaultPhase.STAGE_HANDOFF,
+                    )
+                )
             )
         ):
             raise ProjectionAuthorityError(
@@ -3952,8 +4233,9 @@ class _V2ProjectionOwner:
         ack_snapshot: _AckReplaySnapshot | None = None
         journal_snapshot: _CorrelationJournalReplaySnapshot | None = None
         hydrated_connection: sqlite3.Connection | None = None
+        staged_binding: _StagedReplayBinding | None = None
         primary_error: BaseException | None = None
-        published = False
+        staged = False
         base_generation = self._generation
         acceptance_cursor = 0
         try:
@@ -4245,61 +4527,63 @@ class _V2ProjectionOwner:
                         raise ProjectionConflict(
                             "Projection V2 replay publication cursor changed"
                         )
-                    if _fault_phase is _ReplayFaultPhase.PUBLISH:
-                        raise KeyboardInterrupt(
-                            "injected replay publish failure"
+                    if (
+                        source_snapshot is None
+                        or ack_snapshot is None
+                        or journal_snapshot is None
+                        or hydrated_connection is None
+                    ):
+                        raise ProjectionAuthorityError(
+                            "Projection V2 replay lost staged resources"
                         )
-
-                    retention_consumption = None
-                    if retention_scope is not None:
-                        exact_retention_gate = cast(
-                            _AuthenticatedRetentionReplayGate,
-                            retention_gate,
-                        )
-                        retention_consumption = self._evidence._prepare_authenticated_retention_replay_consumption_locked(
-                            retention_scope,
-                            exact_retention_gate,
-                        )
-                    published_status = _ReplayStatus(
-                        generation=base_generation + 1,
-                        phase=_ReplayPhase.PUBLISHED,
-                        reservation_present=False,
+                    capability = object.__new__(_StagedV2Replay)
+                    binding = _StagedReplayBinding(
+                        capability=capability,
+                        through=through,
+                        through_key=through_key,
+                        retention_scope=retention_scope,
+                        reservation=reservation,
+                        live_connection=connection,
+                        authority=authority,
+                        acceptance_cursor=acceptance_cursor,
+                        source_snapshot=source_snapshot,
+                        ack_snapshot=ack_snapshot,
+                        journal_snapshot=journal_snapshot,
+                        snapshot=snapshot,
+                        computation=computation,
+                        hydrated_connection=hydrated_connection,
+                        report=report,
                     )
-                    if _fault_phase is _ReplayFaultPhase.PRE_COMMIT:
-                        raise KeyboardInterrupt(
-                            "injected replay pre-commit failure"
-                        )
-
-                    owned_ack_snapshot = ack_snapshot
-                    ack_snapshot = None
-                    _close_replay_ack_snapshot(owned_ack_snapshot)
-                    owned_source_snapshot = source_snapshot
-                    source_snapshot = None
-                    _close_replay_source_snapshot(owned_source_snapshot)
-                    connection.close()
-                    _rebuild_correlation_projection_authority(
-                        authority,
-                        computation.terminal_predecessor,
-                    )
+                    staged_binding = binding
                     with self._replay_state_lock:
-                        if self._replay_reservation is not reservation:
+                        if (
+                            self._replay_reservation is not reservation
+                            or self._staged_replay is not None
+                        ):
                             raise ProjectionAuthorityError(
                                 "Projection V2 replay reservation changed "
-                                "before commit"
+                                "before staging"
                             )
-                        # Keep the final edge non-raising and publish status last:
-                        # PUBLISHED must imply exact retention consumption.
-                        if retention_consumption is not None:
-                            self._evidence._commit_prevalidated_retention_replay_consumption_locked(
-                                retention_consumption
+                        self._staged_replay = binding
+                        if _fault_phase is _ReplayFaultPhase.STAGE_HANDOFF:
+                            raise KeyboardInterrupt(
+                                "injected replay stage handoff failure"
                             )
-                        self._connection = hydrated_connection
-                        hydrated_connection = None
-                        self._generation = base_generation + 1
-                        self._replay_reservation = None
-                        self._replay_status = published_status
-                    published = True
-                    return report
+                        self._set_replay_status_locked(
+                            _ReplayStatus(
+                                generation=base_generation,
+                                phase=_ReplayPhase.STAGED,
+                                reservation_present=True,
+                            )
+                        )
+                    # The owner binding, not the returned capability, now owns all
+                    # staged connections, descriptors, snapshots and retention.
+                    hydrated_connection = None
+                    ack_snapshot = None
+                    source_snapshot = None
+                    retention_scope = None
+                    staged = True
+                    return capability
         except (
             AckJournalError,
             CorrelationProjectionError,
@@ -4316,6 +4600,25 @@ class _V2ProjectionOwner:
             raise
         finally:
             cleanup_errors: list[BaseException] = []
+            # Installing the binding is the ownership handoff. Detect that
+            # owner-side fact directly: an asynchronous exception may arrive
+            # after the install but before the local ``staged`` marker or any
+            # individual local reference is cleared.
+            if primary_error is not None and staged_binding is not None:
+                with self._mutex:
+                    if self._staged_replay is staged_binding:
+                        hydrated_connection = None
+                        ack_snapshot = None
+                        source_snapshot = None
+                        retention_scope = None
+                        reservation = None
+                        self._discard_staged_replay_locked(
+                            staged_binding,
+                            primary_error,
+                            unhealthy=False,
+                        )
+                        staged_binding = None
+                        staged = False
             try:
                 self._acknowledgements._drain_replay_corruption_fences(
                     primary_error
@@ -4357,7 +4660,7 @@ class _V2ProjectionOwner:
                     )
                 except BaseException as error:  # noqa: BLE001
                     cleanup_errors.append(error)
-            if not published:
+            if not staged:
                 with self._replay_state_lock:
                     if reservation is not None:
                         failure_phase = self._replay_status.phase
@@ -4376,16 +4679,862 @@ class _V2ProjectionOwner:
                         self._replay_state_condition.notify_all()
             if cleanup_errors:
                 if primary_error is not None:
+                    with self._mutex:
+                        self._latch_unhealthy(primary_error)
                     for cleanup_error in cleanup_errors:
                         primary_error.add_note(
                             "Projection V2 replay cleanup failure: "
                             f"{type(cleanup_error).__name__}: {cleanup_error}"
                         )
                 else:
-                    raise BaseExceptionGroup(
+                    cleanup_group = BaseExceptionGroup(
                         "Projection V2 replay cleanup failed",
                         cleanup_errors,
                     )
+                    if staged and staged_binding is not None:
+                        with self._mutex:
+                            if self._staged_replay is staged_binding:
+                                self._discard_staged_replay_locked(
+                                    staged_binding,
+                                    cleanup_group,
+                                    unhealthy=True,
+                                )
+                    raise cleanup_group
+
+    def _require_staged_replay_locked(
+        self,
+        capability: _StagedV2Replay,
+    ) -> _StagedReplayBinding:
+        binding = self._staged_replay
+        with self._replay_state_lock:
+            if (
+                type(capability) is not _StagedV2Replay
+                or binding is None
+                or binding.capability is not capability
+                or self._replay_reservation is not binding.reservation
+                or self._replay_status.phase is not _ReplayPhase.STAGED
+                or not self._replay_status.reservation_present
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 staged replay capability is not current"
+                )
+        if self._closed or not self._healthy:
+            raise ProjectionUnhealthy("Projection V2 owner is not usable")
+        return binding
+
+    def _revalidate_staged_replay_locked(
+        self,
+        binding: _StagedReplayBinding,
+        retention_gate: _AuthenticatedRetentionReplayGate | None,
+        correlation_binding: _ProjectionAuthorityBinding,
+    ) -> None:
+        source_snapshot = binding.source_snapshot
+        ack_snapshot = binding.ack_snapshot
+        hydrated = binding.hydrated_connection
+        if (
+            type(binding) is not _StagedReplayBinding
+            or self._staged_replay is not binding
+            or self._connection is not binding.live_connection
+            or self._authority is not binding.authority
+            or self._generation != binding.reservation.base_generation
+            or source_snapshot is None
+            or ack_snapshot is None
+            or hydrated is None
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 staged replay owner binding changed"
+            )
+        with self._replay_state_lock:
+            if (
+                self._replay_reservation is not binding.reservation
+                or binding.reservation.publish_generation
+                != binding.reservation.base_generation + 1
+                or binding.reservation.through_key != binding.through_key
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 staged replay reservation changed"
+                )
+        if (
+            _healthy_replay_acceptance_cursor_v2(
+                self._evidence,
+                self._evidence_lifecycle,
+                binding.retention_scope,
+            )
+            != binding.acceptance_cursor
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 staged replay acceptance changed"
+            )
+        self._evidence._revalidate_replay_source_locked(source_snapshot)
+        if binding.retention_scope is not None:
+            current_retention_facts = _bind_retention_replay_scope_v2(
+                self._evidence,
+                binding.retention_scope,
+                source_snapshot,
+                retention_gate,
+            )
+            if current_retention_facts != binding.snapshot.retention_facts:
+                raise ProjectionAuthorityError(
+                    "Projection V2 staged retention facts changed"
+                )
+        elif retention_gate is not None:
+            raise ProjectionAuthorityError(
+                "Projection V2 staged retention gate was substituted"
+            )
+        self._acknowledgements._revalidate_replay_ack_locked(ack_snapshot)
+        _revalidate_correlation_replay_locked(
+            binding.authority,
+            correlation_binding,
+            binding.snapshot.correlation,
+        )
+        _revalidate_correlation_journal_replay_locked(
+            self._journal,
+            binding.journal_snapshot,
+        )
+        report = binding.report
+        computation = binding.computation
+        cursor = _current_v2_cursor(hydrated)
+        if (
+            computation.terminal_predecessor.generation
+            != binding.reservation.publish_generation
+            or report.applied_count != computation.transcript_count
+            or report.prefix_sha256 != computation.prefix_sha256
+            or report.cursor != cursor
+            or (cursor is None) != (binding.through is None)
+            or _v2_snapshot_hash(hydrated) != computation.prefix_sha256
+            or hydrated.serialize() != computation.database_image
+        ):
+            raise ProjectionConflict(
+                "Projection V2 staged replay facts changed"
+            )
+        through = binding.through
+        if through is not None and (
+            cursor is None
+            or cursor.source_sequence != through.source_sequence
+            or cursor.event_id != through.event_id
+            or cursor.content_sha256 != through.content_sha256
+        ):
+            raise ProjectionConflict(
+                "Projection V2 staged replay cursor changed"
+            )
+
+    def _discard_staged_replay_locked(
+        self,
+        binding: _StagedReplayBinding,
+        primary: BaseException | None,
+        *,
+        unhealthy: bool,
+    ) -> None:
+        errors: list[BaseException] = []
+        with self._replay_state_lock:
+            failure_phase = self._replay_status.phase
+            if self._staged_replay is binding:
+                self._staged_replay = None
+            if self._replay_reservation is binding.reservation:
+                self._replay_reservation = None
+            self._set_replay_status_locked(
+                _ReplayStatus(
+                    generation=binding.reservation.base_generation,
+                    phase=_ReplayPhase.FAILED,
+                    reservation_present=False,
+                    failure_phase=failure_phase,
+                )
+            )
+            if self._replay_test_barrier is not None:
+                self._replay_test_barrier = None
+                self._replay_state_condition.notify_all()
+
+        materialized = binding.materialized_connection
+        binding.materialized_connection = None
+        if materialized is not None:
+            try:
+                materialized.close()
+            except BaseException as error:  # noqa: BLE001 - exact owned target
+                errors.append(error)
+        physical = binding.materialized_physical
+        binding.materialized_physical = None
+        if physical is not None and physical.descriptor >= 0:
+            descriptor = physical.descriptor
+            physical.descriptor = -1
+            try:
+                os.close(descriptor)
+            except BaseException as error:  # noqa: BLE001 - exact owned descriptor
+                errors.append(error)
+        hydrated = binding.hydrated_connection
+        binding.hydrated_connection = None
+        if hydrated is not None and hydrated is not materialized:
+            try:
+                hydrated.close()
+            except BaseException as error:  # noqa: BLE001 - exact staged image
+                errors.append(error)
+        ack_snapshot = binding.ack_snapshot
+        binding.ack_snapshot = None
+        if ack_snapshot is not None:
+            try:
+                _close_replay_ack_snapshot(ack_snapshot)
+            except BaseException as error:  # noqa: BLE001 - exact snapshot
+                errors.append(error)
+        source_snapshot = binding.source_snapshot
+        binding.source_snapshot = None
+        if source_snapshot is not None:
+            try:
+                _close_replay_source_snapshot(source_snapshot)
+            except BaseException as error:  # noqa: BLE001 - exact snapshot
+                errors.append(error)
+        scope = binding.retention_scope
+        if (
+            scope is not None
+            and self._evidence._authenticated_retention_replay_scope_is_active(
+                scope
+            )
+        ):
+            try:
+                self._evidence._release_authenticated_retention_replay_scope(
+                    scope
+                )
+            except BaseException as error:  # noqa: BLE001 - exact active scope
+                errors.append(error)
+        try:
+            self._acknowledgements._drain_replay_corruption_fences(primary)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        try:
+            self._journal._drain_replay_corruption_fences(primary)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        if unhealthy or errors:
+            self._latch_unhealthy(
+                primary if primary is not None else (errors[0] if errors else None)
+            )
+        if errors:
+            if primary is not None:
+                for cleanup_issue in errors:
+                    primary.add_note(
+                        "Projection V2 staged cleanup failure: "
+                        f"{type(cleanup_issue).__name__}: {cleanup_issue}"
+                    )
+            else:
+                raise BaseExceptionGroup(
+                    "Projection V2 staged cleanup failed",
+                    errors,
+                )
+
+    def _abort_staged_replay(
+        self,
+        capability: _StagedV2Replay,
+        *,
+        _factory: object,
+    ) -> None:
+        if _factory is not _STAGED_REPLAY_FACTORY:
+            raise ProjectionAuthorityError(
+                "Projection V2 staged abort is factory-only"
+            )
+        with self._mutex:
+            binding = self._require_staged_replay_locked(capability)
+            self._discard_staged_replay_locked(
+                binding,
+                None,
+                unhealthy=False,
+            )
+
+    def _copy_staged_replay_into(
+        self,
+        capability: _StagedV2Replay,
+        target: sqlite3.Connection,
+        *,
+        _factory: object,
+    ) -> _StagedV2ImageSeal:
+        if (
+            _factory is not _STAGED_REPLAY_FACTORY
+            or type(target) is not sqlite3.Connection
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 staged materialization is factory-only"
+            )
+        binding: _StagedReplayBinding | None = None
+        physical: _StagedV2PhysicalBinding | None = None
+        materialization_started = False
+        close_target_on_error = True
+        try:
+            with self._mutex:
+                binding = self._require_staged_replay_locked(capability)
+                if (
+                    binding.materialized_connection is not None
+                    or binding.materialized_seal is not None
+                ):
+                    if target is binding.materialized_connection:
+                        close_target_on_error = False
+                    raise ProjectionAuthorityError(
+                        "Projection V2 staged image is already materialized"
+                    )
+                if (
+                    target is binding.live_connection
+                    or target is binding.hydrated_connection
+                ):
+                    close_target_on_error = False
+                    raise ProjectionConflict(
+                        "Projection V2 materialization target is not exact empty"
+                    )
+                if target.in_transaction:
+                    raise ProjectionConflict(
+                        "Projection V2 materialization target is not exact empty"
+                    )
+                materialization_started = True
+                database_path = _v2_exact_main_database_path(
+                    target,
+                    require_file_backed=True,
+                )
+                existing = target.execute(
+                    "SELECT type,name FROM sqlite_schema "
+                    "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+                ).fetchall()
+                if existing:
+                    raise ProjectionConflict(
+                        "Projection V2 materialization target is not empty"
+                    )
+                source = binding.hydrated_connection
+                if source is None:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 staged image was lost"
+                    )
+                source.backup(target)
+                _configure_v2_connection(
+                    target,
+                    file_backed=bool(database_path),
+                )
+                _verify_v2_schema(target)
+                cursor = _current_v2_cursor(target)
+                prefix_sha256 = _v2_snapshot_hash(target)
+                table_counts = _v2_table_counts(target)
+                if (
+                    cursor != binding.report.cursor
+                    or prefix_sha256 != binding.report.prefix_sha256
+                    or table_counts != _v2_table_counts(source)
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 materialized image changed"
+                    )
+                physical = _capture_staged_v2_physical_binding(database_path)
+                seal = object.__new__(_StagedV2ImageSeal)
+                object.__setattr__(seal, "cursor", cursor)
+                object.__setattr__(
+                    seal,
+                    "applied_count",
+                    binding.report.applied_count,
+                )
+                object.__setattr__(seal, "prefix_sha256", prefix_sha256)
+                object.__setattr__(seal, "table_counts", table_counts)
+                binding.materialized_connection = target
+                binding.materialized_seal = seal
+                binding.materialized_physical = physical
+                physical = None
+                return seal
+        except BaseException as primary:
+            target_cleanup_failed = False
+            if physical is not None and physical.descriptor >= 0:
+                descriptor = physical.descriptor
+                physical.descriptor = -1
+                try:
+                    os.close(descriptor)
+                except BaseException as error:  # noqa: BLE001 - adopted descriptor
+                    target_cleanup_failed = True
+                    primary.add_note(
+                        "Projection V2 target descriptor cleanup failure: "
+                        f"{type(error).__name__}: {error}"
+                    )
+            if close_target_on_error:
+                try:
+                    target.close()
+                except BaseException as error:  # noqa: BLE001 - adopted target
+                    target_cleanup_failed = True
+                    primary.add_note(
+                        "Projection V2 target cleanup failure: "
+                        f"{type(error).__name__}: {error}"
+                    )
+            if binding is not None and materialization_started:
+                with self._mutex:
+                    if self._staged_replay is binding:
+                        self._discard_staged_replay_locked(
+                            binding,
+                            primary,
+                            unhealthy=target_cleanup_failed,
+                        )
+            raise
+
+    def _validate_materialized_replay_locked(
+        self,
+        binding: _StagedReplayBinding,
+        seal: _StagedV2ImageSeal,
+    ) -> None:
+        target = binding.materialized_connection
+        hydrated = binding.hydrated_connection
+        physical = binding.materialized_physical
+        if (
+            type(seal) is not _StagedV2ImageSeal
+            or binding.materialized_seal is not seal
+            or target is None
+            or hydrated is None
+            or physical is None
+            or target.in_transaction
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 staged image seal is not current"
+            )
+        _verify_v2_schema(target)
+        _revalidate_staged_v2_physical_binding(physical)
+        expected_counts = _v2_table_counts(hydrated)
+        if (
+            seal.cursor != binding.report.cursor
+            or seal.applied_count != binding.report.applied_count
+            or seal.prefix_sha256 != binding.report.prefix_sha256
+            or seal.table_counts != expected_counts
+            or _current_v2_cursor(target) != seal.cursor
+            or _v2_snapshot_hash(target) != seal.prefix_sha256
+            or _v2_table_counts(target) != seal.table_counts
+        ):
+            raise ProjectionConflict(
+                "Projection V2 staged materialization seal changed"
+            )
+
+    def _validate_reopened_replay_locked(
+        self,
+        binding: _StagedReplayBinding,
+        seal: _StagedV2ImageSeal,
+        reopened: sqlite3.Connection,
+    ) -> None:
+        hydrated = binding.hydrated_connection
+        physical = binding.materialized_physical
+        if (
+            type(reopened) is not sqlite3.Connection
+            or binding.materialized_seal is not seal
+            or hydrated is None
+            or physical is None
+            or reopened is binding.live_connection
+            or reopened is hydrated
+            or reopened is binding.materialized_connection
+            or reopened.in_transaction
+        ):
+            raise ProjectionConflict(
+                "Projection V2 publisher did not return one reopened image"
+            )
+        published_path = _v2_exact_main_database_path(
+            reopened,
+            require_file_backed=True,
+        )
+        _revalidate_staged_v2_physical_binding(
+            physical,
+            published_path=published_path,
+        )
+        _verify_v2_schema(reopened)
+        cursor = _current_v2_cursor(reopened)
+        self._validate_cursor_evidence(reopened, cursor)
+        expected_counts = _v2_table_counts(hydrated)
+        if (
+            cursor != seal.cursor
+            or cursor != binding.report.cursor
+            or seal.applied_count != binding.report.applied_count
+            or seal.prefix_sha256 != binding.report.prefix_sha256
+            or seal.table_counts != expected_counts
+            or _v2_snapshot_hash(reopened) != binding.report.prefix_sha256
+            or _v2_table_counts(reopened) != expected_counts
+        ):
+            raise ProjectionConflict(
+                "Projection V2 reopened image differs from its staged seal"
+            )
+
+    def _commit_staged_replay(
+        self,
+        capability: _StagedV2Replay,
+        *,
+        seal: _StagedV2ImageSeal | None,
+        publisher: Callable[[_NamespacePublicationLatch], sqlite3.Connection]
+        | None,
+        direct: bool,
+        _fault_phase: _ReplayFaultPhase | None,
+    ) -> _UnpublishedV2ReplayReport:
+        candidate: sqlite3.Connection | None = None
+        committed = False
+        owner_irreversible = False
+        namespace_state: _NamespacePublicationState | None = None
+        namespace_latch: _NamespacePublicationLatch | None = None
+        with self._mutex:
+            binding = self._require_staged_replay_locked(capability)
+            try:
+                # Corruption fences are documented to drain outside the ordered
+                # replay gate stack. No fallible drain remains after publication.
+                self._acknowledgements._drain_replay_corruption_fences(None)
+                self._journal._drain_replay_corruption_fences(None)
+                retention_gate_context = (
+                    nullcontext(None)
+                    if binding.retention_scope is None
+                    else self._evidence._authenticated_retention_replay_scope_gate(
+                        binding.retention_scope,
+                        cast(EvidenceRef, binding.through),
+                    )
+                )
+                with (
+                    retention_gate_context as retention_gate,
+                    self._evidence._replay_source_snapshot_gate(),
+                    self._acknowledgements._replay_ack_snapshot_gate(),
+                    _correlation_projection_snapshot_gate(
+                        binding.authority
+                    ) as correlation_binding,
+                    _correlation_journal_replay_gate(self._journal),
+                ):
+                    with self._replay_state_lock:
+                        if (
+                            self._staged_replay is not binding
+                            or self._replay_reservation is not binding.reservation
+                        ):
+                            raise ProjectionAuthorityError(
+                                "Projection V2 staged replay changed before commit"
+                            )
+                        self._set_replay_status_locked(
+                            _ReplayStatus(
+                                generation=binding.reservation.base_generation,
+                                phase=_ReplayPhase.VALIDATING,
+                                reservation_present=True,
+                            )
+                        )
+                    self._revalidate_staged_replay_locked(
+                        binding,
+                        retention_gate,
+                        correlation_binding,
+                    )
+                    if direct:
+                        if seal is not None or publisher is not None:
+                            raise ProjectionAuthorityError(
+                                "Projection V2 direct staged commit was substituted"
+                            )
+                    else:
+                        if seal is None or publisher is None:
+                            raise ProjectionAuthorityError(
+                                "Projection V2 durable publisher is incomplete"
+                            )
+                        self._validate_materialized_replay_locked(binding, seal)
+                    if _fault_phase is _ReplayFaultPhase.PUBLISH:
+                        raise KeyboardInterrupt("injected replay publish failure")
+                    if _fault_phase is _ReplayFaultPhase.PRE_COMMIT:
+                        raise KeyboardInterrupt(
+                            "injected replay pre-commit failure"
+                        )
+
+                    if direct:
+                        candidate = binding.hydrated_connection
+                        if candidate is None:
+                            raise ProjectionAuthorityError(
+                                "Projection V2 direct staged image was lost"
+                            )
+                    else:
+                        assert seal is not None
+                        assert publisher is not None
+                        namespace_state = _NamespacePublicationState()
+                        latch = object.__new__(_NamespacePublicationLatch)
+                        namespace_state.latch = latch
+                        namespace_latch = latch
+                        _NAMESPACE_PUBLICATION_STATES[latch] = namespace_state
+                        candidate = publisher(latch)
+                        if _fault_phase is _ReplayFaultPhase.POST_CALLBACK:
+                            raise KeyboardInterrupt(
+                                "injected replay post-callback failure"
+                            )
+                        observed_latch_state = _NAMESPACE_PUBLICATION_STATES.pop(
+                            latch,
+                            None,
+                        )
+                        namespace_latch = None
+                        self._revalidate_staged_replay_locked(
+                            binding,
+                            retention_gate,
+                            correlation_binding,
+                        )
+                        if (
+                            observed_latch_state is not namespace_state
+                            or namespace_state.latch is not latch
+                            or namespace_state.marked is not True
+                        ):
+                            raise ProjectionAuthorityError(
+                                "Projection V2 publisher did not latch namespace"
+                            )
+                        self._validate_reopened_replay_locked(
+                            binding,
+                            seal,
+                            candidate,
+                        )
+
+                    retention_consumption = None
+                    if binding.retention_scope is not None:
+                        retention_consumption = self._evidence._prepare_authenticated_retention_replay_consumption_locked(
+                            binding.retention_scope,
+                            cast(
+                                _AuthenticatedRetentionReplayGate,
+                                retention_gate,
+                            ),
+                        )
+                    published_status = _ReplayStatus(
+                        generation=binding.reservation.publish_generation,
+                        phase=_ReplayPhase.PUBLISHED,
+                        reservation_present=False,
+                    )
+
+                    ack_snapshot = binding.ack_snapshot
+                    if ack_snapshot is None:
+                        raise ProjectionAuthorityError(
+                            "Projection V2 staged ACK snapshot was lost"
+                        )
+                    _close_replay_ack_snapshot(ack_snapshot)
+                    binding.ack_snapshot = None
+                    source_snapshot = binding.source_snapshot
+                    if source_snapshot is None:
+                        raise ProjectionAuthorityError(
+                            "Projection V2 staged source snapshot was lost"
+                        )
+                    _close_replay_source_snapshot(source_snapshot)
+                    binding.source_snapshot = None
+                    if not direct:
+                        materialized = binding.materialized_connection
+                        if materialized is not None:
+                            materialized.close()
+                            binding.materialized_connection = None
+                        hydrated = binding.hydrated_connection
+                        if hydrated is not None:
+                            hydrated.close()
+                            binding.hydrated_connection = None
+                        physical = binding.materialized_physical
+                        if physical is None or physical.descriptor < 0:
+                            raise ProjectionAuthorityError(
+                                "Projection V2 materialized descriptor was lost"
+                            )
+                        descriptor = physical.descriptor
+                        physical.descriptor = -1
+                        binding.materialized_physical = None
+                        os.close(descriptor)
+
+                    with self._replay_state_lock:
+                        if (
+                            self._staged_replay is not binding
+                            or self._replay_reservation is not binding.reservation
+                        ):
+                            raise ProjectionAuthorityError(
+                                "Projection V2 staged replay changed at final edge"
+                            )
+                    # Every fallible and higher-lock preparation is complete
+                    # before the final replay-state edge. Any failure from here
+                    # is irreversible and revokes the owner.
+                    owner_irreversible = True
+                    binding.live_connection.close()
+                    _rebuild_correlation_projection_authority(
+                        binding.authority,
+                        binding.computation.terminal_predecessor,
+                    )
+                    with self._replay_state_lock:
+                        if retention_consumption is not None:
+                            self._evidence._commit_prevalidated_retention_replay_consumption_locked(
+                                retention_consumption
+                            )
+                        if direct:
+                            binding.hydrated_connection = None
+                        self._connection = candidate
+                        candidate = None
+                        self._generation = binding.reservation.publish_generation
+                        self._staged_replay = None
+                        self._replay_reservation = None
+                        binding.materialized_seal = None
+                        committed = True
+                        # Observable publication is deliberately the last write.
+                        self._replay_status = published_status
+                        return binding.report
+            except (
+                AckJournalError,
+                CorrelationProjectionError,
+                CorrelationRequestJournalError,
+                EvidenceStoreError,
+            ) as error:
+                converted = ProjectionAuthorityError(
+                    "Projection V2 staged publication authority changed"
+                )
+                if committed:
+                    self._latch_unhealthy(converted)
+                else:
+                    post_namespace = (
+                        namespace_state is not None
+                        and namespace_state.marked is True
+                    )
+                    latch_cleanup_failed = False
+                    if namespace_latch is not None:
+                        try:
+                            observed = _NAMESPACE_PUBLICATION_STATES.pop(
+                                namespace_latch,
+                                None,
+                            )
+                            if observed is not namespace_state:
+                                latch_cleanup_failed = True
+                        except BaseException as cleanup_error:  # noqa: BLE001
+                            latch_cleanup_failed = True
+                            converted.add_note(
+                                "Projection V2 latch cleanup failure: "
+                                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                            )
+                    candidate_cleanup_failed = False
+                    if (
+                        candidate is not None
+                        and candidate is not binding.live_connection
+                        and candidate is not binding.hydrated_connection
+                        and candidate is not binding.materialized_connection
+                    ):
+                        try:
+                            candidate.close()
+                        except BaseException as cleanup_error:  # noqa: BLE001
+                            candidate_cleanup_failed = True
+                            converted.add_note(
+                                "Projection V2 reopened cleanup failure: "
+                                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                            )
+                    self._discard_staged_replay_locked(
+                        binding,
+                        converted,
+                        unhealthy=(
+                            owner_irreversible
+                            or post_namespace
+                            or latch_cleanup_failed
+                            or candidate_cleanup_failed
+                        ),
+                    )
+                raise converted from error
+            except BaseException as error:
+                if committed:
+                    self._latch_unhealthy(error)
+                else:
+                    post_namespace = (
+                        namespace_state is not None
+                        and namespace_state.marked is True
+                    )
+                    latch_cleanup_failed = False
+                    if namespace_latch is not None:
+                        try:
+                            observed = _NAMESPACE_PUBLICATION_STATES.pop(
+                                namespace_latch,
+                                None,
+                            )
+                            if observed is not namespace_state:
+                                latch_cleanup_failed = True
+                        except BaseException as cleanup_error:  # noqa: BLE001
+                            latch_cleanup_failed = True
+                            error.add_note(
+                                "Projection V2 latch cleanup failure: "
+                                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                            )
+                    candidate_cleanup_failed = False
+                    if (
+                        candidate is not None
+                        and candidate is not binding.live_connection
+                        and candidate is not binding.hydrated_connection
+                        and candidate is not binding.materialized_connection
+                    ):
+                        try:
+                            candidate.close()
+                        except BaseException as cleanup_error:  # noqa: BLE001
+                            candidate_cleanup_failed = True
+                            error.add_note(
+                                "Projection V2 reopened cleanup failure: "
+                                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                            )
+                    self._discard_staged_replay_locked(
+                        binding,
+                        error,
+                        unhealthy=(
+                            owner_irreversible
+                            or post_namespace
+                            or latch_cleanup_failed
+                            or candidate_cleanup_failed
+                        ),
+                    )
+                raise
+
+    def _publish_staged_replay(
+        self,
+        capability: _StagedV2Replay,
+        seal: _StagedV2ImageSeal,
+        publisher: Callable[[_NamespacePublicationLatch], sqlite3.Connection],
+        *,
+        _factory: object,
+        _fault_phase: _ReplayFaultPhase | None = None,
+    ) -> _UnpublishedV2ReplayReport:
+        if (
+            _factory is not _STAGED_REPLAY_FACTORY
+            or type(seal) is not _StagedV2ImageSeal
+            or not callable(publisher)
+            or (
+                _fault_phase is not None
+                and (
+                    type(_fault_phase) is not _ReplayFaultPhase
+                    or _fault_phase
+                    not in (
+                        _ReplayFaultPhase.PUBLISH,
+                        _ReplayFaultPhase.POST_CALLBACK,
+                        _ReplayFaultPhase.PRE_COMMIT,
+                    )
+                )
+            )
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 durable publication is factory-only"
+            )
+        return self._commit_staged_replay(
+            capability,
+            seal=seal,
+            publisher=publisher,
+            direct=False,
+            _fault_phase=_fault_phase,
+        )
+
+    def _replay_unpublished_prefix(
+        self,
+        through: EvidenceRef | None,
+        *,
+        _factory: object,
+        retention_completion: AuthenticatedRetentionUnlinkCompletion | None = None,
+        _fault_phase: _ReplayFaultPhase | None = None,
+    ) -> _UnpublishedV2ReplayReport:
+        if (
+            _factory is not _UNPUBLISHED_REPLAY_FACTORY
+            or (through is not None and type(through) is not EvidenceRef)
+            or (
+                retention_completion is not None
+                and type(retention_completion)
+                is not AuthenticatedRetentionUnlinkCompletion
+            )
+            or (
+                _fault_phase is not None
+                and type(_fault_phase) is not _ReplayFaultPhase
+            )
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 unpublished replay is factory-only"
+            )
+        stage_fault = (
+            _fault_phase
+            if _fault_phase in (_ReplayFaultPhase.FREEZE, _ReplayFaultPhase.COMPUTE)
+            else None
+        )
+        commit_fault = (
+            _fault_phase
+            if _fault_phase in (_ReplayFaultPhase.PUBLISH, _ReplayFaultPhase.PRE_COMMIT)
+            else None
+        )
+        capability = self._stage_unpublished_prefix(
+            through,
+            retention_completion=retention_completion,
+            _factory=_STAGED_REPLAY_FACTORY,
+            _fault_phase=stage_fault,
+        )
+        return self._commit_staged_replay(
+            capability,
+            seal=None,
+            publisher=None,
+            direct=True,
+            _fault_phase=commit_fault,
+        )
 
     def _revalidate_transaction_predecessor(
         self,

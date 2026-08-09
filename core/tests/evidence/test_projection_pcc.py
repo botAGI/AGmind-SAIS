@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib
 import os
+import pickle
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -175,6 +177,100 @@ def _owner(
         step_hook=step_hook,
     )
     return owner, connection
+
+
+def _durable_unpublished_case(
+    subject: Any,
+    path: Path,
+) -> tuple[Any, sqlite3.Connection, Any, EvidenceRef]:
+    coordinator, proof = _accepted_complete(path, ttl_seconds=120)
+    store = coordinator.segment_store
+    journal = CorrelationRequestJournal.create_new(store)
+    _complete_journal(journal, proof)
+    owner, connection = _owner(subject, coordinator, journal)
+    records = tuple(store.iter_authenticated_records())
+    return owner, connection, store, records[-1].ref
+
+
+def _durable_retention_case(
+    subject: Any,
+    path: Path,
+) -> dict[str, Any]:
+    retention = importlib.import_module("tests.evidence.test_retention")
+    key, acceptance, store, coverage = retention._live_store_with_active_routine(
+        path
+    )
+    journal = CorrelationRequestJournal.create_new(store)
+    acknowledgements = store._ack_journal_owner
+    assert type(acknowledgements) is AckJournal
+    connection = subject._v2_connection_for_test()
+    owner = subject._v2_projection_owner_for_test(
+        connection,
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+    )
+    selected_snapshot = store._freeze_retention_snapshot(
+        retention._proof_clock(),
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    decision = retention.select_retention(
+        selected_snapshot,
+        request_id=retention.REQUEST_ID,
+    )
+    request = decision.request
+    assert request is not None
+    retention_journal = retention.retention_module._open_retention_state_journal(
+        store
+    )
+    retention_journal.prepare_publication(decision)
+    target_item = retention._item(
+        envelope_value(
+            key,
+            sequence=3,
+            event_type="retention_tombstone",
+            normalized_fields=request.model_dump(mode="python"),
+        )
+    )
+    target_ref = acceptance.accept(target_item)
+    coverage._apply_live_accepted(store, target_ref, None)
+    acknowledgements.record_pending(target_ref)
+    acknowledgements.record_confirmed(target_ref)
+    target = retention.retention_module.RetentionTargetV1(
+        sequence=target_item.sequence,
+        event_id=target_item.event_id,
+        content_sha256=target_item.content_sha256,
+    )
+    retention_journal.bind_target(target)
+    retention_journal.advance_evidence_appended(target)
+    final_snapshot = store._freeze_retention_snapshot(
+        retention._proof_clock(seconds=1),
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    tombstone = store._authenticate_retention_tombstone(
+        retention_journal,
+        final_snapshot,
+        target_ref,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    completion = store._execute_authenticated_retention_unlink(
+        tombstone,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    surviving = tuple(
+        store.iter_authenticated_records(through=target_ref.source_sequence)
+    )
+    return {
+        "retention": retention,
+        "store": store,
+        "coverage": coverage,
+        "owner": owner,
+        "connection": connection,
+        "completion": completion,
+        "target_ref": target_ref,
+        "surviving": surviving,
+    }
 
 
 def _accepted_failed_120(path: Path) -> tuple[Any, AuthenticatedPCCInput]:
@@ -1235,6 +1331,683 @@ def test_unpublished_replay_requires_exact_retention_completion(
     finally:
         fault_coverage.close()
         fault_owner.close()
+
+
+def test_durable_stage_does_not_publish_or_consume_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    case = _durable_retention_case(subject, tmp_path / "evidence")
+    owner = case["owner"]
+    connection = case["connection"]
+    store = case["store"]
+    target_ref = case["target_ref"]
+    completion = case["completion"]
+    authority_before = owner._authority
+    predecessor_before = subject._predecessor_v2(1, None)
+    stage = owner._stage_unpublished_prefix(
+        target_ref,
+        retention_completion=completion,
+        _factory=subject._STAGED_REPLAY_FACTORY,
+    )
+    try:
+        replay_status = owner._replay_status_for_test()
+        assert replay_status.phase is subject._ReplayPhase.STAGED
+        assert replay_status.generation == 1
+        assert replay_status.reservation_present is True
+        assert owner._generation == 1
+        assert owner._connection is connection
+        assert owner._authority is authority_before
+        subject._validate_correlation_projection_predecessor(
+            authority_before,
+            predecessor_before,
+        )
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        assert store._authenticated_retention_replay_scope is not None
+        assert store._authenticated_retention_replay_consumed is None
+        with pytest.raises(ProjectionAuthorityError):
+            owner.status()
+        with pytest.raises(ProjectionAuthorityError):
+            owner.snapshot_hash()
+        with pytest.raises(ProjectionAuthorityError):
+            owner.apply(next(store.iter_authenticated_records()))
+        with pytest.raises(ProjectionAuthorityError):
+            owner._replay_unpublished_prefix(
+                target_ref,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+            )
+        with pytest.raises(ProjectionAuthorityError):
+            owner.close()
+        with pytest.raises(EvidenceSealError):
+            store._capture_authenticated_retention_replay_scope(
+                completion,
+                target_ref,
+            )
+    finally:
+        owner._abort_staged_replay(
+            stage,
+            _factory=subject._STAGED_REPLAY_FACTORY,
+        )
+
+    assert owner._generation == 1
+    assert owner._connection is connection
+    assert owner._authority is authority_before
+    subject._validate_correlation_projection_predecessor(
+        authority_before,
+        predecessor_before,
+    )
+    assert store._authenticated_retention_replay_scope is None
+    assert store._authenticated_retention_replay_consumed is None
+    report = owner._replay_unpublished_prefix(
+        target_ref,
+        retention_completion=completion,
+        _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+    )
+    assert report.applied_count == len(case["surviving"])
+    store._finalize_authenticated_retention_completion(
+        completion,
+        _factory=segments_module._RETENTION_PROOF_FACTORY,
+    )
+    case["coverage"].close()
+    owner.close()
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ("stage", "handoff", "materialize", "publisher"),
+)
+def test_durable_stage_abort_releases_exact_resources_and_allows_actual_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    case_root = tmp_path / failure_kind
+    case_root.mkdir()
+    owner, connection, _store, through = _durable_unpublished_case(
+        subject,
+        case_root / "evidence",
+    )
+    authority_before = owner._authority
+    predecessor_before = subject._predecessor_v2(1, None)
+    candidate: sqlite3.Connection | None = None
+    stage: Any | None = None
+    try:
+        if failure_kind in ("stage", "handoff"):
+            with pytest.raises(KeyboardInterrupt):
+                owner._stage_unpublished_prefix(
+                    through,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                    _fault_phase=(
+                        subject._ReplayFaultPhase.COMPUTE
+                        if failure_kind == "stage"
+                        else subject._ReplayFaultPhase.STAGE_HANDOFF
+                    ),
+                )
+        else:
+            stage = owner._stage_unpublished_prefix(
+                through,
+                _factory=subject._STAGED_REPLAY_FACTORY,
+            )
+            candidate = sqlite3.connect(
+                case_root / "candidate.sqlite3",
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            if failure_kind == "materialize":
+                candidate.execute("CREATE TABLE attacker(value TEXT)")
+                with pytest.raises(subject.ProjectionConflict):
+                    owner._copy_staged_replay_into(
+                        stage,
+                        candidate,
+                        _factory=subject._STAGED_REPLAY_FACTORY,
+                    )
+            else:
+                seal = owner._copy_staged_replay_into(
+                    stage,
+                    candidate,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+
+                def crash_before_latch(_latch: Any) -> sqlite3.Connection:
+                    raise KeyboardInterrupt("injected pre-latch publisher failure")
+
+                with pytest.raises(KeyboardInterrupt):
+                    owner._publish_staged_replay(
+                        stage,
+                        seal,
+                        crash_before_latch,
+                        _factory=subject._STAGED_REPLAY_FACTORY,
+                    )
+
+        status = owner._replay_status_for_test()
+        assert owner._staged_replay is None
+        assert status.phase is subject._ReplayPhase.FAILED
+        assert status.reservation_present is False
+        assert owner._generation == 1
+        assert owner._connection is connection
+        assert owner._authority is authority_before
+        assert owner._healthy is True
+        subject._validate_correlation_projection_predecessor(
+            authority_before,
+            predecessor_before,
+        )
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        if candidate is not None:
+            with pytest.raises(sqlite3.ProgrammingError):
+                candidate.execute("SELECT 1")
+        if stage is not None:
+            with pytest.raises(ProjectionAuthorityError):
+                owner._abort_staged_replay(
+                    stage,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+
+        report = owner._replay_unpublished_prefix(
+            through,
+            _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+        )
+        assert report.cursor is not None
+        assert report.cursor.source_sequence == through.source_sequence
+        assert owner._generation == 2
+        assert owner._authority is authority_before
+        assert owner._replay_status_for_test().phase is subject._ReplayPhase.PUBLISHED
+    finally:
+        owner.close()
+
+
+def test_durable_stage_materialization_is_exact_one_shot_and_unforgeable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+    owner, _connection, _store, through = _durable_unpublished_case(
+        subject,
+        tmp_path / "evidence",
+    )
+    stage = owner._stage_unpublished_prefix(
+        through,
+        _factory=subject._STAGED_REPLAY_FACTORY,
+    )
+    target = sqlite3.connect(
+        tmp_path / "candidate.sqlite3",
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    try:
+        assert not hasattr(stage, "connection")
+        assert not hasattr(stage, "database_image")
+        assert not hasattr(stage, "__dict__")
+        with pytest.raises(TypeError):
+            copy.copy(stage)
+        with pytest.raises(TypeError):
+            copy.deepcopy(stage)
+        with pytest.raises((TypeError, pickle.PicklingError)):
+            pickle.dumps(stage)
+
+        forged = object.__new__(type(stage))
+        forged_target = sqlite3.connect(
+            tmp_path / "forged.sqlite3",
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        with pytest.raises(ProjectionAuthorityError):
+            owner._copy_staged_replay_into(
+                forged,
+                forged_target,
+                _factory=subject._STAGED_REPLAY_FACTORY,
+            )
+        with pytest.raises(sqlite3.ProgrammingError):
+            forged_target.execute("SELECT 1")
+
+        seal = owner._copy_staged_replay_into(
+            stage,
+            target,
+            _factory=subject._STAGED_REPLAY_FACTORY,
+        )
+        assert not hasattr(seal, "connection")
+        assert not hasattr(seal, "database_image")
+        assert not hasattr(seal, "__dict__")
+        with pytest.raises(TypeError):
+            copy.copy(seal)
+        with pytest.raises(TypeError):
+            copy.deepcopy(seal)
+        with pytest.raises((TypeError, pickle.PicklingError)):
+            pickle.dumps(seal)
+        subject._verify_v2_schema(target)
+        assert seal.cursor is not None
+        assert seal.cursor.source_sequence == through.source_sequence
+        assert seal.applied_count == through.source_sequence
+        assert seal.prefix_sha256 == subject._v2_snapshot_hash(target)
+        assert seal.table_counts == tuple(
+            (table, target.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            for table, _columns, _primary_key in subject._TABLE_LAYOUT_V2
+        )
+
+        second_target = sqlite3.connect(
+            tmp_path / "laundered.sqlite3",
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        with pytest.raises(ProjectionAuthorityError):
+            owner._copy_staged_replay_into(
+                stage,
+                second_target,
+                _factory=subject._STAGED_REPLAY_FACTORY,
+            )
+        with pytest.raises(sqlite3.ProgrammingError):
+            second_target.execute("SELECT 1")
+
+        target.execute("DELETE FROM candidate_evidence")
+        called = False
+
+        def must_not_publish(_latch: Any) -> sqlite3.Connection:
+            nonlocal called
+            called = True
+            raise AssertionError("mutated staged image reached publisher")
+
+        with pytest.raises(subject.ProjectionConflict):
+            owner._publish_staged_replay(
+                stage,
+                seal,
+                must_not_publish,
+                _factory=subject._STAGED_REPLAY_FACTORY,
+            )
+        assert called is False
+        with pytest.raises(sqlite3.ProgrammingError):
+            target.execute("SELECT 1")
+        with pytest.raises(ProjectionAuthorityError):
+            owner._abort_staged_replay(
+                stage,
+                _factory=subject._STAGED_REPLAY_FACTORY,
+            )
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize(
+    "commit_kind",
+    (
+        "missing_pcc",
+        "unrelated_memory",
+        "temp_shadow",
+        "pre_commit",
+        "post_callback",
+        "post_latch",
+        "armed_no_namespace",
+        "fence_drain",
+        "fd_close_interrupt",
+        "valid_retention",
+    ),
+)
+def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_kind: str,
+) -> None:
+    subject = _subject()
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
+
+    if commit_kind == "valid_retention":
+        case = _durable_retention_case(subject, tmp_path / "evidence")
+        owner = case["owner"]
+        connection = case["connection"]
+        through = case["target_ref"]
+        completion = case["completion"]
+    else:
+        owner, connection, _store, through = _durable_unpublished_case(
+            subject,
+            tmp_path / "evidence",
+        )
+        case = None
+        completion = None
+
+    stage = owner._stage_unpublished_prefix(
+        through,
+        retention_completion=completion,
+        _factory=subject._STAGED_REPLAY_FACTORY,
+    )
+    candidate_path = tmp_path / "candidate.sqlite3"
+    published_path = tmp_path / "published.sqlite3"
+    target = sqlite3.connect(
+        candidate_path,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    seal = owner._copy_staged_replay_into(
+        stage,
+        target,
+        _factory=subject._STAGED_REPLAY_FACTORY,
+    )
+    authority_before = owner._authority
+    rebuild_calls: list[Any] = []
+    original_rebuild = subject._rebuild_correlation_projection_authority
+
+    def counted_rebuild(authority_handle: Any, successor: Any) -> None:
+        assert owner._replay_state_lock.locked() is False
+        rebuild_calls.append(authority_handle)
+        original_rebuild(authority_handle, successor)
+
+    monkeypatch.setattr(
+        subject,
+        "_rebuild_correlation_projection_authority",
+        counted_rebuild,
+    )
+    reopened: list[sqlite3.Connection] = []
+    try:
+        if commit_kind == "missing_pcc":
+
+            def publish_missing(latch: Any) -> sqlite3.Connection:
+                target.execute("DELETE FROM candidate_evidence")
+                target.execute("DELETE FROM candidates")
+                target.close()
+                latch._arm_namespace_publication()
+                os.replace(candidate_path, published_path)
+                result = subject._v2_connection_for_test(published_path)
+                reopened.append(result)
+                return result
+
+            with pytest.raises(subject.ProjectionConflict):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    publish_missing,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+            assert owner._healthy is False
+            assert owner._authority is None
+            assert rebuild_calls == []
+            inspection = subject._v2_connection_for_test(published_path)
+            try:
+                assert inspection.execute(
+                    "SELECT count(*) FROM candidate_evidence"
+                ).fetchone()[0] == 0
+                assert inspection.execute(
+                    "SELECT count(*) FROM candidates"
+                ).fetchone()[0] == 0
+            finally:
+                inspection.close()
+        elif commit_kind == "unrelated_memory":
+
+            def publish_unrelated(latch: Any) -> sqlite3.Connection:
+                unrelated = subject._v2_connection_for_test()
+                target.backup(unrelated)
+                target.close()
+                latch._arm_namespace_publication()
+                os.replace(candidate_path, published_path)
+                reopened.append(unrelated)
+                return unrelated
+
+            with pytest.raises(subject.ProjectionConflict):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    publish_unrelated,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+            assert owner._healthy is False
+            assert owner._authority is None
+            assert rebuild_calls == []
+        elif commit_kind == "temp_shadow":
+
+            def publish_temp_shadow(latch: Any) -> sqlite3.Connection:
+                target.close()
+                latch._arm_namespace_publication()
+                os.replace(candidate_path, published_path)
+                result = subject._v2_connection_for_test(published_path)
+                result.execute("CREATE TEMP TABLE attacker(value TEXT)")
+                reopened.append(result)
+                return result
+
+            with pytest.raises(subject.ProjectionConflict):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    publish_temp_shadow,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+            assert owner._healthy is False
+            assert owner._authority is None
+            assert rebuild_calls == []
+        elif commit_kind == "pre_commit":
+            called = False
+
+            def must_not_publish(_latch: Any) -> sqlite3.Connection:
+                nonlocal called
+                called = True
+                raise AssertionError("pre-commit fault reached publisher")
+
+            with pytest.raises(KeyboardInterrupt):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    must_not_publish,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                    _fault_phase=subject._ReplayFaultPhase.PRE_COMMIT,
+                )
+            assert called is False
+            assert owner._healthy is True
+            assert owner._generation == 1
+            assert owner._connection is connection
+            assert owner.status().cursor is None
+            report = owner._replay_unpublished_prefix(
+                through,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+            )
+            assert report.cursor is not None
+            assert owner._generation == 2
+            assert owner._authority is authority_before
+            assert rebuild_calls == [authority_before]
+        elif commit_kind == "post_callback":
+
+            def interrupt_after_callback(latch: Any) -> sqlite3.Connection:
+                target.close()
+                latch._arm_namespace_publication()
+                os.replace(candidate_path, published_path)
+                result = subject._v2_connection_for_test(published_path)
+                reopened.append(result)
+                return result
+
+            with pytest.raises(KeyboardInterrupt):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    interrupt_after_callback,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                    _fault_phase=subject._ReplayFaultPhase.POST_CALLBACK,
+                )
+            assert owner._healthy is False
+            assert owner._authority is None
+            assert owner._replay_status_for_test().reservation_present is False
+            assert rebuild_calls == []
+        elif commit_kind == "post_latch":
+
+            def crash_after_latch(latch: Any) -> sqlite3.Connection:
+                target.close()
+                latch._arm_namespace_publication()
+                os.replace(candidate_path, published_path)
+                raise KeyboardInterrupt("injected post-latch failure")
+
+            with pytest.raises(KeyboardInterrupt):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    crash_after_latch,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+            assert owner._healthy is False
+            assert owner._authority is None
+            assert owner._replay_status_for_test().reservation_present is False
+            assert rebuild_calls == []
+        elif commit_kind == "armed_no_namespace":
+
+            def fail_namespace_without_mutation(latch: Any) -> sqlite3.Connection:
+                target.close()
+                latch._arm_namespace_publication()
+                raise OSError("injected namespace syscall failure")
+
+            with pytest.raises(OSError, match="namespace syscall failure"):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    fail_namespace_without_mutation,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+            assert candidate_path.exists()
+            assert not published_path.exists()
+            assert owner._healthy is False
+            assert owner._authority is None
+            assert owner._replay_status_for_test().reservation_present is False
+            with pytest.raises(subject.ProjectionUnhealthy):
+                owner._replay_unpublished_prefix(
+                    through,
+                    _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+                )
+        elif commit_kind == "fence_drain":
+            drain_calls = 0
+            original_drain = owner._acknowledgements._drain_replay_corruption_fences
+
+            def fail_drain_once(primary: BaseException | None) -> None:
+                nonlocal drain_calls
+                drain_calls += 1
+                if drain_calls == 1:
+                    raise KeyboardInterrupt("injected replay fence-drain failure")
+                original_drain(primary)
+
+            monkeypatch.setattr(
+                owner._acknowledgements,
+                "_drain_replay_corruption_fences",
+                fail_drain_once,
+            )
+            callback_called = False
+
+            def must_not_publish(latch: Any) -> sqlite3.Connection:
+                nonlocal callback_called
+                callback_called = True
+                target.close()
+                latch._arm_namespace_publication()
+                os.replace(candidate_path, published_path)
+                result = subject._v2_connection_for_test(published_path)
+                reopened.append(result)
+                return result
+
+            with pytest.raises(KeyboardInterrupt):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    must_not_publish,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+            assert callback_called is False
+            assert owner._healthy is True
+            assert owner._generation == 1
+            assert owner._connection is connection
+            assert owner._replay_status_for_test().phase is subject._ReplayPhase.FAILED
+            report = owner._replay_unpublished_prefix(
+                through,
+                _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
+            )
+            assert report.cursor is not None
+            assert owner._generation == 2
+        elif commit_kind == "fd_close_interrupt":
+            staged_binding = owner._staged_replay
+            assert staged_binding is not None
+            physical = staged_binding.materialized_physical
+            assert physical is not None
+            physical_descriptor = physical.descriptor
+            original_close = os.close
+            injected = False
+            reused_descriptor: int | None = None
+            replacement_descriptors: list[int] = []
+
+            def interrupt_after_physical_close(descriptor: int) -> None:
+                nonlocal injected, reused_descriptor
+                if descriptor == physical_descriptor and not injected:
+                    injected = True
+                    original_close(descriptor)
+                    while reused_descriptor != descriptor:
+                        reused_descriptor = os.open(os.devnull, os.O_RDONLY)
+                        replacement_descriptors.append(reused_descriptor)
+                        assert reused_descriptor <= descriptor
+                    raise KeyboardInterrupt("injected post-fd-close interrupt")
+                original_close(descriptor)
+
+            monkeypatch.setattr(subject.os, "close", interrupt_after_physical_close)
+
+            def publish_before_fd_interrupt(latch: Any) -> sqlite3.Connection:
+                target.close()
+                latch._arm_namespace_publication()
+                os.replace(candidate_path, published_path)
+                result = subject._v2_connection_for_test(published_path)
+                reopened.append(result)
+                return result
+
+            with pytest.raises(KeyboardInterrupt, match="post-fd-close interrupt"):
+                owner._publish_staged_replay(
+                    stage,
+                    seal,
+                    publish_before_fd_interrupt,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+            assert reused_descriptor is not None
+            try:
+                os.fstat(reused_descriptor)
+            finally:
+                for replacement_descriptor in replacement_descriptors:
+                    try:
+                        original_close(replacement_descriptor)
+                    except OSError:
+                        pass
+            assert owner._healthy is False
+            assert owner._authority is None
+        else:
+
+            def publish_exact(latch: Any) -> sqlite3.Connection:
+                target.close()
+                latch._arm_namespace_publication()
+                os.replace(candidate_path, published_path)
+                result = subject._v2_connection_for_test(published_path)
+                reopened.append(result)
+                return result
+
+            report = owner._publish_staged_replay(
+                stage,
+                seal,
+                publish_exact,
+                _factory=subject._STAGED_REPLAY_FACTORY,
+            )
+            assert report.cursor is not None
+            assert report.cursor.source_sequence == through.source_sequence
+            assert owner._connection is reopened[0]
+            assert owner._generation == 2
+            assert owner._authority is authority_before
+            assert rebuild_calls == [authority_before]
+            published = owner._replay_status_for_test()
+            assert published.phase is subject._ReplayPhase.PUBLISHED
+            assert published.reservation_present is False
+            assert case is not None
+            assert case["store"]._authenticated_retention_replay_consumed is not None
+            with pytest.raises(ProjectionAuthorityError):
+                owner._abort_staged_replay(
+                    stage,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+            case["store"]._finalize_authenticated_retention_completion(
+                completion,
+                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            )
+    finally:
+        if case is not None:
+            case["coverage"].close()
+        owner.close()
 
 
 def test_historical_pin_mismatch_returns_no_artifact(
