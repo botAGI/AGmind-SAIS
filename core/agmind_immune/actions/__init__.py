@@ -4,6 +4,7 @@ from .client import (
     ActuatorIntentClient,
     IntentDeliveryError,
     IntentDeliveryFatal,
+    IntentDeliveryRejected,
     IntentDeliveryRetryable,
 )
 from .journal import (
@@ -18,7 +19,11 @@ from .models import (
     DecisionIntentError,
     DecisionIntentValidationError,
 )
-from .state_machine import IntentDeliveryStateMachine, PreparedPlanReceipt
+from .state_machine import (
+    IntentDeliveryStateMachine,
+    PreparedPlanReceipt,
+    QuarantinedIntentReceipt,
+)
 
 __all__ = [
     "ActuatorIntentClient",
@@ -32,7 +37,9 @@ __all__ = [
     "DecisionIntentValidationError",
     "IntentDeliveryError",
     "IntentDeliveryFatal",
+    "IntentDeliveryRejected",
     "IntentDeliveryRetryable",
     "IntentDeliveryStateMachine",
     "PreparedPlanReceipt",
+    "QuarantinedIntentReceipt",
 ]

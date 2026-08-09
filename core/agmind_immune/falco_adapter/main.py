@@ -481,6 +481,16 @@ class HeartbeatWatchdog:
             opened_at=started_at,
         )
 
+    @property
+    def ready(self) -> bool:
+        return (
+            self._last_valid_event_time is not None
+            and self._monotonic() - self._last_valid_monotonic
+            <= HEARTBEAT_TIMEOUT_SECONDS
+            and "falco_heartbeat_gap" not in self._opened
+            and "falco_configuration_mismatch" not in self._opened
+        )
+
     @staticmethod
     def _identity_mismatch(
         settings: AdapterSettings,
@@ -665,6 +675,7 @@ class AdapterRuntime:
         self._queue_dropped = 0
         self._queue_drop_opened_at: str | None = None
         self._delivery_failure_opened_at: str | None = None
+        self._delivered_heartbeat_monotonic: float | None = None
         self._parse_rejection_opened_at: str | None = None
         self._parse_rejection_count = 0
         self._parse_rejection_source_hash: str | None = None
@@ -678,6 +689,20 @@ class AdapterRuntime:
     @property
     def drain_deadline(self) -> float | None:
         return self._drain_deadline
+
+    @property
+    def ready(self) -> bool:
+        delivered = self._delivered_heartbeat_monotonic
+        return (
+            self._started
+            and self._accepting
+            and self._task is not None
+            and not self._task.done()
+            and self._delivery_failure_opened_at is None
+            and delivered is not None
+            and self._monotonic() - delivered <= HEARTBEAT_TIMEOUT_SECONDS
+            and self.watchdog.ready
+        )
 
     @staticmethod
     def _timestamp(value: dt.datetime) -> str:
@@ -816,6 +841,8 @@ class AdapterRuntime:
                 closed_at=closed_at,
             )
             self._delivery_failure_opened_at = None
+        if item.expires_at_monotonic is not None:
+            self._delivered_heartbeat_monotonic = self._monotonic()
         if (
             self._queue_drop_opened_at is not None
             and self.outbox.routine_pending < ROUTINE_CAPACITY
@@ -954,6 +981,18 @@ def create_app(runtime: AdapterRuntime) -> FastAPI:
         except (TypeError, UnicodeError, ValueError):
             return JSONResponse({"error": "invalid_falco_body"}, status_code=400)
         return JSONResponse({"status": "accepted"}, status_code=202)
+
+    @app.get("/health")
+    async def health() -> JSONResponse:
+        return JSONResponse({"live": True, "version": "0.1.0"})
+
+    @app.get("/ready")
+    async def ready() -> JSONResponse:
+        is_ready = runtime.ready
+        return JSONResponse(
+            {"ready": is_ready, "version": "0.1.0"},
+            status_code=200 if is_ready else 503,
+        )
 
     return app
 

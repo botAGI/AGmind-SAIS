@@ -63,6 +63,7 @@ async def test_delivery_is_bounded_crash_idempotent_and_conflict_read_only(
     from agmind_immune.actions import (
         IntentDeliveryFatal,
         IntentDeliveryRetryable,
+        QuarantinedIntentReceipt,
     )
     from agmind_immune.actions.client import _actuator_intent_client_for_test
     from agmind_immune.actions.state_machine import (
@@ -112,6 +113,12 @@ async def test_delivery_is_bounded_crash_idempotent_and_conflict_read_only(
                     headers={"Content-Type": "application/json"},
                     content=canonical_json(mismatched_plan),
                 )
+            if behavior["value"] == "terminal":
+                return httpx.Response(
+                    409,
+                    headers={"Content-Type": "application/json"},
+                    content=b'{"error":"target_stale"}\n',
+                )
             return httpx.Response(
                 200,
                 headers={"Content-Type": "application/json"},
@@ -131,6 +138,33 @@ async def test_delivery_is_bounded_crash_idempotent_and_conflict_read_only(
         with pytest.raises(IntentDeliveryFatal):
             await client.prepare(commit.intent_canonical)
         assert len(requests) == 3
+
+        terminal_root = tmp_path / "terminal-delivery"
+        terminal_root.mkdir(mode=0o700)
+        os.chmod(terminal_root, 0o700)
+        terminal_database = terminal_root / "intent-delivery.sqlite3"
+        behavior["value"] = "terminal"
+        terminal = _intent_delivery_state_machine_for_test(
+            terminal_database,
+            client,
+        )
+        machines.append(terminal)
+        terminal_before = len(requests)
+        quarantine = await terminal.deliver(commit)
+        assert type(quarantine) is QuarantinedIntentReceipt
+        assert quarantine.reason_code == "target_stale"
+        assert len(requests) == terminal_before + 1
+        await terminal.close()
+        machines.remove(terminal)
+        terminal = _intent_delivery_state_machine_for_test(
+            terminal_database,
+            client,
+        )
+        machines.append(terminal)
+        assert await terminal.deliver(commit) == quarantine
+        assert len(requests) == terminal_before + 1
+        await terminal.close()
+        machines.remove(terminal)
 
         empty_root = tmp_path / "existing-empty-delivery"
         empty_root.mkdir(mode=0o700)
@@ -158,7 +192,7 @@ async def test_delivery_is_bounded_crash_idempotent_and_conflict_read_only(
         connection = sqlite3.connect(partial_database)
         try:
             assert dict(connection.execute("SELECT key,value FROM delivery_metadata")) == {
-                "schema_version": "agmind.intent-delivery-state.v1"
+                "schema_version": "agmind.intent-delivery-state.v2"
             }
         finally:
             connection.close()

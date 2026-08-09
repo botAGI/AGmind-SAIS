@@ -25,6 +25,11 @@ _CONNECT_TIMEOUT_SECONDS = 2.0
 _TOTAL_TIMEOUT_SECONDS = 10.0
 _CLIENT_FACTORY = object()
 _TEST_CLIENT_FACTORY = object()
+_TERMINAL_REJECTIONS = {
+    (409, b'{"error":"intent_conflict"}\n'): "intent_conflict",
+    (409, b'{"error":"target_stale"}\n'): "target_stale",
+    (422, b'{"error":"intent_rejected"}\n'): "intent_rejected",
+}
 _INTENT_BINDING_FIELDS = (
     "intent_id",
     "verb",
@@ -53,6 +58,27 @@ class IntentDeliveryError(RuntimeError):
 
 class IntentDeliveryRetryable(IntentDeliveryError):
     """Exact intent delivery may be retried without changing its bytes."""
+
+
+class IntentDeliveryRejected(IntentDeliveryError):
+    """The actuator returned one exact, per-intent terminal rejection."""
+
+    def __init__(self, status_code: int, reason_code: str) -> None:
+        if (
+            type(status_code) is not int
+            or type(reason_code) is not str
+            or reason_code not in _TERMINAL_REJECTIONS.values()
+            or not any(
+                status == status_code and reason == reason_code
+                for (status, _raw), reason in _TERMINAL_REJECTIONS.items()
+            )
+        ):
+            raise ValueError("terminal actuator rejection is invalid")
+        self.status_code = status_code
+        self.reason_code = reason_code
+        super().__init__(
+            f"actuator terminally rejected intent: {status_code} {reason_code}"
+        )
 
 
 class IntentDeliveryFatal(IntentDeliveryError):
@@ -249,7 +275,25 @@ class ActuatorIntentClient:
                         f"actuator intent POST returned {response.status_code}"
                     )
                 if response.status_code != 200:
-                    await _discard_error(response)
+                    if response.headers.get_list("content-type") != ["application/json"]:
+                        await _discard_error(response)
+                        raise IntentDeliveryFatal(
+                            "actuator rejection Content-Type is not exact JSON"
+                        )
+                    declared = _declared_length(response)
+                    raw = await _read_bounded(response, _MAX_ERROR_BYTES)
+                    if declared is not None and declared != len(raw):
+                        raise IntentDeliveryFatal(
+                            "actuator rejection Content-Length differs from response bytes"
+                        )
+                    reason_code = _TERMINAL_REJECTIONS.get(
+                        (response.status_code, raw)
+                    )
+                    if reason_code is not None:
+                        raise IntentDeliveryRejected(
+                            response.status_code,
+                            reason_code,
+                        )
                     raise IntentDeliveryFatal(
                         f"actuator intent POST returned {response.status_code}"
                     )
@@ -294,5 +338,6 @@ __all__ = [
     "ActuatorIntentClient",
     "IntentDeliveryError",
     "IntentDeliveryFatal",
+    "IntentDeliveryRejected",
     "IntentDeliveryRetryable",
 ]

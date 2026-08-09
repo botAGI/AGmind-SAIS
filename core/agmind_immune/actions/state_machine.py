@@ -12,7 +12,7 @@ import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import final
+from typing import cast, final
 
 from agmind_immune.canonicaljson import canonical_json
 from agmind_immune.contracts import PreparedTemporaryEgressDenyPlanV1
@@ -20,6 +20,7 @@ from agmind_immune.contracts import PreparedTemporaryEgressDenyPlanV1
 from .client import (
     ActuatorIntentClient,
     IntentDeliveryFatal,
+    IntentDeliveryRejected,
     _decode_exact_intent,
     _decode_exact_plan,
     _require_plan_binds_intent,
@@ -33,14 +34,21 @@ from .models import (
 _DATABASE_NAME = "intent-delivery.sqlite3"
 _READ_ONLY_MARKER_NAME = "intent-delivery.read-only"
 _READ_ONLY_MARKER = b"agmind.intent-delivery-read-only.v1\n"
-_SCHEMA_VERSION = "agmind.intent-delivery-state.v1"
+_SCHEMA_VERSION = "agmind.intent-delivery-state.v2"
 _RECEIPT_SCHEMA_VERSION = "agmind.prepared-plan-receipt.v1"
+_QUARANTINE_SCHEMA_VERSION = "agmind.terminal-intent-quarantine.v1"
 _INTENT_HASH_DOMAIN = b"AGMIND_ACTUATOR_INTENT_V1\0"
 _RECEIPT_HASH_DOMAIN = b"AGMIND_PREPARED_PLAN_RECEIPT_V1\0"
+_QUARANTINE_HASH_DOMAIN = b"AGMIND_TERMINAL_INTENT_QUARANTINE_V1\0"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_ID = re.compile(r"^cand_[0-9a-f]{64}$")
 _INTENT_ID = re.compile(r"^int_[0-9a-f]{32}$")
 _PLAN_ID = re.compile(r"^plan_[0-9a-f]{32}$")
+_TERMINAL_REASON_STATUS = {
+    "intent_conflict": 409,
+    "target_stale": 409,
+    "intent_rejected": 422,
+}
 _STATE_MACHINE_FACTORY = object()
 _TEST_STATE_MACHINE_FACTORY = object()
 
@@ -63,7 +71,23 @@ CREATE TABLE prepared_plan_receipts (
     receipt_sha256 TEXT NOT NULL UNIQUE
 ) STRICT, WITHOUT ROWID
 """.strip()
-_SCHEMA = f"{_DELIVERY_METADATA_SCHEMA};\n{_PREPARED_PLAN_RECEIPTS_SCHEMA};"
+_TERMINAL_INTENT_QUARANTINES_SCHEMA = """
+CREATE TABLE terminal_intent_quarantines (
+    intent_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL UNIQUE,
+    decision_record_sha256 TEXT NOT NULL,
+    intent_sha256 TEXT NOT NULL,
+    intent_canonical BLOB NOT NULL,
+    status_code INTEGER NOT NULL,
+    reason_code TEXT NOT NULL,
+    quarantine_sha256 TEXT NOT NULL UNIQUE
+) STRICT, WITHOUT ROWID
+""".strip()
+_SCHEMA = (
+    f"{_DELIVERY_METADATA_SCHEMA};\n"
+    f"{_PREPARED_PLAN_RECEIPTS_SCHEMA};\n"
+    f"{_TERMINAL_INTENT_QUARANTINES_SCHEMA};"
+)
 _EXACT_SCHEMA = (
     (
         "table",
@@ -77,11 +101,22 @@ _EXACT_SCHEMA = (
         "prepared_plan_receipts",
         _PREPARED_PLAN_RECEIPTS_SCHEMA,
     ),
+    (
+        "table",
+        "terminal_intent_quarantines",
+        "terminal_intent_quarantines",
+        _TERMINAL_INTENT_QUARANTINES_SCHEMA,
+    ),
 )
 _RECEIPT_SELECT = (
     "SELECT intent_id,candidate_id,decision_record_sha256,intent_sha256,"
     "intent_canonical,plan_id,plan_hash,plan_canonical,receipt_sha256 "
     "FROM prepared_plan_receipts"
+)
+_QUARANTINE_SELECT = (
+    "SELECT intent_id,candidate_id,decision_record_sha256,intent_sha256,"
+    "intent_canonical,status_code,reason_code,quarantine_sha256 "
+    "FROM terminal_intent_quarantines"
 )
 
 
@@ -91,6 +126,12 @@ def _intent_sha256(raw: bytes) -> str:
 
 def _receipt_sha256(document: dict[str, object]) -> str:
     return hashlib.sha256(_RECEIPT_HASH_DOMAIN + canonical_json(document)).hexdigest()
+
+
+def _quarantine_sha256(document: dict[str, object]) -> str:
+    return hashlib.sha256(
+        _QUARANTINE_HASH_DOMAIN + canonical_json(document)
+    ).hexdigest()
 
 
 def _validated_commit(commit: object) -> tuple[DecisionIntentCommit, bytes]:
@@ -183,6 +224,65 @@ class PreparedPlanReceipt:
         return _decode_exact_plan(self.plan_canonical)
 
 
+@dataclass(frozen=True, slots=True)
+class QuarantinedIntentReceipt:
+    """Durable terminal outcome for one exact actuator intent rejection."""
+
+    candidate_id: str
+    decision_record_sha256: str
+    intent_id: str
+    intent_sha256: str
+    intent_canonical: bytes
+    status_code: int
+    reason_code: str
+    quarantine_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.candidate_id) is not str
+            or _CANDIDATE_ID.fullmatch(self.candidate_id) is None
+            or type(self.decision_record_sha256) is not str
+            or _HEX64.fullmatch(self.decision_record_sha256) is None
+            or type(self.intent_id) is not str
+            or _INTENT_ID.fullmatch(self.intent_id) is None
+            or type(self.intent_sha256) is not str
+            or _HEX64.fullmatch(self.intent_sha256) is None
+            or type(self.intent_canonical) is not bytes
+            or type(self.status_code) is not int
+            or type(self.reason_code) is not str
+            or _TERMINAL_REASON_STATUS.get(self.reason_code) != self.status_code
+            or type(self.quarantine_sha256) is not str
+            or _HEX64.fullmatch(self.quarantine_sha256) is None
+        ):
+            raise ValueError("quarantined-intent receipt fields are invalid")
+        intent = _decode_exact_intent(self.intent_canonical)
+        document = self._hash_document()
+        if (
+            intent.intent_id != self.intent_id
+            or not hmac.compare_digest(
+                self.intent_sha256,
+                _intent_sha256(self.intent_canonical),
+            )
+            or not hmac.compare_digest(
+                self.quarantine_sha256,
+                _quarantine_sha256(document),
+            )
+        ):
+            raise ValueError("quarantined-intent receipt bindings are invalid")
+
+    def _hash_document(self) -> dict[str, object]:
+        return {
+            "schema_version": _QUARANTINE_SCHEMA_VERSION,
+            "candidate_id": self.candidate_id,
+            "decision_record_sha256": self.decision_record_sha256,
+            "intent_id": self.intent_id,
+            "intent_sha256": self.intent_sha256,
+            "intent": _decode_exact_intent(self.intent_canonical),
+            "status_code": self.status_code,
+            "reason_code": self.reason_code,
+        }
+
+
 def _build_receipt(
     commit: DecisionIntentCommit,
     intent_canonical: bytes,
@@ -216,6 +316,34 @@ def _build_receipt(
     )
 
 
+def _build_quarantine(
+    commit: DecisionIntentCommit,
+    intent_canonical: bytes,
+    rejection: IntentDeliveryRejected,
+) -> QuarantinedIntentReceipt:
+    intent = _decode_exact_intent(intent_canonical)
+    base: dict[str, object] = {
+        "schema_version": _QUARANTINE_SCHEMA_VERSION,
+        "candidate_id": commit.candidate_id,
+        "decision_record_sha256": commit.record_sha256,
+        "intent_id": intent.intent_id,
+        "intent_sha256": _intent_sha256(intent_canonical),
+        "intent": intent,
+        "status_code": rejection.status_code,
+        "reason_code": rejection.reason_code,
+    }
+    return QuarantinedIntentReceipt(
+        candidate_id=commit.candidate_id,
+        decision_record_sha256=commit.record_sha256,
+        intent_id=intent.intent_id,
+        intent_sha256=str(base["intent_sha256"]),
+        intent_canonical=bytes(intent_canonical),
+        status_code=rejection.status_code,
+        reason_code=rejection.reason_code,
+        quarantine_sha256=_quarantine_sha256(base),
+    )
+
+
 def _receipt_from_row(row: sqlite3.Row) -> PreparedPlanReceipt:
     try:
         values = tuple(row)
@@ -236,6 +364,27 @@ def _receipt_from_row(row: sqlite3.Row) -> PreparedPlanReceipt:
         raise IntentDeliveryFatal("stored prepared-plan receipt is invalid") from error
 
 
+def _quarantine_from_row(row: sqlite3.Row) -> QuarantinedIntentReceipt:
+    try:
+        values = tuple(row)
+        if len(values) != 8:
+            raise ValueError("quarantine row width is invalid")
+        return QuarantinedIntentReceipt(
+            intent_id=values[0],
+            candidate_id=values[1],
+            decision_record_sha256=values[2],
+            intent_sha256=values[3],
+            intent_canonical=bytes(values[4]),
+            status_code=values[5],
+            reason_code=values[6],
+            quarantine_sha256=values[7],
+        )
+    except (IntentDeliveryFatal, TypeError, ValueError) as error:
+        raise IntentDeliveryFatal(
+            "stored quarantined-intent receipt is invalid"
+        ) from error
+
+
 def _receipt_matches(
     receipt: PreparedPlanReceipt,
     commit: DecisionIntentCommit,
@@ -250,6 +399,23 @@ def _receipt_matches(
             _intent_sha256(intent_canonical),
         )
         and hmac.compare_digest(receipt.intent_canonical, intent_canonical)
+    )
+
+
+def _quarantine_matches(
+    quarantine: QuarantinedIntentReceipt,
+    commit: DecisionIntentCommit,
+    intent_canonical: bytes,
+) -> bool:
+    return (
+        quarantine.candidate_id == commit.candidate_id
+        and quarantine.decision_record_sha256 == commit.record_sha256
+        and quarantine.intent_id == commit.intent_id
+        and hmac.compare_digest(
+            quarantine.intent_sha256,
+            _intent_sha256(intent_canonical),
+        )
+        and hmac.compare_digest(quarantine.intent_canonical, intent_canonical)
     )
 
 
@@ -442,9 +608,19 @@ def _validate_metadata(connection: sqlite3.Connection) -> dict[str, str]:
     return metadata
 
 
-def _validate_all_receipts(connection: sqlite3.Connection) -> None:
+def _validate_all_outcomes(connection: sqlite3.Connection) -> None:
     for row in connection.execute(f"{_RECEIPT_SELECT} ORDER BY intent_id"):
         _receipt_from_row(row)
+    for row in connection.execute(f"{_QUARANTINE_SELECT} ORDER BY intent_id"):
+        _quarantine_from_row(row)
+    overlap = connection.execute(
+        "SELECT intent_id,candidate_id FROM prepared_plan_receipts "
+        "WHERE intent_id IN (SELECT intent_id FROM terminal_intent_quarantines) "
+        "OR candidate_id IN (SELECT candidate_id FROM terminal_intent_quarantines) "
+        "LIMIT 1"
+    ).fetchone()
+    if overlap is not None:
+        raise IntentDeliveryFatal("intent has multiple terminal delivery outcomes")
 
 
 def _configure_database(connection: sqlite3.Connection, *, created: bool) -> None:
@@ -505,7 +681,7 @@ def _open_database(path: Path) -> tuple[sqlite3.Connection, int, bool]:
             raise IntentDeliveryFatal("intent-delivery database is inconsistent")
         semantic_corruption = False
         try:
-            _validate_all_receipts(connection)
+            _validate_all_outcomes(connection)
         except IntentDeliveryFatal:
             semantic_corruption = True
             if not marker_exists and metadata["read_only"] != "1":
@@ -600,16 +776,30 @@ class IntentDeliveryStateMachine:
     def read_only(self) -> bool:
         return self._read_only or self._closed
 
-    def _existing(self, intent_id: str) -> PreparedPlanReceipt | None:
-        rows = self._connection.execute(
+    def _existing_outcome(
+        self,
+        intent_id: str,
+        candidate_id: str,
+    ) -> PreparedPlanReceipt | QuarantinedIntentReceipt | None:
+        receipt_rows = self._connection.execute(
             "SELECT intent_id,candidate_id,decision_record_sha256,intent_sha256,"
             "intent_canonical,plan_id,plan_hash,plan_canonical,receipt_sha256 "
-            "FROM prepared_plan_receipts WHERE intent_id=? LIMIT 2",
-            (intent_id,),
+            "FROM prepared_plan_receipts "
+            "WHERE intent_id=? OR candidate_id=? LIMIT 2",
+            (intent_id, candidate_id),
         ).fetchall()
-        if len(rows) > 1:
-            raise IntentDeliveryFatal("intent has multiple prepared-plan receipts")
-        return None if not rows else _receipt_from_row(rows[0])
+        quarantine_rows = self._connection.execute(
+            f"{_QUARANTINE_SELECT} "
+            "WHERE intent_id=? OR candidate_id=? LIMIT 2",
+            (intent_id, candidate_id),
+        ).fetchall()
+        if len(receipt_rows) + len(quarantine_rows) > 1:
+            raise IntentDeliveryFatal("intent has multiple terminal delivery outcomes")
+        if receipt_rows:
+            return _receipt_from_row(receipt_rows[0])
+        if quarantine_rows:
+            return _quarantine_from_row(quarantine_rows[0])
+        return None
 
     def _latch_read_only(self) -> None:
         self._read_only = True
@@ -621,66 +811,103 @@ class IntentDeliveryStateMachine:
             except sqlite3.Error:
                 pass
 
-    def _require_matching_receipt(
+    def _require_matching_outcome(
         self,
-        receipt: PreparedPlanReceipt,
+        outcome: PreparedPlanReceipt | QuarantinedIntentReceipt,
         commit: DecisionIntentCommit,
         intent_canonical: bytes,
-    ) -> PreparedTemporaryEgressDenyPlanV1:
-        if not _receipt_matches(receipt, commit, intent_canonical):
-            self._latch_read_only()
-            raise IntentDeliveryFatal("stored receipt conflicts with the durable decision intent")
-        return receipt.plan()
+    ) -> PreparedTemporaryEgressDenyPlanV1 | QuarantinedIntentReceipt:
+        if type(outcome) is PreparedPlanReceipt and _receipt_matches(
+            outcome,
+            commit,
+            intent_canonical,
+        ):
+            return outcome.plan()
+        if type(outcome) is QuarantinedIntentReceipt and _quarantine_matches(
+            outcome,
+            commit,
+            intent_canonical,
+        ):
+            return outcome
+        self._latch_read_only()
+        raise IntentDeliveryFatal(
+            "stored outcome conflicts with the durable decision intent"
+        )
 
     def _persist(
         self,
-        receipt: PreparedPlanReceipt,
+        outcome: PreparedPlanReceipt | QuarantinedIntentReceipt,
         commit: DecisionIntentCommit,
         intent_canonical: bytes,
-    ) -> PreparedTemporaryEgressDenyPlanV1:
+    ) -> PreparedTemporaryEgressDenyPlanV1 | QuarantinedIntentReceipt:
         try:
             self._connection.execute("BEGIN IMMEDIATE")
-            existing = self._existing(receipt.intent_id)
+            existing = self._existing_outcome(
+                outcome.intent_id,
+                outcome.candidate_id,
+            )
             if existing is not None:
-                plan = self._require_matching_receipt(
+                result = self._require_matching_outcome(
                     existing,
                     commit,
                     intent_canonical,
                 )
                 self._connection.execute("COMMIT")
-                return plan
-            self._connection.execute(
-                "INSERT INTO prepared_plan_receipts("
-                "intent_id,candidate_id,decision_record_sha256,intent_sha256,"
-                "intent_canonical,plan_id,plan_hash,plan_canonical,receipt_sha256"
-                ") VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    receipt.intent_id,
-                    receipt.candidate_id,
-                    receipt.decision_record_sha256,
-                    receipt.intent_sha256,
-                    receipt.intent_canonical,
-                    receipt.plan_id,
-                    receipt.plan_hash,
-                    receipt.plan_canonical,
-                    receipt.receipt_sha256,
-                ),
-            )
+                return result
+            if type(outcome) is PreparedPlanReceipt:
+                self._connection.execute(
+                    "INSERT INTO prepared_plan_receipts("
+                    "intent_id,candidate_id,decision_record_sha256,intent_sha256,"
+                    "intent_canonical,plan_id,plan_hash,plan_canonical,receipt_sha256"
+                    ") VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        outcome.intent_id,
+                        outcome.candidate_id,
+                        outcome.decision_record_sha256,
+                        outcome.intent_sha256,
+                        outcome.intent_canonical,
+                        outcome.plan_id,
+                        outcome.plan_hash,
+                        outcome.plan_canonical,
+                        outcome.receipt_sha256,
+                    ),
+                )
+            elif type(outcome) is QuarantinedIntentReceipt:
+                self._connection.execute(
+                    "INSERT INTO terminal_intent_quarantines("
+                    "intent_id,candidate_id,decision_record_sha256,intent_sha256,"
+                    "intent_canonical,status_code,reason_code,quarantine_sha256"
+                    ") VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        outcome.intent_id,
+                        outcome.candidate_id,
+                        outcome.decision_record_sha256,
+                        outcome.intent_sha256,
+                        outcome.intent_canonical,
+                        outcome.status_code,
+                        outcome.reason_code,
+                        outcome.quarantine_sha256,
+                    ),
+                )
+            else:
+                raise IntentDeliveryFatal("delivery outcome has an inexact type")
             self._connection.execute("COMMIT")
             os.fsync(self._parent_fd)
-            return receipt.plan()
+            if type(outcome) is PreparedPlanReceipt:
+                return outcome.plan()
+            return cast(QuarantinedIntentReceipt, outcome)
         except IntentDeliveryFatal:
             if not self._read_only:
                 self._latch_read_only()
             raise
         except (OSError, sqlite3.Error) as error:
             self._latch_read_only()
-            raise IntentDeliveryFatal("prepared-plan receipt durability is uncertain") from error
+            raise IntentDeliveryFatal("delivery outcome durability is uncertain") from error
 
     async def deliver(
         self,
         commit: object,
-    ) -> PreparedTemporaryEgressDenyPlanV1:
+    ) -> PreparedTemporaryEgressDenyPlanV1 | QuarantinedIntentReceipt:
         async with self._lock:
             if self._closed:
                 raise IntentDeliveryFatal("intent-delivery state machine is closed")
@@ -688,20 +915,33 @@ class IntentDeliveryStateMachine:
                 raise IntentDeliveryFatal("intent-delivery state is read-only")
             exact_commit, intent_canonical = _validated_commit(commit)
             try:
-                existing = self._existing(exact_commit.intent_id or "")
+                existing = self._existing_outcome(
+                    exact_commit.intent_id or "",
+                    exact_commit.candidate_id,
+                )
             except (IntentDeliveryFatal, sqlite3.Error) as error:
                 self._latch_read_only()
-                raise IntentDeliveryFatal("prepared-plan receipt lookup failed") from error
+                raise IntentDeliveryFatal("delivery outcome lookup failed") from error
             if existing is not None:
-                return self._require_matching_receipt(
+                return self._require_matching_outcome(
                     existing,
                     exact_commit,
                     intent_canonical,
                 )
-            plan = await self._client.prepare(intent_canonical)
-            receipt = _build_receipt(exact_commit, intent_canonical, plan)
+            try:
+                plan = await self._client.prepare(intent_canonical)
+            except IntentDeliveryRejected as rejection:
+                outcome: PreparedPlanReceipt | QuarantinedIntentReceipt = (
+                    _build_quarantine(
+                        exact_commit,
+                        intent_canonical,
+                        rejection,
+                    )
+                )
+            else:
+                outcome = _build_receipt(exact_commit, intent_canonical, plan)
             self._after_prepare()
-            return self._persist(receipt, exact_commit, intent_canonical)
+            return self._persist(outcome, exact_commit, intent_canonical)
 
     async def close(self) -> None:
         async with self._lock:
@@ -749,4 +989,5 @@ def _intent_delivery_state_machine_for_test(
 __all__ = [
     "IntentDeliveryStateMachine",
     "PreparedPlanReceipt",
+    "QuarantinedIntentReceipt",
 ]

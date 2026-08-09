@@ -3,6 +3,7 @@ package observerd
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -192,8 +193,22 @@ func TestCoreEventsRejectsNonCanonicalOrUnboundedQuery(t *testing.T) {
 	}
 }
 
-func TestCoreInventoryAndCoverageReturnOnlyBoundedObserverFacts(t *testing.T) {
+func TestCoreInventoryCoverageAndPublicKeysReturnOnlyBoundedObserverFacts(
+	t *testing.T,
+) {
 	service, _, expected := coreAPIEventFixture(t)
+	stateDir := service.daemon.spool.config.StateDir
+	service.daemon.config.StateDir = stateDir
+	state := service.daemon.state.Snapshot()
+	publicKeys := initialPublicMetadata(
+		state.HostID,
+		state.KeyID,
+		state.KeyEpoch,
+		service.daemon.signer.privateKey.Public().(ed25519.PublicKey),
+	)
+	if err := savePublicKeyMetadata(stateDir, publicKeys); err != nil {
+		t.Fatal(err)
+	}
 
 	inventoryRequest := httptest.NewRequest(
 		http.MethodGet,
@@ -249,6 +264,62 @@ func TestCoreInventoryAndCoverageReturnOnlyBoundedObserverFacts(t *testing.T) {
 		coverage.LastSequence != expected.SourceSequence ||
 		coverage.AckSequence != 0 {
 		t.Fatalf("coverage=%+v", coverage)
+	}
+
+	publicKeysResponse := httptest.NewRecorder()
+	corePublicKeysHandler(service).ServeHTTP(
+		publicKeysResponse,
+		httptest.NewRequest(http.MethodGet, "http://unix/v1/public-keys", nil),
+	)
+	if publicKeysResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"public keys status=%d body=%s",
+			publicKeysResponse.Code,
+			publicKeysResponse.Body,
+		)
+	}
+	var returned PublicKeyMetadata
+	if err := json.Unmarshal(publicKeysResponse.Body.Bytes(), &returned); err != nil {
+		t.Fatal(err)
+	}
+	if err := returned.Validate(); err != nil {
+		t.Fatalf("invalid public keys response: %v", err)
+	}
+	if returned.HostID != state.HostID ||
+		returned.CurrentKeyID != state.KeyID ||
+		returned.CurrentEpoch != state.KeyEpoch {
+		t.Fatalf("public keys=%+v state=%+v", returned, state)
+	}
+	canonical, err := contracts.CanonicalJSON(returned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publicKeysResponse.Body.String() != string(canonical)+"\n" {
+		t.Fatalf("non-canonical public keys response=%q", publicKeysResponse.Body)
+	}
+	for name, handler := range map[string]http.Handler{
+		"core":    newCoreAPI(service, 2002, 1002),
+		"ingest":  newIngestAPI(service, 2001),
+		"private": newPrivateAPI(service),
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(
+			response,
+			httptest.NewRequest(http.MethodGet, "http://unix/v1/public-keys", nil),
+		)
+		want := http.StatusNotFound
+		if name == "core" {
+			want = http.StatusForbidden
+		}
+		if response.Code != want {
+			t.Fatalf(
+				"%s public keys status=%d want=%d body=%s",
+				name,
+				response.Code,
+				want,
+				response.Body,
+			)
+		}
 	}
 
 	notFoundRequest := httptest.NewRequest(

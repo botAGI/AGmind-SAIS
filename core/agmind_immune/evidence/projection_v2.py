@@ -8090,6 +8090,133 @@ class _V2ProjectionOwner:
                     self._latch_unhealthy()
             return ProjectionStatus(healthy=self._healthy and not self._closed, cursor=cursor)
 
+    def _candidate_ids(
+        self,
+        *,
+        after: str | None,
+        limit: int,
+    ) -> tuple[str, ...]:
+        """Return one validated, keyset-ordered candidate page."""
+        with self._mutex:
+            connection, _authority = self._require_usable()
+            if (
+                (after is not None and (
+                    type(after) is not str
+                    or _CANDIDATE_ID_V2.fullmatch(after) is None
+                ))
+                or type(limit) is not int
+                or not 1 <= limit <= 100
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 candidate page arguments are invalid"
+                )
+            columns = ",".join(_CANDIDATE_COLUMNS)
+            if after is None:
+                rows = connection.execute(
+                    f"SELECT {columns} FROM candidates "
+                    "ORDER BY candidate_id COLLATE BINARY LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    f"SELECT {columns} FROM candidates "
+                    "WHERE candidate_id COLLATE BINARY>? "
+                    "ORDER BY candidate_id COLLATE BINARY LIMIT ?",
+                    (after, limit),
+                ).fetchall()
+            candidates = tuple(_decode_candidate(row) for row in rows)
+            identifiers = tuple(candidate.candidate_id for candidate in candidates)
+            if identifiers != tuple(sorted(set(identifiers))):
+                error = ProjectionConflict(
+                    "Projection V2 candidate page is not canonical"
+                )
+                self._latch_unhealthy(error)
+                raise error
+            return identifiers
+
+    def _hunter_bundle(self, candidate_id: str) -> object:
+        """Build one redacted observation bundle from validated projection rows."""
+        from agmind_immune.hunter import (
+            HunterBundleV1,
+            HunterEvidenceFactV1,
+            build_hunter_bundle,
+        )
+
+        with self._mutex:
+            connection, _authority = self._require_usable()
+            if (
+                type(candidate_id) is not str
+                or _CANDIDATE_ID_V2.fullmatch(candidate_id) is None
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 hunter candidate ID is invalid"
+                )
+            candidate_rows = connection.execute(
+                f"SELECT {','.join(_CANDIDATE_COLUMNS)} FROM candidates "
+                "WHERE candidate_id=? LIMIT 2",
+                (candidate_id,),
+            ).fetchall()
+            if len(candidate_rows) != 1:
+                raise ProjectionAuthorityError(
+                    "Projection V2 hunter candidate is unavailable"
+                )
+            candidate = _decode_candidate(candidate_rows[0])
+            incident_rows = connection.execute(
+                f"SELECT {','.join(_INCIDENT_COLUMNS)} FROM incidents "
+                "WHERE incident_id=? LIMIT 2",
+                (candidate.incident_id,),
+            ).fetchall()
+            if len(incident_rows) != 1:
+                raise ProjectionConflict(
+                    "Projection V2 hunter incident binding is unavailable"
+                )
+            incident, result_kind = _decode_incident(incident_rows[0])
+            if (
+                result_kind != "candidate"
+                or incident.incident_id != candidate.incident_id
+                or incident.primary_event_id != candidate.primary_event_id
+            ):
+                raise ProjectionConflict(
+                    "Projection V2 hunter incident binding changed"
+                )
+
+            def basename(value: str | None) -> str | None:
+                if value is None:
+                    return None
+                selected = value.rsplit("/", 1)[-1]
+                return None if selected in {"", ".", ".."} else selected
+
+            fact = HunterEvidenceFactV1(
+                evidence_id=incident.primary_event_id,
+                detector_rule=incident.detector_rule,
+                detector_rule_version=incident.detector_rule_version,
+                event_time=incident.event_time,
+                proc_name=incident.proc_name,
+                proc_exe_basename=basename(incident.proc_exe_path),
+                proc_parent_basename=basename(incident.proc_parent_name),
+                destination_ipv4=incident.destination_ipv4,
+                destination_port=incident.destination_port,
+                l4_protocol=incident.l4_protocol,
+                image_id=candidate.image_id,
+                coverage_flags=incident.coverage_flags[:32],
+            )
+            primary_bundle = build_hunter_bundle(incident, (fact,))
+            omitted = tuple(
+                identifier
+                for identifier in incident.evidence_ids
+                if identifier != fact.evidence_id
+            )
+            if not omitted:
+                return primary_bundle
+            return HunterBundleV1(
+                schema_version="agmind.hunter-bundle.v1",
+                evidence=primary_bundle.evidence,
+                omitted_evidence_ids=omitted,
+                limitations=(
+                    "Correlation proof retained for deterministic validation only",
+                ),
+            )
+
     def snapshot_hash(self) -> str:
         with self._mutex:
             connection, _authority = self._require_usable()

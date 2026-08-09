@@ -10,7 +10,7 @@ import re
 import stat
 from collections import deque
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -247,7 +247,7 @@ def _response_content(raw: bytes) -> bytes:
     ):
         raise _HunterResponseInvalid("hunter HTTP response has no exact assistant content")
     try:
-        content = message["content"].encode("utf-8", "strict")
+        content = cast(str, message["content"]).encode("utf-8", "strict")
     except UnicodeError as error:
         raise _HunterResponseInvalid("hunter assistant content is not valid UTF-8") from error
     if not 1 <= len(content) <= MAX_HUNTER_OUTPUT_BYTES:

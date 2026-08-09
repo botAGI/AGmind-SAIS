@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
-from typing import Literal, Never
+from typing import TYPE_CHECKING, Literal, Never
 
 from agmind_immune.actions import (
     DecisionIntentCommit,
@@ -90,6 +90,9 @@ from agmind_immune.policy.client import (
     _detach_policy_evaluation,
 )
 from agmind_immune.policy.models import PolicyError
+
+if TYPE_CHECKING:
+    from agmind_immune.hunter import HunterBundleV1
 
 _CONTROLLER_FACTORY = object()
 _PROJECTION_BATCH = 100
@@ -1898,6 +1901,48 @@ class CoreController:
                 projected=projected,
                 readiness=readiness,
             )
+
+    async def candidate_ids(
+        self,
+        *,
+        after: str | None = None,
+        limit: int = 16,
+    ) -> tuple[str, ...]:
+        """Return a bounded keyset page of durably projected candidates."""
+        async with self._lock:
+            self._require_open()
+            self._catch_up_projection()
+            if not self._projection_healthy:
+                raise CoreControllerAuthorityError(
+                    "candidate discovery requires a healthy projection"
+                )
+            return self._projection._candidate_ids(after=after, limit=limit)
+
+    async def decision_intent_commits(self) -> tuple[DecisionIntentCommit, ...]:
+        """Return detached durable decisions for restart-safe delivery replay."""
+        async with self._lock:
+            self._require_open()
+            records = self._decision_intents.records()
+            if type(records) is not tuple or any(
+                type(record) is not DecisionIntentCommit for record in records
+            ):
+                raise CoreControllerAuthorityError(
+                    "decision-intent journal returned inexact records"
+                )
+            return records
+
+    async def hunter_bundle(self, candidate_id: str) -> HunterBundleV1:
+        """Return a bounded read-only model bundle with no mutation authority."""
+        from agmind_immune.hunter import HunterBundleV1
+
+        async with self._lock:
+            self._require_open()
+            bundle = self._projection._hunter_bundle(candidate_id)
+            if type(bundle) is not HunterBundleV1:
+                raise CoreControllerAuthorityError(
+                    "hunter bundle is not an exact read-only observation"
+                )
+            return bundle
 
     async def close(self) -> None:
         async with self._lock:

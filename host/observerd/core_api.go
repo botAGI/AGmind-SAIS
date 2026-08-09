@@ -127,6 +127,7 @@ type coreAPIBackend interface {
 	AckCoreEvent(context.Context, CoreAckV1) error
 	LookupCoreInventory(context.Context, string) (ContainerIdentityV1, error)
 	CoreCoverage(context.Context) (CoreCoverageV1, error)
+	CorePublicKeys(context.Context) (PublicKeyMetadata, error)
 }
 
 func (service *Service) FetchCoreEvents(
@@ -251,6 +252,38 @@ func (service *Service) CoreCoverage(
 			time.RFC3339Nano,
 		),
 	}, nil
+}
+
+func (service *Service) CorePublicKeys(
+	ctx context.Context,
+) (PublicKeyMetadata, error) {
+	if service == nil ||
+		service.daemon == nil ||
+		service.daemon.state == nil ||
+		service.daemon.config.StateDir == "" {
+		return PublicKeyMetadata{}, fmt.Errorf(
+			"observer public-key metadata unavailable",
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return PublicKeyMetadata{}, err
+	}
+	metadata, err := LoadPublicKeyMetadata(service.daemon.config.StateDir)
+	if err != nil {
+		return PublicKeyMetadata{}, err
+	}
+	if err := metadata.Validate(); err != nil {
+		return PublicKeyMetadata{}, err
+	}
+	state := service.daemon.state.Snapshot()
+	if metadata.HostID != state.HostID ||
+		metadata.CurrentKeyID != state.KeyID ||
+		metadata.CurrentEpoch != state.KeyEpoch {
+		return PublicKeyMetadata{}, fmt.Errorf(
+			"observer public-key metadata does not match current state",
+		)
+	}
+	return metadata, nil
 }
 
 func exactFetchQuery(
@@ -393,6 +426,28 @@ func coreCoverageHandler(backend coreAPIBackend) http.Handler {
 	})
 }
 
+func corePublicKeysHandler(backend coreAPIBackend) http.Handler {
+	return http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		if backend == nil {
+			unavailableAPIHandler(writer, request)
+			return
+		}
+		metadata, err := backend.CorePublicKeys(request.Context())
+		if err != nil {
+			fixedAPIError(
+				writer,
+				http.StatusServiceUnavailable,
+				"public_keys_unavailable",
+			)
+			return
+		}
+		writeAPIJSON(writer, http.StatusOK, metadata)
+	})
+}
+
 func coreMutationPeerAuthorized(peer uds.Peer, coreUID uint32) bool {
 	return peer.UID == 0 || peer.UID == coreUID
 }
@@ -427,6 +482,10 @@ func newCoreAPI(
 	mux.Handle(
 		"GET /v1/coverage",
 		authorize(coreCoverageHandler(backend)),
+	)
+	mux.Handle(
+		"GET /v1/public-keys",
+		authorize(corePublicKeysHandler(backend)),
 	)
 	mux.Handle(
 		"POST /v1/events/retention-tombstone",

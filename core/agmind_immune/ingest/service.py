@@ -49,6 +49,7 @@ from agmind_immune.ingest.envelope import (
     MAX_CORE_EVENT_RESPONSE_BYTES,
     MAX_EVENTS_PAGE_BYTES,
     MAX_PAGE_EVENTS,
+    MAX_PUBLIC_KEY_METADATA_BYTES,
     AuthenticatedFalcoInput,
     AuthenticatedPCCInput,
     CoreEventsPageV1,
@@ -348,6 +349,8 @@ class DeliveryFatalError(DeliveryError):
 
 
 class ObserverCoreTransport(Protocol):
+    async def fetch_public_keys(self) -> bytes: ...
+
     async def fetch_events(self, *, after: int, limit: int) -> bytes: ...
 
     async def ack_event(self, body: bytes) -> None: ...
@@ -509,6 +512,79 @@ class HTTPXObserverCoreTransport:
             raise
         except (httpx.HTTPError, OSError, TimeoutError) as error:
             raise DeliveryRetryableError("observer fetch transport failed") from error
+
+    async def fetch_public_keys(self) -> bytes:
+        """Fetch one canonical, root-anchored metadata candidate at bootstrap."""
+        if self._closed:
+            raise DeliveryFatalError("observer transport is closed")
+        try:
+            async with self._client.stream("GET", "/v1/public-keys") as response:
+                if "content-encoding" in response.headers:
+                    await self._discard_error_body(response)
+                    raise DeliveryFatalError(
+                        "observer public-key response has Content-Encoding"
+                    )
+                if 500 <= response.status_code <= 599:
+                    await self._discard_error_body(response)
+                    raise DeliveryRetryableError(
+                        f"observer public-key fetch returned {response.status_code}"
+                    )
+                if response.status_code != 200:
+                    await self._discard_error_body(response)
+                    raise DeliveryFatalError(
+                        f"observer public-key fetch returned {response.status_code}"
+                    )
+                if response.headers.get_list("content-type") != ["application/json"]:
+                    await self._discard_error_body(response)
+                    raise DeliveryFatalError(
+                        "observer public-key Content-Type is not exact JSON"
+                    )
+                lengths = response.headers.get_list("content-length")
+                if len(lengths) > 1:
+                    await self._discard_error_body(response)
+                    raise DeliveryFatalError(
+                        "observer public-key Content-Length is duplicated"
+                    )
+                declared: int | None = None
+                if lengths:
+                    raw_length = lengths[0]
+                    if (
+                        not raw_length.isascii()
+                        or not raw_length.isdecimal()
+                        or str(int(raw_length)) != raw_length
+                    ):
+                        await self._discard_error_body(response)
+                        raise DeliveryFatalError(
+                            "observer public-key Content-Length is invalid"
+                        )
+                    declared = int(raw_length)
+                    if declared > MAX_PUBLIC_KEY_METADATA_BYTES + 1:
+                        await self._discard_error_body(response)
+                        raise DeliveryFatalError(
+                            "observer public-key response exceeds bound"
+                        )
+                raw = await self._read_raw_bounded(
+                    response,
+                    MAX_PUBLIC_KEY_METADATA_BYTES + 2,
+                )
+                if (
+                    (declared is not None and declared != len(raw))
+                    or
+                    len(raw) > MAX_PUBLIC_KEY_METADATA_BYTES + 1
+                    or len(raw) < 3
+                    or not raw.endswith(b"\n")
+                    or raw.endswith(b"\n\n")
+                ):
+                    raise DeliveryFatalError(
+                        "observer public-key response framing is invalid"
+                    )
+                return raw[:-1]
+        except DeliveryError:
+            raise
+        except (httpx.HTTPError, OSError, TimeoutError) as error:
+            raise DeliveryRetryableError(
+                "observer public-key transport failed"
+            ) from error
 
     async def ack_event(self, body: bytes) -> None:
         if self._closed:

@@ -2919,6 +2919,43 @@ class ProjectionStore:
                 return ProjectionStatus(False, None)
             return cast(ProjectionStatus, result)
 
+    def _candidate_ids(
+        self,
+        *,
+        after: str | None,
+        limit: int,
+    ) -> tuple[str, ...]:
+        with self._mutex:
+            if self._closed or self._owner is None:
+                raise ProjectionUnhealthy("projection is closed")
+            self._verify_namespace_binding_or_latch()
+            result = self._owner._candidate_ids(after=after, limit=limit)
+            self._verify_namespace_binding_or_latch()
+            if type(result) is not tuple or any(
+                type(value) is not str for value in result
+            ):
+                self._owner._healthy = False
+                raise ProjectionAuthorityError(
+                    "projection candidate page is not exact"
+                )
+            return cast(tuple[str, ...], result)
+
+    def _hunter_bundle(self, candidate_id: str) -> Any:
+        from agmind_immune.hunter import HunterBundleV1
+
+        with self._mutex:
+            if self._closed or self._owner is None:
+                raise ProjectionUnhealthy("projection is closed")
+            self._verify_namespace_binding_or_latch()
+            result = self._owner._hunter_bundle(candidate_id)
+            self._verify_namespace_binding_or_latch()
+            if type(result) is not HunterBundleV1:
+                self._owner._healthy = False
+                raise ProjectionAuthorityError(
+                    "projection hunter bundle is not exact"
+                )
+            return result
+
     def apply(self, ref: EvidenceRef) -> ProjectionApplyResult:
         with self._mutex:
             if self._closed or self._owner is None:
