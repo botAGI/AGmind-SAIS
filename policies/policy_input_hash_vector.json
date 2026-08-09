@@ -1,0 +1,38 @@
+{
+  "expected_sha256": "8d31e62e3ca26dffc0151b6a2dec0fba79389b803d0bb11b478808f6ed94c137",
+  "hostile_repo_digest": "repo<bad>@sha256:8888888888888888888888888888888888888888888888888888888888888888",
+  "input_without_hash": {
+    "boot_id": "123e4567-e89b-42d3-a456-426614174001",
+    "candidate_facts_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": "cand_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "coverage_ready": true,
+    "coverage_snapshot_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "destination_ipv4": "1.1.1.1",
+    "destination_port": 443,
+    "detector_bundle_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "detector_rule": "AGmind PCC Suspicious Process Outbound Connect",
+    "detector_rule_version": "agmind-pcc-rules-v1",
+    "docker_container_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "docker_network_snapshot_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "docker_started_at": "2026-07-27T12:00:00Z",
+    "evidence_age_ms": 100,
+    "evidence_ids": [
+      "evt_1111111111111111111111111111111111111111111111111111111111111111",
+      "evt_2222222222222222222222222222222222222222222222222222222222222222"
+    ],
+    "host_id": "123e4567-e89b-42d3-a456-426614174000",
+    "image_id": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "immutable_spec_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "inventory_generation": 9,
+    "inventory_revision": 3,
+    "l4_protocol": "tcp",
+    "management_denylist_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    "operator_denylist_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "policy_bundle_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+    "policy_bundle_version": "pcc-policy-v1",
+    "repo_digests": [],
+    "requested_ttl_seconds": 300,
+    "schema_version": "agmind.policy-input.v1",
+    "special_use_registry_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+  }
+}

@@ -58,6 +58,11 @@ RUN install -d -o root -g root -m 0755 /usr/share/agmind-sais
 COPY --chown=0:0 --chmod=0444 contracts/v1/ipv4-special-use.csv \
   /usr/share/agmind-sais/ipv4-special-use.csv
 
+# Fixed root-owned manual-only OPA policy bytes for Core identity binding
+COPY --chown=0:0 --chmod=0444 policies/pcc.rego /usr/share/agmind-sais/pcc.rego
+RUN test "$(sha256sum /usr/share/agmind-sais/pcc.rego | cut -d ' ' -f 1)" = \
+  "472ca6f13cee7962693c68c95688a49242300109b136640817f37c43bc27f1f7"
+
 # Копируем приложение
 COPY --chown=sais:sais . /app/
 WORKDIR /app
