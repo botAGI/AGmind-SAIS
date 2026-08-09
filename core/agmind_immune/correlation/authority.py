@@ -561,6 +561,50 @@ class _StoreLifecycleOwner:
     authority_ref: weakref.ReferenceType[CorrelationProjectionAuthority]
 
 
+@final
+class _PreparedProjectionAuthorityReplacement:
+    """Identity-only handle for one sealed authority replacement plan."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("projection authority replacements are factory-issued")
+
+    def __copy__(self) -> Never:
+        raise TypeError("projection authority replacements cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise TypeError("projection authority replacements cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise TypeError("projection authority replacements cannot be serialized")
+
+
+@dataclass(slots=True)
+class _ProjectionAuthorityReplacementState:
+    old_authority: CorrelationProjectionAuthority
+    old_binding: _ProjectionAuthorityBinding
+    old_revision: object
+    old_owner: _StoreLifecycleOwner
+    fresh_authority: CorrelationProjectionAuthority
+    fresh_reference: weakref.ReferenceType[CorrelationProjectionAuthority]
+    fresh_binding: _ProjectionAuthorityBinding
+    fresh_revision: object
+    fresh_revocation_revision: object
+    fresh_identity: int
+    fresh_issued_entry: tuple[
+        weakref.ReferenceType[CorrelationProjectionAuthority],
+        _ProjectionAuthorityBinding,
+    ]
+    owner_identity: tuple[int, int]
+    fresh_owner: _StoreLifecycleOwner
+    old_predecessor: _ProjectionPredecessor
+    old_revocation_revision: object
+    success_successor: _ProjectionPredecessor
+    fallback_successor: _ProjectionPredecessor
+    committed: bool = False
+
+
 _ISSUED_AUTHORITIES: dict[
     int,
     tuple[
@@ -572,7 +616,12 @@ _STORE_LIFECYCLE_OWNERS: dict[
     tuple[int, int],
     _StoreLifecycleOwner,
 ] = {}
+_PREPARED_AUTHORITY_REPLACEMENTS: weakref.WeakKeyDictionary[
+    _PreparedProjectionAuthorityReplacement,
+    _ProjectionAuthorityReplacementState,
+] = weakref.WeakKeyDictionary()
 _ISSUED_AUTHORITIES_LOCK = RLockType()
+_AUTHORITY_REPLACEMENT_FACTORY = object()
 
 
 def _safe_detector_bundle_sha256() -> str:
@@ -646,12 +695,22 @@ def _require_authority_locked(
 ) -> None:
     with _ISSUED_AUTHORITIES_LOCK:
         registered = _ISSUED_AUTHORITIES.get(id(authority))
+        owner = _STORE_LIFECYCLE_OWNERS.get(
+            (id(binding.store), id(binding.store_lifecycle))
+        )
+        current_owner = (
+            owner is not None
+            and owner.store_ref() is binding.store
+            and owner.lifecycle is binding.store_lifecycle
+            and owner.authority_ref() is authority
+        )
     if (
         registered is None
         or registered[0]() is not authority
         or registered[1] is not binding
         or authority._token is not binding.token
         or (binding.closed and not allow_closed)
+        or (not binding.closed and not current_owner)
     ):
         raise CorrelationProjectionError(
             "correlation projection authority is no longer live"
@@ -1481,6 +1540,299 @@ def _rebuild_correlation_projection_authority(
             )
         binding.predecessor = _clone_predecessor(successor_before)
         binding.revision = object()
+
+
+def _prepare_correlation_projection_authority_replacement(
+    authority: CorrelationProjectionAuthority,
+    success_successor: _ProjectionPredecessor,
+    fallback_successor: _ProjectionPredecessor,
+    *,
+    _factory: object,
+) -> _PreparedProjectionAuthorityReplacement:
+    """Preallocate an unregistered, two-outcome successor for one live owner."""
+    if _factory is not _AUTHORITY_REPLACEMENT_FACTORY:
+        raise CorrelationProjectionError(
+            "projection authority replacement preparation is factory-only"
+        )
+    success_before = _clone_predecessor(success_successor)
+    fallback_before = _clone_predecessor(fallback_successor)
+    binding = _authority_binding(authority)
+    with binding.lock, _ISSUED_AUTHORITIES_LOCK:
+        _require_authority_locked(authority, binding)
+        current = _clone_predecessor(binding.predecessor)
+        if (
+            current.generation == MAX_UINT64
+            or success_before.generation != current.generation + 1
+            or fallback_before.generation != current.generation + 1
+            or fallback_before.host_id != current.host_id
+            or fallback_before.source_sequence != current.source_sequence
+            or fallback_before.event_id != current.event_id
+            or fallback_before.content_sha256 != current.content_sha256
+            or fallback_before.frame_sha256 != current.frame_sha256
+            or success_before.source_sequence < current.source_sequence
+            or (
+                current.source_sequence != 0
+                and success_before.host_id != current.host_id
+            )
+            or _clone_predecessor(success_successor) != success_before
+            or _clone_predecessor(fallback_successor) != fallback_before
+            or _registry_facts(binding.registry) != binding.registry_facts
+            or _safe_detector_bundle_sha256()
+            != binding.detector_bundle_sha256
+        ):
+            raise CorrelationProjectionError(
+                "projection authority replacement successors are invalid"
+            )
+        owner_identity = (id(binding.store), id(binding.store_lifecycle))
+        current_owner = _STORE_LIFECYCLE_OWNERS.get(owner_identity)
+        if (
+            current_owner is None
+            or current_owner.store_ref() is not binding.store
+            or current_owner.lifecycle is not binding.store_lifecycle
+            or current_owner.authority_ref() is not authority
+        ):
+            raise CorrelationProjectionError(
+                "projection authority replacement lost its sole owner"
+            )
+        fresh = object.__new__(CorrelationProjectionAuthority)
+        fresh_token = object()
+        object.__setattr__(fresh, "_token", fresh_token)
+        fresh_revision = object()
+        fresh_binding = _ProjectionAuthorityBinding(
+            token=fresh_token,
+            lifecycle_token=os.urandom(32),
+            store=binding.store,
+            store_lifecycle=binding.store_lifecycle,
+            registry=binding.registry,
+            registry_facts=binding.registry_facts,
+            detector_bundle_sha256=binding.detector_bundle_sha256,
+            predecessor=fallback_before,
+            revision=fresh_revision,
+            closed=False,
+            lock=RLockType(),
+        )
+        fresh_identity = id(fresh)
+        store_reference = weakref.ref(binding.store)
+
+        def cleanup(
+            reference: weakref.ReferenceType[CorrelationProjectionAuthority],
+        ) -> None:
+            with _ISSUED_AUTHORITIES_LOCK:
+                registered = _ISSUED_AUTHORITIES.get(fresh_identity)
+                if registered is not None and registered[0] is reference:
+                    _ISSUED_AUTHORITIES.pop(fresh_identity, None)
+                owner = _STORE_LIFECYCLE_OWNERS.get(owner_identity)
+                if owner is not None and owner.authority_ref is reference:
+                    _STORE_LIFECYCLE_OWNERS.pop(owner_identity, None)
+
+        fresh_reference = weakref.ref(fresh, cleanup)
+        fresh_issued_entry = (fresh_reference, fresh_binding)
+        fresh_owner = _StoreLifecycleOwner(
+            store_ref=store_reference,
+            lifecycle=binding.store_lifecycle,
+            authority_ref=fresh_reference,
+        )
+        prepared = object.__new__(_PreparedProjectionAuthorityReplacement)
+        state = _ProjectionAuthorityReplacementState(
+            old_authority=authority,
+            old_binding=binding,
+            old_revision=binding.revision,
+            old_owner=current_owner,
+            fresh_authority=fresh,
+            fresh_reference=fresh_reference,
+            fresh_binding=fresh_binding,
+            fresh_revision=fresh_revision,
+            fresh_revocation_revision=object(),
+            fresh_identity=fresh_identity,
+            fresh_issued_entry=fresh_issued_entry,
+            owner_identity=owner_identity,
+            fresh_owner=fresh_owner,
+            old_predecessor=current,
+            old_revocation_revision=object(),
+            success_successor=success_before,
+            fallback_successor=fallback_before,
+        )
+        if (
+            _clone_predecessor(success_successor) != success_before
+            or _clone_predecessor(fallback_successor) != fallback_before
+            or _STORE_LIFECYCLE_OWNERS.get(owner_identity) is not current_owner
+        ):
+            raise CorrelationProjectionError(
+                "projection authority replacement changed during prepare"
+            )
+        _PREPARED_AUTHORITY_REPLACEMENTS[prepared] = state
+        return prepared
+
+
+def _commit_correlation_projection_authority_replacement(
+    prepared: _PreparedProjectionAuthorityReplacement,
+    *,
+    success: bool,
+    _factory: object,
+) -> CorrelationProjectionAuthority:
+    """Atomically revoke the old owner and install one prepared successor."""
+    if (
+        type(prepared) is not _PreparedProjectionAuthorityReplacement
+        or type(success) is not bool
+        or _factory is not _AUTHORITY_REPLACEMENT_FACTORY
+    ):
+        raise CorrelationProjectionError(
+            "projection authority replacement commit is not exact"
+        )
+    with _ISSUED_AUTHORITIES_LOCK:
+        state = _PREPARED_AUTHORITY_REPLACEMENTS.get(prepared)
+    if state is None:
+        raise CorrelationProjectionError(
+            "projection authority replacement was not prepared"
+        )
+    binding = state.old_binding
+    fresh_binding = state.fresh_binding
+    with binding.lock, fresh_binding.lock, _ISSUED_AUTHORITIES_LOCK:
+        _require_authority_locked(state.old_authority, binding)
+        owner = _STORE_LIFECYCLE_OWNERS.get(state.owner_identity)
+        if (
+            state.committed
+            or _PREPARED_AUTHORITY_REPLACEMENTS.get(prepared) is not state
+            or binding.revision is not state.old_revision
+            or _clone_predecessor(binding.predecessor)
+            != state.old_predecessor
+            or owner is not state.old_owner
+            or owner.store_ref() is not binding.store
+            or owner.lifecycle is not binding.store_lifecycle
+            or owner.authority_ref() is not state.old_authority
+            or _ISSUED_AUTHORITIES.get(state.fresh_identity) is not None
+            or state.fresh_reference() is not state.fresh_authority
+            or state.fresh_authority._token is not fresh_binding.token
+            or state.fresh_issued_entry
+            != (state.fresh_reference, fresh_binding)
+            or state.fresh_owner.store_ref() is not binding.store
+            or state.fresh_owner.lifecycle is not binding.store_lifecycle
+            or state.fresh_owner.authority_ref is not state.fresh_reference
+            or fresh_binding.store is not binding.store
+            or fresh_binding.store_lifecycle is not binding.store_lifecycle
+            or fresh_binding.registry is not binding.registry
+            or fresh_binding.registry_facts != binding.registry_facts
+            or fresh_binding.detector_bundle_sha256
+            != binding.detector_bundle_sha256
+            or fresh_binding.revision is not state.fresh_revision
+            or fresh_binding.closed
+            or _clone_predecessor(fresh_binding.predecessor)
+            != state.fallback_successor
+            or state.fallback_successor.generation
+            != state.old_predecessor.generation + 1
+            or state.fallback_successor.host_id
+            != state.old_predecessor.host_id
+            or state.fallback_successor.source_sequence
+            != state.old_predecessor.source_sequence
+            or state.fallback_successor.event_id
+            != state.old_predecessor.event_id
+            or state.fallback_successor.content_sha256
+            != state.old_predecessor.content_sha256
+            or state.fallback_successor.frame_sha256
+            != state.old_predecessor.frame_sha256
+            or state.success_successor.generation
+            != state.old_predecessor.generation + 1
+            or state.success_successor.source_sequence
+            < state.old_predecessor.source_sequence
+            or (
+                state.old_predecessor.source_sequence != 0
+                and state.success_successor.host_id
+                != state.old_predecessor.host_id
+            )
+        ):
+            raise CorrelationProjectionError(
+                "projection authority replacement is stale"
+            )
+        selected_successor = (
+            state.success_successor
+            if success
+            else state.fallback_successor
+        )
+        fresh_binding.predecessor = selected_successor
+        try:
+            # Registration is not liveness: while the old lifecycle owner is
+            # current, the prepared successor cannot authorize work.
+            _ISSUED_AUTHORITIES[state.fresh_identity] = state.fresh_issued_entry
+            # This single replacement is the visibility/ownership commit edge.
+            _STORE_LIFECYCLE_OWNERS[state.owner_identity] = state.fresh_owner
+            binding.closed = True
+            binding.revision = state.old_revocation_revision
+            state.committed = True
+        except BaseException:
+            current = _STORE_LIFECYCLE_OWNERS.get(state.owner_identity)
+            if current is state.fresh_owner:
+                # The edge happened. Normalize the committed lane; the caller
+                # can recover and explicitly fail-shut the fresh handle.
+                binding.closed = True
+                binding.revision = state.old_revocation_revision
+                state.committed = True
+            else:
+                registered = _ISSUED_AUTHORITIES.get(state.fresh_identity)
+                if registered is state.fresh_issued_entry:
+                    _ISSUED_AUTHORITIES.pop(state.fresh_identity, None)
+                fresh_binding.predecessor = state.fallback_successor
+            raise
+        return state.fresh_authority
+
+
+def _fail_closed_correlation_projection_authority_replacement(
+    prepared: _PreparedProjectionAuthorityReplacement,
+    primary: BaseException,
+    *,
+    _factory: object,
+) -> bool:
+    """Close a visible prepared successor without relying on caller adoption."""
+    if (
+        type(prepared) is not _PreparedProjectionAuthorityReplacement
+        or not isinstance(primary, BaseException)
+        or _factory is not _AUTHORITY_REPLACEMENT_FACTORY
+    ):
+        raise CorrelationProjectionError(
+            "projection authority replacement fail-shut is not exact"
+        )
+    with _ISSUED_AUTHORITIES_LOCK:
+        state = _PREPARED_AUTHORITY_REPLACEMENTS.get(prepared)
+    if state is None:
+        raise CorrelationProjectionError(
+            "projection authority replacement was not prepared"
+        )
+    with (
+        state.old_binding.lock,
+        state.fresh_binding.lock,
+        _ISSUED_AUTHORITIES_LOCK,
+    ):
+        current = _STORE_LIFECYCLE_OWNERS.get(state.owner_identity)
+        fresh_is_current = (
+            current is state.fresh_owner
+            and current.store_ref() is state.fresh_binding.store
+            and current.lifecycle is state.fresh_binding.store_lifecycle
+            and current.authority_ref() is state.fresh_authority
+        )
+        if fresh_is_current:
+            state.old_binding.closed = True
+            state.old_binding.revision = state.old_revocation_revision
+            state.committed = True
+            state.fresh_binding.closed = True
+            state.fresh_binding.revision = state.fresh_revocation_revision
+            if _STORE_LIFECYCLE_OWNERS.get(state.owner_identity) is current:
+                _STORE_LIFECYCLE_OWNERS.pop(state.owner_identity, None)
+            return True
+        old_is_current = (
+            current is state.old_owner
+            and current.store_ref() is state.old_binding.store
+            and current.lifecycle is state.old_binding.store_lifecycle
+            and current.authority_ref() is state.old_authority
+        )
+        registered = _ISSUED_AUTHORITIES.get(state.fresh_identity)
+        if old_is_current and registered is state.fresh_issued_entry:
+            _ISSUED_AUTHORITIES.pop(state.fresh_identity, None)
+        state.fresh_binding.closed = True
+        state.fresh_binding.revision = state.fresh_revocation_revision
+        if not old_is_current:
+            primary.add_note(
+                "correlation projection authority replacement lost its owner lane"
+            )
+        return False
 
 
 def _close_correlation_projection_authority(

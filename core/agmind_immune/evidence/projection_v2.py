@@ -31,14 +31,19 @@ from agmind_immune.contracts import (
     decode_strict,
 )
 from agmind_immune.correlation.authority import (
+    _AUTHORITY_REPLACEMENT_FACTORY,
     CorrelationProjectionAuthority,
     _advance_correlation_projection_authority,
     _capture_correlation_replay_locked,
     _close_correlation_projection_authority,
+    _commit_correlation_projection_authority_replacement,
     _correlation_projection_snapshot_gate,
     _CorrelationReplaySnapshot,
     _create_correlation_projection_authority,
+    _fail_closed_correlation_projection_authority_replacement,
     _issue_correlation_context,
+    _prepare_correlation_projection_authority_replacement,
+    _PreparedProjectionAuthorityReplacement,
     _ProjectionAuthorityBinding,
     _ProjectionPredecessor,
     _rebuild_correlation_projection_authority,
@@ -120,6 +125,8 @@ from agmind_immune.evidence.segments import (
     _ReplayRecordDescriptor,
     _ReplaySegmentDescriptor,
     _ReplaySourceSnapshot,
+    _RetentionAcceptedAuthorityBinding,
+    _RetentionAcceptedEnvelopeBinding,
 )
 from agmind_immune.incidents.models import ContainmentCandidateV1, IncidentV1
 from agmind_immune.ingest.ack_journal import (
@@ -405,8 +412,14 @@ class _ReplayPhase(StrEnum):
     COMPUTING = "computing"
     VALIDATING = "validating"
     STAGED = "staged"
+    SUSPENDED = "suspended"
     PUBLISHED = "published"
     FAILED = "failed"
+
+
+class _ReplayPurpose(StrEnum):
+    INITIAL = "initial"
+    V2_REBUILD = "v2_rebuild"
 
 
 class _ReplayFaultPhase(StrEnum):
@@ -416,6 +429,11 @@ class _ReplayFaultPhase(StrEnum):
     PUBLISH = "publish"
     POST_CALLBACK = "post_callback"
     PRE_COMMIT = "pre_commit"
+    REBUILD_CHECKPOINT = "rebuild_checkpoint"
+    REBUILD_CLOSE = "rebuild_close"
+    REBUILD_MATERIALIZE = "rebuild_materialize"
+    REBUILD_STAGED_CHECKPOINT = "rebuild_staged_checkpoint"
+    REBUILD_STAGED_CLOSE = "rebuild_staged_close"
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,6 +447,7 @@ class _ReplayStatus:
 @dataclass(frozen=True, slots=True)
 class _ReplayReservation:
     token: object
+    purpose: _ReplayPurpose
     base_generation: int
     publish_generation: int
     through_key: tuple[str, str, int, int, str, str, int, str] | None
@@ -457,6 +476,7 @@ class _ReplayInputSnapshot:
     base_projection_generation: int
     publish_generation: int
     retention_facts: _RetentionReplayFacts | None = None
+    purpose: _ReplayPurpose = _ReplayPurpose.INITIAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,6 +511,25 @@ class _StagedV2Replay:
 
     def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
         raise TypeError("staged Projection V2 capabilities cannot be serialized")
+
+
+@final
+class _V2RebuildGuard:
+    """Identity-only proof that one staged rebuild owns one live V2 namespace."""
+
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        raise TypeError("Projection V2 rebuild guards are owner-issued")
+
+    def __copy__(self) -> Never:
+        raise TypeError("Projection V2 rebuild guards cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise TypeError("Projection V2 rebuild guards cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise TypeError("Projection V2 rebuild guards cannot be serialized")
 
 
 @final
@@ -561,6 +600,7 @@ _NAMESPACE_PUBLICATION_STATES: dict[
 @dataclass(slots=True)
 class _StagedReplayBinding:
     capability: _StagedV2Replay
+    purpose: _ReplayPurpose
     through: EvidenceRef | None
     through_key: tuple[str, str, int, int, str, str, int, str] | None
     retention_scope: _AuthenticatedRetentionReplayScope | None
@@ -575,9 +615,13 @@ class _StagedReplayBinding:
     computation: _ReplayComputation
     hydrated_connection: sqlite3.Connection | None
     report: _UnpublishedV2ReplayReport
+    verified_old_cursor: ProjectionCursor | None
+    verified_old_prefix_sha256: str | None
+    verified_old_table_counts: tuple[tuple[str, int], ...] | None
     materialized_connection: sqlite3.Connection | None = None
     materialized_seal: _StagedV2ImageSeal | None = None
     materialized_physical: _StagedV2PhysicalBinding | None = None
+    rebuild: _V2RebuildBinding | None = None
 
 
 @dataclass(slots=True)
@@ -586,6 +630,26 @@ class _StagedV2PhysicalBinding:
     path: str
     device: int
     inode: int
+
+
+@dataclass(slots=True)
+class _ReopenedV2Old:
+    connection: sqlite3.Connection
+    physical: _StagedV2PhysicalBinding
+
+
+@dataclass(slots=True)
+class _V2RebuildBinding:
+    guard: _V2RebuildGuard
+    old_cursor: ProjectionCursor
+    old_prefix_sha256: str
+    old_table_counts: tuple[tuple[str, int], ...]
+    old_physical: _StagedV2PhysicalBinding
+    namespace_device: int
+    namespace_inode: int
+    authority_replacement: _PreparedProjectionAuthorityReplacement
+    suspended: bool = False
+    guard_consumed: bool = False
 
 
 @dataclass(slots=True)
@@ -1276,6 +1340,92 @@ def _revalidate_staged_v2_physical_binding(
         )
 
 
+def _revalidate_v2_rebuild_old_physical(
+    binding: _StagedV2PhysicalBinding,
+    *,
+    named: bool,
+) -> None:
+    if (
+        type(binding) is not _StagedV2PhysicalBinding
+        or type(named) is not bool
+        or binding.descriptor < 0
+    ):
+        raise ProjectionConflict("Projection V2 rebuild old binding changed")
+    try:
+        descriptor_info = os.fstat(binding.descriptor)
+        path_info = os.lstat(binding.path) if named else None
+        access_mode = fcntl.fcntl(binding.descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+    except OSError as error:
+        raise ProjectionConflict(
+            "Projection V2 rebuild old binding is unavailable"
+        ) from error
+    expected_links = 1 if named else 0
+    if (
+        not stat.S_ISREG(descriptor_info.st_mode)
+        or descriptor_info.st_uid != os.geteuid()
+        or stat.S_IMODE(descriptor_info.st_mode) != 0o600
+        or descriptor_info.st_nlink != expected_links
+        or (descriptor_info.st_dev, descriptor_info.st_ino)
+        != (binding.device, binding.inode)
+        or access_mode != os.O_RDONLY
+        or (
+            path_info is not None
+            and (
+                not stat.S_ISREG(path_info.st_mode)
+                or path_info.st_uid != os.geteuid()
+                or stat.S_IMODE(path_info.st_mode) != 0o600
+                or path_info.st_nlink != 1
+                or (path_info.st_dev, path_info.st_ino)
+                != (binding.device, binding.inode)
+            )
+        )
+    ):
+        raise ProjectionConflict("Projection V2 rebuild old binding changed")
+
+
+def _revalidate_reopened_v2_old_physical(
+    reopened: _StagedV2PhysicalBinding,
+    expected: _StagedV2PhysicalBinding,
+) -> None:
+    if (
+        type(reopened) is not _StagedV2PhysicalBinding
+        or type(expected) is not _StagedV2PhysicalBinding
+        or reopened.descriptor < 0
+        or reopened.path != expected.path
+        or (reopened.device, reopened.inode)
+        != (expected.device, expected.inode)
+    ):
+        raise ProjectionConflict(
+            "Projection V2 reopened old descriptor was substituted"
+        )
+    try:
+        descriptor_info = os.fstat(reopened.descriptor)
+        path_info = os.lstat(reopened.path)
+        access_mode = (
+            fcntl.fcntl(reopened.descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+        )
+    except OSError as error:
+        raise ProjectionConflict(
+            "Projection V2 reopened old descriptor is unavailable"
+        ) from error
+    if (
+        not stat.S_ISREG(descriptor_info.st_mode)
+        or descriptor_info.st_uid != os.geteuid()
+        or stat.S_IMODE(descriptor_info.st_mode) != 0o600
+        or descriptor_info.st_nlink != 1
+        or (descriptor_info.st_dev, descriptor_info.st_ino)
+        != (expected.device, expected.inode)
+        or access_mode != os.O_RDWR
+        or not stat.S_ISREG(path_info.st_mode)
+        or path_info.st_uid != os.geteuid()
+        or stat.S_IMODE(path_info.st_mode) != 0o600
+        or path_info.st_nlink != 1
+        or (path_info.st_dev, path_info.st_ino)
+        != (expected.device, expected.inode)
+    ):
+        raise ProjectionConflict(
+            "Projection V2 reopened old descriptor changed"
+        )
 def _prepare_v2(record: StoredEvidenceRecord) -> _PreparedV2Record:
     if type(record) is not StoredEvidenceRecord or type(record.ref) is not EvidenceRef:
         raise ProjectionValidationError("Projection V2 record is not exact evidence")
@@ -1621,6 +1771,91 @@ def _bind_retention_replay_scope_v2(
     )
 
 
+def _authenticated_retained_prefix_records_v2(
+    scope: _AuthenticatedRetentionReplayScope,
+    cursor: ProjectionCursor,
+) -> tuple[StoredEvidenceRecord, ...]:
+    """Rehydrate a retired prefix from the completion's verifier authority."""
+    completion = scope.completion_binding
+    authority = completion.tombstone.accepted_authority
+    if (
+        type(scope) is not _AuthenticatedRetentionReplayScope
+        or type(cursor) is not ProjectionCursor
+        or type(authority) is not _RetentionAcceptedAuthorityBinding
+        or type(authority.entries) is not tuple
+    ):
+        raise ProjectionAuthorityError(
+            "Projection V2 retained prefix authority is not exact"
+        )
+    records: list[StoredEvidenceRecord] = []
+    expected_sequence = 1
+    for entry in authority.entries:
+        if type(entry) is not _RetentionAcceptedEnvelopeBinding:
+            raise ProjectionAuthorityError(
+                "Projection V2 retained prefix entry is not exact"
+            )
+        if entry.sequence > cursor.source_sequence:
+            break
+        ref = entry.evidence_ref
+        accepted = entry.accepted
+        try:
+            envelope = decode_strict(
+                entry.canonical,
+                EventEnvelopeV1,
+                _MAX_CANONICAL_ENVELOPE_BYTES_V2,
+            )
+            canonical = canonical_json(envelope.model_dump(exclude_none=True))
+            priority = EvidencePriority(entry.evidence_priority)
+            ref_key = _exact_coverage_ref_key(ref)
+        except (AttributeError, TypeError, ValueError, ValidationError) as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 retained prefix entry is malformed"
+            ) from error
+        if (
+            type(ref) is not EvidenceRef
+            or entry.sequence != expected_sequence
+            or ref.source_sequence != entry.sequence
+            or entry.evidence_ref_key != ref_key
+            or canonical != entry.canonical
+            or hashlib.sha256(canonical).hexdigest() != ref.content_sha256
+            or envelope.source_sequence != ref.source_sequence
+            or envelope.event_id != ref.event_id
+            or getattr(accepted, "canonical", None) != entry.canonical
+            or getattr(accepted, "evidence_ref", None) is not ref
+            or getattr(accepted, "evidence_priority", None)
+            != entry.evidence_priority
+            or getattr(accepted, "key_epoch", None) != entry.key_epoch
+            or getattr(accepted, "key_id", None) != entry.key_id
+        ):
+            raise ProjectionConflict(
+                "Projection V2 retained prefix authority changed"
+            )
+        records.append(
+            StoredEvidenceRecord(
+                envelope=envelope.model_dump(exclude_none=True),
+                canonical_envelope=canonical,
+                priority=priority,
+                # accepted_at is validated by the storage contract but is not a
+                # persisted Projection V2 fact or reducer input.
+                accepted_at="1970-01-01T00:00:00Z",
+                ref=ref,
+            )
+        )
+        expected_sequence += 1
+    if (
+        not records
+        or expected_sequence != cursor.source_sequence + 1
+        or records[-1].ref.source_sequence != cursor.source_sequence
+        or records[-1].ref.event_id != cursor.event_id
+        or records[-1].ref.content_sha256 != cursor.content_sha256
+        or records[-1].ref.frame_sha256 != cursor.frame_sha256
+    ):
+        raise ProjectionConflict(
+            "Projection V2 retained prefix does not bind its old cursor"
+        )
+    return tuple(records)
+
+
 def _same_stored_record_v2(
     left: StoredEvidenceRecord,
     right: StoredEvidenceRecord,
@@ -1817,6 +2052,7 @@ def _validate_replay_snapshot_shape_v2(
 ]:
     if type(snapshot) is not _ReplayInputSnapshot:
         raise TypeError("Projection V2 compute requires an exact replay snapshot")
+    purpose = snapshot.purpose
     source = snapshot.source
     ack = snapshot.ack
     correlation = snapshot.correlation
@@ -1825,7 +2061,8 @@ def _validate_replay_snapshot_shape_v2(
     base_generation = snapshot.base_projection_generation
     publish_generation = snapshot.publish_generation
     if (
-        type(source) is not _ReplaySourceSnapshot
+        type(purpose) is not _ReplayPurpose
+        or type(source) is not _ReplaySourceSnapshot
         or type(ack) is not _AckReplaySnapshot
         or type(correlation) is not _CorrelationReplaySnapshot
         or type(pcc_inputs) is not tuple
@@ -1928,10 +2165,23 @@ def _validate_replay_snapshot_shape_v2(
         raise TypeError("Projection V2 replay predecessor is malformed") from error
     if (
         predecessor_seal.canonical != correlation.predecessor_canonical
-        or predecessor
-        != _ProjectionPredecessor(base_generation, None, 0, None, None, None)
+        or predecessor.generation != base_generation
+        or (
+            purpose is _ReplayPurpose.INITIAL
+            and predecessor
+            != _ProjectionPredecessor(base_generation, None, 0, None, None, None)
+        )
+        or (
+            purpose is _ReplayPurpose.V2_REBUILD
+            and (
+                predecessor.source_sequence == 0
+                or predecessor.host_id is None
+                or predecessor.event_id is None
+                or predecessor.content_sha256 is None
+            )
+        )
     ):
-        raise ProjectionConflict("Projection V2 replay predecessor is not empty")
+        raise ProjectionConflict("Projection V2 replay predecessor is not exact")
     return (
         source,
         ack,
@@ -3470,6 +3720,53 @@ class _V2ProjectionOwner:
                 "Projection V2 cursor does not bind exact authenticated evidence"
             )
 
+    def _validate_v2_rebuild_cursor_evidence(
+        self,
+        connection: sqlite3.Connection,
+        cursor: ProjectionCursor | None,
+        retention_scope: _AuthenticatedRetentionReplayScope | None,
+    ) -> None:
+        if retention_scope is None:
+            self._validate_cursor_evidence(connection, cursor)
+            return
+        if cursor is None:
+            raise ProjectionConflict(
+                "Projection V2 retained rebuild lost its old cursor"
+            )
+        cursor_ref = _current_v2_cursor_ref(connection)
+        if (
+            cursor_ref is None
+            or cursor_ref.source_sequence != cursor.source_sequence
+            or cursor_ref.event_id != cursor.event_id
+            or cursor_ref.content_sha256 != cursor.content_sha256
+            or cursor_ref.frame_sha256 != cursor.frame_sha256
+            or sum(
+                1
+                for start, end in retention_scope.retained_ranges
+                if start <= cursor.source_sequence <= end
+            )
+            != 1
+        ):
+            raise ProjectionConflict(
+                "Projection V2 retained rebuild old cursor is not exact"
+            )
+        try:
+            resolved = self._evidence._resolve_recovered_ack_identity(
+                self._acknowledgements,
+                self._ack_lifecycle,
+                sequence=cursor.source_sequence,
+                event_id=cursor.event_id,
+                content_sha256=cursor.content_sha256,
+            )
+        except EvidenceStoreError as error:
+            raise ProjectionAuthorityError(
+                "Projection V2 retained rebuild cursor lost authority"
+            ) from error
+        if resolved is not None:
+            raise ProjectionConflict(
+                "Projection V2 retained rebuild cursor was not retired"
+            )
+
     def _latch_unhealthy(self, primary: BaseException | None = None) -> None:
         self._healthy = False
         authority = self._authority
@@ -3679,6 +3976,7 @@ class _V2ProjectionOwner:
         prepared: _PreparedV2Record,
         *,
         is_primary: bool,
+        retained_authority: bool,
     ) -> None:
         event_id = prepared.envelope.event_id
         self._validate_coverage_invalidation_closure(
@@ -3815,21 +4113,34 @@ class _V2ProjectionOwner:
                     "Projection V2 retry has an unexpected incident"
                 )
             return
-        verifier = self._evidence._bound_verifier
-        if verifier is None:
-            raise ProjectionAuthorityError(
-                "Projection V2 retry lost Falco verifier authority"
+        if retained_authority:
+            assert falco is not None
+            incident = _incident_from_frozen_falco(
+                falco,
+                event_id=prepared.envelope.event_id,
+                source_sequence=prepared.envelope.source_sequence,
+                host_id=prepared.envelope.host_id,
+                boot_id=prepared.envelope.boot_id,
+                event_time=prepared.envelope.event_time,
+                ingest_time=prepared.envelope.ingest_time,
+                coverage_flags=tuple(prepared.envelope.coverage_flags),
             )
-        try:
-            authenticated = self._evidence._authenticated_falco_input(
-                verifier,
-                prepared.record.ref,
-            )
-            incident = incident_from_verified_falco(authenticated)
-        except Exception as error:
-            raise ProjectionAuthorityError(
-                "Projection V2 retry Falco authority is unavailable"
-            ) from error
+        else:
+            verifier = self._evidence._bound_verifier
+            if verifier is None:
+                raise ProjectionAuthorityError(
+                    "Projection V2 retry lost Falco verifier authority"
+                )
+            try:
+                authenticated = self._evidence._authenticated_falco_input(
+                    verifier,
+                    prepared.record.ref,
+                )
+                incident = incident_from_verified_falco(authenticated)
+            except Exception as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 retry Falco authority is unavailable"
+                ) from error
         if (
             len(incident_rows) != 1
             or tuple(incident_rows[0])
@@ -3847,6 +4158,7 @@ class _V2ProjectionOwner:
         prepared: _PreparedV2Record,
         *,
         is_primary: bool,
+        retained_authority: bool = False,
     ) -> None:
         self._validate_retry_base_closure(
             connection,
@@ -3859,6 +4171,7 @@ class _V2ProjectionOwner:
             predecessor,
             prepared,
             is_primary=is_primary,
+            retained_authority=retained_authority,
         )
 
     def _validate_persisted_prefix(
@@ -3867,6 +4180,8 @@ class _V2ProjectionOwner:
         authority: CorrelationProjectionAuthority,
         predecessor: _ProjectionPredecessor,
         cursor: ProjectionCursor | None,
+        *,
+        authenticated_records: tuple[StoredEvidenceRecord, ...] | None = None,
     ) -> str:
         prefix_sha256 = _v2_snapshot_hash(connection)
         if cursor is None:
@@ -3883,17 +4198,30 @@ class _V2ProjectionOwner:
                     "Projection V2 has facts without a cursor"
                 )
             return prefix_sha256
-        try:
-            records = tuple(
-                self._evidence.iter_authenticated_records(
-                    after=0,
-                    through=cursor.source_sequence,
+        if authenticated_records is None:
+            try:
+                records = tuple(
+                    self._evidence.iter_authenticated_records(
+                        after=0,
+                        through=cursor.source_sequence,
+                    )
                 )
-            )
-        except Exception as error:
-            raise ProjectionAuthorityError(
-                "Projection V2 persisted prefix is unavailable"
-            ) from error
+            except Exception as error:
+                raise ProjectionAuthorityError(
+                    "Projection V2 persisted prefix is unavailable"
+                ) from error
+        else:
+            if (
+                type(authenticated_records) is not tuple
+                or any(
+                    type(record) is not StoredEvidenceRecord
+                    for record in authenticated_records
+                )
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 supplied prefix authority is not exact"
+                )
+            records = authenticated_records
         if (
             not records
             or records[-1].ref.source_sequence != cursor.source_sequence
@@ -3992,6 +4320,7 @@ class _V2ProjectionOwner:
                 predecessor,
                 prepared,
                 is_primary=is_primary,
+                retained_authority=authenticated_records is not None,
             )
             falco = prepared.falco
             if (
@@ -4197,16 +4526,18 @@ class _V2ProjectionOwner:
                 ack_boundary,
             )
 
-    def _stage_unpublished_prefix(
+    def _stage_replay_prefix(
         self,
         through: EvidenceRef | None,
         *,
+        purpose: _ReplayPurpose,
         _factory: object,
         retention_completion: AuthenticatedRetentionUnlinkCompletion | None = None,
         _fault_phase: _ReplayFaultPhase | None = None,
     ) -> _StagedV2Replay:
         if (
             _factory is not _STAGED_REPLAY_FACTORY
+            or type(purpose) is not _ReplayPurpose
             or (through is not None and type(through) is not EvidenceRef)
             or (
                 retention_completion is not None
@@ -4248,7 +4579,17 @@ class _V2ProjectionOwner:
         staged = False
         base_generation = self._generation
         acceptance_cursor = 0
+        verified_old_cursor: ProjectionCursor | None = None
+        verified_old_prefix_sha256: str | None = None
+        verified_old_table_counts: tuple[tuple[str, int], ...] | None = None
         try:
+            if purpose is _ReplayPurpose.V2_REBUILD:
+                with self._mutex:
+                    self._require_usable()
+                    if self._generation >= MAX_UINT64:
+                        raise ProjectionAuthorityError(
+                            "Projection V2 rebuild generation is exhausted"
+                        )
             if retention_completion is not None:
                 retention_scope = _capture_retention_replay_scope_v2(
                     self._evidence,
@@ -4267,18 +4608,25 @@ class _V2ProjectionOwner:
                     self._evidence_lifecycle,
                     retention_scope,
                 )
-                if _current_v2_cursor(connection) is not None or any(
-                    connection.execute(
-                        f"SELECT count(*) FROM {table}"
-                    ).fetchone()[0]
-                    for table, _columns, _primary_key in _TABLE_LAYOUT_V2[1:]
-                ):
+                live_cursor = _current_v2_cursor(connection)
+                if purpose is _ReplayPurpose.INITIAL:
+                    if live_cursor is not None or any(
+                        connection.execute(
+                            f"SELECT count(*) FROM {table}"
+                        ).fetchone()[0]
+                        for table, _columns, _primary_key in _TABLE_LAYOUT_V2[1:]
+                    ):
+                        raise ProjectionConflict(
+                            "Projection V2 unpublished replay requires an empty database"
+                        )
+                elif live_cursor is None or through is None:
                     raise ProjectionConflict(
-                        "Projection V2 unpublished replay requires an empty database"
+                        "Projection V2 rebuild requires a nonempty exact V2 base"
                     )
                 base_generation = self._generation
                 reservation = _ReplayReservation(
                     token=object(),
+                    purpose=purpose,
                     base_generation=base_generation,
                     publish_generation=base_generation + 1,
                     through_key=through_key,
@@ -4299,8 +4647,35 @@ class _V2ProjectionOwner:
 
                 expected_predecessor = _predecessor_v2(
                     base_generation,
-                    None,
+                    (
+                        None
+                        if purpose is _ReplayPurpose.INITIAL
+                        else live_cursor
+                    ),
                 )
+                if purpose is _ReplayPurpose.V2_REBUILD:
+                    self._validate_v2_rebuild_cursor_evidence(
+                        connection,
+                        live_cursor,
+                        retention_scope,
+                    )
+                    verified_old_cursor = cast(ProjectionCursor, live_cursor)
+                    retained_records = (
+                        None
+                        if retention_scope is None
+                        else _authenticated_retained_prefix_records_v2(
+                            retention_scope,
+                            verified_old_cursor,
+                        )
+                    )
+                    verified_old_prefix_sha256 = self._validate_persisted_prefix(
+                        connection,
+                        authority,
+                        expected_predecessor,
+                        verified_old_cursor,
+                        authenticated_records=retained_records,
+                    )
+                    verified_old_table_counts = _v2_table_counts(connection)
                 retention_gate_context = (
                     nullcontext(None)
                     if retention_scope is None
@@ -4341,6 +4716,19 @@ class _V2ProjectionOwner:
                             retention_gate,
                         )
                     )
+                    if purpose is _ReplayPurpose.V2_REBUILD and (
+                        verified_old_cursor is None
+                        or verified_old_prefix_sha256 is None
+                        or verified_old_table_counts is None
+                        or _current_v2_cursor(connection) != verified_old_cursor
+                        or _v2_snapshot_hash(connection)
+                        != verified_old_prefix_sha256
+                        or _v2_table_counts(connection)
+                        != verified_old_table_counts
+                    ):
+                        raise ProjectionConflict(
+                            "Projection V2 rebuild old base changed during freeze"
+                        )
                     ack_snapshot = (
                         self._acknowledgements._capture_replay_ack_locked(
                             acceptance_cursor
@@ -4400,6 +4788,7 @@ class _V2ProjectionOwner:
                         ) from error
                     issued_proofs = ()
                     snapshot = _ReplayInputSnapshot(
+                        purpose=purpose,
                         source=source_snapshot,
                         ack=ack_snapshot,
                         correlation=correlation_snapshot,
@@ -4520,6 +4909,31 @@ class _V2ProjectionOwner:
                         self._journal,
                         journal_snapshot,
                     )
+                    if purpose is _ReplayPurpose.V2_REBUILD:
+                        if (
+                            verified_old_cursor is None
+                            or verified_old_prefix_sha256 is None
+                            or verified_old_table_counts is None
+                        ):
+                            raise ProjectionAuthorityError(
+                                "Projection V2 rebuild lost its verified old base"
+                            )
+                        self._validate_v2_rebuild_cursor_evidence(
+                            connection,
+                            verified_old_cursor,
+                            retention_scope,
+                        )
+                        if (
+                            _current_v2_cursor(connection)
+                            != verified_old_cursor
+                            or _v2_snapshot_hash(connection)
+                            != verified_old_prefix_sha256
+                            or _v2_table_counts(connection)
+                            != verified_old_table_counts
+                        ):
+                            raise ProjectionConflict(
+                                "Projection V2 rebuild verified old base changed"
+                            )
                     if (
                         computation.terminal_predecessor.generation
                         != base_generation + 1
@@ -4549,6 +4963,7 @@ class _V2ProjectionOwner:
                     capability = object.__new__(_StagedV2Replay)
                     binding = _StagedReplayBinding(
                         capability=capability,
+                        purpose=purpose,
                         through=through,
                         through_key=through_key,
                         retention_scope=retention_scope,
@@ -4563,6 +4978,11 @@ class _V2ProjectionOwner:
                         computation=computation,
                         hydrated_connection=hydrated_connection,
                         report=report,
+                        verified_old_cursor=verified_old_cursor,
+                        verified_old_prefix_sha256=(
+                            verified_old_prefix_sha256
+                        ),
+                        verified_old_table_counts=verified_old_table_counts,
                     )
                     staged_binding = binding
                     with self._replay_state_lock:
@@ -4711,6 +5131,158 @@ class _V2ProjectionOwner:
                                 )
                     raise cleanup_group
 
+    def _stage_unpublished_prefix(
+        self,
+        through: EvidenceRef | None,
+        *,
+        _factory: object,
+        retention_completion: AuthenticatedRetentionUnlinkCompletion | None = None,
+        _fault_phase: _ReplayFaultPhase | None = None,
+    ) -> _StagedV2Replay:
+        return self._stage_replay_prefix(
+            through,
+            purpose=_ReplayPurpose.INITIAL,
+            _factory=_factory,
+            retention_completion=retention_completion,
+            _fault_phase=_fault_phase,
+        )
+
+    def _stage_v2_rebuild_prefix(
+        self,
+        through: EvidenceRef,
+        *,
+        _factory: object,
+        retention_completion: AuthenticatedRetentionUnlinkCompletion | None = None,
+        _fault_phase: _ReplayFaultPhase | None = None,
+    ) -> _StagedV2Replay:
+        if type(through) is not EvidenceRef:
+            raise ProjectionAuthorityError(
+                "Projection V2 rebuild terminal is not exact"
+            )
+        return self._stage_replay_prefix(
+            through,
+            purpose=_ReplayPurpose.V2_REBUILD,
+            _factory=_factory,
+            retention_completion=retention_completion,
+            _fault_phase=_fault_phase,
+        )
+
+    def _bind_staged_v2_rebuild_namespace(
+        self,
+        capability: _StagedV2Replay,
+        *,
+        device: int,
+        inode: int,
+        _factory: object,
+    ) -> _V2RebuildGuard:
+        if (
+            _factory is not _STAGED_REPLAY_FACTORY
+            or type(device) is not int
+            or type(inode) is not int
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 rebuild namespace binding is factory-only"
+            )
+        binding: _StagedReplayBinding | None = None
+        physical: _StagedV2PhysicalBinding | None = None
+        try:
+            with self._mutex:
+                binding = self._require_staged_replay_locked(capability)
+                if (
+                    binding.purpose is not _ReplayPurpose.V2_REBUILD
+                    or binding.rebuild is not None
+                ):
+                    raise ProjectionAuthorityError(
+                        "Projection V2 rebuild guard is not available"
+                    )
+                connection = binding.live_connection
+                cursor = _current_v2_cursor(connection)
+                if cursor is None:
+                    raise ProjectionConflict(
+                        "Projection V2 rebuild lost its old cursor"
+                    )
+                _verify_v2_schema(connection)
+                self._validate_v2_rebuild_cursor_evidence(
+                    connection,
+                    cursor,
+                    binding.retention_scope,
+                )
+                prefix_sha256 = _v2_snapshot_hash(connection)
+                table_counts = _v2_table_counts(connection)
+                if (
+                    binding.verified_old_cursor is None
+                    or binding.verified_old_prefix_sha256 is None
+                    or binding.verified_old_table_counts is None
+                    or cursor != binding.verified_old_cursor
+                    or prefix_sha256 != binding.verified_old_prefix_sha256
+                    or table_counts != binding.verified_old_table_counts
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 rebuild old base differs from verified stage"
+                    )
+                database_path = _v2_exact_main_database_path(
+                    connection,
+                    require_file_backed=True,
+                )
+                physical = _capture_staged_v2_physical_binding(database_path)
+                if (physical.device, physical.inode) != (device, inode):
+                    raise ProjectionConflict(
+                        "Projection V2 rebuild namespace inode was substituted"
+                    )
+                current_predecessor = _predecessor_v2(
+                    binding.reservation.base_generation,
+                    cursor,
+                )
+                _validate_correlation_projection_predecessor(
+                    binding.authority,
+                    current_predecessor,
+                )
+                fallback_successor = _predecessor_v2(
+                    binding.reservation.publish_generation,
+                    cursor,
+                )
+                replacement = (
+                    _prepare_correlation_projection_authority_replacement(
+                        binding.authority,
+                        binding.computation.terminal_predecessor,
+                        fallback_successor,
+                        _factory=_AUTHORITY_REPLACEMENT_FACTORY,
+                    )
+                )
+                _revalidate_staged_v2_physical_binding(physical)
+                if (
+                    _current_v2_cursor(connection) != cursor
+                    or _v2_snapshot_hash(connection) != prefix_sha256
+                    or _v2_table_counts(connection) != table_counts
+                ):
+                    raise ProjectionConflict(
+                        "Projection V2 rebuild old image changed during binding"
+                    )
+                guard = object.__new__(_V2RebuildGuard)
+                installed = _V2RebuildBinding(
+                    guard=guard,
+                    old_cursor=cursor,
+                    old_prefix_sha256=prefix_sha256,
+                    old_table_counts=table_counts,
+                    old_physical=physical,
+                    namespace_device=device,
+                    namespace_inode=inode,
+                    authority_replacement=replacement,
+                )
+                binding.rebuild = installed
+                return guard
+        finally:
+            adopted = (
+                physical is not None
+                and binding is not None
+                and binding.rebuild is not None
+                and binding.rebuild.old_physical is physical
+            )
+            if physical is not None and not adopted and physical.descriptor >= 0:
+                descriptor = physical.descriptor
+                physical.descriptor = -1
+                os.close(descriptor)
+
     def _require_staged_replay_locked(
         self,
         capability: _StagedV2Replay,
@@ -4732,6 +5304,114 @@ class _V2ProjectionOwner:
             raise ProjectionUnhealthy("Projection V2 owner is not usable")
         return binding
 
+    def _v2_rebuild_fallback_completed(
+        self,
+        capability: _StagedV2Replay,
+        guard: _V2RebuildGuard,
+        generation: int,
+        *,
+        _factory: object,
+    ) -> bool:
+        if (
+            _factory is not _STAGED_REPLAY_FACTORY
+            or type(capability) is not _StagedV2Replay
+            or type(guard) is not _V2RebuildGuard
+            or type(generation) is not int
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 fallback observation is factory-only"
+            )
+        with self._mutex, self._replay_state_lock:
+            return (
+                self._healthy
+                and self._generation == generation
+                and self._staged_replay is None
+                and self._replay_reservation is None
+                and self._replay_status.generation == generation
+                and self._replay_status.phase is _ReplayPhase.FAILED
+                and self._replay_status.reservation_present is False
+            )
+
+    def _require_v2_rebuild_guard_locked(
+        self,
+        capability: _StagedV2Replay,
+        guard: _V2RebuildGuard,
+        *,
+        permit_suspended: bool,
+    ) -> tuple[_StagedReplayBinding, _V2RebuildBinding]:
+        binding = self._staged_replay
+        with self._replay_state_lock:
+            phase = self._replay_status.phase
+            if (
+                type(capability) is not _StagedV2Replay
+                or type(guard) is not _V2RebuildGuard
+                or binding is None
+                or binding.capability is not capability
+                or binding.purpose is not _ReplayPurpose.V2_REBUILD
+                or binding.rebuild is None
+                or binding.rebuild.guard is not guard
+                or self._replay_reservation is not binding.reservation
+                or binding.reservation.purpose is not _ReplayPurpose.V2_REBUILD
+                or not self._replay_status.reservation_present
+                or (
+                    phase is not _ReplayPhase.STAGED
+                    and not (
+                        permit_suspended
+                        and phase is _ReplayPhase.SUSPENDED
+                        and binding.rebuild.suspended
+                    )
+                )
+            ):
+                raise ProjectionAuthorityError(
+                    "Projection V2 rebuild guard is not current"
+                )
+        if self._closed or not self._healthy:
+            raise ProjectionUnhealthy("Projection V2 owner is not usable")
+        return binding, binding.rebuild
+
+    def _validate_v2_rebuild_old_locked(
+        self,
+        binding: _StagedReplayBinding,
+        rebuild: _V2RebuildBinding,
+        connection: sqlite3.Connection,
+    ) -> None:
+        if (
+            type(connection) is not sqlite3.Connection
+            or connection.in_transaction
+            or _v2_exact_main_database_path(
+                connection,
+                require_file_backed=True,
+            )
+            != rebuild.old_physical.path
+        ):
+            raise ProjectionConflict(
+                "Projection V2 rebuild old connection is not exact"
+            )
+        _revalidate_v2_rebuild_old_physical(
+            rebuild.old_physical,
+            named=True,
+        )
+        _verify_v2_schema(connection)
+        cursor = _current_v2_cursor(connection)
+        self._validate_v2_rebuild_cursor_evidence(
+            connection,
+            cursor,
+            binding.retention_scope,
+        )
+        if (
+            cursor != rebuild.old_cursor
+            or cursor != binding.verified_old_cursor
+            or _v2_snapshot_hash(connection) != rebuild.old_prefix_sha256
+            or rebuild.old_prefix_sha256
+            != binding.verified_old_prefix_sha256
+            or _v2_table_counts(connection) != rebuild.old_table_counts
+            or rebuild.old_table_counts != binding.verified_old_table_counts
+            or (rebuild.old_physical.device, rebuild.old_physical.inode)
+            != (rebuild.namespace_device, rebuild.namespace_inode)
+            or self._generation != binding.reservation.base_generation
+        ):
+            raise ProjectionConflict("Projection V2 rebuild old seal changed")
+
     def _revalidate_staged_replay_locked(
         self,
         binding: _StagedReplayBinding,
@@ -4741,12 +5421,23 @@ class _V2ProjectionOwner:
         source_snapshot = binding.source_snapshot
         ack_snapshot = binding.ack_snapshot
         hydrated = binding.hydrated_connection
+        rebuild_suspended = (
+            binding.purpose is _ReplayPurpose.V2_REBUILD
+            and binding.rebuild is not None
+            and binding.rebuild.suspended
+            and self._connection is None
+        )
         if (
             type(binding) is not _StagedReplayBinding
             or self._staged_replay is not binding
-            or self._connection is not binding.live_connection
+            or (
+                self._connection is not binding.live_connection
+                and not rebuild_suspended
+            )
             or self._authority is not binding.authority
             or self._generation != binding.reservation.base_generation
+            or binding.purpose is not binding.reservation.purpose
+            or binding.snapshot.purpose is not binding.purpose
             or source_snapshot is None
             or ack_snapshot is None
             or hydrated is None
@@ -4828,6 +5519,282 @@ class _V2ProjectionOwner:
                 "Projection V2 staged replay cursor changed"
             )
 
+    def _close_v2_rebuild_stage_resources_locked(
+        self,
+        binding: _StagedReplayBinding,
+    ) -> list[BaseException]:
+        errors: list[BaseException] = []
+        materialized = binding.materialized_connection
+        binding.materialized_connection = None
+        if materialized is not None:
+            try:
+                materialized.close()
+            except BaseException as error:  # noqa: BLE001 - drain exact target
+                errors.append(error)
+        for physical in (
+            binding.materialized_physical,
+            None if binding.rebuild is None else binding.rebuild.old_physical,
+        ):
+            if physical is None or physical.descriptor < 0:
+                continue
+            descriptor = physical.descriptor
+            physical.descriptor = -1
+            try:
+                os.close(descriptor)
+            except BaseException as error:  # noqa: BLE001 - drain exact fd
+                errors.append(error)
+        binding.materialized_physical = None
+        hydrated = binding.hydrated_connection
+        binding.hydrated_connection = None
+        if hydrated is not None and hydrated is not materialized:
+            try:
+                hydrated.close()
+            except BaseException as error:  # noqa: BLE001 - exact staged image
+                errors.append(error)
+        ack_snapshot = binding.ack_snapshot
+        binding.ack_snapshot = None
+        if ack_snapshot is not None:
+            try:
+                _close_replay_ack_snapshot(ack_snapshot)
+            except BaseException as error:  # noqa: BLE001 - exact snapshot
+                errors.append(error)
+        source_snapshot = binding.source_snapshot
+        binding.source_snapshot = None
+        if source_snapshot is not None:
+            try:
+                _close_replay_source_snapshot(source_snapshot)
+            except BaseException as error:  # noqa: BLE001 - exact snapshot
+                errors.append(error)
+        binding.materialized_seal = None
+        return errors
+
+    def _rebase_failed_staged_v2_rebuild(
+        self,
+        capability: _StagedV2Replay,
+        guard: _V2RebuildGuard,
+        *,
+        reopened_old: _ReopenedV2Old | None = None,
+        primary: BaseException,
+        _factory: object,
+    ) -> None:
+        if (
+            _factory is not _STAGED_REPLAY_FACTORY
+            or not isinstance(primary, BaseException)
+            or (
+                reopened_old is not None
+                and type(reopened_old) is not _ReopenedV2Old
+            )
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 rebuild rebase is factory-only"
+            )
+        selected: sqlite3.Connection | None = (
+            None if reopened_old is None else reopened_old.connection
+        )
+        reopened_physical = (
+            None if reopened_old is None else reopened_old.physical
+        )
+        binding: _StagedReplayBinding | None = None
+        replacement_attempted = False
+        try:
+            with self._mutex:
+                candidate_binding = self._staged_replay
+                if (
+                    candidate_binding is not None
+                    and candidate_binding.capability is capability
+                    and candidate_binding.rebuild is not None
+                    and candidate_binding.rebuild.guard is guard
+                ):
+                    binding = candidate_binding
+                binding, rebuild = self._require_v2_rebuild_guard_locked(
+                    capability,
+                    guard,
+                    permit_suspended=True,
+                )
+                rebuild.guard_consumed = True
+                if rebuild.suspended:
+                    if selected is None or reopened_physical is None:
+                        raise ProjectionConflict(
+                            "Projection V2 rebuild suspended without exact reopen"
+                        )
+                    _revalidate_reopened_v2_old_physical(
+                        reopened_physical,
+                        rebuild.old_physical,
+                    )
+                else:
+                    if selected is not None or reopened_physical is not None:
+                        raise ProjectionConflict(
+                            "Projection V2 rebuild old connection was duplicated"
+                        )
+                    selected = binding.live_connection
+                retention_gate_context = (
+                    nullcontext(None)
+                    if binding.retention_scope is None
+                    else self._evidence._authenticated_retention_replay_scope_gate(
+                        binding.retention_scope,
+                        cast(EvidenceRef, binding.through),
+                    )
+                )
+                with (
+                    retention_gate_context as retention_gate,
+                    self._evidence._replay_source_snapshot_gate(),
+                    self._acknowledgements._replay_ack_snapshot_gate(),
+                    _correlation_projection_snapshot_gate(
+                        binding.authority
+                    ) as correlation_binding,
+                    _correlation_journal_replay_gate(self._journal),
+                ):
+                    self._revalidate_staged_replay_locked(
+                        binding,
+                        retention_gate,
+                        correlation_binding,
+                    )
+                    assert selected is not None
+                    self._validate_v2_rebuild_old_locked(
+                        binding,
+                        rebuild,
+                        selected,
+                    )
+                    if reopened_physical is not None:
+                        _revalidate_reopened_v2_old_physical(
+                            reopened_physical,
+                            rebuild.old_physical,
+                        )
+                        descriptor = reopened_physical.descriptor
+                        reopened_physical.descriptor = -1
+                        os.close(descriptor)
+                    cleanup_errors = (
+                        self._close_v2_rebuild_stage_resources_locked(binding)
+                    )
+                    if cleanup_errors:
+                        raise BaseExceptionGroup(
+                            "Projection V2 rebuild fallback cleanup failed",
+                            cleanup_errors,
+                        )
+                    failed_status = _ReplayStatus(
+                        generation=binding.reservation.publish_generation,
+                        phase=_ReplayPhase.FAILED,
+                        reservation_present=False,
+                        failure_phase=(
+                            _ReplayPhase.SUSPENDED
+                            if rebuild.suspended
+                            else _ReplayPhase.STAGED
+                        ),
+                    )
+                    with self._replay_state_lock:
+                        if (
+                            self._staged_replay is not binding
+                            or self._replay_reservation is not binding.reservation
+                        ):
+                            raise ProjectionAuthorityError(
+                                "Projection V2 rebuild changed at fallback edge"
+                            )
+                    replacement_attempted = True
+                    fresh_authority = (
+                        _commit_correlation_projection_authority_replacement(
+                            rebuild.authority_replacement,
+                            success=False,
+                            _factory=_AUTHORITY_REPLACEMENT_FACTORY,
+                        )
+                    )
+                    self._authority = fresh_authority
+                    with self._replay_state_lock:
+                        if (
+                            self._staged_replay is not binding
+                            or self._replay_reservation is not binding.reservation
+                        ):
+                            raise ProjectionAuthorityError(
+                                "Projection V2 rebuild changed after fallback edge"
+                            )
+                        self._connection = selected
+                        self._generation = binding.reservation.publish_generation
+                        self._staged_replay = None
+                        self._replay_reservation = None
+                        binding.rebuild = None
+                        self._replay_status = failed_status
+                    scope = binding.retention_scope
+                    if scope is not None:
+                        self._evidence._release_authenticated_retention_replay_scope(
+                            scope
+                        )
+                        binding.retention_scope = None
+        except BaseException as rebase_error:
+            if reopened_physical is not None and reopened_physical.descriptor >= 0:
+                descriptor = reopened_physical.descriptor
+                reopened_physical.descriptor = -1
+                try:
+                    os.close(descriptor)
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    primary.add_note(
+                        "Projection V2 fallback fd-proof cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if selected is not None and selected is not (
+                None if binding is None else binding.live_connection
+            ):
+                try:
+                    selected.close()
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    primary.add_note(
+                        "Projection V2 fallback reopen cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            primary.add_note(
+                "Projection V2 exact fallback rebase failed: "
+                f"{type(rebase_error).__name__}: {rebase_error}"
+            )
+            with self._mutex:
+                retained_binding = binding
+                scope = (
+                    None
+                    if retained_binding is None
+                    else retained_binding.retention_scope
+                )
+                if (
+                    retained_binding is not None
+                    and scope is not None
+                    and self._evidence._authenticated_retention_replay_scope_is_active(
+                        scope
+                    )
+                ):
+                    try:
+                        self._evidence._release_authenticated_retention_replay_scope(
+                            scope
+                        )
+                        retained_binding.retention_scope = None
+                    except BaseException as cleanup_error:  # noqa: BLE001
+                        primary.add_note(
+                            "Projection V2 fallback retention release failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                if replacement_attempted and binding is not None:
+                    try:
+                        fresh_closed = (
+                            _fail_closed_correlation_projection_authority_replacement(
+                                binding.rebuild.authority_replacement
+                                if binding.rebuild is not None
+                                else rebuild.authority_replacement,
+                                primary,
+                                _factory=_AUTHORITY_REPLACEMENT_FACTORY,
+                            )
+                        )
+                    except BaseException as cleanup_error:  # noqa: BLE001
+                        primary.add_note(
+                            "Projection V2 fallback authority fail-shut failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    else:
+                        if fresh_closed:
+                            self._authority = None
+                self._latch_unhealthy(primary)
+                if binding is not None and self._staged_replay is binding:
+                    self._discard_staged_replay_locked(
+                        binding,
+                        primary,
+                        unhealthy=True,
+                    )
+            raise primary from rebase_error
+
     def _discard_staged_replay_locked(
         self,
         binding: _StagedReplayBinding,
@@ -4869,6 +5836,15 @@ class _V2ProjectionOwner:
             try:
                 os.close(descriptor)
             except BaseException as error:  # noqa: BLE001 - exact owned descriptor
+                errors.append(error)
+        rebuild = binding.rebuild
+        binding.rebuild = None
+        if rebuild is not None and rebuild.old_physical.descriptor >= 0:
+            descriptor = rebuild.old_physical.descriptor
+            rebuild.old_physical.descriptor = -1
+            try:
+                os.close(descriptor)
+            except BaseException as error:  # noqa: BLE001 - exact old inode
                 errors.append(error)
         hydrated = binding.hydrated_connection
         binding.hydrated_connection = None
@@ -4941,6 +5917,10 @@ class _V2ProjectionOwner:
             )
         with self._mutex:
             binding = self._require_staged_replay_locked(capability)
+            if binding.rebuild is not None:
+                raise ProjectionAuthorityError(
+                    "guarded Projection V2 rebuild requires exact fallback"
+                )
             self._discard_staged_replay_locked(
                 binding,
                 None,
@@ -4953,10 +5933,15 @@ class _V2ProjectionOwner:
         target: sqlite3.Connection,
         *,
         _factory: object,
+        _fault_phase: _ReplayFaultPhase | None = None,
     ) -> _StagedV2ImageSeal:
         if (
             _factory is not _STAGED_REPLAY_FACTORY
             or type(target) is not sqlite3.Connection
+            or (
+                _fault_phase is not None
+                and _fault_phase is not _ReplayFaultPhase.REBUILD_MATERIALIZE
+            )
         ):
             raise ProjectionAuthorityError(
                 "Projection V2 staged materialization is factory-only"
@@ -5008,6 +5993,10 @@ class _V2ProjectionOwner:
                         "Projection V2 staged image was lost"
                     )
                 source.backup(target)
+                if _fault_phase is _ReplayFaultPhase.REBUILD_MATERIALIZE:
+                    raise KeyboardInterrupt(
+                        "injected Projection V2 staged materialization failure"
+                    )
                 _configure_v2_connection(
                     target,
                     file_backed=bool(database_path),
@@ -5064,11 +6053,21 @@ class _V2ProjectionOwner:
             if binding is not None and materialization_started:
                 with self._mutex:
                     if self._staged_replay is binding:
-                        self._discard_staged_replay_locked(
-                            binding,
-                            primary,
-                            unhealthy=target_cleanup_failed,
-                        )
+                        if (
+                            binding.purpose is _ReplayPurpose.V2_REBUILD
+                            and binding.rebuild is not None
+                        ):
+                            if binding.materialized_connection is target:
+                                binding.materialized_connection = None
+                            binding.materialized_seal = None
+                            if target_cleanup_failed:
+                                self._latch_unhealthy(primary)
+                        else:
+                            self._discard_staged_replay_locked(
+                                binding,
+                                primary,
+                                unhealthy=target_cleanup_failed,
+                            )
             raise
 
     def _validate_materialized_replay_locked(
@@ -5143,10 +6142,19 @@ class _V2ProjectionOwner:
         seal: _StagedV2ImageSeal,
         *,
         _factory: object,
+        _fault_phase: _ReplayFaultPhase | None = None,
     ) -> None:
         if (
             _factory is not _STAGED_REPLAY_FACTORY
             or type(seal) is not _StagedV2ImageSeal
+            or (
+                _fault_phase is not None
+                and _fault_phase
+                not in (
+                    _ReplayFaultPhase.REBUILD_STAGED_CHECKPOINT,
+                    _ReplayFaultPhase.REBUILD_STAGED_CLOSE,
+                )
+            )
         ):
             raise ProjectionAuthorityError(
                 "Projection V2 staged preparation is factory-only"
@@ -5155,6 +6163,7 @@ class _V2ProjectionOwner:
         target: sqlite3.Connection | None = None
         target_handoff_started = False
         target_close_attempted = False
+        target_close_completed = False
         with self._mutex:
             try:
                 binding = self._require_staged_replay_locked(capability)
@@ -5163,6 +6172,10 @@ class _V2ProjectionOwner:
                 if target is None or target.in_transaction:
                     raise ProjectionAuthorityError(
                         "Projection V2 staged target is not transaction-free"
+                    )
+                if _fault_phase is _ReplayFaultPhase.REBUILD_STAGED_CHECKPOINT:
+                    raise KeyboardInterrupt(
+                        "injected Projection V2 staged checkpoint failure"
                     )
                 checkpoint = target.execute(
                     "PRAGMA wal_checkpoint(TRUNCATE)"
@@ -5189,6 +6202,11 @@ class _V2ProjectionOwner:
                 binding.materialized_connection = None
                 target_close_attempted = True
                 target.close()
+                if _fault_phase is _ReplayFaultPhase.REBUILD_STAGED_CLOSE:
+                    raise KeyboardInterrupt(
+                        "injected ambiguous Projection V2 staged close"
+                    )
+                target_close_completed = True
                 self._validate_prepared_replay_locked(binding, seal)
             except BaseException as primary:
                 if binding is not None and self._staged_replay is binding:
@@ -5206,11 +6224,17 @@ class _V2ProjectionOwner:
                                 "Projection V2 detached target cleanup failure: "
                                 f"{type(cleanup_error).__name__}: {cleanup_error}"
                             )
-                    self._discard_staged_replay_locked(
-                        binding,
-                        primary,
-                        unhealthy=target_handoff_started,
-                    )
+                    if not (
+                        binding.purpose is _ReplayPurpose.V2_REBUILD
+                        and binding.rebuild is not None
+                    ):
+                        self._discard_staged_replay_locked(
+                            binding,
+                            primary,
+                            unhealthy=target_handoff_started,
+                        )
+                    elif target_close_attempted and not target_close_completed:
+                        self._latch_unhealthy(primary)
                 raise
 
     def _validate_reopened_replay_locked(
@@ -5276,6 +6300,10 @@ class _V2ProjectionOwner:
         namespace_latch: _NamespacePublicationLatch | None = None
         with self._mutex:
             binding = self._require_staged_replay_locked(capability)
+            if binding.purpose is _ReplayPurpose.V2_REBUILD:
+                raise ProjectionAuthorityError(
+                    "Projection V2 rebuild requires its guarded publisher"
+                )
             try:
                 # Corruption fences are documented to drain outside the ordered
                 # replay gate stack. No fallible drain remains after publication.
@@ -5563,6 +6591,310 @@ class _V2ProjectionOwner:
                         ),
                     )
                 raise
+
+    def _publish_staged_v2_rebuild(
+        self,
+        capability: _StagedV2Replay,
+        seal: _StagedV2ImageSeal,
+        guard: _V2RebuildGuard,
+        publisher: Callable[[_NamespacePublicationLatch], sqlite3.Connection],
+        reopen_old: Callable[[], _ReopenedV2Old],
+        *,
+        _factory: object,
+        _fault_phase: _ReplayFaultPhase | None = None,
+    ) -> _UnpublishedV2ReplayReport:
+        if (
+            _factory is not _STAGED_REPLAY_FACTORY
+            or type(seal) is not _StagedV2ImageSeal
+            or type(guard) is not _V2RebuildGuard
+            or not callable(publisher)
+            or not callable(reopen_old)
+            or (
+                _fault_phase is not None
+                and _fault_phase
+                not in (
+                    _ReplayFaultPhase.PRE_COMMIT,
+                    _ReplayFaultPhase.REBUILD_CHECKPOINT,
+                    _ReplayFaultPhase.REBUILD_CLOSE,
+                )
+            )
+        ):
+            raise ProjectionAuthorityError(
+                "Projection V2 rebuild publication is factory-only"
+            )
+        binding: _StagedReplayBinding | None = None
+        rebuild: _V2RebuildBinding | None = None
+        candidate: sqlite3.Connection | None = None
+        namespace_state: _NamespacePublicationState | None = None
+        namespace_latch: _NamespacePublicationLatch | None = None
+        close_attempted = False
+        close_completed = False
+        committed = False
+        replacement_attempted = False
+        try:
+            with self._mutex:
+                binding, rebuild = self._require_v2_rebuild_guard_locked(
+                    capability,
+                    guard,
+                    permit_suspended=False,
+                )
+                if rebuild.guard_consumed:
+                    raise ProjectionAuthorityError(
+                        "Projection V2 rebuild guard was already consumed"
+                    )
+                rebuild.guard_consumed = True
+                self._acknowledgements._drain_replay_corruption_fences(None)
+                self._journal._drain_replay_corruption_fences(None)
+                retention_gate_context = (
+                    nullcontext(None)
+                    if binding.retention_scope is None
+                    else self._evidence._authenticated_retention_replay_scope_gate(
+                        binding.retention_scope,
+                        cast(EvidenceRef, binding.through),
+                    )
+                )
+                with (
+                    retention_gate_context as retention_gate,
+                    self._evidence._replay_source_snapshot_gate(),
+                    self._acknowledgements._replay_ack_snapshot_gate(),
+                    _correlation_projection_snapshot_gate(
+                        binding.authority
+                    ) as correlation_binding,
+                    _correlation_journal_replay_gate(self._journal),
+                ):
+                    self._revalidate_staged_replay_locked(
+                        binding,
+                        retention_gate,
+                        correlation_binding,
+                    )
+                    self._validate_prepared_replay_locked(binding, seal)
+                    old_connection = binding.live_connection
+                    self._validate_v2_rebuild_old_locked(
+                        binding,
+                        rebuild,
+                        old_connection,
+                    )
+                    if _fault_phase is _ReplayFaultPhase.REBUILD_CHECKPOINT:
+                        raise KeyboardInterrupt(
+                            "injected Projection V2 rebuild checkpoint failure"
+                        )
+                    checkpoint = old_connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                    checkpoint_values = (
+                        () if checkpoint is None else tuple(checkpoint)
+                    )
+                    if (
+                        len(checkpoint_values) != 3
+                        or any(type(value) is not int for value in checkpoint_values)
+                        or checkpoint_values != (0, 0, 0)
+                    ):
+                        raise ProjectionConflict(
+                            "Projection V2 rebuild old checkpoint was not exact"
+                        )
+                    self._validate_v2_rebuild_old_locked(
+                        binding,
+                        rebuild,
+                        old_connection,
+                    )
+                    os.fsync(rebuild.old_physical.descriptor)
+                    self._validate_v2_rebuild_old_locked(
+                        binding,
+                        rebuild,
+                        old_connection,
+                    )
+                    # Detach before the sole close attempt. A raised close is
+                    # ambiguous and therefore cannot enter fallback rebase.
+                    self._connection = None
+                    close_attempted = True
+                    old_connection.close()
+                    if _fault_phase is _ReplayFaultPhase.REBUILD_CLOSE:
+                        raise KeyboardInterrupt(
+                            "injected ambiguous Projection V2 old close"
+                        )
+                    rebuild.suspended = True
+                    close_completed = True
+                    with self._replay_state_lock:
+                        self._set_replay_status_locked(
+                            _ReplayStatus(
+                                generation=binding.reservation.base_generation,
+                                phase=_ReplayPhase.SUSPENDED,
+                                reservation_present=True,
+                            )
+                        )
+                    if _fault_phase is _ReplayFaultPhase.PRE_COMMIT:
+                        raise KeyboardInterrupt(
+                            "injected Projection V2 rebuild pre-arm failure"
+                        )
+
+                    namespace_state = _NamespacePublicationState()
+                    latch = object.__new__(_NamespacePublicationLatch)
+                    namespace_state.latch = latch
+                    namespace_latch = latch
+                    _NAMESPACE_PUBLICATION_STATES[latch] = namespace_state
+                    candidate = publisher(latch)
+                    observed = _NAMESPACE_PUBLICATION_STATES.pop(latch, None)
+                    namespace_latch = None
+                    if (
+                        observed is not namespace_state
+                        or namespace_state.latch is not latch
+                        or namespace_state.marked is not True
+                    ):
+                        raise ProjectionAuthorityError(
+                            "Projection V2 rebuild publisher did not arm namespace"
+                        )
+                    self._validate_reopened_replay_locked(
+                        binding,
+                        seal,
+                        candidate,
+                    )
+                    _revalidate_v2_rebuild_old_physical(
+                        rebuild.old_physical,
+                        named=False,
+                    )
+                    retention_consumption = None
+                    if binding.retention_scope is not None:
+                        retention_consumption = self._evidence._prepare_authenticated_retention_replay_consumption_locked(
+                            binding.retention_scope,
+                            cast(
+                                _AuthenticatedRetentionReplayGate,
+                                retention_gate,
+                            ),
+                        )
+                    cleanup_errors = (
+                        self._close_v2_rebuild_stage_resources_locked(binding)
+                    )
+                    if cleanup_errors:
+                        raise BaseExceptionGroup(
+                            "Projection V2 rebuild final resource cleanup failed",
+                            cleanup_errors,
+                        )
+                    published_status = _ReplayStatus(
+                        generation=binding.reservation.publish_generation,
+                        phase=_ReplayPhase.PUBLISHED,
+                        reservation_present=False,
+                    )
+                    with self._replay_state_lock:
+                        if (
+                            self._staged_replay is not binding
+                            or self._replay_reservation is not binding.reservation
+                        ):
+                            raise ProjectionAuthorityError(
+                                "Projection V2 rebuild changed at final edge"
+                            )
+                    replacement_attempted = True
+                    fresh_authority = (
+                        _commit_correlation_projection_authority_replacement(
+                            rebuild.authority_replacement,
+                            success=True,
+                            _factory=_AUTHORITY_REPLACEMENT_FACTORY,
+                        )
+                    )
+                    self._authority = fresh_authority
+                    with self._replay_state_lock:
+                        if (
+                            self._staged_replay is not binding
+                            or self._replay_reservation is not binding.reservation
+                        ):
+                            raise ProjectionAuthorityError(
+                                "Projection V2 rebuild changed after final edge"
+                            )
+                        self._connection = candidate
+                        self._generation = binding.reservation.publish_generation
+                        if retention_consumption is not None:
+                            self._evidence._commit_prevalidated_retention_replay_consumption_locked(
+                                retention_consumption
+                            )
+                        self._staged_replay = None
+                        self._replay_reservation = None
+                        binding.rebuild = None
+                        committed = True
+                        self._replay_status = published_status
+                        return binding.report
+        except BaseException as error:
+            if replacement_attempted and rebuild is not None:
+                try:
+                    fresh_closed = (
+                        _fail_closed_correlation_projection_authority_replacement(
+                            rebuild.authority_replacement,
+                            error,
+                            _factory=_AUTHORITY_REPLACEMENT_FACTORY,
+                        )
+                    )
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    error.add_note(
+                        "Projection V2 published authority fail-shut failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                else:
+                    if fresh_closed:
+                        self._authority = None
+            armed = namespace_state is not None and namespace_state.marked is True
+            if namespace_latch is not None:
+                try:
+                    observed = _NAMESPACE_PUBLICATION_STATES.pop(
+                        namespace_latch,
+                        None,
+                    )
+                    if observed is not namespace_state:
+                        armed = True
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    armed = True
+                    error.add_note(
+                        "Projection V2 rebuild latch cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    armed = True
+                    error.add_note(
+                        "Projection V2 rebuild reopened cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if (
+                binding is not None
+                and rebuild is not None
+                and not committed
+                and not armed
+                and (not close_attempted or close_completed)
+            ):
+                reopened: _ReopenedV2Old | None = None
+                if close_completed:
+                    try:
+                        reopened = reopen_old()
+                    except BaseException as reopen_error:
+                        error.add_note(
+                            "Projection V2 rebuild old reopen failure: "
+                            f"{type(reopen_error).__name__}: {reopen_error}"
+                        )
+                        with self._mutex:
+                            self._latch_unhealthy(error)
+                            if self._staged_replay is binding:
+                                self._discard_staged_replay_locked(
+                                    binding,
+                                    error,
+                                    unhealthy=True,
+                                )
+                        raise error from reopen_error
+                self._rebase_failed_staged_v2_rebuild(
+                    capability,
+                    guard,
+                    reopened_old=reopened,
+                    primary=error,
+                    _factory=_STAGED_REPLAY_FACTORY,
+                )
+                raise
+            with self._mutex:
+                self._latch_unhealthy(error)
+                if binding is not None and self._staged_replay is binding:
+                    self._discard_staged_replay_locked(
+                        binding,
+                        error,
+                        unhealthy=True,
+                    )
+            raise
 
     def _publish_staged_replay(
         self,

@@ -67,6 +67,7 @@ class _PublicationAcquisition:
     v1_artifact: _HeldArtifact | None = None
     v1_baseline: _V1Baseline | None = None
     v1_connection: sqlite3.Connection | None = None
+    v2_artifact: _HeldArtifact | None = None
 
 
 @dataclass(slots=True)
@@ -75,6 +76,7 @@ class _PublicationState:
     temp: _HeldArtifact
     v1_baseline: _V1Baseline | None
     namespace_attempted: bool = False
+    v2_artifact: _HeldArtifact | None = None
 
 
 class _RecoveryDisposition(StrEnum):
@@ -101,6 +103,110 @@ class _FilesystemNamespacePublisher:
         latch: projection_v2._NamespacePublicationLatch,
     ) -> sqlite3.Connection:
         return _publish_namespace(self.state, latch)
+
+
+class _V2RebuildFilesystemPublisher:
+    def __init__(self, state: _PublicationState) -> None:
+        self.state = state
+
+    def __call__(
+        self,
+        latch: projection_v2._NamespacePublicationLatch,
+    ) -> sqlite3.Connection:
+        return _publish_v2_rebuild_namespace(self.state, latch)
+
+
+class _V2RebuildOldReopener:
+    def __init__(self, state: _PublicationState) -> None:
+        self.state = state
+        self.used = False
+
+    def __call__(self) -> projection_v2._ReopenedV2Old:
+        if self.used:
+            raise projection.ProjectionAuthorityError(
+                "old Projection V2 reopener is one-shot"
+            )
+        self.used = True
+        state = self.state
+        namespace = state.namespace
+        old = state.v2_artifact
+        if old is None or state.namespace_attempted:
+            raise projection.ProjectionConflict(
+                "old Projection V2 rebase is no longer pre-arm"
+            )
+        _validate_namespace(namespace)
+        _require_held_artifact(
+            namespace.parent_descriptor,
+            old,
+            label="old Projection V2",
+            links=frozenset({1}),
+        )
+        if _any_sidecar(namespace.parent_descriptor, namespace.main_name):
+            raise projection.ProjectionConflict(
+                "old Projection V2 sidecar survived suspension"
+            )
+        before = _open_descriptor_snapshot()
+        connection: sqlite3.Connection | None = None
+        proof_descriptor = -1
+        try:
+            connection = _open_existing_sqlite(
+                namespace.path,
+                configure_v2=True,
+            )
+            candidates: list[tuple[int, os.stat_result]] = []
+            after = _open_descriptor_snapshot()
+            for descriptor, descriptor_identity in after.items():
+                if before.get(descriptor) == descriptor_identity:
+                    continue
+                try:
+                    info = os.fstat(descriptor)
+                    header = os.pread(descriptor, 16, 0)
+                except OSError:
+                    continue
+                if (
+                    stat.S_ISREG(info.st_mode)
+                    and (
+                        fcntl.fcntl(descriptor, fcntl.F_GETFL)
+                        & os.O_ACCMODE
+                    )
+                    == os.O_RDWR
+                    and header == b"SQLite format 3\x00"
+                ):
+                    candidates.append((descriptor, info))
+            if len(candidates) != 1:
+                raise projection.ProjectionConflict(
+                    "reopened Projection V2 did not expose one exact main fd"
+                )
+            candidate_descriptor, candidate_info = candidates[0]
+            if _inode(candidate_info) != old.binding:
+                raise projection.ProjectionConflict(
+                    "reopened Projection V2 main fd is not the held old inode"
+                )
+            proof_descriptor = _dup_cloexec(candidate_descriptor)
+            proof_info = os.fstat(proof_descriptor)
+            _require_held_artifact(
+                namespace.parent_descriptor,
+                old,
+                label="old Projection V2",
+                links=frozenset({1}),
+            )
+            result = projection_v2._ReopenedV2Old(
+                connection=connection,
+                physical=projection_v2._StagedV2PhysicalBinding(
+                    descriptor=proof_descriptor,
+                    path=str(namespace.path),
+                    device=proof_info.st_dev,
+                    inode=proof_info.st_ino,
+                ),
+            )
+            connection = None
+            proof_descriptor = -1
+            return result
+        finally:
+            if connection is not None:
+                connection.close()
+            if proof_descriptor >= 0:
+                _close_descriptor(proof_descriptor)
 
 
 def _inode(info: os.stat_result) -> _InodeBinding:
@@ -139,6 +245,32 @@ def _dup_cloexec(descriptor: int) -> int:
     duplicated = os.dup(descriptor)
     os.set_inheritable(duplicated, False)
     return duplicated
+
+
+def _open_descriptor_snapshot() -> dict[int, tuple[int, int, int, int]]:
+    try:
+        names = os.listdir("/dev/fd")
+    except OSError as error:
+        raise projection.ProjectionAuthorityError(
+            "process descriptor inventory is unavailable"
+        ) from error
+    descriptors: dict[int, tuple[int, int, int, int]] = {}
+    for name in names:
+        if type(name) is not str or not name.isascii() or not name.isdecimal():
+            continue
+        descriptor = int(name)
+        try:
+            info = os.fstat(descriptor)
+            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        except OSError:
+            continue
+        descriptors[descriptor] = (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            flags,
+        )
+    return descriptors
 
 
 def _close_descriptor(descriptor: int) -> None:
@@ -358,10 +490,15 @@ def _stable_namespace(
         or image_kind not in (
             projection._ProjectionImageKind.NEW,
             projection._ProjectionImageKind.V1,
+            projection._ProjectionImageKind.V2,
         )
         or (image_kind is projection._ProjectionImageKind.NEW and main_binding is not None)
         or (
-            image_kind is projection._ProjectionImageKind.V1
+            image_kind
+            in (
+                projection._ProjectionImageKind.V1,
+                projection._ProjectionImageKind.V2,
+            )
             and type(main_binding) is not projection._FileBinding
         )
     ):
@@ -402,15 +539,20 @@ def _stable_namespace(
         else:
             assert namespace.original_main_binding is not None
             if current is None:
-                raise projection.ProjectionConflict("V1 projection disappeared")
+                raise projection.ProjectionConflict("projection image disappeared")
             _validate_core_artifact(
                 current,
-                label="V1 projection",
+                label="existing projection",
                 links=frozenset({1}),
             )
             if _inode(current) != namespace.original_main_binding:
-                raise projection.ProjectionConflict("V1 projection identity changed")
-            if _any_sidecar(owned_parent, path.name):
+                raise projection.ProjectionConflict(
+                    "existing projection identity changed"
+                )
+            if (
+                image_kind is projection._ProjectionImageKind.V1
+                and _any_sidecar(owned_parent, path.name)
+            ):
                 raise projection.ProjectionConflict(
                     "V1 projection sidecar exists before publication"
                 )
@@ -878,6 +1020,106 @@ def _publish_namespace(
     return reopened
 
 
+def _prepublish_validate_v2_rebuild(state: _PublicationState) -> None:
+    namespace = state.namespace
+    old = state.v2_artifact
+    if (
+        namespace.image_kind is not projection._ProjectionImageKind.V2
+        or old is None
+    ):
+        raise projection.ProjectionConflict(
+            "Projection V2 rebuild publication state is not exact"
+        )
+    _validate_namespace(namespace)
+    _require_held_artifact(
+        namespace.parent_descriptor,
+        old,
+        label="old Projection V2",
+        links=frozenset({1}),
+    )
+    _require_held_artifact(
+        namespace.parent_descriptor,
+        state.temp,
+        label="temporary Projection V2",
+        links=frozenset({1}),
+    )
+    if (
+        _any_sidecar(namespace.parent_descriptor, namespace.main_name)
+        or _any_sidecar(namespace.parent_descriptor, state.temp.name)
+    ):
+        raise projection.ProjectionConflict(
+            "Projection V2 rebuild sidecar survived suspension"
+        )
+
+
+def _v2_replace_completed(state: _PublicationState) -> bool:
+    old = state.v2_artifact
+    if old is None:
+        return False
+    namespace = state.namespace
+    final = _lstat(namespace.parent_descriptor, namespace.main_name)
+    temp = _lstat(namespace.parent_descriptor, state.temp.name)
+    try:
+        old_info = os.fstat(old.descriptor)
+        staged_info = os.fstat(state.temp.descriptor)
+    except OSError:
+        return False
+    return (
+        final is not None
+        and _inode(final) == state.temp.binding
+        and _inode(staged_info) == state.temp.binding
+        and final.st_nlink == staged_info.st_nlink == 1
+        and temp is None
+        and _inode(old_info) == old.binding
+        and old_info.st_nlink == 0
+    )
+
+
+def _publish_v2_rebuild_namespace(
+    state: _PublicationState,
+    latch: projection_v2._NamespacePublicationLatch,
+) -> sqlite3.Connection:
+    if type(latch) is not projection_v2._NamespacePublicationLatch:
+        raise projection.ProjectionAuthorityError(
+            "Projection V2 rebuild received a substituted namespace latch"
+        )
+    _prepublish_validate_v2_rebuild(state)
+    state.namespace_attempted = True
+    latch._arm_namespace_publication()
+    syscall_error: BaseException | None = None
+    try:
+        os.replace(
+            state.temp.name,
+            state.namespace.main_name,
+            src_dir_fd=state.namespace.parent_descriptor,
+            dst_dir_fd=state.namespace.parent_descriptor,
+        )
+    except BaseException as error:  # noqa: BLE001 - preserve armed syscall result
+        syscall_error = error
+    try:
+        completed = _v2_replace_completed(state)
+    except BaseException as classification_error:
+        if syscall_error is None:
+            raise
+        syscall_error.add_note(
+            "Projection V2 replace classification failure: "
+            f"{type(classification_error).__name__}: {classification_error}"
+        )
+        raise syscall_error from classification_error
+    if syscall_error is not None:
+        # Even a proven mutation propagates the original interruption. The owner
+        # has already observed the arm and must fail closed rather than commit.
+        if not completed:
+            latch._arm_namespace_publication()
+        raise syscall_error
+    if not completed:
+        raise projection.ProjectionConflict(
+            "Projection V2 replacement state is ambiguous"
+        )
+    _fsync_parent(state.namespace)
+    return _open_existing_sqlite(state.namespace.path, configure_v2=True)
+
+
 def _cleanup_prearm_temp(
     namespace: _StableProjectionNamespace,
     temp: _HeldArtifact,
@@ -944,9 +1186,12 @@ def _publish_staged_v2_filesystem(
     _factory: object,
 ) -> projection_v2._UnpublishedV2ReplayReport:
     """Materialize and durably publish one already-staged V2 replay."""
-    if _factory is not _PUBLICATION_FACTORY:
+    if (
+        _factory is not _PUBLICATION_FACTORY
+        or image_kind is projection._ProjectionImageKind.V2
+    ):
         raise projection.ProjectionAuthorityError(
-            "durable Projection V2 publication is factory-only"
+            "durable Projection V2 publication route is not exact"
         )
     acquisition = _PublicationAcquisition()
     state: _PublicationState | None = None
@@ -1083,6 +1328,10 @@ def _publish_staged_v2_filesystem(
         acquisition.v1_artifact = None
         if v1_artifact is not None:
             close_errors.extend(_drain_close_held([v1_artifact]))
+        v2_artifact = acquisition.v2_artifact
+        acquisition.v2_artifact = None
+        if v2_artifact is not None:
+            close_errors.extend(_drain_close_held([v2_artifact]))
         owned_namespace = acquisition.namespace
         acquisition.namespace = None
         if owned_namespace is not None:
@@ -1094,6 +1343,260 @@ def _publish_staged_v2_filesystem(
                 close_errors,
                 primary=primary,
                 label="durable publication final cleanup failure",
+            )
+
+
+def _publish_staged_v2_rebuild_filesystem(
+    owner: projection_v2._V2ProjectionOwner,
+    stage: projection_v2._StagedV2Replay,
+    path: Path,
+    *,
+    parent_fd: int,
+    lock_fd: int,
+    main_binding: projection._FileBinding,
+    _factory: object,
+    _fault_phase: projection_v2._ReplayFaultPhase | None = None,
+) -> projection_v2._UnpublishedV2ReplayReport:
+    """Replace one exact live V2 image, with exact pre-arm fallback rebase."""
+    if (
+        _factory is not _PUBLICATION_FACTORY
+        or type(main_binding) is not projection._FileBinding
+        or (
+            _fault_phase is not None
+            and _fault_phase
+            not in (
+                projection_v2._ReplayFaultPhase.PRE_COMMIT,
+                projection_v2._ReplayFaultPhase.REBUILD_CHECKPOINT,
+                projection_v2._ReplayFaultPhase.REBUILD_CLOSE,
+                projection_v2._ReplayFaultPhase.REBUILD_MATERIALIZE,
+                projection_v2._ReplayFaultPhase.REBUILD_STAGED_CHECKPOINT,
+                projection_v2._ReplayFaultPhase.REBUILD_STAGED_CLOSE,
+            )
+        )
+    ):
+        raise projection.ProjectionAuthorityError(
+            "durable Projection V2 rebuild publication is factory-only"
+        )
+    acquisition = _PublicationAcquisition()
+    state: _PublicationState | None = None
+    guard: projection_v2._V2RebuildGuard | None = None
+    guard_requested = False
+    publish_generation: int | None = None
+    primary: BaseException | None = None
+    try:
+        namespace = _stable_namespace(
+            path,
+            parent_fd=parent_fd,
+            lock_fd=lock_fd,
+            image_kind=projection._ProjectionImageKind.V2,
+            main_binding=main_binding,
+            acquisition=acquisition,
+        )
+        old = _open_held_artifact(
+            namespace.parent_descriptor,
+            namespace.main_name,
+            label="old Projection V2",
+            links=frozenset({1}),
+        )
+        acquisition.v2_artifact = old
+        if old.binding != _projection_binding(main_binding):
+            raise projection.ProjectionConflict(
+                "old Projection V2 inode changed before guard"
+            )
+        guard_requested = True
+        guard = owner._bind_staged_v2_rebuild_namespace(
+            stage,
+            device=old.binding.device,
+            inode=old.binding.inode,
+            _factory=projection_v2._STAGED_REPLAY_FACTORY,
+        )
+        guarded_binding = owner._staged_replay
+        if (
+            guarded_binding is None
+            or guarded_binding.capability is not stage
+            or guarded_binding.rebuild is None
+            or guarded_binding.rebuild.guard is not guard
+        ):
+            raise projection.ProjectionAuthorityError(
+                "Projection V2 rebuild guard handoff changed"
+            )
+        publish_generation = guarded_binding.reservation.publish_generation
+        temp = _create_temp(namespace, acquisition=acquisition)
+        state = _PublicationState(
+            namespace=namespace,
+            temp=temp,
+            v1_baseline=None,
+            v2_artifact=old,
+        )
+        target: sqlite3.Connection | None = _open_existing_sqlite(
+            namespace.parent_path / temp.name,
+            configure_v2=False,
+        )
+        try:
+            assert target is not None
+            seal = owner._copy_staged_replay_into(
+                stage,
+                target,
+                _factory=projection_v2._STAGED_REPLAY_FACTORY,
+                _fault_phase=(
+                    _fault_phase
+                    if _fault_phase
+                    is projection_v2._ReplayFaultPhase.REBUILD_MATERIALIZE
+                    else None
+                ),
+            )
+        finally:
+            target = None
+        owner._prepare_staged_replay_for_publication(
+            stage,
+            seal,
+            _factory=projection_v2._STAGED_REPLAY_FACTORY,
+            _fault_phase=(
+                _fault_phase
+                if _fault_phase
+                in (
+                    projection_v2._ReplayFaultPhase.REBUILD_STAGED_CHECKPOINT,
+                    projection_v2._ReplayFaultPhase.REBUILD_STAGED_CLOSE,
+                )
+                else None
+            ),
+        )
+        _require_held_artifact(
+            namespace.parent_descriptor,
+            temp,
+            label="temporary Projection V2",
+            links=frozenset({1}),
+        )
+        _sync_file(temp.descriptor)
+        _require_held_artifact(
+            namespace.parent_descriptor,
+            temp,
+            label="temporary Projection V2",
+            links=frozenset({1}),
+        )
+        sidecars = _bind_sidecars(namespace, temp.name, require_empty=True)
+        _remove_bound_sidecars(namespace, sidecars)
+        if _any_sidecar(namespace.parent_descriptor, temp.name):
+            raise projection.ProjectionConflict(
+                "temporary Projection V2 sidecar removal was incomplete"
+            )
+        _fsync_parent(namespace)
+        return owner._publish_staged_v2_rebuild(
+            stage,
+            seal,
+            guard,
+            _V2RebuildFilesystemPublisher(state),
+            _V2RebuildOldReopener(state),
+            _factory=projection_v2._STAGED_REPLAY_FACTORY,
+            _fault_phase=_fault_phase,
+        )
+    except BaseException as error:
+        primary = error
+        binding = owner._staged_replay
+        bound_rebuild = (
+            None
+            if binding is None or binding.capability is not stage
+            else binding.rebuild
+        )
+        effective_guard = (
+            guard
+            if guard is not None
+            else (None if bound_rebuild is None else bound_rebuild.guard)
+        )
+        already_rebased = (
+            publish_generation is not None
+            and binding is None
+            and effective_guard is not None
+            and owner._v2_rebuild_fallback_completed(
+                stage,
+                effective_guard,
+                publish_generation,
+                _factory=projection_v2._STAGED_REPLAY_FACTORY,
+            )
+        )
+        if already_rebased:
+            pass
+        elif (
+            effective_guard is not None
+            and (state is None or not state.namespace_attempted)
+            and binding is not None
+            and binding.capability is stage
+            and binding.rebuild is not None
+            and binding.rebuild.guard is effective_guard
+        ):
+            owner._rebase_failed_staged_v2_rebuild(
+                stage,
+                effective_guard,
+                primary=error,
+                _factory=projection_v2._STAGED_REPLAY_FACTORY,
+            )
+        elif (
+            guard_requested
+            and bound_rebuild is None
+            and binding is not None
+            and binding.capability is stage
+        ):
+            owner._abort_staged_replay(
+                stage,
+                _factory=projection_v2._STAGED_REPLAY_FACTORY,
+            )
+        elif guard_requested:
+            owner._latch_unhealthy(error)
+        elif (
+            guard is None
+            and binding is not None
+            and binding.capability is stage
+        ):
+            owner._abort_staged_replay(
+                stage,
+                _factory=projection_v2._STAGED_REPLAY_FACTORY,
+            )
+        cleanup_namespace = (
+            state.namespace if state is not None else acquisition.namespace
+        )
+        cleanup_temp = state.temp if state is not None else acquisition.temp
+        if (
+            (state is None or not state.namespace_attempted)
+            and cleanup_namespace is not None
+            and cleanup_temp is not None
+        ):
+            try:
+                _cleanup_prearm_temp(cleanup_namespace, cleanup_temp)
+                cleanup_old = acquisition.v2_artifact
+                if cleanup_old is not None:
+                    _require_held_artifact(
+                        cleanup_namespace.parent_descriptor,
+                        cleanup_old,
+                        label="old Projection V2",
+                        links=frozenset({1}),
+                    )
+            except BaseException as cleanup_error:  # noqa: BLE001
+                error.add_note(
+                    "Projection V2 rebuild pre-arm cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                owner._latch_unhealthy(error)
+        raise
+    finally:
+        close_errors: list[BaseException] = []
+        owned_temp = acquisition.temp
+        acquisition.temp = None
+        if owned_temp is not None:
+            close_errors.extend(_drain_close_held([owned_temp]))
+        owned_old = acquisition.v2_artifact
+        acquisition.v2_artifact = None
+        if owned_old is not None:
+            close_errors.extend(_drain_close_held([owned_old]))
+        owned_namespace = acquisition.namespace
+        acquisition.namespace = None
+        if owned_namespace is not None:
+            close_errors.extend(_drain_close_namespace(owned_namespace))
+        if close_errors:
+            owner._latch_unhealthy(close_errors[0])
+            _finish_cleanup(
+                close_errors,
+                primary=primary,
+                label="Projection V2 rebuild final cleanup failure",
             )
 
 
