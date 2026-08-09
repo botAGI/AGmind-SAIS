@@ -1,0 +1,7 @@
+[Unit]
+Description=AGmind SAIS single-host proof-carrying containment
+Requires=agmind-observerd.service agmind-actuatord.service agmind-core-compose.service
+After=agmind-observerd.service agmind-actuatord.service agmind-core-compose.service
+
+[Install]
+WantedBy=multi-user.target

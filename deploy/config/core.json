@@ -1,0 +1,14 @@
+{
+  "schema_version": "agmind.core-config.v1",
+  "observer_socket": "/run/agmind-sais/observer-core/socket",
+  "actuator_socket": "/run/agmind-sais/actuator-intent/socket",
+  "evidence_dir": "/var/lib/agmind-sais/core/evidence",
+  "projection_db": "/var/lib/agmind-sais/core/projection.sqlite3",
+  "observer_trust_root_file": "/etc/agmind-sais/observer-trust-root.json",
+  "actuator_public_key_file": "/etc/agmind-sais/public/actuator-ed25519.pub",
+  "api_token_file": "/run/secrets/core-api.token",
+  "api_bind_host": "0.0.0.0",
+  "api_bind_port": 8787,
+  "opa_url": "http://opa:8181",
+  "hunter_config_file": "/etc/agmind-sais/hunter.json"
+}

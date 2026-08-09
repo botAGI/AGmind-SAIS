@@ -1,0 +1,6 @@
+{
+  "denied_addresses": [
+    "REPLACE_WITH_PINNED_DGX_IPV4"
+  ],
+  "denied_networks": []
+}

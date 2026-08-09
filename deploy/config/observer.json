@@ -1,0 +1,9 @@
+{
+  "schema_version": "agmind.observer-config.v1",
+  "host_id_file": "/var/lib/agmind-sais/identity/host-id",
+  "private_key_file": "/etc/agmind-sais/secrets/observer-ed25519.key",
+  "state_dir": "/var/lib/agmind-sais/observer",
+  "run_dir": "/run/agmind-sais",
+  "spool_max_bytes": 268435456,
+  "spool_priority_reserve_bytes": 16777216
+}

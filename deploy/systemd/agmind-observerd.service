@@ -1,0 +1,56 @@
+[Unit]
+Description=AGmind SAIS host observer
+Documentation=file:/opt/agmind-sais/docs/runbooks/install-single-host.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+PartOf=agmind-sais.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# M1 observerd deliberately runs as root: its fixed PCC pin loader and owned
+# Unix-socket implementation reject a non-root EUID. It has no actuator/admin
+# socket path and its API surface remains read-only with respect to Docker.
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/libexec/agmind-sais/agmind-observerd --config /etc/agmind-sais/observer.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+RuntimeDirectory=agmind-sais
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=agmind-sais/observer
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SYS_PTRACE
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SYS_PTRACE
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/proc /etc/agmind-sais /etc/falco /usr/share/agmind-sais /var/run/docker.sock
+ReadWritePaths=/var/lib/agmind-sais/observer /run/agmind-sais
+InaccessiblePaths=-/run/agmind-sais/actuator-intent -/run/agmind-sais/actuator-admin
+TasksMax=128
+MemoryMax=256M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=agmind-sais.target

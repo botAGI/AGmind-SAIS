@@ -1,0 +1,223 @@
+name: agmind-sais
+
+services:
+  falco-adapter:
+    image: ${AGMIND_ADAPTER_IMAGE:-agmind-sais-falco-adapter:0.1.0}
+    pull_policy: never
+    user: "${AGMIND_SENSOR_UID:?set AGMIND_SENSOR_UID}:${AGMIND_SENSOR_GID:?set AGMIND_SENSOR_GID}"
+    group_add:
+      - "${AGMIND_SENSOR_GID:?set AGMIND_SENSOR_GID}"
+    environment:
+      AGMIND_FALCO_CONFIG_SHA256: f9e4aa17553cdb9d00634d909bc08bb53fc16260ff672e220c888bfd2739ae9b
+      AGMIND_FALCO_RULES_SHA256: bf21a051f1efe9a5b4abe3d9540f0d9a0110c2d4155c1a52191e475f755dff8d
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    volumes:
+      - /run/agmind-sais/observer-ingest:/run/agmind-sais/observer-ingest:ro
+    expose:
+      - "8765"
+    networks:
+      - sensor_internal
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.25
+    stop_grace_period: 6s
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  falco:
+    image: ${AGMIND_FALCO_IMAGE:-falcosecurity/falco:0.44.1@sha256:d0cfe422d6ac0e0f20857798f46c7d7273210e1b064b22821e4e6e7f843cde6b}
+    pull_policy: never
+    command:
+      - /usr/bin/falco
+      - -c
+      - /etc/falco/falco.yaml
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      - SYS_PTRACE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      - /proc:/host/proc:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+      - ../falco/falco.yaml:/etc/falco/falco.yaml:ro
+      - ../falco/rules.d/agmind-pcc.yaml:/etc/falco/rules.d/agmind-pcc.yaml:ro
+    networks:
+      - sensor_internal
+    depends_on:
+      falco-adapter:
+        condition: service_started
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 0.5
+    stop_grace_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: 25m
+        max-file: "4"
+
+  opa:
+    image: ${AGMIND_OPA_IMAGE:-openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da}
+    pull_policy: never
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --disable-telemetry
+      - /policies/pcc.rego
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    volumes:
+      - ../../policies/pcc.rego:/policies/pcc.rego:ro
+    networks:
+      - control_internal
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.25
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/opa", "eval", "true"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  dgx-relay:
+    image: ${AGMIND_HAPROXY_IMAGE:-haproxy:3.2.21-alpine3.24@sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a}
+    pull_policy: never
+    user: "99:99"
+    environment:
+      AGMIND_DGX_IPV4: ${AGMIND_DGX_IPV4:?set the pinned DGX management IPv4}
+    command:
+      - haproxy
+      - -W
+      - -db
+      - -f
+      - /usr/local/etc/haproxy/haproxy.cfg
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m
+    volumes:
+      - ../config/dgx-relay.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    expose:
+      - "8000"
+    networks:
+      - control_internal
+      - inference
+    pids_limit: 64
+    mem_limit: 64m
+    cpus: 0.1
+    stop_grace_period: 6s
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: "2"
+
+  core:
+    image: ${AGMIND_CORE_IMAGE:-agmind-sais-core:0.1.0}
+    pull_policy: never
+    user: "${AGMIND_CORE_UID:?set AGMIND_CORE_UID}:${AGMIND_CORE_GID:?set AGMIND_CORE_GID}"
+    group_add:
+      - "${AGMIND_CORE_GID:?set AGMIND_CORE_GID}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    volumes:
+      - /run/agmind-sais/observer-core:/run/agmind-sais/observer-core:ro
+      - /run/agmind-sais/actuator-intent:/run/agmind-sais/actuator-intent:ro
+      - /var/lib/agmind-sais/core:/var/lib/agmind-sais/core:rw
+      - /etc/agmind-sais/core.json:/etc/agmind-sais/core.json:ro
+      - /etc/agmind-sais/hunter.json:/etc/agmind-sais/hunter.json:ro
+      - /etc/agmind-sais/observer-trust-root.json:/etc/agmind-sais/observer-trust-root.json:ro
+      - /etc/agmind-sais/public/actuator-ed25519.pub:/etc/agmind-sais/public/actuator-ed25519.pub:ro
+    secrets:
+      - source: core_api_token
+        target: core-api.token
+      - source: dgx_api_token
+        target: dgx-api-token
+    ports:
+      - "127.0.0.1:8787:8787"
+    networks:
+      - control_internal
+    depends_on:
+      falco:
+        condition: service_started
+      falco-adapter:
+        condition: service_healthy
+      dgx-relay:
+        condition: service_started
+      opa:
+        condition: service_healthy
+    pids_limit: 256
+    mem_limit: 1024m
+    cpus: 1.0
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: 25m
+        max-file: "4"
+
+networks:
+  sensor_internal:
+    internal: true
+    driver: bridge
+  control_internal:
+    internal: true
+    driver: bridge
+  inference:
+    driver: bridge
+
+secrets:
+  core_api_token:
+    file: /etc/agmind-sais/secrets/core-api.token
+  dgx_api_token:
+    file: /etc/agmind-sais/secrets/dgx-api.token

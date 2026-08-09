@@ -1,0 +1,12 @@
+{
+  "schema_version": "agmind.actuator-config.v1",
+  "state_dir": "/var/lib/agmind-sais/actuator",
+  "private_key_file": "/etc/agmind-sais/secrets/actuator-ed25519.key",
+  "observer_socket": "/run/agmind-sais/observer-actuator/socket",
+  "intent_socket": "/run/agmind-sais/actuator-intent/socket",
+  "admin_socket": "/run/agmind-sais/actuator-admin/socket",
+  "management_denylist_file": "/etc/agmind-sais/management-destinations.json",
+  "special_use_registry_file": "/usr/share/agmind-sais/ipv4-special-use.csv",
+  "approval_ttl_seconds": 300,
+  "default_action_ttl_seconds": 120
+}

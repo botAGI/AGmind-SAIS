@@ -1,0 +1,51 @@
+[Unit]
+Description=AGmind SAIS proof-carrying containment actuator
+Documentation=file:/opt/agmind-sais/docs/runbooks/install-single-host.md
+Requires=agmind-observerd.service
+After=agmind-observerd.service
+PartOf=agmind-sais.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/libexec/agmind-sais/agmind-actuatord --config /etc/agmind-sais/actuator.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+RuntimeDirectory=agmind-sais
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=agmind-sais/actuator
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_KILL CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_KILL CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+ReadOnlyPaths=/proc /etc/agmind-sais /usr/share/agmind-sais -/run/agmind-sais/observer-actuator
+ReadWritePaths=/var/lib/agmind-sais/actuator /run/agmind-sais
+InaccessiblePaths=-/var/run/docker.sock -/run/agmind-sais/observer-core -/run/agmind-sais/observer-ingest
+TasksMax=128
+MemoryMax=256M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=agmind-sais.target
