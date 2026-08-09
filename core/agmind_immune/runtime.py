@@ -9,11 +9,16 @@ from dataclasses import dataclass
 
 from agmind_immune.actions import (
     ActuatorIntentClient,
+    ActuatorJournalClient,
+    ActuatorJournalRetryable,
+    ActuatorMirror,
+    ActuatorMirrorFatal,
     DecisionIntentCommit,
     IntentDeliveryRetryable,
     IntentDeliveryStateMachine,
     QuarantinedIntentReceipt,
 )
+from agmind_immune.contracts import ActionRecordV1
 from agmind_immune.controller import CoreController
 from agmind_immune.hunter import (
     HunterClient,
@@ -42,6 +47,9 @@ class CoreRuntimeStatus:
     quarantined_intents: int
     last_hunter_status: str | None
     hunter_persistence_status: str
+    actuator_feedback_status: str
+    actuator_journal_records: int
+    action_records: int
 
 
 class CoreRuntime:
@@ -53,6 +61,8 @@ class CoreRuntime:
         policy: PolicyClient,
         delivery: IntentDeliveryStateMachine,
         actuator: ActuatorIntentClient,
+        actuator_journal: ActuatorJournalClient,
+        actuator_mirror: ActuatorMirror,
         *,
         hunter: HunterClient | None = None,
         hunter_investigations: HunterInvestigationStore | None = None,
@@ -62,7 +72,10 @@ class CoreRuntime:
             or type(policy) is not PolicyClient
             or type(delivery) is not IntentDeliveryStateMachine
             or type(actuator) is not ActuatorIntentClient
+            or type(actuator_journal) is not ActuatorJournalClient
+            or type(actuator_mirror) is not ActuatorMirror
             or delivery._client is not actuator
+            or actuator_mirror._client is not actuator_journal
             or (hunter is not None and type(hunter) is not HunterClient)
             or (
                 hunter_investigations is not None
@@ -74,6 +87,8 @@ class CoreRuntime:
         self._policy = policy
         self._delivery = delivery
         self._actuator = actuator
+        self._actuator_journal = actuator_journal
+        self._actuator_mirror = actuator_mirror
         self._hunter = hunter
         self._hunter_investigations = hunter_investigations
         self._hunter_tasks: dict[asyncio.Task[HunterResult], str] = {}
@@ -93,6 +108,8 @@ class CoreRuntime:
         self._hunter_persistence_status = (
             "ready" if hunter_investigations is not None else "unavailable"
         )
+        self._actuator_feedback_status = "unverified"
+        self._actuator_feedback_ready = False
         self._closed = False
 
     @property
@@ -104,7 +121,21 @@ class CoreRuntime:
             quarantined_intents=len(self._quarantined),
             last_hunter_status=self._last_hunter_status,
             hunter_persistence_status=self._hunter_persistence_status,
+            actuator_feedback_status=self._actuator_feedback_status,
+            actuator_journal_records=self._actuator_mirror.snapshot().record_count,
+            action_records=len(self._actuator_mirror.snapshot().action_records),
         )
+
+    def action_records(
+        self,
+        *,
+        after: int,
+        limit: int,
+    ) -> tuple[ActionRecordV1, ...]:
+        return self._actuator_mirror.action_records(after=after, limit=limit)
+
+    def latest_action(self, action_id: str) -> ActionRecordV1 | None:
+        return self._actuator_mirror.latest_for_action(action_id)
 
     def hunter_investigation(
         self,
@@ -128,7 +159,13 @@ class CoreRuntime:
 
     @property
     def ready(self) -> bool:
-        if self._closed or self._polls <= 0 or self._delivery.read_only:
+        if (
+            self._closed
+            or self._polls <= 0
+            or self._delivery.read_only
+            or not self._actuator_feedback_ready
+            or self._actuator_mirror.read_only
+        ):
             return False
         try:
             return self._controller.mutation_readiness().ready is True
@@ -202,6 +239,8 @@ class CoreRuntime:
     async def _deliver(self, commit: DecisionIntentCommit) -> bool:
         if commit.effect != "manual_approval_required" or commit.candidate_id in self._prepared:
             return True
+        if not self._actuator_feedback_ready or self._actuator_mirror.read_only:
+            return False
         try:
             outcome = await self._delivery.deliver(commit)
         except IntentDeliveryRetryable as error:
@@ -217,6 +256,27 @@ class CoreRuntime:
             return True
         self._prepared.add(commit.candidate_id)
         self._prepared_plans += 1
+        return True
+
+    async def _sync_actuator_feedback(self) -> bool:
+        if self._actuator_mirror.read_only:
+            self._actuator_feedback_ready = False
+            self._actuator_feedback_status = "fatal"
+            return False
+        try:
+            await self._actuator_mirror.sync_once()
+        except ActuatorJournalRetryable as error:
+            self._actuator_feedback_ready = False
+            self._actuator_feedback_status = "unavailable"
+            _LOG.warning("actuator feedback retryable: %s", error)
+            return False
+        except ActuatorMirrorFatal as error:
+            self._actuator_feedback_ready = False
+            self._actuator_feedback_status = "fatal"
+            _LOG.error("actuator feedback verification failed: %s", error)
+            return False
+        self._actuator_feedback_ready = True
+        self._actuator_feedback_status = "verified"
         return True
 
     async def _retry_durable_deliveries(self) -> None:
@@ -337,6 +397,7 @@ class CoreRuntime:
         if self._closed:
             raise RuntimeError("Core runtime is closed")
         await self._refresh_commits()
+        await self._sync_actuator_feedback()
         await self._retry_durable_deliveries()
         await self._run_retention_if_due()
         try:
@@ -383,7 +444,12 @@ class CoreRuntime:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         primary: BaseException | None = None
-        steps = [self._delivery.close, self._actuator.close, self._policy.close]
+        steps = [
+            self._delivery.close,
+            self._actuator.close,
+            self._actuator_journal.close,
+            self._policy.close,
+        ]
         if self._hunter is not None:
             steps.append(self._hunter.close)
         steps.append(self._controller.close)
@@ -397,6 +463,15 @@ class CoreRuntime:
                     primary.add_note(
                         f"secondary Core runtime close failure ({type(error).__name__})"
                     )
+        try:
+            self._actuator_mirror.close()
+        except BaseException as error:  # noqa: BLE001 - close every authority
+            if primary is None:
+                primary = error
+            else:
+                primary.add_note(
+                    f"secondary actuator mirror close failure ({type(error).__name__})"
+                )
         if self._hunter_investigations is not None:
             try:
                 self._hunter_investigations.close()

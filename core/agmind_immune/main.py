@@ -13,7 +13,13 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from agmind_immune.actions import ActuatorIntentClient, IntentDeliveryStateMachine
+from agmind_immune.actions import (
+    ActuatorIntentClient,
+    ActuatorJournalClient,
+    ActuatorMirror,
+    IntentDeliveryStateMachine,
+)
+from agmind_immune.api import CoreRuntimeProvider, ManagementServer
 from agmind_immune.clock import CoreClockSample
 from agmind_immune.config import (
     CORE_CONFIG_PATH,
@@ -27,7 +33,6 @@ from agmind_immune.correlation.primitives import load_pinned_special_use_registr
 from agmind_immune.coverage import CoverageState
 from agmind_immune.evidence.projection import ProjectionStore
 from agmind_immune.evidence.segments import SegmentStore
-from agmind_immune.health import HealthServer
 from agmind_immune.hunter import (
     HunterClient,
     HunterInvestigationStore,
@@ -91,6 +96,8 @@ async def _open_runtime(config: CoreConfigV1) -> CoreRuntime:
     controller: CoreController | None = None
     policy: PolicyClient | None = None
     actuator: ActuatorIntentClient | None = None
+    actuator_journal: ActuatorJournalClient | None = None
+    actuator_mirror: ActuatorMirror | None = None
     delivery: IntentDeliveryStateMachine | None = None
     hunter: HunterClient | None = None
     hunter_investigations: HunterInvestigationStore | None = None
@@ -142,6 +149,8 @@ async def _open_runtime(config: CoreConfigV1) -> CoreRuntime:
             config.intent_delivery_db,
             actuator,
         )
+        actuator_journal = ActuatorJournalClient.create(Path(config.actuator_socket))
+        actuator_mirror = ActuatorMirror.open(actuator_journal)
         try:
             hunter_investigations = HunterInvestigationStore.open(
                 config.hunter_investigations_db
@@ -164,10 +173,20 @@ async def _open_runtime(config: CoreConfigV1) -> CoreRuntime:
             policy,
             delivery,
             actuator,
+            actuator_journal,
+            actuator_mirror,
             hunter=hunter,
             hunter_investigations=hunter_investigations,
         )
     except BaseException as primary:
+        if actuator_mirror is not None:
+            try:
+                actuator_mirror.close()
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve primary
+                primary.add_note(
+                    "secondary actuator mirror cleanup failure "
+                    f"({type(cleanup_error).__name__})"
+                )
         async_steps = []
         if hunter is not None:
             async_steps.append(hunter.close)
@@ -175,6 +194,8 @@ async def _open_runtime(config: CoreConfigV1) -> CoreRuntime:
             async_steps.append(delivery.close)
         if actuator is not None:
             async_steps.append(actuator.close)
+        if actuator_journal is not None:
+            async_steps.append(actuator_journal.close)
         if policy is not None:
             async_steps.append(policy.close)
         if controller is not None:
@@ -215,9 +236,13 @@ async def _serve(config_path: Path) -> None:
         raise RuntimeError("agmind-core requires Linux and a non-root service user")
     config = load_core_config(config_path)
     runtime = await _open_runtime(config)
-    health = HealthServer(lambda: runtime.ready)
+    management = ManagementServer(
+        readiness=lambda: runtime.ready,
+        token_file=Path(config.api_token_file),
+        provider=CoreRuntimeProvider(runtime),
+    )
     try:
-        await health.start(config.api_bind_host, config.api_bind_port)
+        await management.start(config.api_bind_host, config.api_bind_port)
     except BaseException as bind_error:
         try:
             await runtime.close()
@@ -235,7 +260,7 @@ async def _serve(config_path: Path) -> None:
     finally:
         shutdown_error: BaseException | None = None
         try:
-            await health.close()
+            await management.close()
         except BaseException as error:  # noqa: BLE001 - close both owners
             shutdown_error = error
         try:
