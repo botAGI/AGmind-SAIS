@@ -94,20 +94,21 @@ sudo agmindctl token rotate
 
 ## Нативная проверка
 
-Smoke создаёт отдельные target/control контейнеры, требует реальное локальное
-подтверждение, проверяет изоляцию только target, отсутствие AGmind-правил в
-host namespace и самостоятельное истечение TTL при остановленном Core и
-actuator:
+Один итоговый gate создаёт отдельные target/control контейнеры, требует реальное
+локальное подтверждение и связывает target-only TTL, signed `EXPIRED`, offline
+proof и фактический read-only ответ `dspark` в один отчёт:
 
 ```sh
+sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
 sudo env \
   AGMIND_DEDICATED_TEST_HOST=1 \
   AGMIND_DGX_URL=http://192.168.1.45:8000/v1 \
-  /opt/agmind-sais/scripts/smoke-containment-linux.sh
+  /opt/agmind-sais/scripts/verify-linux-integration.sh \
+  --output /var/lib/agmind-sais/acceptance/run-001
 ```
 
 Только финальный отчёт со `"status":"PASS"` считается нативным доказательством
-M1. Инструкции: [`docs/runbooks/install-single-host.md`](docs/runbooks/install-single-host.md).
+M1. Инструкции: [`docs/runbooks/beelink-lab.md`](docs/runbooks/beelink-lab.md).
 
 ## Экспорт доказательства действия
 

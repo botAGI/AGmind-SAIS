@@ -10,6 +10,7 @@ It is a deployment scaffold for the Beelink lab, not native-acceptance proof.
 - checkout and Compose assets: `/opt/agmind-sais`
 - host binaries: `/usr/local/libexec/agmind-sais`
 - trusted configuration: `/etc/agmind-sais`
+- installed runtime image-ID manifest: `/etc/agmind-sais/runtime-image-ids.json`
 - durable state: `/var/lib/agmind-sais`
 - isolated Unix sockets: `/run/agmind-sais/<boundary>/socket`
 - Core management API: `127.0.0.1:8787`
@@ -101,26 +102,26 @@ never the bearer value. Core receives the parent secrets directory read-only so
 the rename is immediately visible; its process can traverse that directory but
 cannot list it or read the root-only observer/actuator private keys.
 
-## Native target-only TTL smoke
+## Native M1 acceptance
 
-Run this only on a dedicated Beelink test host. It creates two exact-labelled,
-unprivileged containers on one temporary bridge. It proves the target loses
-access to `1.1.1.1:443`, the control remains reachable, the host namespace is
-untouched, and the target rule expires in the kernel while Core and actuator
-are stopped. Approval still requires typing the hash suffix shown by the real
-CLI. Cleanup removes only resources carrying the current run ID and restores
-the services.
+Run the single consolidated gate only on a dedicated Beelink test host. It wraps
+the target-only TTL smoke, signed Core mirror, offline proof, authenticated API,
+and real `dspark` Hunter boundary into one root-owned report. Approval still
+requires typing the hash suffix shown by the real CLI.
 
 ```sh
+sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
 sudo env \
   AGMIND_DEDICATED_TEST_HOST=1 \
   AGMIND_DGX_URL=http://192.168.1.45:8000/v1 \
-  /opt/agmind-sais/scripts/smoke-containment-linux.sh
+  /opt/agmind-sais/scripts/verify-linux-integration.sh \
+  --output /var/lib/agmind-sais/acceptance/run-001
 ```
 
-Only a final JSON object with `"status":"PASS"` is native containment evidence.
+Only `acceptance-report.json` with `"status":"PASS"` is native M1 evidence.
 Darwin, Docker Desktop, OrbStack, WSL, rootless Docker, a degraded preflight, or
-a non-interactive invocation cannot satisfy this gate.
+a non-interactive invocation cannot satisfy this gate. Full operator procedure
+and artifact semantics are in `docs/runbooks/beelink-lab.md`.
 
 ## Kubernetes migration boundary
 

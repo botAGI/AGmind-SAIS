@@ -365,6 +365,7 @@ if [[ "$repo_root" != "$install_root" ]]; then
   done
   copy_file scripts/preflight-linux.sh
   copy_file scripts/smoke-containment-linux.sh
+  copy_file scripts/verify-linux-integration.sh
   copy_file scripts/export-proof-linux.sh
   copy_file scripts/install-linux.sh
 fi
@@ -378,6 +379,7 @@ for required_source in \
   deploy/images/falco-adapter.Dockerfile \
   scripts/preflight-linux.sh \
   scripts/smoke-containment-linux.sh \
+  scripts/verify-linux-integration.sh \
   scripts/export-proof-linux.sh; do
   [[ -f "${install_root}/${required_source}" && ! -L "${install_root}/${required_source}" ]] ||
     die "installed build tree is incomplete: $required_source"
@@ -561,6 +563,31 @@ docker_rootful build \
   --file "${install_root}/deploy/images/falco-adapter.Dockerfile" \
   --tag "$adapter_image" \
   "$install_root"
+
+runtime_image_id() {
+  local reference="$1"
+  local image_id=""
+  if ! image_id="$(docker_rootful image inspect --format '{{.Id}}' -- "$reference")" ||
+    [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    die "runtime image ID is unavailable: $reference"
+  fi
+  printf '%s\n' "$image_id"
+}
+
+status "pinning immutable runtime image IDs"
+core_runtime_image_id="$(runtime_image_id "$core_image")"
+adapter_runtime_image_id="$(runtime_image_id "$adapter_image")"
+falco_runtime_image_id="$(runtime_image_id "$falco_image")"
+opa_runtime_image_id="$(runtime_image_id "$opa_image")"
+haproxy_runtime_image_id="$(runtime_image_id "$haproxy_image")"
+printf \
+  '{"schema_version":"agmind.runtime-image-ids.v1","services":{"core":"%s","dgx-relay":"%s","falco":"%s","falco-adapter":"%s","opa":"%s"}}\n' \
+  "$core_runtime_image_id" "$haproxy_runtime_image_id" \
+  "$falco_runtime_image_id" "$adapter_runtime_image_id" "$opa_runtime_image_id" \
+  >"${work_dir}/runtime-image-ids.json"
+atomic_install_file \
+  "${work_dir}/runtime-image-ids.json" \
+  "${config_root}/runtime-image-ids.json" 0444 root root
 
 status "running the full read-only host and DGX preflight"
 DOCKER_CONFIG="${runtime_root}/docker-config" \
