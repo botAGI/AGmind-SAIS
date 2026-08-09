@@ -1,136 +1,102 @@
-# 🛡️ AGmind-SAIS — Security AI Sensor
+# AGmind-SAIS
 
-Автономный контейнер безопасности с ML-ядром. 24/7 мониторинг системы, сети и логов. Выявление угроз через LLM. Автоматическое реагирование с guardrails.
+AGmind-SAIS — разрабатываемый слой «кибер-иммунитета» для Docker-хостов.
+Он собирает подписанные события безопасности, принимает решение по
+детерминированной policy, требует локальное подтверждение оператора и только
+после этого временно изолирует точный сетевой namespace контейнера.
 
-## Архитектура
+Это не очередной LLM-firewall: модель не получает полномочий менять систему.
+DeepSeek на DGX Spark используется только как недоверенный read-only Hunter —
+для гипотез и объяснений поверх уже зафиксированных фактов.
 
-```
-┌───────────────────────────────────────────────────┐
-│                 AGmind-SAIS                         │
-│                                                     │
-│   ┌─────────────┐    ┌─────────────────────────┐   │
-│   │   FastAPI    │    │     Agent Core (цикл)    │   │
-│   │  REST API   │    │  collect → analyze → act │   │
-│   │  WebSocket  │    │         │                 │   │
-│   │  Web UI     │    │    ┌────┴────┐            │   │
-│   └──────┬──────┘    │    │ Analyzer │            │   │
-│          │           │    └────┬────┘            │   │
-│   ┌──────┴──────┐    │    ┌────┴────┐            │   │
-│   │ ML Client   │◄───│────│ Alerter │            │   │
-│   │ abstract.   │    │    └─────────┘            │   │
-│   └──────┬──────┘    └──────────┬────────────────┘   │
-│          │                      │                     │
-│   ┌──────┴──────┐    ┌──────────┴──────────────┐    │
-│   │ Ollama      │    │ Investigation Ledger      │    │
-│   │ vLLM        │    │ + Risk-Based Alerting    │    │
-│   │ llama.cpp   │    │ + Guardrails             │    │
-│   │ OpenAI API  │    │ + Reactor Engine         │    │
-│   └─────────────┘    └──────────────────────────┘    │
-└───────────────────────────────────────────────────┘
+## Главный инвариант M1
+
+```text
+signed evidence
+  -> deterministic correlation
+  -> OPA admission
+  -> durable intent
+  -> local interactive approval
+  -> exact container netns
+  -> nftables deny with native TTL
+  -> signed action journal
+  -> Core mirror / offline proof
 ```
 
-## Возможности
+Ни модель, ни Core, ни HTTP API не могут подтвердить план или напрямую вызвать
+`nft`. Привилегированный actuator принимает решение только через локальный Unix
+socket от пользователя `root` или группы `agmind-admin`. Правило содержит
+kernel timeout и исчезает без участия control plane.
 
-### 🧠 ML-ядро (любой провайдер)
-- Ollama, vLLM, llama.cpp, OpenAI-совместимый API
-- Переключение провайдера через config.yaml
-- Декларативная экстракция через Pydantic-схемы
+## Архитектура одного хоста
 
-### 👁️ Мониторинг 24/7
-- **Система:** CPU, RAM, диск, процессы, пользователи
-- **Сеть:** соединения, порты, подозрительный трафик
-- **Логи:** инкрементальное чтение syslog, auth.log, nginx
+- `agmind-observerd` — host-сенсор, Docker inventory и подписанные события.
+- Falco + redacting adapter — monitor-only detection без доступа к секретам.
+- Core — evidence, correlation, OPA, durable intents и проверяемое зеркало
+  действий; без Docker socket и `CAP_NET_ADMIN`.
+- OPA — единственная policy admission boundary. Она может потребовать ручное
+  подтверждение, но не сформировать команду исполнения.
+- Hunter — изолированный запрос к DeepSeek V4 Flash через фиксированный relay;
+  результат не входит в policy, intent или approval.
+- `agmind-actuatord` — минимальная root-boundary, повторно проверяющая identity
+  контейнера и применяющая точечный `nftables` timeout внутри его netns.
+- `agmindctl` — host-only просмотр и интерактивное approve/reject.
 
-### 🎯 Анализ угроз
-- LLM-анализ собранных данных
-- Выявление: аномалии системы, сетевые атаки, угрозы из логов
-- Классификация по severity (1-5) и confidence (0.0-1.0)
-- MITRE ATT&CK техники
+## Текущий статус
 
-### ⚡ Reactor с Guardrails
-- Автономные действия только при confidence ≥ 0.90
-- С человеческим подтверждением при ≥ 0.60
-- Поддерживаемые действия: BLOCK_IP, KILL_PROCESS, QUARANTINE_USER, ALERT_ONLY
-- Cooldown на повторные действия
-- Risk-Based Alerting с затуханием баллов
+M1 ориентирован на один выделенный Linux Docker-хост. Рабочий вертикальный
+контур evidence → policy → intent → local approval → target-only TTL уже
+реализован вместе с hardened Compose/systemd installer. Сейчас завершаются
+Core action mirror, proof export/offline verification и нативный acceptance на
+Beelink. До успешного Linux smoke проект не заявляет production-ready статус.
 
-### 📋 Investigation Ledger
-- Логирование каждого шага агента (промпты, ответы, решения)
-- Полный replay задним числом
-- JSONL-формат для простой интеграции
+Kubernetes, multi-node coordination и DaemonSet actuator относятся к следующей
+фазе. M1 специально сохраняет границы, которые можно перенести: Core/OPA как
+обычные непривилегированные workloads, observer/actuator как node-local слой.
 
-### 💬 Чат с КиберБезОпасовичем
-- REST API + WebSocket
-- Web UI dashboard
-- Прямой доступ к ML-ядру
+## Установка M1
 
-### 🔔 Алерты
-- Telegram (Markdown, эмодзи-приоритеты)
-- Webhook (JSON payload)
-- Локальный лог
+Нужен выделенный Linux-хост с systemd, rootful Docker Engine, Compose v2,
+cgroup v2 и nftables. macOS, Docker Desktop, rootless Docker, WSL и общий
+production-хост не являются валидным acceptance-окружением.
 
-## Быстрый старт
-
-### 1. Конфигурация
-
-```yaml
-# config/config.yaml
-ml:
-  provider: ollama          # ollama | vllm | llamacpp | openai
-  model: cyberbez-bezopasovich
-  base_url: "http://localhost:11434"
+```sh
+sudo ./scripts/install-linux.sh \
+  --admin-user testbot \
+  --dgx-url http://192.168.1.45:8000/v1
 ```
 
-### 2. Docker
+Полные prerequisites, фиксированные пути и безопасное обновление описаны в
+[`docs/runbooks/install-single-host.md`](docs/runbooks/install-single-host.md).
 
-```bash
-docker build -t agmind-sais .
-docker run -d \
-  --name sais \
-  --network host \
-  -v /var/log:/var/log:ro \
-  -v /path/to/config.yaml:/app/config/config.yaml \
-  agmind-sais
+## Нативная проверка
+
+Smoke создаёт отдельные target/control контейнеры, требует реальное локальное
+подтверждение, проверяет изоляцию только target, отсутствие AGmind-правил в
+host namespace и самостоятельное истечение TTL при остановленном Core и
+actuator:
+
+```sh
+sudo env \
+  AGMIND_DEDICATED_TEST_HOST=1 \
+  AGMIND_DGX_URL=http://192.168.1.45:8000/v1 \
+  /opt/agmind-sais/scripts/smoke-containment-linux.sh
 ```
 
-### 3. Или локально
+Только финальный отчёт со `"status":"PASS"` считается нативным доказательством
+M1. Инструкции: [`docs/runbooks/install-single-host.md`](docs/runbooks/install-single-host.md).
 
-```bash
-pip install -r requirements.txt
-python main.py
-```
+## Что проект намеренно не делает
 
-### 4. Открыть дашборд
-
-```
-http://localhost:8080/ui/dashboard.html
-```
-
-## API Endpoints
-
-| Method | Path | Описание |
-|--------|------|---------|
-| GET | /health | Проверка здоровья |
-| GET | /api/status | Полный статус |
-| POST | /api/chat | Чат с ML-ядром |
-| WS | /api/chat/ws | WebSocket чат |
-| POST | /api/analyze | Принудительный анализ |
-| GET | /api/ledger | Investigation Ledger |
-| POST | /api/reactor | Управление реактором |
-| GET | /api/monitor/live | Свежие данные мониторинга |
-
-## Зависимости
-
-- Python 3.12
-- FastAPI + Uvicorn
-- aiohttp
-- Pydantic
-- PyYAML
+- не исполняет текст, команды или tool calls от LLM;
+- не блокирует адрес по одному model confidence score;
+- не выдаёт Core или web API права approve/apply;
+- не использует `--network host` для Core;
+- не обещает заменить perimeter/WAF firewall во всех сценариях;
+- не заявляет Kubernetes/multi-server готовность до отдельного threat model и
+  нативного acceptance.
 
 ## Лицензия
 
-MIT — делайте что хотите. Но отвечаете за использование сами.
-
----
-
-*Сделано Gbot для проекта agmind-hat.*
+MIT. Использование защитных действий в реальной инфраструктуре остаётся
+ответственностью оператора.
