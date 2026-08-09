@@ -213,14 +213,16 @@ func (service *Service) journalPage(query journalPageQuery) (durablefile.Journal
 		return durablefile.JournalPage{}, durablefile.ErrJournalClosed
 	}
 	service.mutex.Lock()
-	defer service.mutex.Unlock()
 	if service.closed || service.journal == nil {
+		service.mutex.Unlock()
 		return durablefile.JournalPage{}, durablefile.ErrJournalClosed
 	}
-	if service.journal.failed() {
-		return durablefile.JournalPage{}, durablefile.ErrJournalFailed
+	stream := service.journal.stream
+	service.mutex.Unlock()
+	if stream == nil {
+		return durablefile.JournalPage{}, durablefile.ErrJournalClosed
 	}
-	return service.journal.stream.ReadPage(durablefile.JournalPageRequest{
+	return stream.ReadPage(durablefile.JournalPageRequest{
 		After:               query.after,
 		Limit:               query.limit,
 		MaxRecords:          actionJournalMaxRecords,

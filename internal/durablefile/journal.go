@@ -119,6 +119,7 @@ type Journal struct {
 	write        func(*os.File, []byte) (int, error)
 	previousHash [sha256.Size]byte
 	offset       int64
+	frameIndex   []RecordMeta
 	failed       bool
 	closed       bool
 }
@@ -416,14 +417,19 @@ func newJournal(
 		_ = unlockAndClose(file)
 		return nil, Recovery{}, err
 	}
+	frameIndex := make([]RecordMeta, len(recovery.Records))
+	for index := range recovery.Records {
+		frameIndex[index] = recovery.Records[index].RecordMeta
+	}
 	journal := &Journal{
-		path:     path,
-		file:     file,
-		maxFrame: config.maxFrame,
-		sync:     config.sync,
-		syncDir:  config.syncDir,
-		write:    config.write,
-		offset:   recovery.VerifiedBytes,
+		path:       path,
+		file:       file,
+		maxFrame:   config.maxFrame,
+		sync:       config.sync,
+		syncDir:    config.syncDir,
+		write:      config.write,
+		offset:     recovery.VerifiedBytes,
+		frameIndex: frameIndex,
 	}
 	if len(recovery.Records) > 0 {
 		journal.previousHash = recovery.Records[len(recovery.Records)-1].Hash
@@ -448,6 +454,8 @@ func (journal *Journal) Checkpoint(payload []byte) (RecordMeta, error) {
 	if err != nil {
 		return RecordMeta{}, err
 	}
+	meta.Offset = 0
+	replacementIndex := []RecordMeta{meta}
 	parent, err := openSecureParent(journal.path)
 	if err != nil {
 		return RecordMeta{}, err
@@ -532,7 +540,7 @@ func (journal *Journal) Checkpoint(payload []byte) (RecordMeta, error) {
 	temporary = nil
 	journal.previousHash = meta.Hash
 	journal.offset = int64(meta.Size)
-	meta.Offset = 0
+	journal.frameIndex = replacementIndex
 	closeErr := unlockAndClose(old)
 	syncErr := journal.syncDir(parent.fd)
 	if closeErr != nil || syncErr != nil {
@@ -577,12 +585,107 @@ func (journal *Journal) Append(payload []byte, critical bool) (RecordMeta, error
 	}
 	journal.previousHash = meta.Hash
 	journal.offset += int64(meta.Size)
+	journal.frameIndex = append(journal.frameIndex, meta)
 	return meta, nil
 }
 
+func frameEnd(meta RecordMeta) (int64, bool) {
+	if meta.Offset < 0 || meta.Size > uint64(^uint64(0)>>1) {
+		return 0, false
+	}
+	size := int64(meta.Size)
+	if meta.Offset > int64(^uint64(0)>>1)-size {
+		return 0, false
+	}
+	return meta.Offset + size, true
+}
+
+func (journal *Journal) indexedSnapshot() (JournalSnapshot, error) {
+	snapshot := JournalSnapshot{
+		RecordCount:   uint64(len(journal.frameIndex)),
+		VerifiedBytes: journal.offset,
+		Head:          journal.previousHash,
+	}
+	var zero [sha256.Size]byte
+	if len(journal.frameIndex) == 0 {
+		if journal.offset != 0 || journal.previousHash != zero {
+			return JournalSnapshot{}, fmt.Errorf(
+				"%w: empty frame index disagrees with journal head",
+				ErrJournalCorrupt,
+			)
+		}
+		return snapshot, nil
+	}
+	last := journal.frameIndex[len(journal.frameIndex)-1]
+	end, ok := frameEnd(last)
+	if !ok || end != journal.offset || last.Hash != journal.previousHash {
+		return JournalSnapshot{}, fmt.Errorf(
+			"%w: frame index disagrees with journal head",
+			ErrJournalCorrupt,
+		)
+	}
+	return snapshot, nil
+}
+
+func (journal *Journal) validateIndexedSnapshot(snapshot JournalSnapshot) bool {
+	var zero [sha256.Size]byte
+	if snapshot.RecordCount == 0 {
+		return snapshot.VerifiedBytes == 0 && snapshot.Head == zero
+	}
+	if snapshot.RecordCount > uint64(len(journal.frameIndex)) {
+		return false
+	}
+	last := journal.frameIndex[snapshot.RecordCount-1]
+	end, ok := frameEnd(last)
+	return ok && end == snapshot.VerifiedBytes && last.Hash == snapshot.Head
+}
+
+func (journal *Journal) readIndexedRecord(position uint64) (Record, error) {
+	meta := journal.frameIndex[position]
+	var expectedPrevious [sha256.Size]byte
+	var expectedOffset int64
+	if position > 0 {
+		previous := journal.frameIndex[position-1]
+		end, ok := frameEnd(previous)
+		if !ok {
+			return Record{}, fmt.Errorf(
+				"%w: invalid frame index boundary",
+				ErrJournalCorrupt,
+			)
+		}
+		expectedPrevious = previous.Hash
+		expectedOffset = end
+	}
+	end, ok := frameEnd(meta)
+	if !ok || meta.Offset != expectedOffset || end > journal.offset ||
+		meta.PreviousHash != expectedPrevious ||
+		meta.Size != uint64(frameOverhead)+uint64(meta.PayloadLength) {
+		return Record{}, fmt.Errorf(
+			"%w: invalid frame index entry",
+			ErrJournalCorrupt,
+		)
+	}
+	raw := make([]byte, int(meta.Size))
+	if _, err := journal.file.ReadAt(raw, meta.Offset); err != nil {
+		return Record{}, err
+	}
+	record, err := DecodeFrame(raw, journal.maxFrame, expectedPrevious)
+	if err != nil {
+		return Record{}, err
+	}
+	record.Offset = meta.Offset
+	if record.RecordMeta != meta {
+		return Record{}, fmt.Errorf(
+			"%w: frame differs from verified index",
+			ErrJournalCorrupt,
+		)
+	}
+	return record, nil
+}
+
 // ReadPage verifies and copies a bounded page from the journal's current file
-// descriptor. The journal mutex remains held for the entire scan, so Append
-// and Checkpoint cannot change the descriptor or prefix during the read.
+// descriptor. The journal mutex remains held for the page read, so Append and
+// Checkpoint cannot change the descriptor or prefix during the read.
 func (journal *Journal) ReadPage(request JournalPageRequest) (JournalPage, error) {
 	if journal == nil {
 		return JournalPage{}, ErrJournalClosed
@@ -602,10 +705,11 @@ func (journal *Journal) ReadPage(request JournalPageRequest) (JournalPage, error
 		return JournalPage{}, ErrJournalPageBounds
 	}
 
-	target := JournalSnapshot{
-		VerifiedBytes: journal.offset,
-		Head:          journal.previousHash,
+	current, err := journal.indexedSnapshot()
+	if err != nil {
+		return JournalPage{}, err
 	}
+	target := current
 	pinned := request.Snapshot != nil
 	if pinned {
 		target = *request.Snapshot
@@ -615,6 +719,8 @@ func (journal *Journal) ReadPage(request JournalPageRequest) (JournalPage, error
 			request.After > target.RecordCount {
 			return JournalPage{}, ErrJournalSnapshotMismatch
 		}
+	} else if target.RecordCount > request.MaxRecords {
+		return JournalPage{}, ErrJournalPageBounds
 	}
 	info, err := journal.file.Stat()
 	if err != nil {
@@ -626,104 +732,32 @@ func (journal *Journal) ReadPage(request JournalPageRequest) (JournalPage, error
 			ErrJournalCorrupt,
 		)
 	}
-
-	page := JournalPage{Records: make([]Record, 0, request.Limit)}
-	var expectedPrevious [sha256.Size]byte
-	var offset int64
-	var recordCount uint64
-	var pagePayloadBytes int64
-	pageOpen := true
-	if target.VerifiedBytes == 0 {
-		if target.RecordCount != 0 || target.Head != expectedPrevious ||
-			request.After != 0 {
-			return JournalPage{}, ErrJournalSnapshotMismatch
-		}
-		page.Snapshot = target
-		page.NextAfter = request.After
-		return page, nil
+	if !journal.validateIndexedSnapshot(target) ||
+		request.After > target.RecordCount {
+		return JournalPage{}, ErrJournalSnapshotMismatch
 	}
-
-	for offset < journal.offset {
-		if recordCount == request.MaxRecords {
-			return JournalPage{}, ErrJournalPageBounds
-		}
-		remaining := journal.offset - offset
-		if remaining < frameHeaderSize {
-			return JournalPage{}, fmt.Errorf(
-				"%w: incomplete verified frame header",
-				ErrJournalCorrupt,
-			)
-		}
-		header := make([]byte, frameHeaderSize)
-		if _, err := journal.file.ReadAt(header, offset); err != nil {
-			return JournalPage{}, err
-		}
-		payloadLength := uint32(header[4])<<24 |
-			uint32(header[5])<<16 |
-			uint32(header[6])<<8 |
-			uint32(header[7])
-		if payloadLength > journal.maxFrame {
-			return JournalPage{}, fmt.Errorf(
-				"%w: payload length exceeds limit",
-				ErrJournalCorrupt,
-			)
-		}
-		total := int64(frameOverhead) + int64(payloadLength)
-		if total > remaining {
-			return JournalPage{}, fmt.Errorf(
-				"%w: incomplete verified frame",
-				ErrJournalCorrupt,
-			)
-		}
-		raw := make([]byte, int(total))
-		if _, err := journal.file.ReadAt(raw, offset); err != nil {
-			return JournalPage{}, err
-		}
-		record, err := DecodeFrame(raw, journal.maxFrame, expectedPrevious)
-		if err != nil {
-			return JournalPage{}, err
-		}
-		record.Offset = offset
-		offset += total
-		recordCount++
-		expectedPrevious = record.Hash
-
-		if offset > target.VerifiedBytes {
-			return JournalPage{}, ErrJournalSnapshotMismatch
-		}
-		if recordCount > request.After && len(page.Records) < request.Limit && pageOpen {
-			payloadBytes := int64(len(record.Payload))
-			if payloadBytes > request.MaxPagePayloadBytes-pagePayloadBytes {
-				if len(page.Records) == 0 {
-					return JournalPage{}, ErrJournalPageBounds
-				}
-				pageOpen = false
-			} else {
-				page.Records = append(page.Records, record)
-				pagePayloadBytes += payloadBytes
-			}
-		}
-		if offset == target.VerifiedBytes {
-			if pinned && (recordCount != target.RecordCount ||
-				expectedPrevious != target.Head) {
-				return JournalPage{}, ErrJournalSnapshotMismatch
-			}
-			if !pinned {
-				target.RecordCount = recordCount
-				if expectedPrevious != target.Head {
-					return JournalPage{}, fmt.Errorf(
-						"%w: journal head mismatch",
-						ErrJournalCorrupt,
-					)
-				}
+	page := JournalPage{
+		Snapshot: target,
+		Records:  make([]Record, 0, request.Limit),
+	}
+	var pagePayloadBytes int64
+	for position := request.After; position < target.RecordCount &&
+		len(page.Records) < request.Limit; position++ {
+		meta := journal.frameIndex[position]
+		payloadBytes := int64(meta.PayloadLength)
+		if payloadBytes > request.MaxPagePayloadBytes-pagePayloadBytes {
+			if len(page.Records) == 0 {
+				return JournalPage{}, ErrJournalPageBounds
 			}
 			break
 		}
+		record, err := journal.readIndexedRecord(position)
+		if err != nil {
+			return JournalPage{}, err
+		}
+		page.Records = append(page.Records, record)
+		pagePayloadBytes += payloadBytes
 	}
-	if offset != target.VerifiedBytes || request.After > target.RecordCount {
-		return JournalPage{}, ErrJournalSnapshotMismatch
-	}
-	page.Snapshot = target
 	page.NextAfter = request.After + uint64(len(page.Records))
 	page.More = page.NextAfter < target.RecordCount
 	return page, nil
