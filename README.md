@@ -26,8 +26,10 @@ signed evidence
 
 Ни модель, ни Core, ни HTTP API не могут подтвердить план или напрямую вызвать
 `nft`. Привилегированный actuator принимает решение только через локальный Unix
-socket от пользователя `root` или группы `agmind-admin`. Правило содержит
-kernel timeout и исчезает без участия control plane.
+socket от пользователя `root` или группы `agmind-admin`. Блокирующий элемент
+set имеет kernel timeout и исчезает без участия control plane; служебные
+table, chain и drop-правило при этом остаются в netns контейнера (пустые они
+ни на что не влияют) до удаления самого netns.
 
 ## Архитектура одного хоста
 
@@ -35,8 +37,11 @@ kernel timeout и исчезает без участия control plane.
 - Falco + redacting adapter — monitor-only detection без доступа к секретам.
 - Core — evidence, correlation, OPA, durable intents, проверяемое зеркало
   действий и authenticated read-only API; без Docker socket и `CAP_NET_ADMIN`.
-- OPA — единственная policy admission boundary. Она может потребовать ручное
-  подтверждение, но не сформировать команду исполнения.
+- OPA — policy admission gate: валидирует candidate и выдаёт только
+  `manual_approval_required` или `deny`; сформировать команду исполнения она
+  не может. Жёсткие лимиты — TTL, запрещённые назначения, docker-сети —
+  actuator независимо проверяет ещё раз (`host/actuatord/limits.go`), поэтому
+  граница остаётся fail-closed даже при подмене policy.
 - Hunter — изолированный запрос к DeepSeek V4 Flash через фиксированный relay;
   результат не входит в policy, intent или approval.
 - `agmind-actuatord` — минимальная root-boundary, повторно проверяющая identity
@@ -135,5 +140,6 @@ sudo /opt/agmind-sais/scripts/export-proof-linux.sh \
 
 ## Лицензия
 
-MIT. Использование защитных действий в реальной инфраструктуре остаётся
-ответственностью оператора.
+MIT — см. [LICENSE](LICENSE). Уязвимости — приватно, по процедуре из
+[SECURITY.md](SECURITY.md). Использование защитных действий в реальной
+инфраструктуре остаётся ответственностью оператора.
