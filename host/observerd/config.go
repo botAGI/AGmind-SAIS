@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -56,12 +57,41 @@ func (config Config) Validate() error {
 	return nil
 }
 
+// Modes observerd accepts for the immutable artifacts scripts/install-linux.sh creates.
+//
+// These are NOT free choices — they are the modes the installer actually produces, plus 0600
+// because durablefile.AtomicWrite chmods rotated files to 0600. Reading them with the
+// hardcoded-0600 reader made observerd unable to load its own config on a real host, so the
+// signed-evidence leg never started while every unit test stayed green against its own
+// 0600 fixtures. host/observerd/installed_modes_test.go derives both sides from the installer so
+// the two can no longer drift silently.
+//
+// Config and secrets are deliberately separate sets: the config is non-secret and is installed
+// world-readable alongside the other service configs, while the host identity and the signing key
+// must stay owner-only whatever the config does.
+var (
+	installedConfigModes = []fs.FileMode{0o444, 0o400, 0o600}
+	installedSecretModes = []fs.FileMode{0o400, 0o600}
+)
+
+// readSingleLinkRegular reads runtime state that observerd itself wrote (spool, rotation
+// markers), which durablefile.AtomicWrite always creates at 0600.
 func readSingleLinkRegular(path string, maxBytes int64) ([]byte, error) {
 	return durablefile.ReadRegular(path, maxBytes)
 }
 
+// readInstalledConfig reads a root-installed, non-secret artifact.
+func readInstalledConfig(path string, maxBytes int64) ([]byte, error) {
+	return durablefile.ReadRegularModes(path, maxBytes, installedConfigModes...)
+}
+
+// readInstalledSecret reads a root-installed owner-only artifact (identity, signing key).
+func readInstalledSecret(path string, maxBytes int64) ([]byte, error) {
+	return durablefile.ReadRegularModes(path, maxBytes, installedSecretModes...)
+}
+
 func LoadConfig(path string) (Config, error) {
-	raw, err := readSingleLinkRegular(path, 65_536)
+	raw, err := readInstalledConfig(path, 65_536)
 	if err != nil {
 		return Config{}, err
 	}

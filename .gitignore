@@ -17,3 +17,9 @@ venv/
 /var/log/
 config/config.local.yaml
 /.worktrees/
+
+# Local agent working notes — never committed (see AGmindx86 convention)
+.claude/
+CLAUDE.md
+AGENTS.md
+.planning/

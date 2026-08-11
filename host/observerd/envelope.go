@@ -2658,7 +2658,7 @@ func readKernelBootID() (string, error) {
 }
 
 func readHostID(path string) (string, error) {
-	raw, err := readSingleLinkRegular(path, 128)
+	raw, err := readInstalledSecret(path, 128)
 	if err != nil {
 		return "", err
 	}
@@ -2670,7 +2670,7 @@ func readHostID(path string) (string, error) {
 }
 
 func readPrivateKey(path string) (ed25519.PrivateKey, error) {
-	raw, err := readSingleLinkRegular(path, ed25519.PrivateKeySize)
+	raw, err := readInstalledSecret(path, ed25519.PrivateKeySize)
 	if err != nil {
 		return nil, err
 	}

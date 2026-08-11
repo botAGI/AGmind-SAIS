@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,11 +68,32 @@ func openSecureParent(path string) (secureParent, error) {
 	return secureParent{fd: current, base: parts[len(parts)-1]}, nil
 }
 
+// defaultRegularMode is the mode files this package WRITES always carry: AtomicWrite chmods to
+// 0600. Readers of self-written runtime state keep exactly this expectation.
+const defaultRegularMode = 0o600
+
 func regularSingleLink(stat unix.Stat_t) bool {
-	return stat.Mode&unix.S_IFMT == unix.S_IFREG &&
-		stat.Nlink == 1 &&
-		stat.Mode&0o777 == 0o600 &&
-		stat.Uid == uint32(os.Geteuid())
+	return regularSingleLinkModes(stat, defaultRegularMode)
+}
+
+// regularSingleLinkModes is regularSingleLink with an explicit mode allowlist, for artifacts this
+// package did not write. The installer ships root-owned files read-only (0400) and non-secret
+// configs world-readable (0444); demanding 0600 from them made observerd unable to load its own
+// config on a real host. Every other property — regular file, single link, owned by the reading
+// euid, reached through a secure nofollow parent walk — is unchanged.
+func regularSingleLinkModes(stat unix.Stat_t, allowed ...uint32) bool {
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG ||
+		stat.Nlink != 1 ||
+		stat.Uid != uint32(os.Geteuid()) {
+		return false
+	}
+	perm := stat.Mode & 0o777
+	for _, mode := range allowed {
+		if perm == mode {
+			return true
+		}
+	}
+	return false
 }
 
 func privateDirectory(stat unix.Stat_t) bool {
@@ -542,8 +564,22 @@ func ReadRegularIdentity(
 	path string,
 	maxBytes int64,
 ) ([]byte, FileIdentity, error) {
+	return readRegularIdentity(path, maxBytes, defaultRegularMode)
+}
+
+// readRegularIdentity is ReadRegularIdentity with an explicit mode allowlist. Every caller-facing
+// wrapper funnels through here so the secure-parent walk, the nofollow open and the
+// re-validation on the OPENED descriptor can never diverge between mode policies.
+func readRegularIdentity(
+	path string,
+	maxBytes int64,
+	permitted ...uint32,
+) ([]byte, FileIdentity, error) {
 	if maxBytes < 1 {
 		return nil, FileIdentity{}, fmt.Errorf("maxBytes must be positive")
+	}
+	if len(permitted) == 0 {
+		return nil, FileIdentity{}, fmt.Errorf("mode allowlist must not be empty")
 	}
 	parent, err := openSecureParent(path)
 	if err != nil {
@@ -554,7 +590,7 @@ func ReadRegularIdentity(
 	if err != nil {
 		return nil, FileIdentity{}, err
 	}
-	if !regularSingleLink(before) || before.Size < 0 || before.Size > maxBytes {
+	if !regularSingleLinkModes(before, permitted...) || before.Size < 0 || before.Size > maxBytes {
 		return nil, FileIdentity{}, ErrUnsafePath
 	}
 	fd, err := unix.Openat(
@@ -576,7 +612,7 @@ func ReadRegularIdentity(
 	if err := unix.Fstat(fd, &after); err != nil {
 		return nil, FileIdentity{}, err
 	}
-	if !regularSingleLink(after) ||
+	if !regularSingleLinkModes(after, permitted...) ||
 		before.Dev != after.Dev ||
 		before.Ino != after.Ino {
 		return nil, FileIdentity{}, ErrUnsafePath
@@ -598,6 +634,23 @@ func ReadRegularIdentity(
 // ReadRegular reads one bounded single-link regular file.
 func ReadRegular(path string, maxBytes int64) ([]byte, error) {
 	raw, _, err := ReadRegularIdentity(path, maxBytes)
+	return raw, err
+}
+
+// ReadRegularModes reads one installed artifact whose mode this package did not choose, using the
+// SAME secure parent walk, nofollow open, single-link/ownership checks and open-descriptor
+// re-validation as ReadRegular — only the accepted mode set differs. Use it for files the
+// INSTALLER creates; use ReadRegular for state this package wrote itself.
+func ReadRegularModes(path string, maxBytes int64, allowed ...fs.FileMode) ([]byte, error) {
+	modes, err := normalizeTrustedModes(allowed)
+	if err != nil {
+		return nil, err
+	}
+	permitted := make([]uint32, 0, len(modes))
+	for _, mode := range modes {
+		permitted = append(permitted, uint32(mode.Perm()))
+	}
+	raw, _, err := readRegularIdentity(path, maxBytes, permitted...)
 	return raw, err
 }
 
