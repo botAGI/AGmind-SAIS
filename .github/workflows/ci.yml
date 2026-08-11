@@ -58,13 +58,15 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - name: pull the image-mounted uv pin
-        # Same fresh-runner pitfall as in the contracts job: the uv mount source is never
-        # auto-pulled.
+      - name: pull the image-mounted uv pin and the falco pin
+        # Same fresh-runner pitfall as in the contracts job for the uv mount source; the falco
+        # rules validation then runs with --pull=never by design, so its pinned image must also
+        # be present before make runs.
         run: |
           set -euo pipefail
           . deploy/versions.env
           docker pull --quiet "$UV_IMAGE"
+          docker pull --quiet "$FALCO_IMAGE"
       - name: make sensor
         run: make sensor
 
