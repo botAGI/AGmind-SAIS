@@ -25,6 +25,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+      - name: pull the image-mounted uv pin
+        # `--mount type=image` does not pull: docker auto-pulls only the image it RUNS, so on a
+        # fresh runner the uv mount source must be pulled explicitly or the target dies with
+        # "No such image".
+        run: |
+          set -euo pipefail
+          . deploy/versions.env
+          docker pull --quiet "$UV_IMAGE"
       - name: make contracts
         run: make contracts
 
@@ -35,6 +43,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+      - name: pull the image-mounted uv pin
+        # Same fresh-runner pitfall as in the contracts job: the uv mount source is never
+        # auto-pulled.
+        run: |
+          set -euo pipefail
+          . deploy/versions.env
+          docker pull --quiet "$UV_IMAGE"
       - name: make observer
         run: make observer
 
@@ -43,6 +58,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+      - name: pull the image-mounted uv pin
+        # Same fresh-runner pitfall as in the contracts job: the uv mount source is never
+        # auto-pulled.
+        run: |
+          set -euo pipefail
+          . deploy/versions.env
+          docker pull --quiet "$UV_IMAGE"
       - name: make sensor
         run: make sensor
 
@@ -59,13 +81,16 @@ jobs:
           set -euo pipefail
           # Single source of truth: the same pins the Makefile uses.
           grep -E '^(GO_IMAGE|PYTHON_IMAGE|UV_IMAGE|PYTHON_VERSION)=' deploy/versions.env >> "$GITHUB_ENV"
+      # -buildvcs=false: inside the container git refuses the runner-owned worktree ("dubious
+      # ownership", exit 128) and `go build` fails obtaining VCS status. `go test` does not stamp
+      # VCS info, which is why the test jobs never hit this.
       - name: go build ./...
         run: |
-          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$GO_IMAGE" \
+          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS='-mod=readonly -buildvcs=false' "$GO_IMAGE" \
             go build ./...
       - name: go vet ./...
         run: |
-          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$GO_IMAGE" \
+          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS='-mod=readonly -buildvcs=false' "$GO_IMAGE" \
             go vet ./...
 
   privileged-boundary:
