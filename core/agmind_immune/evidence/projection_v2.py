@@ -5960,18 +5960,21 @@ class _V2ProjectionOwner:
                         reservation_present=False,
                     )
 
+                    # Ownership must transfer before close: if a close raises, the
+                    # unwind sweeps the binding again, and a descriptor number the OS
+                    # already reassigned would be closed out from under another thread.
                     ack_snapshot = binding.ack_snapshot
                     if ack_snapshot is None:
                         raise ProjectionAuthorityError("Projection V2 staged ACK snapshot was lost")
-                    _close_replay_ack_snapshot(ack_snapshot)
                     binding.ack_snapshot = None
+                    _close_replay_ack_snapshot(ack_snapshot)
                     source_snapshot = binding.source_snapshot
                     if source_snapshot is None:
                         raise ProjectionAuthorityError(
                             "Projection V2 staged source snapshot was lost"
                         )
-                    _close_replay_source_snapshot(source_snapshot)
                     binding.source_snapshot = None
+                    _close_replay_source_snapshot(source_snapshot)
                     if not direct:
                         hydrated = binding.hydrated_connection
                         if hydrated is not None:
