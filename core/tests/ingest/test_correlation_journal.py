@@ -838,6 +838,10 @@ def test_completed_snapshot_batch_is_ordered_and_replays_exactly_twice(
         store.close()
 
 
+# Every branch below must appear here: a case string with no parametrize entry
+# is a security case that silently never runs (this exact test sat unexecuted
+# from birth because the decorator was missing).
+@pytest.mark.parametrize("invalid", ["duplicate", "subclass", "oversize"])
 def test_completed_snapshot_batch_rejects_invalid_ref_sets(
     tmp_path: Path,
     invalid: str,
