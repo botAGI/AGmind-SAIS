@@ -902,7 +902,7 @@ func (spool *Spool) lookupUnacknowledgedLocked(
 	if err != nil || event.SourceSequence != item.Sequence ||
 		event.EventID != item.EventID || contentHash != item.ContentSHA256 ||
 		tierForEvent(event) != item.Tier || frameBytes != item.frameBytes ||
-		identity != item.identity || !bytes.Equal(canonical, item.Canonical) ||
+		!identity.Same(item.identity) || !bytes.Equal(canonical, item.Canonical) ||
 		validatePublicationItem(item) != nil {
 		return SpoolItem{}, ErrSpoolCorrupt
 	}

@@ -352,7 +352,7 @@ func (spool *Spool) authenticatedPriorityEvents() (
 			event.EventID != item.EventID ||
 			contentHash != item.ContentSHA256 ||
 			frameBytes != item.frameBytes ||
-			identity != item.identity ||
+			!identity.Same(item.identity) ||
 			!bytes.Equal(canonical, item.Canonical) ||
 			validatePublicationItem(item) != nil {
 			return nil, ErrSpoolCorrupt

@@ -191,7 +191,7 @@ func pccCoverageProvenThroughLocked(
 			contentHash != item.ContentSHA256 ||
 			tierForEvent(event) != item.Tier ||
 			frameBytes != item.frameBytes ||
-			identity != item.identity ||
+			!identity.Same(item.identity) ||
 			!bytes.Equal(canonical, item.Canonical) ||
 			validatePublicationItem(item) != nil {
 			_ = spool.state.PersistReadOnly("observer_pcc_coverage_corrupt")

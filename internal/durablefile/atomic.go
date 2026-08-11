@@ -552,10 +552,49 @@ func PromoteNoReplace(sourcePath string, destinationPath string) error {
 	return nil
 }
 
+// IdentityHandle pins the inode a FileIdentity was read from by keeping the
+// O_RDONLY|O_NOFOLLOW descriptor open. While the descriptor stays open the
+// kernel cannot free the inode, so its number cannot be recycled onto a
+// replacement file; bare {Device, Inode, Size} numbers carry no such
+// guarantee because ext4 and overlayfs promptly reuse a freed inode number
+// for the next create in the same directory.
+type IdentityHandle struct {
+	file *os.File
+}
+
+// Close releases the pinned inode. A closed handle makes any later
+// RemoveIfIdentity fail closed with ErrUnsafePath.
+func (handle *IdentityHandle) Close() error {
+	if handle == nil || handle.file == nil {
+		return nil
+	}
+	return handle.file.Close()
+}
+
 type FileIdentity struct {
 	Device uint64
 	Inode  uint64
 	Size   uint64
+	// handle, when non-nil, pins the inode the numbers above were read
+	// from. RemoveIfIdentity refuses to act without a live pin: on its own
+	// the number triple may already describe a recycled inode.
+	handle *IdentityHandle
+}
+
+// Same reports whether both identities carry the same {device, inode, size}
+// numbers. It deliberately ignores the pinning handle: a pinned and an
+// unpinned observation of one inode are the same identity. Direct struct
+// comparison would instead compare handle pointers and is always wrong.
+func (identity FileIdentity) Same(other FileIdentity) bool {
+	return identity.Device == other.Device &&
+		identity.Inode == other.Inode &&
+		identity.Size == other.Size
+}
+
+// Close releases the pinning descriptor attached by ReadRegularIdentityHandle.
+// It is safe on unpinned identities and on every copy of a pinned one.
+func (identity FileIdentity) Close() error {
+	return identity.handle.Close()
 }
 
 // ReadRegularIdentity reads one single-link regular file through fd-relative
@@ -564,15 +603,28 @@ func ReadRegularIdentity(
 	path string,
 	maxBytes int64,
 ) ([]byte, FileIdentity, error) {
-	return readRegularIdentity(path, maxBytes, defaultRegularMode)
+	return readRegularIdentity(path, maxBytes, false, defaultRegularMode)
 }
 
-// readRegularIdentity is ReadRegularIdentity with an explicit mode allowlist. Every caller-facing
-// wrapper funnels through here so the secure-parent walk, the nofollow open and the
-// re-validation on the OPENED descriptor can never diverge between mode policies.
+// ReadRegularIdentityHandle reads like ReadRegularIdentity but keeps the
+// opened descriptor pinned inside the returned identity so that a later
+// RemoveIfIdentity can prove it unlinks that exact inode. The caller owns
+// the pin and must Close it once the identity can no longer need removal.
+func ReadRegularIdentityHandle(
+	path string,
+	maxBytes int64,
+) ([]byte, FileIdentity, error) {
+	return readRegularIdentity(path, maxBytes, true, defaultRegularMode)
+}
+
+// readRegularIdentity is ReadRegularIdentity with an explicit mode allowlist and
+// an optional inode pin. Every caller-facing wrapper funnels through here so the
+// secure-parent walk, the nofollow open and the re-validation on the OPENED
+// descriptor can never diverge between mode policies.
 func readRegularIdentity(
 	path string,
 	maxBytes int64,
+	pin bool,
 	permitted ...uint32,
 ) ([]byte, FileIdentity, error) {
 	if maxBytes < 1 {
@@ -607,7 +659,12 @@ func readRegularIdentity(
 		_ = unix.Close(fd)
 		return nil, FileIdentity{}, fmt.Errorf("failed to own file descriptor")
 	}
-	defer file.Close()
+	pinned := false
+	defer func() {
+		if !pinned {
+			_ = file.Close()
+		}
+	}()
 	var after unix.Stat_t
 	if err := unix.Fstat(fd, &after); err != nil {
 		return nil, FileIdentity{}, err
@@ -624,11 +681,16 @@ func readRegularIdentity(
 	if int64(len(raw)) > maxBytes {
 		return nil, FileIdentity{}, ErrUnsafePath
 	}
-	return raw, FileIdentity{
+	identity := FileIdentity{
 		Device: uint64(after.Dev),
 		Inode:  uint64(after.Ino),
 		Size:   uint64(after.Size),
-	}, nil
+	}
+	if pin {
+		identity.handle = &IdentityHandle{file: file}
+		pinned = true
+	}
+	return raw, identity, nil
 }
 
 // ReadRegular reads one bounded single-link regular file.
@@ -650,7 +712,7 @@ func ReadRegularModes(path string, maxBytes int64, allowed ...fs.FileMode) ([]by
 	for _, mode := range modes {
 		permitted = append(permitted, uint32(mode.Perm()))
 	}
-	raw, _, err := readRegularIdentity(path, maxBytes, permitted...)
+	raw, _, err := readRegularIdentity(path, maxBytes, false, permitted...)
 	return raw, err
 }
 
@@ -678,6 +740,9 @@ func Remove(path string) error {
 }
 
 // RemoveIfIdentity durably unlinks only the exact previously opened inode.
+// The identity must come from ReadRegularIdentityHandle and still hold its
+// live pin; an unpinned or closed identity is refused with ErrUnsafePath
+// because its numbers could belong to a recycled inode.
 func RemoveIfIdentity(path string, identity FileIdentity) error {
 	return removeIfIdentity(
 		path,
@@ -708,6 +773,12 @@ func removeIfIdentity(
 	identity FileIdentity,
 	syncDirectory func(int) error,
 ) error {
+	// Fail closed without a pin: an unpinned {Device, Inode, Size} triple
+	// can already describe a recycled inode, so matching numbers prove
+	// nothing and the unlink must be refused.
+	if identity.handle == nil || identity.handle.file == nil {
+		return ErrUnsafePath
+	}
 	parent, err := openSecureParent(path)
 	if err != nil {
 		return err
@@ -722,6 +793,17 @@ func removeIfIdentity(
 		uint64(stat.Ino) != identity.Inode ||
 		stat.Size < 0 ||
 		uint64(stat.Size) != identity.Size {
+		return ErrUnsafePath
+	}
+	// The pin has kept this inode number allocated since the identity was
+	// read, so Dev+Ino equality between the still-open descriptor and the
+	// path is kernel-guaranteed proof they are the same inode. A closed or
+	// invalid pin fstats to EBADF and is refused like any mismatch.
+	var held unix.Stat_t
+	if err := unix.Fstat(int(identity.handle.file.Fd()), &held); err != nil {
+		return ErrUnsafePath
+	}
+	if held.Dev != stat.Dev || held.Ino != stat.Ino {
 		return ErrUnsafePath
 	}
 	if err := unix.Unlinkat(parent.fd, parent.base, 0); err != nil {

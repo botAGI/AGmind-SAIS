@@ -544,7 +544,7 @@ func controlReceiptProofFromLiveSpoolItem(
 		event.EventID != item.EventID ||
 		contentHash != item.ContentSHA256 ||
 		frameBytes != item.frameBytes ||
-		identity != item.identity ||
+		!identity.Same(item.identity) ||
 		tierForEvent(event) != item.Tier ||
 		!bytes.Equal(canonical, item.Canonical) ||
 		validatePublicationItem(item) != nil {

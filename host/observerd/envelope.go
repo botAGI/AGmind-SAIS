@@ -2723,11 +2723,14 @@ func removeExactRotationArtifact(
 	expected []byte,
 	maxBytes int64,
 ) error {
-	raw, identity, err := durablefile.ReadRegularIdentity(path, maxBytes)
+	// Pinned: RemoveIfIdentity refuses unpinned identities, and the pin is
+	// what proves the unlinked inode is the one whose bytes matched.
+	raw, identity, err := durablefile.ReadRegularIdentityHandle(path, maxBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil || !bytes.Equal(raw, expected) {
+		_ = identity.Close()
 		return fmt.Errorf("rotation artifact identity mismatch")
 	}
 	return removeIdentityDurably(
@@ -3175,7 +3178,7 @@ func (spool *Spool) bindRotationTransition(
 		event.EventID != item.EventID ||
 		contentHash != item.ContentSHA256 ||
 		frameBytes != item.frameBytes ||
-		identity != item.identity ||
+		!identity.Same(item.identity) ||
 		!bytes.Equal(canonical, item.Canonical) {
 		return rotationTransitionBinding{}, ErrRotationPublicationMismatch
 	}
@@ -3201,12 +3204,12 @@ func rotationBindingMatchesItem(
 		bytes.Equal(canonical, item.Canonical) &&
 		contentHash == binding.contentSHA256 &&
 		frameBytes == item.frameBytes &&
-		identity == binding.frameIdentity &&
+		identity.Same(binding.frameIdentity) &&
 		binding.event.EventID == item.EventID &&
 		binding.event.SourceSequence == item.Sequence &&
 		binding.contentSHA256 == item.ContentSHA256 &&
-		binding.frameIdentity == item.identity &&
-		binding.publicationIdentity == item.publicationIdentity &&
+		binding.frameIdentity.Same(item.identity) &&
+		binding.publicationIdentity.Same(item.publicationIdentity) &&
 		binding.publicationHash == item.publicationHash
 }
 

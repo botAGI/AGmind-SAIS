@@ -205,7 +205,9 @@ func collectCreateOnlyTemp(
 		sequence <= snapshot.PublicationHeadSequence {
 		return ErrSpoolCorrupt
 	}
-	_, identity, err := durablefile.ReadRegularIdentity(path, maxBytes)
+	// Pinned: this identity is exactly what the startup cleanup later hands
+	// to RemoveIfIdentity, which refuses unpinned identities.
+	_, identity, err := durablefile.ReadRegularIdentityHandle(path, maxBytes)
 	if err != nil {
 		return ErrSpoolCorrupt
 	}
@@ -277,7 +279,25 @@ func publicationNodeHash(
 func readPublication(
 	path string,
 ) (publicationRecord, []byte, durablefile.FileIdentity, error) {
-	raw, identity, err := durablefile.ReadRegularIdentity(path, 4_096)
+	return readPublicationWith(durablefile.ReadRegularIdentity, path)
+}
+
+// readPublicationPinned keeps the publication inode pinned inside the
+// returned identity. Every read that establishes the identity a later
+// spool.removePublication acts on must use this form: RemoveIfIdentity
+// refuses unpinned identities because their inode numbers may have been
+// recycled onto a replacement.
+func readPublicationPinned(
+	path string,
+) (publicationRecord, []byte, durablefile.FileIdentity, error) {
+	return readPublicationWith(durablefile.ReadRegularIdentityHandle, path)
+}
+
+func readPublicationWith(
+	read func(string, int64) ([]byte, durablefile.FileIdentity, error),
+	path string,
+) (publicationRecord, []byte, durablefile.FileIdentity, error) {
+	raw, identity, err := read(path, 4_096)
 	if err != nil {
 		return publicationRecord{}, nil, durablefile.FileIdentity{}, err
 	}
@@ -286,13 +306,16 @@ func readPublication(
 		4_096,
 	)
 	if err != nil {
+		_ = identity.Close()
 		return publicationRecord{}, nil, durablefile.FileIdentity{}, ErrSpoolCorrupt
 	}
 	if err := record.Validate(); err != nil {
+		_ = identity.Close()
 		return publicationRecord{}, nil, durablefile.FileIdentity{}, ErrSpoolCorrupt
 	}
 	canonical, err := contracts.CanonicalJSON(record)
 	if err != nil || !bytes.Equal(canonical, raw) {
+		_ = identity.Close()
 		return publicationRecord{}, nil, durablefile.FileIdentity{}, ErrSpoolCorrupt
 	}
 	return record, raw, identity, nil
@@ -631,17 +654,56 @@ func readStandaloneFrame(
 	durablefile.FileIdentity,
 	error,
 ) {
-	raw, identity, err := durablefile.ReadRegularIdentity(path, 65_536+76)
+	return readStandaloneFrameWith(durablefile.ReadRegularIdentity, path, keys)
+}
+
+// readStandaloneFramePinned keeps the frame inode pinned inside the returned
+// identity. Every read that establishes the identity a later spool.remove
+// acts on must use this form: RemoveIfIdentity refuses unpinned identities
+// because their inode numbers may have been recycled onto a replacement.
+func readStandaloneFramePinned(
+	path string,
+	keys *Keyring,
+) (
+	contracts.EventEnvelopeV1,
+	[]byte,
+	string,
+	uint64,
+	durablefile.FileIdentity,
+	error,
+) {
+	return readStandaloneFrameWith(
+		durablefile.ReadRegularIdentityHandle,
+		path,
+		keys,
+	)
+}
+
+func readStandaloneFrameWith(
+	read func(string, int64) ([]byte, durablefile.FileIdentity, error),
+	path string,
+	keys *Keyring,
+) (
+	contracts.EventEnvelopeV1,
+	[]byte,
+	string,
+	uint64,
+	durablefile.FileIdentity,
+	error,
+) {
+	raw, identity, err := read(path, 65_536+76)
 	if err != nil {
 		return contracts.EventEnvelopeV1{}, nil, "", 0, durablefile.FileIdentity{}, err
 	}
 	record, err := durablefile.DecodeFrame(raw, 65_536, [32]byte{})
 	if err != nil {
 		// Standalone published frames are never repaired or truncated.
+		_ = identity.Close()
 		return contracts.EventEnvelopeV1{}, nil, "", 0, durablefile.FileIdentity{}, ErrSpoolCorrupt
 	}
 	event, contentHash, err := validateSpoolPayload(record.Payload, keys)
 	if err != nil {
+		_ = identity.Close()
 		return contracts.EventEnvelopeV1{}, nil, "", 0, durablefile.FileIdentity{}, ErrSpoolCorrupt
 	}
 	return event, record.Payload, contentHash, uint64(len(raw)), identity, nil
@@ -695,7 +757,7 @@ func scanTier(
 		}
 		path := filepath.Join(directory, entry)
 		event, canonical, contentHash, frameBytes, identity, err :=
-			readStandaloneFrame(path, keys)
+			readStandaloneFramePinned(path, keys)
 		if err != nil ||
 			event.SourceSequence != sequence ||
 			tierForEvent(event) != tier ||
@@ -795,7 +857,7 @@ func scanPublications(
 		}
 		seen[sequence] = struct{}{}
 		path := filepath.Join(directory, entry)
-		record, raw, identity, readErr := readPublication(path)
+		record, raw, identity, readErr := readPublicationPinned(path)
 		if readErr != nil ||
 			record.Sequence != sequence ||
 			record.Sequence > snapshot.LastSequence ||
@@ -1005,7 +1067,7 @@ func finalizePublicationRecovery(
 			return promoteErr
 		}
 		item.publicationPath = publishedPath
-		record, raw, identity, err := readPublication(publishedPath)
+		record, raw, identity, err := readPublicationPinned(publishedPath)
 		_, nodeHash, hashErr := publicationNodeHash(record)
 		if err != nil ||
 			hashErr != nil ||
@@ -1013,8 +1075,12 @@ func finalizePublicationRecovery(
 			!bytes.Equal(raw, item.publicationRaw) ||
 			uint64(len(raw)) != item.publicationBytes ||
 			nodeHash != item.publicationHash {
+			_ = identity.Close()
 			return ErrSpoolCorrupt
 		}
+		// The promoted file is the same inode the scan pinned; re-pinning it
+		// here supersedes that earlier pin, which must not be leaked.
+		_ = item.publicationIdentity.Close()
 		item.publicationIdentity = identity
 		items[recovery.sequence] = item
 	} else if err := validatePublicationItem(item); err != nil {
@@ -1310,7 +1376,9 @@ func NewSpool(
 	temps := make([]tempArtifact, 0, len(tempPaths))
 	var tempBytes uint64
 	for _, path := range tempPaths {
-		_, identity, readErr := durablefile.ReadRegularIdentity(
+		// Pinned: this identity is exactly what the temp cleanup below hands
+		// to RemoveIfIdentity, which refuses unpinned identities.
+		_, identity, readErr := durablefile.ReadRegularIdentityHandle(
 			path,
 			int64(ackJournalMaxFrameBytes),
 		)
@@ -1860,7 +1928,7 @@ func validatePublicationItem(item SpoolItem) error {
 		nodeHash != item.publicationHash ||
 		!bytes.Equal(raw, item.publicationRaw) ||
 		uint64(len(raw)) != item.publicationBytes ||
-		identity != item.publicationIdentity {
+		!identity.Same(item.publicationIdentity) {
 		return ErrSpoolCorrupt
 	}
 	return nil
@@ -2396,7 +2464,7 @@ func (spool *Spool) appendLocked(
 				diskHash != existing.ContentSHA256 ||
 				tierForEvent(diskEvent) != existing.Tier ||
 				diskBytes != existing.frameBytes ||
-				diskIdentity != existing.identity ||
+				!diskIdentity.Same(existing.identity) ||
 				!bytes.Equal(diskCanonical, existing.Canonical) ||
 				validatePublicationItem(existing) != nil {
 				_ = spool.state.PersistReadOnly(
@@ -2421,8 +2489,8 @@ func (spool *Spool) appendLocked(
 			fmt.Sprintf("%020d.agf", event.SourceSequence),
 		)
 		diskEvent, diskCanonical, diskHash, diskBytes, diskIdentity, diskErr :=
-			readStandaloneFrame(path, spool.keys)
-		record, raw, publicationIdentity, publicationErr := readPublication(
+			readStandaloneFramePinned(path, spool.keys)
+		record, raw, publicationIdentity, publicationErr := readPublicationPinned(
 			publicationPublishedPath(
 				spool.config.StateDir,
 				event.SourceSequence,
@@ -2450,6 +2518,8 @@ func (spool *Spool) appendLocked(
 			diskBytes != uint64(len(frame)) ||
 			!bytes.Equal(diskCanonical, canonical) ||
 			!publicationMatchesItem(record, expected) {
+			_ = diskIdentity.Close()
+			_ = publicationIdentity.Close()
 			_ = spool.state.PersistReadOnly(
 				"observer_spool_existing_unbound",
 			)
@@ -2575,12 +2645,12 @@ func (spool *Spool) appendLocked(
 		event.SourceSequence,
 	)
 	if existingEvent, existingCanonical, existingHash, existingSize,
-		existingIdentity, readErr := readStandaloneFrame(path, spool.keys); readErr == nil {
+		existingIdentity, readErr := readStandaloneFramePinned(path, spool.keys); readErr == nil {
 		record, raw, publicationIdentity, publicationErr :=
-			readPublication(publishedPath)
+			readPublicationPinned(publishedPath)
 		if errors.Is(publicationErr, os.ErrNotExist) {
 			record, raw, publicationIdentity, publicationErr =
-				readPublication(preparedPath)
+				readPublicationPinned(preparedPath)
 			if publicationErr == nil {
 				promoteErr := spool.promotePublication(
 					preparedPath,
@@ -2592,8 +2662,11 @@ func (spool *Spool) appendLocked(
 					)
 				}
 				if promoteErr == nil {
+					// Promotion renamed the same inode; the re-read below
+					// supersedes the prepared-path pin.
+					_ = publicationIdentity.Close()
 					record, raw, publicationIdentity, publicationErr =
-						readPublication(publishedPath)
+						readPublicationPinned(publishedPath)
 				} else {
 					publicationErr = promoteErr
 				}
@@ -2614,6 +2687,8 @@ func (spool *Spool) appendLocked(
 			!bytes.Equal(existingCanonical, canonical) ||
 			!publicationMatchesItem(record, expected) ||
 			!bytes.Equal(raw, publicationRaw) {
+			_ = existingIdentity.Close()
+			_ = publicationIdentity.Close()
 			_ = spool.state.PersistReadOnly("observer_spool_existing_unbound")
 			return SpoolItem{}, ErrSpoolCorrupt
 		}
@@ -2708,13 +2783,14 @@ func (spool *Spool) appendLocked(
 		}
 	}
 	publishedEvent, publishedCanonical, publishedHash, publishedSize,
-		publishedIdentity, readErr := readStandaloneFrame(path, spool.keys)
+		publishedIdentity, readErr := readStandaloneFramePinned(path, spool.keys)
 	if readErr != nil ||
 		publishedEvent.SourceSequence != event.SourceSequence ||
 		tierForEvent(publishedEvent) != tier ||
 		publishedHash != contentHash ||
 		publishedSize != frameBytes ||
 		!bytes.Equal(publishedCanonical, canonical) {
+		_ = publishedIdentity.Close()
 		_ = spool.state.PersistReadOnly("observer_spool_write_uncertain")
 		return SpoolItem{}, ErrSpoolCorrupt
 	}
@@ -2725,14 +2801,17 @@ func (spool *Spool) appendLocked(
 		)
 	}
 	if promoteErr != nil {
+		_ = publishedIdentity.Close()
 		_ = spool.state.PersistReadOnly("observer_spool_publication_promote_failed")
 		return SpoolItem{}, promoteErr
 	}
 	publishedRecord, publishedRaw, publicationIdentity, publicationErr :=
-		readPublication(publishedPath)
+		readPublicationPinned(publishedPath)
 	if publicationErr != nil ||
 		!publicationMatchesItem(publishedRecord, expected) ||
 		!bytes.Equal(publishedRaw, publicationRaw) {
+		_ = publishedIdentity.Close()
+		_ = publicationIdentity.Close()
 		_ = spool.state.PersistReadOnly("observer_spool_publication_promote_invalid")
 		return SpoolItem{}, ErrSpoolCorrupt
 	}
@@ -2815,7 +2894,7 @@ func (spool *Spool) Fetch(
 			contentHash != item.ContentSHA256 ||
 			tierForEvent(event) != item.Tier ||
 			frameBytes != item.frameBytes ||
-			identity != item.identity {
+			!identity.Same(item.identity) {
 			_ = spool.state.PersistReadOnly("observer_spool_fetch_corrupt")
 			return nil, ErrSpoolCorrupt
 		}
@@ -2953,7 +3032,7 @@ func (spool *Spool) cleanupAckedLocked(sequence uint64) error {
 					contentHash != item.ContentSHA256 ||
 					tierForEvent(event) != item.Tier ||
 					frameBytes != item.frameBytes ||
-					identity != item.identity ||
+					!identity.Same(item.identity) ||
 					!bytes.Equal(canonical, item.Canonical)) {
 			_ = spool.state.PersistReadOnly("observer_spool_cleanup_identity_changed")
 			return ErrSpoolCorrupt
@@ -3010,6 +3089,10 @@ func (spool *Spool) forgetItemLocked(
 		_ = spool.state.PersistReadOnly("observer_spool_counter_underflow")
 		return ErrSpoolCorrupt
 	}
+	// Once the item leaves the map nothing can remove its inodes through
+	// these identities again, so their pins must not outlive it.
+	_ = item.identity.Close()
+	_ = item.publicationIdentity.Close()
 	delete(spool.items, sequence)
 	spool.totalBytes -= itemBytes
 	if item.Tier == RoutineTier {
@@ -3036,6 +3119,12 @@ func removeIdentityDurably(
 	}
 	err := remove(path, identity)
 	if !errors.Is(err, durablefile.ErrCommitUncertain) {
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			// The inode is provably gone; the pin that guarded the unlink
+			// has nothing left to guard. Refusals keep the pin so a retry
+			// can still prove identity.
+			_ = identity.Close()
+		}
 		return err
 	}
 	if syncErr := syncDirectory(filepath.Dir(path)); syncErr != nil {
@@ -3043,7 +3132,10 @@ func removeIdentityDurably(
 	}
 	retryErr := remove(path, identity)
 	if errors.Is(retryErr, os.ErrNotExist) {
-		return nil
+		retryErr = nil
+	}
+	if retryErr == nil {
+		_ = identity.Close()
 	}
 	return retryErr
 }
@@ -3130,7 +3222,7 @@ func (spool *Spool) Ack(
 		diskHash != item.ContentSHA256 ||
 		tierForEvent(diskEvent) != item.Tier ||
 		diskBytes != item.frameBytes ||
-		diskIdentity != item.identity ||
+		!diskIdentity.Same(item.identity) ||
 		!bytes.Equal(diskCanonical, item.Canonical) {
 		_ = spool.state.PersistReadOnly("observer_ack_disk_identity_changed")
 		return ErrSpoolCorrupt
