@@ -1,0 +1,103 @@
+name: ci
+
+# The project shipped 213k lines with no CI at all, so `make contracts` — its only gate — sat red
+# for over a hundred commits and nobody saw. Everything here therefore runs the SAME make targets
+# a developer runs, never a re-implementation of them: a CI that drifts from the local gate is a
+# second thing to keep green rather than a guard.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    # The wire-contract gate: schema fixtures, strict decoding, canonical JSON and the two fuzz
+    # targets, across the Python and Go models that must agree with each other.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: make contracts
+        run: make contracts
+
+  observer:
+    # The evidence-producer gate: durablefile, the Unix-socket layer and observerd, including the
+    # race detector, the AGF1 fuzz target and the darwin cross-compile.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: make observer
+        run: make observer
+
+  sensor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: make sensor
+        run: make sensor
+
+  build:
+    # Everything must at least compile, including packages no make target currently covers —
+    # notably host/actuatord, the privileged root boundary, which had no automated gate at all.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: read pinned toolchain
+        id: pins
+        run: |
+          set -euo pipefail
+          # Single source of truth: the same pins the Makefile uses.
+          grep -E '^(GO_IMAGE|PYTHON_IMAGE|UV_IMAGE|PYTHON_VERSION)=' deploy/versions.env >> "$GITHUB_ENV"
+      - name: go build ./...
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$GO_IMAGE" \
+            go build ./...
+      - name: go vet ./...
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$GO_IMAGE" \
+            go vet ./...
+
+  privileged-boundary:
+    # host/actuatord is the only component that touches nftables as root. No make target compiles
+    # or tests it, which meant the product's single privileged boundary was the least-guarded code
+    # in the repo. Failures are surfaced, not swallowed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: read pinned toolchain
+        run: grep -E '^GO_IMAGE=' deploy/versions.env >> "$GITHUB_ENV"
+      - name: go test ./host/actuatord ./cmd/...
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$GO_IMAGE" \
+            go test ./host/actuatord ./cmd/...
+
+  shell:
+    # The installer, the containment smoke and the acceptance gate are shell. They apply nftables
+    # rules as root on a real host, so CI cannot execute them — but it can refuse to let them rot
+    # syntactically.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: shellcheck
+        # severity=error, not warning: the six current warnings were assessed and are false
+        # positives (SC1007 on the canonical `CDPATH= cd --` idiom, SC2054 inside a quoted
+        # format string). They are listed in .planning/BACKLOG.md rather than silenced with a
+        # blanket `|| true`, which would turn this into a gate that cannot fail.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=error scripts/*.sh
+      - name: bash -n
+        run: for script in scripts/*.sh; do bash -n "$script"; done
