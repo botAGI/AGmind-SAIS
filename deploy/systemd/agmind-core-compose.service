@@ -12,11 +12,16 @@ Type=oneshot
 User=root
 Group=root
 WorkingDirectory=/opt/agmind-sais
+# Supplies PCC_POLICY_SHA256 for the policy check below.
+EnvironmentFile=/opt/agmind-sais/deploy/versions.env
 Environment=COMPOSE_PROJECT_NAME=agmind-sais
 Environment=DOCKER_CONFIG=/run/agmind-sais/docker-config
 ExecStartPre=/usr/bin/test -S /run/agmind-sais/observer-core/socket
 ExecStartPre=/usr/bin/test -S /run/agmind-sais/actuator-intent/socket
 ExecStartPre=/usr/bin/test -S /run/agmind-sais/observer-ingest/socket
+# Verify the policy OPA is about to load, on EVERY start and not only at preflight. Core
+# attests against the copy baked into its image; this is the copy that actually decides.
+ExecStartPre=/bin/sh -c 'test "$(sha256sum /opt/agmind-sais/policies/pcc.rego | cut -d" " -f1)" = "${PCC_POLICY_SHA256}"'
 ExecStartPre=/usr/bin/docker compose --env-file /etc/agmind-sais/runtime.env -f /opt/agmind-sais/deploy/compose/compose.yaml config --quiet
 ExecStart=/usr/bin/docker compose --env-file /etc/agmind-sais/runtime.env -f /opt/agmind-sais/deploy/compose/compose.yaml up --detach --wait --wait-timeout 90
 ExecReload=/usr/bin/docker compose --env-file /etc/agmind-sais/runtime.env -f /opt/agmind-sais/deploy/compose/compose.yaml up --detach --wait --wait-timeout 90

@@ -198,6 +198,11 @@ asset_specs = {
     "hunter_config": ("HUNTER_CONFIG_SHA256", "deploy/config/hunter.json"),
     "ipv4_special_use": ("IPV4_SPECIAL_USE_SHA256", "contracts/v1/ipv4-special-use.csv"),
     "observer_config": ("OBSERVER_CONFIG_SHA256", "deploy/config/observer.json"),
+    # The copy OPA actually loads. Core verifies /usr/share/agmind-sais/pcc.rego, which is baked
+    # into its image at build time; OPA bind-mounts this one from the host at run time. Same
+    # origin, different moments — without this entry the deciding copy was the one artifact in
+    # the deployment nothing re-verified after install.
+    "opa_policy": ("PCC_POLICY_SHA256", "/opt/agmind-sais/policies/pcc.rego"),
     "operator_denylist": (
         "OPERATOR_DENYLIST_SHA256",
         "deploy/config/operator-denylist.json",
