@@ -81,7 +81,7 @@ class SAISApp:
 
 
 # The legacy sensor predates the proof-carrying design and is retained until native acceptance
-# passes (docs/superpowers/plans/2026-07-27-proof-carrying-containment.md). It serves an
+# passes (docs/adr/0002-retain-legacy-generation.md). It serves an
 # unauthenticated REST/WebSocket surface on 0.0.0.0:8080 with wildcard CORS, and it is what a
 # plain `docker build . && docker run` at the repo root produces — a control panel nobody
 # deliberately asked for. No shipped deployment starts it: the installer copies an explicit
