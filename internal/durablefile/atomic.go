@@ -87,7 +87,9 @@ func regularSingleLinkModes(stat unix.Stat_t, allowed ...uint32) bool {
 		stat.Uid != uint32(os.Geteuid()) {
 		return false
 	}
-	perm := stat.Mode & 0o777
+	// uint32() is load-bearing: Stat_t.Mode is uint16 on darwin and uint32 on
+	// linux, and the darwin cross-compile in `make observer` must keep building.
+	perm := uint32(stat.Mode) & 0o777
 	for _, mode := range allowed {
 		if perm == mode {
 			return true
