@@ -23,3 +23,5 @@ config/config.local.yaml
 CLAUDE.md
 AGENTS.md
 .planning/
+.superpowers/
+docs/superpowers/
