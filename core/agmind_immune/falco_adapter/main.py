@@ -485,8 +485,7 @@ class HeartbeatWatchdog:
     def ready(self) -> bool:
         return (
             self._last_valid_event_time is not None
-            and self._monotonic() - self._last_valid_monotonic
-            <= HEARTBEAT_TIMEOUT_SECONDS
+            and self._monotonic() - self._last_valid_monotonic <= HEARTBEAT_TIMEOUT_SECONDS
             and "falco_heartbeat_gap" not in self._opened
             and "falco_configuration_mismatch" not in self._opened
         )

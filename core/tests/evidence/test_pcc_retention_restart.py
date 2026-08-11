@@ -121,9 +121,7 @@ def _build_pcc_retention_case(
             request_id=REQUEST_ID,
         )
         assert type(decision.request) is RetentionTombstoneV2
-        assert decision.request.removed_manifest_hashes == [
-            routine_manifest.manifest_sha256
-        ]
+        assert decision.request.removed_manifest_hashes == [routine_manifest.manifest_sha256]
         assert (
             routine_manifest.first_source_sequence
             == routine_manifest.last_source_sequence
@@ -139,9 +137,7 @@ def _build_pcc_retention_case(
                     key,
                     sequence=4,
                     event_type="retention_tombstone",
-                    normalized_fields=decision.request.model_dump(
-                        mode="python"
-                    ),
+                    normalized_fields=decision.request.model_dump(mode="python"),
                 )
             ),
         )
@@ -214,31 +210,23 @@ def test_retired_pcc_trigger_restarts_without_fabricated_trigger(
         )
 
         assert recovered.verifier.fsm.last_sequence == case.last_sequence
+        assert recovered.verifier.accepted_ref(case.trigger_ref.source_sequence) is None
+        assert recovered.verifier.accepted_ref(case.ref.source_sequence) == case.ref
         assert (
-            recovered.verifier.accepted_ref(
-                case.trigger_ref.source_sequence
+            recovered.accept_pcc(
+                case.item,
+                case.request,
             )
-            is None
-        )
-        assert (
-            recovered.verifier.accepted_ref(case.ref.source_sequence)
             == case.ref
         )
-        assert recovered.accept_pcc(
-            case.item,
-            case.request,
-        ) == case.ref
         capability = recovered.authenticated_pcc_input(
             case.ref,
             case.request,
         )
         assert capability.evidence_ref == case.ref
-        assert capability.snapshot.trigger.source_sequence == (
-            case.trigger_ref.source_sequence
-        )
+        assert capability.snapshot.trigger.source_sequence == (case.trigger_ref.source_sequence)
         assert all(
-            record.ref.source_sequence
-            != case.trigger_ref.source_sequence
+            record.ref.source_sequence != case.trigger_ref.source_sequence
             for record in store.iter_authenticated_records()
         )
         assert store.status().healthy is True

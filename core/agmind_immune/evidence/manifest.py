@@ -16,9 +16,7 @@ MANIFEST_HASH_DOMAIN = b"AGMIND_SEGMENT_MANIFEST_V1\0"
 GENESIS_MANIFEST_SHA256 = "0" * 64
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _EVENT = re.compile(r"^evt_[0-9a-f]{64}$")
-_UUID4 = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
+_UUID4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _SEGMENT_PATH = re.compile(
     r"^segments/[0-9]{4}-[0-9]{2}-[0-9]{2}/"
     r"[0-9]{20}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
@@ -122,9 +120,7 @@ class SegmentManifestV1(ContractModel):
             raise ValueError("manifest closed_at precedes opened_at")
         if self.segment_id not in self.segment_relative_path:
             raise ValueError("segment path does not contain segment_id")
-        expected_name = (
-            f"{self.first_source_sequence:020d}-{self.segment_id}.agseg"
-        )
+        expected_name = f"{self.first_source_sequence:020d}-{self.segment_id}.agseg"
         components = self.segment_relative_path.split("/")
         if components[-1] != expected_name:
             raise ValueError("segment filename does not bind first sequence and segment_id")

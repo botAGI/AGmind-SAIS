@@ -158,9 +158,7 @@ def _manifest(
     value: dict[str, object] = {
         "schema_version": "agmind.segment-manifest.v1",
         "segment_id": segment_id,
-        "segment_relative_path": (
-            f"segments/2026-07-01/{sequence:020d}-{segment_id}.agseg"
-        ),
+        "segment_relative_path": (f"segments/2026-07-01/{sequence:020d}-{segment_id}.agseg"),
         "host_id": HOST_ID,
         "evidence_priority": spec.priority,
         "first_event_id": first_event_id,
@@ -218,10 +216,7 @@ def _snapshot(
                             index * 100 + position + 1,
                             event_type,
                         )[1],
-                        frame_size=(
-                            frame_base
-                            + (1 if position < frame_extra else 0)
-                        ),
+                        frame_size=(frame_base + (1 if position < frame_extra else 0)),
                     )
                     for position, event_type in enumerate(spec.event_types)
                 ),
@@ -274,10 +269,7 @@ def _tombstone(
         first_removed_manifest_sha256=hashes[0],
         last_removed_manifest_sha256=hashes[-1],
         first_retained_manifest_sha256=successor,
-        removed_bytes=sum(
-            snapshot.facts[position].segment_size_bytes
-            for position in positions
-        ),
+        removed_bytes=sum(snapshot.facts[position].segment_size_bytes for position in positions),
         reason="retention_age_limit",
         policy_version="agmind-retention-v1",
         current_chain_head_sha256=snapshot.current_chain_head_sha256,
@@ -480,9 +472,7 @@ def test_selection_seven_day_nanosecond_boundary_is_strict() -> None:
     decision = select_retention(snapshot, request_id=REQUEST_ID)
 
     assert isinstance(decision.request, RetentionTombstoneV2)
-    assert decision.request.removed_manifest_hashes == [
-        snapshot.facts[1].manifest_sha256
-    ]
+    assert decision.request.removed_manifest_hashes == [snapshot.facts[1].manifest_sha256]
     assert decision.request.first_retained_manifest_sha256 == ZERO_SHA256
 
 
@@ -502,11 +492,7 @@ def test_selection_clock_uncertainty_subtracts_and_invalid_health_disables_age()
     high_precision = _snapshot(
         _FactSpec("2026-07-22T11:59:59.999999998Z", 1),
         _FactSpec("2026-07-22T11:59:59.999999997Z", 1),
-        clock=_clock(
-            uncertainty=Decimal(
-                "0.0000000010000000000000000000000000001"
-            )
-        ),
+        clock=_clock(uncertainty=Decimal("0.0000000010000000000000000000000000001")),
     )
     disabled_samples = (
         _clock(healthy=False, uncertainty=Decimal(0)),
@@ -525,9 +511,7 @@ def test_selection_clock_uncertainty_subtracts_and_invalid_health_disables_age()
     )
 
     assert isinstance(selected.request, RetentionTombstoneV2)
-    assert selected.request.removed_manifest_hashes == [
-        healthy.facts[1].manifest_sha256
-    ]
+    assert selected.request.removed_manifest_hashes == [healthy.facts[1].manifest_sha256]
     assert isinstance(subnanosecond_selected.request, RetentionTombstoneV2)
     assert subnanosecond_selected.uncertainty_ns == 1
     assert subnanosecond_selected.request.removed_manifest_hashes == [
@@ -613,19 +597,11 @@ def test_selection_returns_oldest_contiguous_run_and_splits_at_128() -> None:
     long_decision = select_retention(long, request_id=REQUEST_ID)
 
     assert isinstance(gap_decision.request, RetentionTombstoneV2)
-    assert gap_decision.request.removed_manifest_hashes == [
-        gap.facts[0].manifest_sha256
-    ]
-    assert (
-        gap_decision.request.first_retained_manifest_sha256
-        == gap.facts[1].manifest_sha256
-    )
+    assert gap_decision.request.removed_manifest_hashes == [gap.facts[0].manifest_sha256]
+    assert gap_decision.request.first_retained_manifest_sha256 == gap.facts[1].manifest_sha256
     assert isinstance(long_decision.request, RetentionTombstoneV2)
     assert len(long_decision.request.removed_manifest_hashes) == 128
-    assert (
-        long_decision.request.first_retained_manifest_sha256
-        == long.facts[128].manifest_sha256
-    )
+    assert long_decision.request.first_retained_manifest_sha256 == long.facts[128].manifest_sha256
 
 
 @pytest.mark.parametrize(
@@ -715,9 +691,7 @@ def test_selection_production_policy_is_not_module_mutable(
 
 
 def test_selection_rejects_valid_value_post_freeze_tamper() -> None:
-    record_snapshot = _snapshot(
-        _FactSpec(EXPIRED, 1, event_types=("future_routine",))
-    )
+    record_snapshot = _snapshot(_FactSpec(EXPIRED, 1, event_types=("future_routine",)))
     object.__setattr__(
         record_snapshot.facts[0].records[0],
         "event_type",
@@ -802,9 +776,7 @@ def test_selection_prior_historical_h0_allows_append_only_suffix() -> None:
     spec = _FactSpec(EXPIRED, 1)
     historical = _snapshot(spec)
     historical_manifest = _manifest(0, spec, ZERO_SHA256)
-    expected_h0 = hashlib.sha256(
-        canonical_json(chain_head_for(historical_manifest))
-    ).hexdigest()
+    expected_h0 = hashlib.sha256(canonical_json(chain_head_for(historical_manifest))).hexdigest()
     assert historical.current_chain_head_sha256 == expected_h0
     historical_request = _tombstone(historical, (0,))
     assert historical_request.first_retained_manifest_sha256 == ZERO_SHA256
@@ -818,9 +790,7 @@ def test_selection_prior_historical_h0_allows_append_only_suffix() -> None:
     decision = select_retention(extended, request_id=OTHER_REQUEST_ID)
 
     assert isinstance(decision.request, RetentionTombstoneV2)
-    assert decision.request.removed_manifest_hashes == [
-        extended.facts[1].manifest_sha256
-    ]
+    assert decision.request.removed_manifest_hashes == [extended.facts[1].manifest_sha256]
 
     unknown_h0 = historical_request.model_dump(mode="python")
     unknown_h0["current_chain_head_sha256"] = "f" * 64
@@ -842,9 +812,7 @@ def test_selection_prior_historical_h0_allows_append_only_suffix() -> None:
         )
 
     wrong_successor = historical_request.model_dump(mode="python")
-    wrong_successor["first_retained_manifest_sha256"] = (
-        extended.facts[1].manifest_sha256
-    )
+    wrong_successor["first_retained_manifest_sha256"] = extended.facts[1].manifest_sha256
     with pytest.raises(RetentionCorruption, match="historical prefix"):
         select_retention(
             _snapshot(
@@ -1123,9 +1091,7 @@ def test_c2e2a_exact_blocked_report_frames_do_not_amplify_pressure() -> None:
 
     assert type(mixed_report.request) is RetentionBlockedV1
     assert mixed_report.request.blocked_id == OTHER_REQUEST_ID
-    assert mixed_report.request.protected_bytes == (
-        RETENTION_TARGET_BYTES + 37
-    )
+    assert mixed_report.request.protected_bytes == (RETENTION_TARGET_BYTES + 37)
     assert mixed_report.request.blocked_bytes == 37
     assert mixed_report.reused_blocked is None
     assert mixed_report.protected_bytes == RETENTION_TARGET_BYTES + 37
@@ -1343,9 +1309,7 @@ def test_c2e2a_prior_blocked_authority_rejects_cross_binding_attacks(
         blocked_request = RetentionBlockedV1.model_validate(
             {
                 **blocked_request.model_dump(mode="python"),
-                "current_chain_head_sha256": hashlib.sha256(
-                    b"foreign-blocked-h0"
-                ).hexdigest(),
+                "current_chain_head_sha256": hashlib.sha256(b"foreign-blocked-h0").hexdigest(),
             },
             strict=True,
         )
@@ -1447,24 +1411,16 @@ def test_state_selection_witness_is_canonical_bounded_and_complete() -> None:
             "content_sha256": prior.content_sha256,
             "tombstone_id": request.tombstone_id,
             "h0": request.current_chain_head_sha256,
-            "first_removed_manifest_sha256": (
-                request.first_removed_manifest_sha256
-            ),
-            "last_removed_manifest_sha256": (
-                request.last_removed_manifest_sha256
-            ),
-            "first_retained_manifest_sha256": (
-                request.first_retained_manifest_sha256
-            ),
+            "first_removed_manifest_sha256": (request.first_removed_manifest_sha256),
+            "last_removed_manifest_sha256": (request.last_removed_manifest_sha256),
+            "first_retained_manifest_sha256": (request.first_retained_manifest_sha256),
             "removed_manifest_count": len(request.removed_manifest_hashes),
             "removed_bytes": request.removed_bytes,
             "manifest_run_sha256": request.manifest_run_sha256,
         }
     )
     expected_index = hashlib.sha256(
-        b"agmind.retention-prior-index.v1\0"
-        + len(index_record).to_bytes(8, "big")
-        + index_record
+        b"agmind.retention-prior-index.v1\0" + len(index_record).to_bytes(8, "big") + index_record
     ).hexdigest()
     raw = retention_module.encode_retention_state(state)
 
@@ -1530,18 +1486,10 @@ def test_boundary_cache_is_complete_ordered_and_expands_exact_runs() -> None:
             "content_sha256": accepted.content_sha256,
             "tombstone_id": request.tombstone_id,
             "h0": request.current_chain_head_sha256,
-            "first_removed_manifest_sha256": (
-                request.first_removed_manifest_sha256
-            ),
-            "last_removed_manifest_sha256": (
-                request.last_removed_manifest_sha256
-            ),
-            "first_retained_manifest_sha256": (
-                request.first_retained_manifest_sha256
-            ),
-            "removed_manifest_count": len(
-                request.removed_manifest_hashes
-            ),
+            "first_removed_manifest_sha256": (request.first_removed_manifest_sha256),
+            "last_removed_manifest_sha256": (request.last_removed_manifest_sha256),
+            "first_retained_manifest_sha256": (request.first_retained_manifest_sha256),
+            "removed_manifest_count": len(request.removed_manifest_hashes),
             "removed_bytes": request.removed_bytes,
             "manifest_run_sha256": request.manifest_run_sha256,
         }
@@ -1682,10 +1630,7 @@ def test_state_temp_namespace_is_discarded_without_promotion(
 ) -> None:
     selected = _selected_state(_snapshot(_FactSpec(EXPIRED, 5)))
     selected_raw = retention_module.encode_retention_state(selected)
-    temporary_name = (
-        ".retention-state.json."
-        "33333333-3333-4333-8333-333333333333.tmp"
-    )
+    temporary_name = ".retention-state.json.33333333-3333-4333-8333-333333333333.tmp"
 
     temp_only = tmp_path / "temp-only"
     temp_only.mkdir(mode=0o700)
@@ -1746,11 +1691,7 @@ def test_state_unbound_temporary_appearing_after_open_is_rejected(
     )
     store = SegmentStore(tmp_path)
     journal = retention_module._open_retention_state_journal(store)
-    temporary = (
-        tmp_path
-        / ".retention-state.json."
-        "33333333-3333-4333-8333-333333333333.tmp"
-    )
+    temporary = tmp_path / ".retention-state.json.33333333-3333-4333-8333-333333333333.tmp"
     temporary.write_bytes(b'{"foreign":true}')
     temporary.chmod(0o600)
 
@@ -1773,10 +1714,7 @@ def test_state_startup_rejects_unsafe_final_and_temporary_artifacts(
     name = (
         "retention-state.json"
         if artifact_kind == "final"
-        else (
-            ".retention-state.json."
-            "33333333-3333-4333-8333-333333333333.tmp"
-        )
+        else (".retention-state.json.33333333-3333-4333-8333-333333333333.tmp")
     )
     artifact = root / name
     if attack == "type":
@@ -1787,11 +1725,7 @@ def test_state_startup_rejects_unsafe_final_and_temporary_artifacts(
         source.chmod(0o600)
         os.link(source, artifact)
     else:
-        artifact.write_bytes(
-            b"x" * (128 * 1024 + 1)
-            if attack == "oversize"
-            else b"{}"
-        )
+        artifact.write_bytes(b"x" * (128 * 1024 + 1) if attack == "oversize" else b"{}")
         artifact.chmod(0o644 if attack == "mode" else 0o600)
 
     with pytest.raises(
@@ -1910,9 +1844,7 @@ def test_retention_proof_snapshot_is_factory_only_and_jit_reverifies(
     tmp_path: Path,
     attack: str,
 ) -> None:
-    _key, _acceptance, store, coverage = _live_store_with_active_routine(
-        tmp_path
-    )
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(tmp_path)
     try:
         active_before = store.active_path
         manifests_before = store.manifests
@@ -1930,22 +1862,18 @@ def test_retention_proof_snapshot_is_factory_only_and_jit_reverifies(
                 _factory=segments_module._RETENTION_PROOF_FACTORY,
             )
             assert store.active_path is None
-            assert tuple(
-                fact.manifest_sha256 for fact in snapshot.facts
-            ) == tuple(
+            assert tuple(fact.manifest_sha256 for fact in snapshot.facts) == tuple(
                 manifest.manifest_sha256 for manifest in store.manifests
             )
-            assert tuple(
-                record.event_type for record in snapshot.facts[-1].records
-            ) == ("falco_connect",)
+            assert tuple(record.event_type for record in snapshot.facts[-1].records) == (
+                "falco_connect",
+            )
             return
 
         store.flush_security_boundary()
         manifest = store.manifests[-1]
         if attack == "manifest":
-            manifest_path = (
-                tmp_path / "manifests" / f"{manifest.segment_id}.json"
-            )
+            manifest_path = tmp_path / "manifests" / f"{manifest.segment_id}.json"
             manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
         else:
             payload_path = tmp_path / manifest.segment_relative_path
@@ -1972,8 +1900,7 @@ def test_retention_proof_accepts_h0_extension_and_exact_target(
             == case.selected_snapshot.current_chain_head_sha256
         )
         assert (
-            case.final_snapshot.current_chain_head_sha256
-            != case.request.current_chain_head_sha256
+            case.final_snapshot.current_chain_head_sha256 != case.request.current_chain_head_sha256
         )
         assert (
             case.final_snapshot.facts[1].prefix_chain_head_sha256
@@ -2002,10 +1929,7 @@ def test_retention_proof_accepts_h0_extension_and_exact_target(
         )
 
         assert type(capability).__name__ == "AuthenticatedRetentionTombstone"
-        assert (
-            case.store.resolve_authenticated_ref(case.target_ref).ref
-            == case.target_ref
-        )
+        assert case.store.resolve_authenticated_ref(case.target_ref).ref == case.target_ref
     finally:
         case.coverage.close()
         case.store.close(flush=False)
@@ -2273,9 +2197,7 @@ def test_retention_proof_rejects_equal_distinct_accepted_ref_substitution(
     case = _retention_proof_case(tmp_path)
     verifier = case.store._bound_verifier
     assert verifier is not None
-    accepted = verifier._authority.accepted[
-        case.target_ref.source_sequence
-    ]
+    accepted = verifier._authority.accepted[case.target_ref.source_sequence]
     original_ref = accepted.evidence_ref
     substitute = replace(case.target_ref)
     assert substitute == original_ref
@@ -2293,9 +2215,7 @@ def test_retention_proof_rejects_equal_distinct_accepted_ref_substitution(
 def test_retention_proof_snapshot_rejects_preissuance_equal_distinct_ref(
     tmp_path: Path,
 ) -> None:
-    _key, _acceptance, store, coverage = _live_store_with_active_routine(
-        tmp_path
-    )
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(tmp_path)
     verifier = store._bound_verifier
     assert verifier is not None
     accepted = verifier._authority.accepted[2]
@@ -2321,9 +2241,7 @@ def test_retention_proof_chain_length_race_is_typed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _key, _acceptance, store, coverage = _live_store_with_active_routine(
-        tmp_path
-    )
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(tmp_path)
     original_read = store._read_retention_manifest_chain
     reads = 0
 
@@ -2429,9 +2347,7 @@ def test_retention_proof_rejects_transient_verifier_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _key, _acceptance, store, coverage = _live_store_with_active_routine(
-        tmp_path
-    )
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(tmp_path)
     verifier = store._bound_verifier
     assert verifier is not None
     original_verify = store._verify_retention_payload

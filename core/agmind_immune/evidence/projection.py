@@ -626,8 +626,7 @@ def _open_projection_image_read_only(path: Path) -> sqlite3.Connection:
 
 def _projection_sidecar_exists(parent_fd: int, name: str) -> bool:
     return any(
-        _lstat_at(parent_fd, f"{name}{suffix}") is not None
-        for suffix in _SQLITE_SIDECAR_SUFFIXES
+        _lstat_at(parent_fd, f"{name}{suffix}") is not None for suffix in _SQLITE_SIDECAR_SUFFIXES
     )
 
 
@@ -847,17 +846,13 @@ def _retired_record_from_projection_event(
     def required_text(name: str) -> str:
         value = values[name]
         if type(value) is not str:
-            raise ProjectionConflict(
-                f"retired projection event {name} is not exact text"
-            )
+            raise ProjectionConflict(f"retired projection event {name} is not exact text")
         return value
 
     def optional_text(name: str) -> str | None:
         value = values[name]
         if value is not None and type(value) is not str:
-            raise ProjectionConflict(
-                f"retired projection event {name} is not exact optional text"
-            )
+            raise ProjectionConflict(f"retired projection event {name} is not exact optional text")
         return value
 
     def canonical_json_value(
@@ -872,9 +867,7 @@ def _retired_record_from_projection_event(
                 f"retired projection event {name} is not canonical JSON"
             ) from error
         if rebuilt != encoded:
-            raise ProjectionConflict(
-                f"retired projection event {name} is not exact canonical JSON"
-            )
+            raise ProjectionConflict(f"retired projection event {name} is not exact canonical JSON")
         return decoded
 
     normalized_fields = canonical_json_value("normalized_fields_json")
@@ -885,14 +878,10 @@ def _retired_record_from_projection_event(
         or type(redaction_flags) is not list
         or type(coverage_flags) is not list
     ):
-        raise ProjectionConflict(
-            "retired projection event canonical JSON types are invalid"
-        )
+        raise ProjectionConflict("retired projection event canonical JSON types are invalid")
     clock_uncertainty_ms = values["clock_uncertainty_ms"]
     if type(clock_uncertainty_ms) is not int:
-        raise ProjectionConflict(
-            "retired projection event clock uncertainty is invalid"
-        )
+        raise ProjectionConflict("retired projection event clock uncertainty is invalid")
     envelope_value: dict[str, object] = {
         "schema_version": "agmind.event-envelope.v1",
         "event_id": required_text("event_id"),
@@ -907,13 +896,9 @@ def _retired_record_from_projection_event(
         "event_time": required_text("event_time"),
         "ingest_time": required_text("ingest_time"),
         "clock_uncertainty_ms": clock_uncertainty_ms,
-        "inventory_generation": _decode_uint64(
-            values["inventory_generation"]
-        ),
+        "inventory_generation": _decode_uint64(values["inventory_generation"]),
         "normalized_fields": normalized_fields,
-        "normalized_fields_sha256": required_text(
-            "normalized_fields_sha256"
-        ),
+        "normalized_fields_sha256": required_text("normalized_fields_sha256"),
         "redaction_flags": redaction_flags,
         "coverage_flags": coverage_flags,
         "source_payload_hash": required_text("source_payload_hash"),
@@ -929,9 +914,7 @@ def _retired_record_from_projection_event(
             envelope_value[name] = value
     inventory_revision = values["inventory_revision"]
     if inventory_revision is not None:
-        envelope_value["inventory_revision"] = _decode_uint64(
-            inventory_revision
-        )
+        envelope_value["inventory_revision"] = _decode_uint64(inventory_revision)
     try:
         EnvelopeVerifier._precheck_signed_content(envelope_value)
         envelope = EventEnvelopeV1.model_validate(
@@ -952,18 +935,11 @@ def _retired_record_from_projection_event(
         or envelope.host_id != verifier.root.host_id
         or envelope.source_id != "agmind-observerd"
     ):
-        raise ProjectionConflict(
-            "retired projection event is outside routine Falco authority"
-        )
+        raise ProjectionConflict("retired projection event is outside routine Falco authority")
     canonical = canonical_json(envelope)
     digest = hashlib.sha256(canonical).hexdigest()
-    if (
-        required_text("canonical_sha256") != digest
-        or required_text("content_sha256") != digest
-    ):
-        raise ProjectionConflict(
-            "retired projection event does not bind its canonical digest"
-        )
+    if required_text("canonical_sha256") != digest or required_text("content_sha256") != digest:
+        raise ProjectionConflict("retired projection event does not bind its canonical digest")
     try:
         public_key = verifier.key_chain.key(
             envelope.key_epoch,
@@ -976,9 +952,7 @@ def _retired_record_from_projection_event(
         TypeError,
         ValueError,
     ) as error:
-        raise ProjectionConflict(
-            "retired projection event signature is not anchored"
-        ) from error
+        raise ProjectionConflict("retired projection event signature is not anchored") from error
 
     segment_id = required_text("segment_id")
     segment_relative_path = required_text("segment_relative_path")
@@ -989,9 +963,7 @@ def _retired_record_from_projection_event(
         or not segment_relative_path.endswith(f"-{segment_id}.agseg")
         or HEX64.fullmatch(frame_sha256) is None
     ):
-        raise ProjectionConflict(
-            "retired projection event frame reference is invalid"
-        )
+        raise ProjectionConflict("retired projection event frame reference is invalid")
     ref = EvidenceRef(
         segment_id=segment_id,
         segment_relative_path=segment_relative_path,
@@ -1012,13 +984,9 @@ def _retired_record_from_projection_event(
     try:
         prepared = _prepare(record)
     except ProjectionValidationError as error:
-        raise ProjectionConflict(
-            "retired projection event cannot be replayed exactly"
-        ) from error
+        raise ProjectionConflict("retired projection event cannot be replayed exactly") from error
     if prepared.falco is None or prepared.coverage is not None:
-        raise ProjectionConflict(
-            "retired projection event is not routine Falco reducer input"
-        )
+        raise ProjectionConflict("retired projection event is not routine Falco reducer input")
     return record
 
 
@@ -1084,13 +1052,8 @@ class _LegacyProjectionStore:
                 None,
             )
             if handoff_value is not None:
-                if (
-                    type(evidence) is not SegmentStore
-                    or type(handoff_value) is not bytes
-                ):
-                    raise ProjectionAuthorityError(
-                        "projection reconciliation handoff is invalid"
-                    )
+                if type(evidence) is not SegmentStore or type(handoff_value) is not bytes:
+                    raise ProjectionAuthorityError("projection reconciliation handoff is invalid")
                 reconciliation_handoff = handoff_value
             snapshot = acknowledgements.snapshot()
             if not snapshot.healthy:
@@ -1131,13 +1094,10 @@ class _LegacyProjectionStore:
                         records,
                     )
                 except ProjectionConflict:
-                    if (
-                        type(evidence) is not SegmentStore
-                        or not getattr(
-                            evidence,
-                            "_authenticated_retired_ranges",
-                            (),
-                        )
+                    if type(evidence) is not SegmentStore or not getattr(
+                        evidence,
+                        "_authenticated_retired_ranges",
+                        (),
                     ):
                         raise
                     retired_ranges = _validated_retired_ranges(
@@ -1159,13 +1119,9 @@ class _LegacyProjectionStore:
                 )
                 is not reconciliation_handoff
             ):
-                raise ProjectionConflict(
-                    "projection reconciliation handoff changed during open"
-                )
+                raise ProjectionConflict("projection reconciliation handoff changed during open")
             if reconciliation_handoff is not None:
-                evidence._projection_reconciliation_completed_state_raw = (
-                    None
-                )
+                evidence._projection_reconciliation_completed_state_raw = None
         except BaseException:
             store.close()
             raise
@@ -1181,10 +1137,7 @@ class _LegacyProjectionStore:
         acknowledgements: AckJournal,
     ) -> bool:
         with self._mutex:
-            return (
-                self._evidence is evidence
-                and self._acknowledgements is acknowledgements
-            )
+            return self._evidence is evidence and self._acknowledgements is acknowledgements
 
     def status(self) -> ProjectionStatus:
         with self._mutex:
@@ -1421,17 +1374,11 @@ class _LegacyProjectionStore:
         permit_monotonic_extension: bool,
     ) -> None:
         try:
-            authenticated_frozen, frozen_pending = (
-                self._authenticated_ack_snapshot(frozen_snapshot)
-            )
+            authenticated_frozen, frozen_pending = self._authenticated_ack_snapshot(frozen_snapshot)
             live_snapshot = self._acknowledgements.snapshot()
-            live_records, _live_pending = self._authenticated_ack_snapshot(
-                live_snapshot
-            )
+            live_records, _live_pending = self._authenticated_ack_snapshot(live_snapshot)
         except ProjectionAuthorityError as error:
-            raise ProjectionConflict(
-                "rebuild ACK authority is no longer authenticated"
-            ) from error
+            raise ProjectionConflict("rebuild ACK authority is no longer authenticated") from error
         if authenticated_frozen != frozen_records:
             raise ProjectionConflict("frozen rebuild evidence prefix changed")
         if not permit_monotonic_extension:
@@ -1504,9 +1451,7 @@ class _LegacyProjectionStore:
                 ]
                 expected_rows = [
                     tuple(row)
-                    for row in expected.execute(
-                        f"SELECT {selected} FROM {table} ORDER BY {order}"
-                    )
+                    for row in expected.execute(f"SELECT {selected} FROM {table} ORDER BY {order}")
                 ]
                 if actual_rows != expected_rows:
                     raise ProjectionConflict(
@@ -1528,10 +1473,7 @@ class _LegacyProjectionStore:
         )
 
         state_binding = self._evidence._retention_state_binding
-        reconciliation_handoff = (
-            self._evidence
-            ._projection_reconciliation_completed_state_raw
-        )
+        reconciliation_handoff = self._evidence._projection_reconciliation_completed_state_raw
         if (
             self._evidence._retention_state_temporary is not None
             or self._evidence._retention_state_namespace_uncertain
@@ -1541,9 +1483,7 @@ class _LegacyProjectionStore:
             )
         if state_binding is None:
             if type(reconciliation_handoff) is not bytes:
-                raise ProjectionConflict(
-                    "projection reconciliation lacks completed-state handoff"
-                )
+                raise ProjectionConflict("projection reconciliation lacks completed-state handoff")
             state_raw = reconciliation_handoff
         else:
             if (
@@ -1554,16 +1494,11 @@ class _LegacyProjectionStore:
                     and reconciliation_handoff is not state_binding.raw
                 )
             ):
-                raise ProjectionConflict(
-                    "projection reconciliation completed state is ambiguous"
-                )
+                raise ProjectionConflict("projection reconciliation completed state is ambiguous")
             state_raw = state_binding.raw
         try:
             state = decode_retention_state(state_raw)
-            manifests = (
-                self._evidence
-                ._retention_state_selected_manifests(state)
-            )
+            manifests = self._evidence._retention_state_selected_manifests(state)
         except (
             EvidenceCorrupt,
             RetentionStateCorrupt,
@@ -1580,24 +1515,20 @@ class _LegacyProjectionStore:
             or not manifests
             or (
                 state_binding is not None
-                and self._evidence._retention_state_binding
-                is not state_binding
+                and self._evidence._retention_state_binding is not state_binding
             )
             or (
                 state_binding is None
                 and (
                     self._evidence._retention_state_binding is not None
-                    or self._evidence
-                    ._projection_reconciliation_completed_state_raw
+                    or self._evidence._projection_reconciliation_completed_state_raw
                     is not state_raw
                 )
             )
             or self._evidence._retention_state_temporary is not None
             or self._evidence._retention_state_namespace_uncertain
         ):
-            raise ProjectionConflict(
-                "projection reconciliation retention state is not completed"
-            )
+            raise ProjectionConflict("projection reconciliation retention state is not completed")
         current_retired_ranges = tuple(
             (
                 manifest.first_source_sequence,
@@ -1607,36 +1538,21 @@ class _LegacyProjectionStore:
         )
         if any(
             not any(
-                retired_start <= start
-                and end <= retired_end
+                retired_start <= start and end <= retired_end
                 for retired_start, retired_end in retired_ranges
             )
             for start, end in current_retired_ranges
         ):
-            raise ProjectionConflict(
-                "completed retention ranges lack authenticated retirement"
-            )
+            raise ProjectionConflict("completed retention ranges lack authenticated retirement")
         cursor_ref = _current_cursor_ref(connection)
-        cursor_sequence = (
-            0
-            if cursor_ref is None
-            else cursor_ref.source_sequence
-        )
-        if (
-            cursor_ref is not None
-            and (
-                snapshot.confirmed is None
-                or cursor_sequence > snapshot.confirmed.sequence
-            )
+        cursor_sequence = 0 if cursor_ref is None else cursor_ref.source_sequence
+        if cursor_ref is not None and (
+            snapshot.confirmed is None or cursor_sequence > snapshot.confirmed.sequence
         ):
-            raise ProjectionConflict(
-                "projection cursor exceeds frozen confirmed ACK"
-            )
+            raise ProjectionConflict("projection cursor exceeds frozen confirmed ACK")
         confirmed_records = self._records_for_snapshot(snapshot)
         surviving_records = tuple(
-            record
-            for record in confirmed_records
-            if record.ref.source_sequence <= cursor_sequence
+            record for record in confirmed_records if record.ref.source_sequence <= cursor_sequence
         )
         retired_prefix_ranges = tuple(
             (start, min(end, cursor_sequence))
@@ -1653,17 +1569,12 @@ class _LegacyProjectionStore:
             for record in surviving_records
             for start, end in retired_prefix_ranges
         ):
-            raise ProjectionConflict(
-                "authenticated retired ranges overlap surviving evidence"
-            )
+            raise ProjectionConflict("authenticated retired ranges overlap surviving evidence")
         verifier = self._evidence._bound_verifier
-        if (
-            type(verifier) is not EnvelopeVerifier
-            or not self._evidence._is_bound_verifier(verifier)
+        if type(verifier) is not EnvelopeVerifier or not self._evidence._is_bound_verifier(
+            verifier
         ):
-            raise ProjectionConflict(
-                "retired projection reconstruction lacks verifier authority"
-            )
+            raise ProjectionConflict("retired projection reconstruction lacks verifier authority")
         event_columns = _TABLE_LAYOUT[1][1]
         sequence_index = event_columns.index("source_sequence")
         retired_records = tuple(
@@ -1684,21 +1595,14 @@ class _LegacyProjectionStore:
                 )
             )
         )
-        retired_record_count = sum(
-            end - start + 1
-            for start, end in required_retired_prefix_ranges
-        )
+        retired_record_count = sum(end - start + 1 for start, end in required_retired_prefix_ranges)
         if len(required_retired_sequences) != retired_record_count:
-            raise ProjectionConflict(
-                "retired projection reconstruction is not dense"
-            )
+            raise ProjectionConflict("retired projection reconstruction is not dense")
         position = 0
         for start, end in required_retired_prefix_ranges:
             for expected_sequence in range(start, end + 1):
                 if required_retired_sequences[position] != expected_sequence:
-                    raise ProjectionConflict(
-                        "retired projection reconstruction has a sequence gap"
-                    )
+                    raise ProjectionConflict("retired projection reconstruction has a sequence gap")
                 position += 1
         replay_records = tuple(
             sorted(
@@ -1706,23 +1610,12 @@ class _LegacyProjectionStore:
                 key=lambda record: record.ref.source_sequence,
             )
         )
-        terminal_ref = (
-            None
-            if not replay_records
-            else replay_records[-1].ref
-        )
+        terminal_ref = None if not replay_records else replay_records[-1].ref
         if terminal_ref != cursor_ref:
-            raise ProjectionConflict(
-                "signed pre-retention replay does not bind old cursor"
-            )
-        sequences = tuple(
-            record.ref.source_sequence
-            for record in replay_records
-        )
+            raise ProjectionConflict("signed pre-retention replay does not bind old cursor")
+        sequences = tuple(record.ref.source_sequence for record in replay_records)
         if len(sequences) != len(set(sequences)):
-            raise ProjectionConflict(
-                "retired projection reconstruction has duplicate sequences"
-            )
+            raise ProjectionConflict("retired projection reconstruction has duplicate sequences")
 
         expected = sqlite3.connect(":memory:", isolation_level=None)
         expected.row_factory = sqlite3.Row
@@ -1759,22 +1652,13 @@ class _LegacyProjectionStore:
         connection: sqlite3.Connection,
         table: str,
     ) -> list[tuple[object, ...]]:
-        layout = next(
-            item
-            for item in _TABLE_LAYOUT
-            if item[0] == table
-        )
+        layout = next(item for item in _TABLE_LAYOUT if item[0] == table)
         _table, columns, primary_key = layout
         selected = ",".join(columns)
-        order = ",".join(
-            f"{column} COLLATE BINARY"
-            for column in primary_key
-        )
+        order = ",".join(f"{column} COLLATE BINARY" for column in primary_key)
         return [
             tuple(row)
-            for row in connection.execute(
-                f"SELECT {selected} FROM {table} ORDER BY {order}"
-            )
+            for row in connection.execute(f"SELECT {selected} FROM {table} ORDER BY {order}")
         ]
 
     def _exact_retry(
@@ -1782,7 +1666,9 @@ class _LegacyProjectionStore:
         connection: sqlite3.Connection,
         prepared: _PreparedRecord,
     ) -> ProjectionApplyResult | None:
-        row = connection.execute("SELECT * FROM events WHERE event_id=?", (prepared.envelope.event_id,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM events WHERE event_id=?", (prepared.envelope.event_id,)
+        ).fetchone()
         if row is None:
             return None
         dedup = connection.execute(
@@ -1863,11 +1749,7 @@ class _LegacyProjectionStore:
                 "WHERE dedup_kind=? AND logical_key_sha256=? AND is_primary=1",
                 (prepared.dedup_kind, prepared.logical_key_sha256),
             ).fetchone()
-            duplicate = (
-                None
-                if duplicate_row is None
-                else str(duplicate_row["primary_event_id"])
-            )
+            duplicate = None if duplicate_row is None else str(duplicate_row["primary_event_id"])
             is_primary = duplicate is None
             primary_event_id = envelope.event_id if is_primary else duplicate
             placeholders = ",".join("?" for _ in _TABLE_LAYOUT[1][1])
@@ -1970,9 +1852,7 @@ class _LegacyProjectionStore:
         except BaseException as state_error:  # noqa: BLE001 - health ambiguity
             if connection is self._connection:
                 self._healthy = False
-            primary.add_note(
-                f"transaction state could not be read: {state_error!r}"
-            )
+            primary.add_note(f"transaction state could not be read: {state_error!r}")
             return
         if commit_attempted and not in_transaction:
             if connection is self._connection:
@@ -2024,10 +1904,7 @@ class _LegacyProjectionStore:
         if prepared.falco is None:
             return
         falco_item = prepared.falco
-        if (
-            falco_item.docker_container_id is not None
-            and falco_item.docker_started_at is not None
-        ):
+        if falco_item.docker_container_id is not None and falco_item.docker_started_at is not None:
             connection.execute(
                 "INSERT INTO containers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(host_id,container_id,container_started_at) DO UPDATE SET "
@@ -2104,9 +1981,7 @@ class _LegacyProjectionStore:
                 digest.update(b"\n")
                 order = ",".join(f"{column} COLLATE BINARY" for column in primary_key)
                 selected = ",".join(columns)
-                for row in connection.execute(
-                    f"SELECT {selected} FROM {table} ORDER BY {order}"
-                ):
+                for row in connection.execute(f"SELECT {selected} FROM {table} ORDER BY {order}"):
                     digest.update(canonical_json({"row": list(row)}))
                     digest.update(b"\n")
             connection.execute("COMMIT")
@@ -2141,19 +2016,11 @@ class _LegacyProjectionStore:
         *,
         _factory: object,
     ) -> RebuildReport:
-        if (
-            _factory is not _RETENTION_REBUILD_FACTORY
-            or type(self) is not _LegacyProjectionStore
-        ):
-            raise TypeError(
-                "retention projection rebuild requires its exact factory"
-            )
+        if _factory is not _RETENTION_REBUILD_FACTORY or type(self) is not _LegacyProjectionStore:
+            raise TypeError("retention projection rebuild requires its exact factory")
         with self._mutex:
             try:
-                binding = (
-                    self._evidence
-                    ._authenticated_retention_unlink_completion
-                )
+                binding = self._evidence._authenticated_retention_unlink_completion
                 if binding is None or binding.capability is not completion:
                     raise ProjectionAuthorityError(
                         "retention projection rebuild lacks exact completion authority"
@@ -2163,10 +2030,7 @@ class _LegacyProjectionStore:
                     binding,
                 )
                 report = self._rebuild(require_existing_prefix=False)
-                current = (
-                    self._evidence
-                    ._authenticated_retention_unlink_completion
-                )
+                current = self._evidence._authenticated_retention_unlink_completion
                 if current is not binding:
                     raise ProjectionAuthorityError(
                         "retention completion changed during projection rebuild"
@@ -2245,9 +2109,7 @@ class _LegacyProjectionStore:
                     temp_binding,
                     label="temporary projection",
                 )
-                checkpoint = temp_connection.execute(
-                    "PRAGMA wal_checkpoint(TRUNCATE)"
-                ).fetchone()
+                checkpoint = temp_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 if checkpoint is None or int(checkpoint[0]) != 0:
                     raise ProjectionConflict("temporary projection checkpoint is busy")
                 self._verify_parent_path_binding()
@@ -2275,9 +2137,7 @@ class _LegacyProjectionStore:
                     temp_fsync_info = os.fstat(descriptor)
                     _validate_regular(temp_fsync_info, label="temporary projection")
                     if _binding(temp_fsync_info) != temp_binding:
-                        raise ProjectionConflict(
-                            "temporary projection changed before fsync"
-                        )
+                        raise ProjectionConflict("temporary projection changed before fsync")
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
@@ -2290,9 +2150,7 @@ class _LegacyProjectionStore:
                 self._step_hook(_REBUILD_STEPS[4])
 
                 self._verify_namespace_bindings()
-                checkpoint = old_connection.execute(
-                    "PRAGMA wal_checkpoint(TRUNCATE)"
-                ).fetchone()
+                checkpoint = old_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 if checkpoint is None or int(checkpoint[0]) != 0:
                     raise ProjectionConflict("old projection checkpoint is busy")
                 self._verify_namespace_bindings()
@@ -2369,25 +2227,19 @@ class _LegacyProjectionStore:
                     try:
                         temp_connection.close()
                     except BaseException as close_error:  # noqa: BLE001 - preserve primary
-                        primary.add_note(
-                            f"temporary projection close failed: {close_error!r}"
-                        )
+                        primary.add_note(f"temporary projection close failed: {close_error!r}")
                 if reopened_connection is not None:
                     try:
                         reopened_connection.close()
                     except BaseException as close_error:  # noqa: BLE001 - preserve primary
-                        primary.add_note(
-                            f"reopened projection close failed: {close_error!r}"
-                        )
+                        primary.add_note(f"reopened projection close failed: {close_error!r}")
                 if renamed:
                     self._healthy = False
                     if self._connection is not None:
                         try:
                             self._connection.close()
                         except BaseException as close_error:  # noqa: BLE001
-                            primary.add_note(
-                                f"live projection close failed: {close_error!r}"
-                            )
+                            primary.add_note(f"live projection close failed: {close_error!r}")
                         self._connection = None
                 else:
                     for suffix in ("", "-wal", "-shm"):
@@ -2398,9 +2250,7 @@ class _LegacyProjectionStore:
                                 _validate_regular(info, label="temporary projection")
                                 os.unlink(artifact, dir_fd=self._parent_fd)
                             except BaseException as cleanup_error:  # noqa: BLE001
-                                primary.add_note(
-                                    f"temporary cleanup failed: {cleanup_error!r}"
-                                )
+                                primary.add_note(f"temporary cleanup failed: {cleanup_error!r}")
                     if self._connection is None:
                         reopened_old: sqlite3.Connection | None = None
                         try:
@@ -2425,12 +2275,9 @@ class _LegacyProjectionStore:
                                     reopened_old.close()
                                 except BaseException as close_error:  # noqa: BLE001
                                     primary.add_note(
-                                        "failed recovered connection close: "
-                                        f"{close_error!r}"
+                                        f"failed recovered connection close: {close_error!r}"
                                     )
-                            primary.add_note(
-                                f"old projection recovery failed: {recovery_error!r}"
-                            )
+                            primary.add_note(f"old projection recovery failed: {recovery_error!r}")
                         else:
                             self._connection = reopened_old
                 raise
@@ -2471,9 +2318,7 @@ def _confirmed_projection_ref(
         limit=1,
     )
     if len(refs) != 1 or refs[0].source_sequence != confirmed:
-        raise ProjectionAuthorityError(
-            "ACK boundary is not backed by exact authenticated evidence"
-        )
+        raise ProjectionAuthorityError("ACK boundary is not backed by exact authenticated evidence")
     return refs[0]
 
 
@@ -2709,8 +2554,7 @@ class ProjectionStore:
         _validate_regular(named_lock, label="projection lock")
         if (
             _binding(opened_lock) != _binding(named_lock)
-            or fcntl.fcntl(self._lock_fd, fcntl.F_GETFL) & os.O_ACCMODE
-            != os.O_RDWR
+            or fcntl.fcntl(self._lock_fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDWR
         ):
             raise ProjectionConflict("projection stable lock changed")
         try:
@@ -2754,10 +2598,7 @@ class ProjectionStore:
         return self._admission_revision
 
     def _burn_admission_rebuild_locked(self) -> None:
-        if (
-            self._admission_rebuild_epoch >= MAX_UINT64
-            or self._admission_revision >= MAX_UINT64
-        ):
+        if self._admission_rebuild_epoch >= MAX_UINT64 or self._admission_revision >= MAX_UINT64:
             owner = self._owner
             if owner is not None:
                 owner._healthy = False
@@ -2788,9 +2629,7 @@ class ProjectionStore:
                 or expected_revision != self._admission_revision
                 or expected_lifecycle is not self._admission_lifecycle
             ):
-                raise ProjectionAuthorityError(
-                    "projection candidate admission authority is stale"
-                )
+                raise ProjectionAuthorityError("projection candidate admission authority is stale")
             revision = expected_revision
         epoch = self._admission_rebuild_epoch
         lifecycle = self._admission_lifecycle
@@ -2816,9 +2655,7 @@ class ProjectionStore:
             return None
         if type(snapshot) is not projection_v2._CandidateAdmissionProjectionSnapshot:
             self._owner._healthy = False
-            raise ProjectionAuthorityError(
-                "projection candidate admission snapshot is not exact"
-            )
+            raise ProjectionAuthorityError("projection candidate admission snapshot is not exact")
         return _CandidateAdmissionSnapshot(
             candidate=snapshot.candidate,
             candidate_facts_sha256=snapshot.candidate_facts_sha256,
@@ -2856,9 +2693,7 @@ class ProjectionStore:
         _factory: object,
     ) -> _CandidateAdmissionSnapshot | None:
         if _factory is not _CANDIDATE_ADMISSION_GATE_FACTORY:
-            raise TypeError(
-                "candidate admission reauthentication requires its exact factory"
-            )
+            raise TypeError("candidate admission reauthentication requires its exact factory")
         with self._mutex:
             return self._candidate_snapshot_locked(
                 candidate_id,
@@ -2931,13 +2766,9 @@ class ProjectionStore:
             self._verify_namespace_binding_or_latch()
             result = self._owner._candidate_ids(after=after, limit=limit)
             self._verify_namespace_binding_or_latch()
-            if type(result) is not tuple or any(
-                type(value) is not str for value in result
-            ):
+            if type(result) is not tuple or any(type(value) is not str for value in result):
                 self._owner._healthy = False
-                raise ProjectionAuthorityError(
-                    "projection candidate page is not exact"
-                )
+                raise ProjectionAuthorityError("projection candidate page is not exact")
             return cast(tuple[str, ...], result)
 
     def _hunter_bundle(self, candidate_id: str) -> Any:
@@ -2951,9 +2782,7 @@ class ProjectionStore:
             self._verify_namespace_binding_or_latch()
             if type(result) is not HunterBundleV1:
                 self._owner._healthy = False
-                raise ProjectionAuthorityError(
-                    "projection hunter bundle is not exact"
-                )
+                raise ProjectionAuthorityError("projection hunter bundle is not exact")
             return result
 
     def apply(self, ref: EvidenceRef) -> ProjectionApplyResult:
@@ -3067,9 +2896,7 @@ class ProjectionStore:
         _factory: object,
     ) -> RebuildReport:
         if _factory is not _RETENTION_REBUILD_FACTORY or type(self) is not ProjectionStore:
-            raise TypeError(
-                "retention projection rebuild requires its exact factory"
-            )
+            raise TypeError("retention projection rebuild requires its exact factory")
         with self._mutex:
             self._burn_admission_rebuild_locked()
             through = _confirmed_projection_ref(

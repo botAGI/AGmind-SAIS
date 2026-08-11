@@ -23,9 +23,7 @@ def _subjects(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any]:
     authority = importlib.import_module("agmind_immune.correlation.authority")
     monkeypatch.setattr(authority, "_load_pinned_detector_bundle", lambda: _DETECTOR_HASH)
     try:
-        publication = importlib.import_module(
-            "agmind_immune.evidence.projection_publication"
-        )
+        publication = importlib.import_module("agmind_immune.evidence.projection_publication")
     except ModuleNotFoundError:
         pytest.fail("dormant durable Projection V2 publisher is not implemented")
     return active, v2, publication
@@ -408,10 +406,7 @@ def test_v2_publisher_binds_and_removes_only_exact_empty_temp_sidecars(
 
         def fail_one_sidecar_close(descriptor: int) -> None:
             nonlocal injected_cleanup_failure
-            if (
-                descriptor in sidecar_descriptors
-                and not injected_cleanup_failure
-            ):
+            if descriptor in sidecar_descriptors and not injected_cleanup_failure:
                 injected_cleanup_failure = True
                 original_close_descriptor(descriptor)
                 raise KeyboardInterrupt("injected sidecar close failure")
@@ -443,7 +438,9 @@ def test_v2_publisher_binds_and_removes_only_exact_empty_temp_sidecars(
         try:
             with pytest.MonkeyPatch.context() as patch:
                 patch.setattr(publication.uuid, "uuid4", lambda: token)
-                patch.setattr(type(owner), "_prepare_staged_replay_for_publication", prepare_with_sidecars)
+                patch.setattr(
+                    type(owner), "_prepare_staged_replay_for_publication", prepare_with_sidecars
+                )
                 patch.setattr(type(owner), "_publish_staged_replay", inspect_callback)
                 patch.setattr(publication, "_open_held_artifact", track_sidecar)
                 if case == "unlink_failure":
@@ -472,8 +469,7 @@ def test_v2_publisher_binds_and_removes_only_exact_empty_temp_sidecars(
                     assert stage not in callback_values
                     assert published_seals[0] not in callback_values
                     assert not any(
-                        isinstance(value, sqlite3.Connection)
-                        for value in callback_values
+                        isinstance(value, sqlite3.Connection) for value in callback_values
                     )
                 elif case in ("nonempty", "symlink"):
                     with pytest.raises(v2.ProjectionConflict, match="sidecar"):
@@ -508,10 +504,7 @@ def test_v2_publisher_binds_and_removes_only_exact_empty_temp_sidecars(
                         )
                     assert injected_cleanup_failure is True
                     assert sidecar_artifacts
-                    assert all(
-                        artifact.descriptor == -1
-                        for artifact in sidecar_artifacts
-                    )
+                    assert all(artifact.descriptor == -1 for artifact in sidecar_artifacts)
                     assert owner._healthy is True
         finally:
             for artifact in sidecar_artifacts:
@@ -647,7 +640,9 @@ def test_v1_replace_crash_matrix_preserves_prearm_inode_and_latches_postarm(
                 elif case == "late_main_sidecar":
                     patch.setattr(type(owner), "_publish_staged_replay", late_v1_sidecar)
                 elif case == "prearm":
-                    patch.setattr(type(owner), "_prepare_staged_replay_for_publication", prearm_failure)
+                    patch.setattr(
+                        type(owner), "_prepare_staged_replay_for_publication", prearm_failure
+                    )
                 if case == "connection_swap":
                     report = publication._publish_staged_v2_filesystem(
                         owner,
@@ -931,8 +926,7 @@ def test_new_link_no_overwrite_and_crash_recovery_matrix(
                 after = {
                     candidate.name: hashlib.sha256(candidate.read_bytes()).hexdigest()
                     for candidate in root.iterdir()
-                    if candidate.is_file()
-                    and not candidate.name.endswith(".projection.lock")
+                    if candidate.is_file() and not candidate.name.endswith(".projection.lock")
                 }
                 assert after == before
             else:
@@ -1009,11 +1003,7 @@ def test_new_link_no_overwrite_and_crash_recovery_matrix(
     def interrupt_main_close(descriptor: int) -> None:
         nonlocal injected
         close_attempts.append(descriptor)
-        if (
-            main_artifact
-            and descriptor == main_descriptors[0]
-            and not injected
-        ):
+        if main_artifact and descriptor == main_descriptors[0] and not injected:
             injected = True
             original_close_descriptor(descriptor)
             raise KeyboardInterrupt("injected recovery main close failure")
@@ -1036,9 +1026,6 @@ def test_new_link_no_overwrite_and_crash_recovery_matrix(
         assert captured_namespace[0].lock_descriptor == -1
         assert captured_namespace[0].parent_descriptor == -1
         assert main_artifact[0].descriptor == -1
-        assert all(
-            descriptor in close_attempts
-            for descriptor in captured_namespace_descriptors[0]
-        )
+        assert all(descriptor in close_attempts for descriptor in captured_namespace_descriptors[0])
     finally:
         _close_namespace(parent_fd, lock_fd)

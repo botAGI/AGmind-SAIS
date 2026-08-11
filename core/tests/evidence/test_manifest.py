@@ -90,9 +90,7 @@ def _store_with_prior_head_and_active_record(
         EnvelopeVerifier(root, chain),
         store,
     )
-    coordinator.accept(
-        decode_events_page(canonical_json(page_value(boot_boundary(key)))).events[0]
-    )
+    coordinator.accept(decode_events_page(canonical_json(page_value(boot_boundary(key)))).events[0])
     store.flush_security_boundary()
     prior_head = (path / "chain-head.json").read_bytes()
     coordinator.accept(
@@ -175,9 +173,7 @@ def test_active_torn_tail_is_typed_and_never_truncated(tmp_path: Path) -> None:
         EnvelopeVerifier(root, chain),
         store,
     )
-    first = decode_events_page(
-        canonical_json(page_value(boot_boundary(key)))
-    ).events[0]
+    first = decode_events_page(canonical_json(page_value(boot_boundary(key)))).events[0]
     coordinator.accept(first)
     store.flush_security_boundary()
     second = decode_events_page(
@@ -214,10 +210,7 @@ def test_zero_byte_open_is_corruption_and_never_deleted(tmp_path: Path) -> None:
     store.close()
     date_path = path / "segments" / "2026-07-28"
     date_path.mkdir(mode=0o700)
-    empty_open = (
-        date_path
-        / "00000000000000000001-00000000-0000-4000-8000-000000000001.open"
-    )
+    empty_open = date_path / "00000000000000000001-00000000-0000-4000-8000-000000000001.open"
     empty_open.touch(mode=0o600)
     before = empty_open.stat()
     with pytest.raises(EvidenceCorrupt):
@@ -289,9 +282,7 @@ def test_health_fence_makes_startup_recovery_plan_nonmutating(
         EnvelopeVerifier(root, chain),
         store,
     )
-    item = decode_events_page(
-        canonical_json(page_value(boot_boundary(key)))
-    ).events[0]
+    item = decode_events_page(canonical_json(page_value(boot_boundary(key)))).events[0]
     coordinator.accept(item)
     store.flush_security_boundary()
     manifest = store.manifests[0]
@@ -336,9 +327,7 @@ def test_deep_chain_head_rollback_is_persistent_corruption(
         EnvelopeVerifier(root, chain),
         store,
     )
-    coordinator.accept(
-        decode_events_page(canonical_json(page_value(boot_boundary(key)))).events[0]
-    )
+    coordinator.accept(decode_events_page(canonical_json(page_value(boot_boundary(key)))).events[0])
     store.flush_security_boundary()
     for sequence in (2, 3):
         coordinator.accept(
@@ -391,14 +380,12 @@ def test_no_replace_publication_never_overwrites_racing_target(
         destination_dir_fd: int,
     ) -> None:
         nonlocal inserted
-        is_manifest = (
-            destination_name.endswith(".json")
-            and destination_name
-            not in {"chain-head.json", "health.intent.json", "health.json"}
-        )
-        should_insert = (
-            target_kind == "manifest" and is_manifest
-        ) or (
+        is_manifest = destination_name.endswith(".json") and destination_name not in {
+            "chain-head.json",
+            "health.intent.json",
+            "health.json",
+        }
+        should_insert = (target_kind == "manifest" and is_manifest) or (
             target_kind == "segment" and destination_name.endswith(".agseg")
         )
         if should_insert and inserted is None:
@@ -462,10 +449,7 @@ def test_atomic_no_replace_unavailable_changes_no_source_or_destination(
         source_dir_fd: int,
         destination_dir_fd: int,
     ) -> None:
-        is_manifest = (
-            destination_name == f"{segment_id}.json"
-            and publication == "manifest"
-        )
+        is_manifest = destination_name == f"{segment_id}.json" and publication == "manifest"
         is_segment = destination_name.endswith(".agseg") and publication == "segment"
         if not (is_manifest or is_segment):
             rename_noreplace(
@@ -589,9 +573,7 @@ def test_runtime_segment_source_disappearance_after_manifest_fences_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "runtime-segment-disappearance"
-    coordinator, store, prior_head, later = (
-        _store_with_prior_head_and_active_record(path)
-    )
+    coordinator, store, prior_head, later = _store_with_prior_head_and_active_record(path)
     promote_authenticated_source = segments_module._promote_authenticated_source
     disappeared = False
 
@@ -625,9 +607,7 @@ def test_runtime_segment_source_disappearance_after_manifest_fences_store(
         store.flush_security_boundary()
     assert disappeared is True
     assert len(list((path / "manifests").glob("*.json"))) == 2
-    assert json.loads((path / "health.json").read_bytes())["reason"] == (
-        "segment_corrupt"
-    )
+    assert json.loads((path / "health.json").read_bytes())["reason"] == ("segment_corrupt")
     assert (path / "chain-head.json").read_bytes() == prior_head
     with pytest.raises(EvidenceReadOnly):
         coordinator.accept(later)
@@ -639,9 +619,7 @@ def test_chain_head_private_source_disappearance_fences_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "chain-head-disappearance"
-    coordinator, store, prior_head, later = (
-        _store_with_prior_head_and_active_record(path)
-    )
+    coordinator, store, prior_head, later = _store_with_prior_head_and_active_record(path)
     replace = segments_module.os.replace
     disappeared = False
 
@@ -671,9 +649,7 @@ def test_chain_head_private_source_disappearance_fences_store(
     with pytest.raises(EvidenceCorrupt):
         store.flush_security_boundary()
     assert disappeared is True
-    assert json.loads((path / "health.json").read_bytes())["reason"] == (
-        "segment_corrupt"
-    )
+    assert json.loads((path / "health.json").read_bytes())["reason"] == ("segment_corrupt")
     assert (path / "chain-head.json").read_bytes() == prior_head
     with pytest.raises(EvidenceReadOnly):
         coordinator.accept(later)
@@ -687,9 +663,7 @@ def test_private_source_replacement_cleanup_preserves_corruption_fence(
     publication: str,
 ) -> None:
     path = tmp_path / publication
-    coordinator, store, prior_head, later = (
-        _store_with_prior_head_and_active_record(path)
-    )
+    coordinator, store, prior_head, later = _store_with_prior_head_and_active_record(path)
     if publication == "first_frame":
         store.flush_security_boundary()
         prior_head = (path / "chain-head.json").read_bytes()
@@ -707,14 +681,9 @@ def test_private_source_replacement_cleanup_preserves_corruption_fence(
     ) -> None:
         nonlocal replaced
         is_target = (
-            publication == "first_frame"
-            and name.startswith(".agmind-create-")
-        ) or (
-            publication == "manifest"
-            and display_path.parent == path / "manifests"
-        ) or (
-            publication == "chain_head"
-            and display_path == path / "chain-head.json"
+            (publication == "first_frame" and name.startswith(".agmind-create-"))
+            or (publication == "manifest" and display_path.parent == path / "manifests")
+            or (publication == "chain_head" and display_path == path / "chain-head.json")
         )
         if is_target and not replaced:
             os.rename(
@@ -744,9 +713,7 @@ def test_private_source_replacement_cleanup_preserves_corruption_fence(
         else:
             store.flush_security_boundary()
     assert replaced is True
-    assert json.loads((path / "health.json").read_bytes())["reason"] == (
-        "segment_corrupt"
-    )
+    assert json.loads((path / "health.json").read_bytes())["reason"] == ("segment_corrupt")
     assert (path / "chain-head.json").read_bytes() == prior_head
     with pytest.raises(EvidenceReadOnly):
         coordinator.accept(later)

@@ -201,9 +201,7 @@ def test_authenticated_first_frame_source_disappearance_fences_store(
         destination_dir_fd: int,
     ) -> None:
         nonlocal disappeared
-        if source_name.startswith(".agmind-create-") and destination_name.endswith(
-            ".open"
-        ):
+        if source_name.startswith(".agmind-create-") and destination_name.endswith(".open"):
             os.unlink(source_name, dir_fd=source_dir_fd)
             disappeared = True
         rename_noreplace(
@@ -221,9 +219,7 @@ def test_authenticated_first_frame_source_disappearance_fences_store(
     with pytest.raises(EvidenceCorrupt):
         coordinator.accept(item)
     assert disappeared is True
-    assert json.loads((path / "health.json").read_bytes())["reason"] == (
-        "segment_corrupt"
-    )
+    assert json.loads((path / "health.json").read_bytes())["reason"] == ("segment_corrupt")
     assert not (path / "chain-head.json").exists()
     with pytest.raises(EvidenceReadOnly):
         coordinator.accept(item)
@@ -313,9 +309,7 @@ def test_root_is_component_safe_and_live_operations_stay_on_locked_inode(
         )
     )
     moved_active = moved_parent / "evidence" / relative_active
-    assert len(
-        decode_frames(moved_active.read_bytes(), max_frame=128 * 1024).records
-    ) == 2
+    assert len(decode_frames(moved_active.read_bytes(), max_frame=128 * 1024).records) == 2
     assert decoy.read_bytes() == b"do-not-touch"
     store.close()
     assert list((moved_parent / "evidence" / "manifests").iterdir())

@@ -178,13 +178,8 @@ class RepairStateV1(ContractModel):
             raise ValueError("repair byte facts are inconsistent")
         no_verified_frame = self.last_verified_frame_sha256 == ZERO_SHA256
         if (self.verified_bytes == 0) != no_verified_frame:
-            raise ValueError(
-                "last verified frame must be zero iff the prefix is empty"
-            )
-        if (
-            self.verified_bytes == 0
-            and self.post_repair_prefix_sha256 != EMPTY_SHA256
-        ):
+            raise ValueError("last verified frame must be zero iff the prefix is empty")
+        if self.verified_bytes == 0 and self.post_repair_prefix_sha256 != EMPTY_SHA256:
             raise ValueError("empty repair prefix must use SHA256(empty)")
 
         authorization_required = self.phase != "detected"
@@ -299,21 +294,15 @@ def detected_state(
                 "discarded_bytes": facts.discarded_bytes,
                 "discarded_sha256": facts.discarded_sha256,
                 "post_repair_prefix_sha256": facts.post_repair_prefix_sha256,
-                "last_verified_frame_sha256": (
-                    facts.last_verified_frame_sha256
-                ),
-                "current_chain_head_sha256": (
-                    facts.current_chain_head_sha256
-                ),
+                "last_verified_frame_sha256": (facts.last_verified_frame_sha256),
+                "current_chain_head_sha256": (facts.current_chain_head_sha256),
                 "authorization": None,
                 "completion": None,
             },
             strict=True,
         )
     except (AttributeError, TypeError, ValueError, ValidationError) as error:
-        raise RepairProtocolError(
-            "tail-repair detection facts are invalid"
-        ) from error
+        raise RepairProtocolError("tail-repair detection facts are invalid") from error
 
 
 def repair_event_identity(value: object) -> RepairEventIdentity:
@@ -325,13 +314,9 @@ def repair_event_identity(value: object) -> RepairEventIdentity:
 
     if type(value) is CoreEventV1:
         try:
-            exact = decode_core_event(
-                canonical_json(value.model_dump(mode="python"))
-            )
+            exact = decode_core_event(canonical_json(value.model_dump(mode="python")))
         except (TypeError, ValueError) as error:
-            raise RepairProtocolError(
-                "repair event outer identity is invalid"
-            ) from error
+            raise RepairProtocolError("repair event outer identity is invalid") from error
         sequence = exact.sequence
         event_id = exact.event_id
         content_sha256 = exact.content_sha256
@@ -413,10 +398,7 @@ def _immutable_facts(state: RepairStateV1) -> tuple[object, ...]:
 def _validate_transition(current: RepairStateV1, next_state: RepairStateV1) -> None:
     if _immutable_facts(current) != _immutable_facts(next_state):
         raise RepairProtocolError("repair transition changed immutable facts")
-    if (
-        current.authorization is not None
-        and next_state.authorization != current.authorization
-    ):
+    if current.authorization is not None and next_state.authorization != current.authorization:
         raise RepairProtocolError("repair transition changed authorization identity")
     if current.completion is not None and next_state.completion != current.completion:
         raise RepairProtocolError("repair transition changed completion identity")
@@ -586,9 +568,7 @@ class AuthenticatedRepairCompletion:
         _factory: object,
     ) -> None:
         if _factory is not _FINAL_REPAIR_COMPLETION_FACTORY:
-            raise TypeError(
-                "AuthenticatedRepairCompletion is issued only by final replay"
-            )
+            raise TypeError("AuthenticatedRepairCompletion is issued only by final replay")
         object.__setattr__(self, "_factory_marker", _factory)
         object.__setattr__(self, "_journal", journal)
         object.__setattr__(self, "_journal_identity", journal_identity)
@@ -635,22 +615,16 @@ class AuthenticatedRepairCompletion:
         from agmind_immune.ingest.service import _REPAIR_DELIVERY_FACTORY
 
         if _factory is not _REPAIR_DELIVERY_FACTORY:
-            raise TypeError(
-                "final repair authority requires the exact delivery fence"
-            )
+            raise TypeError("final repair authority requires the exact delivery fence")
         if self._used:
-            raise RepairProtocolError(
-                "final repair authority has already been consumed"
-            )
+            raise RepairProtocolError("final repair authority has already been consumed")
         journal = self._journal
         if (
             type(journal) is not RepairStateJournal
             or journal._identity is not self._journal_identity
             or journal._clear_authorization is not self
         ):
-            raise RepairProtocolError(
-                "final repair authority is not bound to its exact journal"
-            )
+            raise RepairProtocolError("final repair authority is not bound to its exact journal")
         object.__setattr__(self, "_used", True)
         journal.clear_completed(self)
 
@@ -684,14 +658,8 @@ class RepairStateJournal:
         raw = self._raw
         if state is None and raw is None:
             return
-        if (
-            state is None
-            or raw is None
-            or decode_repair_state(raw) != _validated_state(state)
-        ):
-            raise RepairStateCorrupt(
-                "repair journal state does not match its exact durable bytes"
-            )
+        if state is None or raw is None or decode_repair_state(raw) != _validated_state(state):
+            raise RepairStateCorrupt("repair journal state does not match its exact durable bytes")
 
     @classmethod
     def open(cls, authority: RepairStateAuthority) -> RepairStateJournal:
@@ -722,11 +690,7 @@ class RepairStateJournal:
 
     @property
     def state(self) -> RepairStateV1 | None:
-        return (
-            None
-            if self._state is None
-            else self._state.model_copy(deep=True)
-        )
+        return None if self._state is None else self._state.model_copy(deep=True)
 
     def _prove_publication(self, expected: bytes | None) -> None:
         actual = self._authority.read_repair_state_bytes()
@@ -770,16 +734,10 @@ class RepairStateJournal:
         authority = cast(Any, self._authority)
         current = self._state
         expected = self._raw
-        if (
-            current is None
-            or expected is None
-            or current.phase != "completion_appended"
-        ):
+        if current is None or expected is None or current.phase != "completion_appended":
             raise RepairProtocolError("only completed repair state can be cleared")
         if type(proof) is not AuthenticatedRepairCompletion:
-            raise RepairProtocolError(
-                "final repair clear lacks exact historical replay authority"
-            )
+            raise RepairProtocolError("final repair clear lacks exact historical replay authority")
         proof_acknowledgements = cast(
             _SnapshotAuthority,
             proof._acknowledgements,
@@ -790,21 +748,16 @@ class RepairStateJournal:
             or proof._journal_identity is not self._identity
             or proof._expected_raw != expected
             or proof._store is not self._authority
-            or proof_acknowledgements
-            is not getattr(authority, "ack_journal", None)
+            or proof_acknowledgements is not getattr(authority, "ack_journal", None)
             or proof._status != authority.status()
             or proof._ack_snapshot != proof_acknowledgements.snapshot()
-            or proof._verifier_generation
-            != proof._verifier._authority.generation
-            or proof._transient_generation
-            != proof._verifier._repair_transient_generation
+            or proof._verifier_generation != proof._verifier._authority.generation
+            or proof._transient_generation != proof._verifier._repair_transient_generation
             or proof._verifier._staged
             or proof._verifier._authorizations
             or not authority._is_bound_verifier(proof._verifier)
         ):
-            raise RepairProtocolError(
-                "final repair clear lacks exact historical replay authority"
-            )
+            raise RepairProtocolError("final repair clear lacks exact historical replay authority")
         self._prove_publication(expected)
         self._authority.remove_repair_state(expected, proof)
         self._clear_authorization = None
@@ -830,13 +783,11 @@ def authorization_request(state: RepairStateV1) -> EvidenceRepairAuthorizeV1:
 def completion_request(state: RepairStateV1) -> EvidenceRepairCompleteV1:
     state = _validated_state(state)
     authorization = state.authorization
-    if (
-        authorization is None
-        or state.phase not in {"authorization_appended", "completion_appended"}
-    ):
-        raise RepairProtocolError(
-            "completion request requires authenticated authorization append"
-        )
+    if authorization is None or state.phase not in {
+        "authorization_appended",
+        "completion_appended",
+    }:
+        raise RepairProtocolError("completion request requires authenticated authorization append")
     return EvidenceRepairCompleteV1(
         schema_version="agmind.evidence-repair-complete.v1",
         repair_id=state.repair_id,
@@ -867,9 +818,7 @@ def _exact_authenticated_repair_event(
         limit=1,
     )
     if len(refs) != 1:
-        raise RepairProtocolError(
-            "final repair identity lacks one authenticated evidence ref"
-        )
+        raise RepairProtocolError("final repair identity lacks one authenticated evidence ref")
     ref = refs[0]
     record = typed_store.resolve_authenticated_ref(ref)
     try:
@@ -890,12 +839,9 @@ def _exact_authenticated_repair_event(
     if (
         repair_event_identity(item) != identity
         or item.envelope.get("event_type") != event_type
-        or canonical_json(item.envelope.get("normalized_fields"))
-        != canonical_json(request)
+        or canonical_json(item.envelope.get("normalized_fields")) != canonical_json(request)
     ):
-        raise RepairProtocolError(
-            "final repair evidence does not bind its exact request"
-        )
+        raise RepairProtocolError("final repair evidence does not bind its exact request")
     return item, ref
 
 
@@ -927,9 +873,7 @@ def finalize_completed_repair(
         or journal._authority is not store
         or not store._is_bound_verifier(verifier)
     ):
-        raise RepairProtocolError(
-            "final repair replay lacks exact live authorities"
-        )
+        raise RepairProtocolError("final repair replay lacks exact live authorities")
     state = journal.state
     expected_raw = journal._raw
     facts = store.repair_facts
@@ -937,9 +881,7 @@ def finalize_completed_repair(
     status_before = store.status()
     snapshot_before = acknowledgements.snapshot()
     if facts is None:
-        raise RepairProtocolError(
-            "final repair state has no retained physical facts"
-        )
+        raise RepairProtocolError("final repair state has no retained physical facts")
     facts_view = cast(TailRepairFactsView, facts)
     if (
         state is None
@@ -956,26 +898,19 @@ def finalize_completed_repair(
         or snapshot_before.confirmed_through != state.completion.sequence
         or status_before.evidence_head != state.completion.sequence
         or store.active_path is not None
-        or _immutable_facts(
-            detected_state(facts_view, state.repair_id)
-        )
-        != _immutable_facts(state)
+        or _immutable_facts(detected_state(facts_view, state.repair_id)) != _immutable_facts(state)
         or store.classify_repair_physical(facts)
         not in {
             RepairPhysicalState.SETTLED_PREFIX,
             RepairPhysicalState.ZERO_RETIRED,
         }
     ):
-        raise RepairProtocolError(
-            "final repair state is not durably settled and ACK-confirmed"
-        )
-    authorization_item, authorization_ref = (
-        _exact_authenticated_repair_event(
-            store=store,
-            identity=state.authorization,
-            event_type="evidence_repair_authorized",
-            request=authorization_request(state),
-        )
+        raise RepairProtocolError("final repair state is not durably settled and ACK-confirmed")
+    authorization_item, authorization_ref = _exact_authenticated_repair_event(
+        store=store,
+        identity=state.authorization,
+        event_type="evidence_repair_authorized",
+        request=authorization_request(state),
     )
     completion_item, completion_ref = _exact_authenticated_repair_event(
         store=store,
@@ -998,17 +933,13 @@ def finalize_completed_repair(
         or replayed[0].sequence != state.authorization.sequence
         or replayed[1].sequence != state.completion.sequence
     ):
-        raise RepairProtocolError(
-            "final historical repair replay returned an inexact proof"
-        )
+        raise RepairProtocolError("final historical repair replay returned an inexact proof")
     if (
         journal._raw != expected_raw
         or store.status() != status_before
         or acknowledgements.snapshot() != snapshot_before
     ):
-        raise RepairStateConflict(
-            "repair authority changed during final historical replay"
-        )
+        raise RepairStateConflict("repair authority changed during final historical replay")
     capability = AuthenticatedRepairCompletion(
         journal=journal,
         journal_identity=journal._identity,
@@ -1051,18 +982,14 @@ def _preflight_authorities(
         or acknowledgements._store is not store
         or not store._is_bound_verifier(verifier)
     ):
-        raise RepairPreflightError(
-            "repair preflight authorities are not exactly bound"
-        )
+        raise RepairPreflightError("repair preflight authorities are not exactly bound")
     for method_name in (
         "fetch_events",
         "publish_repair_authorization",
         "publish_repair_completion",
     ):
         if not callable(getattr(transport, method_name, None)):
-            raise RepairPreflightError(
-                "repair preflight transport lacks a fixed method"
-            )
+            raise RepairPreflightError("repair preflight transport lacks a fixed method")
     status = store.status()
     snapshot = acknowledgements.snapshot()
     try:
@@ -1079,9 +1006,7 @@ def _preflight_authorities(
         or retained_journal is not acknowledgements
         or status.evidence_head != verifier.fsm.last_sequence
     ):
-        raise RepairPreflightError(
-            "repair preflight local authority is inconsistent"
-        )
+        raise RepairPreflightError("repair preflight local authority is inconsistent")
     evidence_head = status.evidence_head
     confirmed = snapshot.confirmed_through
     if not 0 <= confirmed <= evidence_head:
@@ -1090,9 +1015,7 @@ def _preflight_authorities(
     pending = snapshot.pending
     if pending is not None:
         if not confirmed < pending.sequence <= evidence_head:
-            raise RepairPreflightError(
-                "repair preflight pending ACK is outside evidence"
-            )
+            raise RepairPreflightError("repair preflight pending ACK is outside evidence")
         refs = store.authenticated_refs(
             after_sequence=pending.sequence - 1,
             through_sequence=pending.sequence,
@@ -1104,9 +1027,7 @@ def _preflight_authorities(
             or refs[0].event_id != pending.event_id
             or refs[0].content_sha256 != pending.content_sha256
         ):
-            raise RepairPreflightError(
-                "repair preflight pending ACK lacks authenticated evidence"
-            )
+            raise RepairPreflightError("repair preflight pending ACK lacks authenticated evidence")
         allowed_acks.add(pending.sequence)
     return status, snapshot, evidence_head, allowed_acks
 
@@ -1127,13 +1048,11 @@ async def _preflight_exact_repair(
         decode_events_page,
     )
 
-    status_before, snapshot_before, evidence_head, allowed_acks = (
-        _preflight_authorities(
-            verifier=verifier,
-            store=store,
-            acknowledgements=acknowledgements,
-            transport=transport,
-        )
+    status_before, snapshot_before, evidence_head, allowed_acks = _preflight_authorities(
+        verifier=verifier,
+        store=store,
+        acknowledgements=acknowledgements,
+        transport=transport,
     )
     typed_transport = cast(_RepairPreflightTransport, transport)
     typed_verifier = cast(_RepairVerifierView, verifier)
@@ -1143,13 +1062,11 @@ async def _preflight_exact_repair(
         raise RepairPreflightError(
             "repair preflight could not freeze verifier authority"
         ) from error
-    captured_status, captured_snapshot, captured_head, captured_acks = (
-        _preflight_authorities(
-            verifier=verifier,
-            store=store,
-            acknowledgements=acknowledgements,
-            transport=transport,
-        )
+    captured_status, captured_snapshot, captured_head, captured_acks = _preflight_authorities(
+        verifier=verifier,
+        store=store,
+        acknowledgements=acknowledgements,
+        transport=transport,
     )
     if (
         captured_status != status_before
@@ -1157,9 +1074,7 @@ async def _preflight_exact_repair(
         or captured_head != evidence_head
         or captured_acks != allowed_acks
     ):
-        raise RepairPreflightError(
-            "local authority changed while repair preflight was frozen"
-        )
+        raise RepairPreflightError("local authority changed while repair preflight was frozen")
     request_type = type(request)
     if request_type not in {
         EvidenceRepairAuthorizeV1,
@@ -1173,9 +1088,7 @@ async def _preflight_exact_repair(
         )
         body = canonical_json(normalized_request)
     except (TypeError, ValueError, ValidationError) as error:
-        raise RepairPreflightError(
-            "repair preflight request is invalid"
-        ) from error
+        raise RepairPreflightError("repair preflight request is invalid") from error
 
     publish = (
         typed_transport.publish_repair_authorization
@@ -1184,19 +1097,13 @@ async def _preflight_exact_repair(
     )
     direct_raw = await publish(body)
     if type(direct_raw) is not bytes:
-        raise RepairPreflightError(
-            "repair POST returned a non-exact byte response"
-        )
+        raise RepairPreflightError("repair POST returned a non-exact byte response")
     try:
         direct = decode_core_event(direct_raw)
     except (TypeError, ValueError) as error:
-        raise RepairPreflightError(
-            "repair POST response is not one exact Core event"
-        ) from error
+        raise RepairPreflightError("repair POST response is not one exact Core event") from error
     if direct.sequence <= evidence_head:
-        raise RepairPreflightError(
-            "repair preflight target does not follow authenticated evidence"
-        )
+        raise RepairPreflightError("repair preflight target does not follow authenticated evidence")
 
     after = evidence_head
     fetched: list[CoreEventV1] = []
@@ -1213,20 +1120,14 @@ async def _preflight_exact_repair(
             limit=requested_limit,
         )
         if type(raw) is not bytes:
-            raise RepairPreflightError(
-                "repair preflight page is not exact bytes"
-            )
+            raise RepairPreflightError("repair preflight page is not exact bytes")
         total_response_bytes += len(raw)
         if total_response_bytes > MAX_REPAIR_PREFLIGHT_RESPONSE_BYTES:
-            raise RepairPreflightError(
-                "repair preflight response-byte bound exhausted"
-            )
+            raise RepairPreflightError("repair preflight response-byte bound exhausted")
         try:
             page = decode_events_page(raw)
         except PageDecodeError as error:
-            raise RepairPreflightError(
-                "repair preflight page is invalid"
-            ) from error
+            raise RepairPreflightError("repair preflight page is invalid") from error
         if selected_page_ack is None:
             if page.acked_through not in allowed_acks:
                 raise RepairPreflightError(
@@ -1234,44 +1135,31 @@ async def _preflight_exact_repair(
                 )
             selected_page_ack = page.acked_through
         elif page.acked_through != selected_page_ack:
-            raise RepairPreflightError(
-                "repair preflight ACK cursor changed between pages"
-            )
+            raise RepairPreflightError("repair preflight ACK cursor changed between pages")
         if (
             page.acked_through > evidence_head
             or page.reserved_through < direct.sequence
             or not page.events
         ):
-            raise RepairPreflightError(
-                "repair preflight page cannot reach the exact target"
-            )
+            raise RepairPreflightError("repair preflight page cannot reach the exact target")
         if (
             len(page.events) > requested_limit
             or len(fetched) + len(page.events) > MAX_REPAIR_PREFLIGHT_EVENTS
         ):
-            raise RepairPreflightError(
-                "repair preflight event bound exhausted"
-            )
+            raise RepairPreflightError("repair preflight event bound exhausted")
         page_previous = after
         page_target_found = False
         for item in page.events:
             if item.sequence <= page_previous:
-                raise RepairPreflightError(
-                    "repair preflight path is not strictly forward"
-                )
+                raise RepairPreflightError("repair preflight path is not strictly forward")
             if item.sequence == direct.sequence:
-                if (
-                    canonical_json(item.model_dump(mode="python"))
-                    != canonical_json(direct.model_dump(mode="python"))
+                if canonical_json(item.model_dump(mode="python")) != canonical_json(
+                    direct.model_dump(mode="python")
                 ):
-                    raise RepairPreflightError(
-                        "repair preflight fetched a different exact target"
-                    )
+                    raise RepairPreflightError("repair preflight fetched a different exact target")
                 page_target_found = True
             elif item.sequence > direct.sequence and not page_target_found:
-                raise RepairPreflightError(
-                    "repair preflight passed the exact target"
-                )
+                raise RepairPreflightError("repair preflight passed the exact target")
             page_previous = item.sequence
         for item in page.events:
             fetched.append(item)
@@ -1299,16 +1187,12 @@ async def _preflight_exact_repair(
                 tuple(fetched),
             )
     except (RepairSimulationError, VerifierCommitError) as error:
-        raise RepairPreflightError(
-            "repair preflight simulation rejected the exact path"
-        ) from error
-    status_after, snapshot_after, after_head, after_acks = (
-        _preflight_authorities(
-            verifier=verifier,
-            store=store,
-            acknowledgements=acknowledgements,
-            transport=transport,
-        )
+        raise RepairPreflightError("repair preflight simulation rejected the exact path") from error
+    status_after, snapshot_after, after_head, after_acks = _preflight_authorities(
+        verifier=verifier,
+        store=store,
+        acknowledgements=acknowledgements,
+        transport=transport,
     )
     if (
         status_after != status_before
@@ -1316,9 +1200,7 @@ async def _preflight_exact_repair(
         or after_head != evidence_head
         or after_acks != allowed_acks
     ):
-        raise RepairPreflightError(
-            "local authority changed during repair preflight"
-        )
+        raise RepairPreflightError("local authority changed during repair preflight")
     return proof
 
 
@@ -1369,9 +1251,7 @@ async def preflight_completion(
     try:
         return typed_verifier._validate_repair_completion_proof(proof)
     except VerifierCommitError as error:
-        raise RepairPreflightError(
-            "live verifier changed during completion preflight"
-        ) from error
+        raise RepairPreflightError("live verifier changed during completion preflight") from error
 
 
 def _core_event_from_simulated_proof(proof: object) -> CoreEventV1:
@@ -1444,9 +1324,7 @@ async def _complete_tail_repair(
         or not session._is_bound_verifier(verifier)
         or type(session.ack_journal) is not AckJournal
     ):
-        raise RepairProtocolError(
-            "tail repair requires one exact same-lock recovered lifecycle"
-        )
+        raise RepairProtocolError("tail repair requires one exact same-lock recovered lifecycle")
     journal = RepairStateJournal.open(session)
     facts = session.repair_facts
     if type(facts) is not TailRepairFacts:
@@ -1456,40 +1334,27 @@ async def _complete_tail_repair(
     if temporary is not None:
         if (
             journal.state is None
-            and session.classify_repair_physical(facts)
-            is not RepairPhysicalState.ORIGINAL_TORN
+            and session.classify_repair_physical(facts) is not RepairPhysicalState.ORIGINAL_TORN
         ):
-            raise RepairStateCorrupt(
-                "phase-neutral repair temporary cannot cover changed evidence"
-            )
+            raise RepairStateCorrupt("phase-neutral repair temporary cannot cover changed evidence")
         session.remove_repair_state_temporary(temporary)
 
     state = journal.state
     if state is None:
-        if (
-            session.classify_repair_physical(facts)
-            is not RepairPhysicalState.ORIGINAL_TORN
-        ):
-            raise RepairStateCorrupt(
-                "post-truncate evidence lacks durable repair state"
-            )
+        if session.classify_repair_physical(facts) is not RepairPhysicalState.ORIGINAL_TORN:
+            raise RepairStateCorrupt("post-truncate evidence lacks durable repair state")
         state = detected_state(
             cast(TailRepairFactsView, facts),
             str(uuid.uuid4()),
         )
         journal.publish_detected(state)
-    if (
-        _immutable_facts(
-            detected_state(
-                cast(TailRepairFactsView, facts),
-                state.repair_id,
-            )
+    if _immutable_facts(
+        detected_state(
+            cast(TailRepairFactsView, facts),
+            state.repair_id,
         )
-        != _immutable_facts(state)
-    ):
-        raise RepairStateCorrupt(
-            "durable repair state differs from retained physical facts"
-        )
+    ) != _immutable_facts(state):
+        raise RepairStateCorrupt("durable repair state differs from retained physical facts")
 
     if state.phase in {"detected", "authorized"}:
         entry_phase = state.phase
@@ -1501,9 +1366,7 @@ async def _complete_tail_repair(
             request=authorization_request(state),
         )
         if type(proof) is not SimulatedRepairAuthorization:
-            raise RepairProtocolError(
-                "authorization preflight returned an inexact proof"
-            )
+            raise RepairProtocolError("authorization preflight returned an inexact proof")
         identity = repair_event_identity(proof.target)
         physical = session.classify_repair_physical(facts)
         if entry_phase == "detected":
@@ -1514,9 +1377,7 @@ async def _complete_tail_repair(
             state = advance_authorized(state, identity)
             journal.transition(state)
         elif state.authorization != identity:
-            raise RepairProtocolError(
-                "authorization retry returned a different exact target"
-            )
+            raise RepairProtocolError("authorization retry returned a different exact target")
 
         if physical is RepairPhysicalState.ORIGINAL_TORN:
             capability = session.register_authorization(proof)
@@ -1525,29 +1386,21 @@ async def _complete_tail_repair(
             RepairPhysicalState.CLEAN_OPEN,
             RepairPhysicalState.ZERO_HELD,
         }:
-            raise RepairStateCorrupt(
-                "durable authorization contradicts repair target bytes"
-            )
+            raise RepairStateCorrupt("durable authorization contradicts repair target bytes")
         if physical not in {
             RepairPhysicalState.CLEAN_OPEN,
             RepairPhysicalState.ZERO_HELD,
         }:
-            raise RepairStateCorrupt(
-                "authorized truncate did not reach one exact clean prefix"
-            )
+            raise RepairStateCorrupt("authorized truncate did not reach one exact clean prefix")
         state = advance_truncated(state)
         journal.transition(state)
 
     state = journal.state
-    if (
-        state is None
-        or state.phase
-        not in {
-            "truncated",
-            "authorization_appended",
-            "completion_appended",
-        }
-    ):
+    if state is None or state.phase not in {
+        "truncated",
+        "authorization_appended",
+        "completion_appended",
+    }:
         raise RepairStateCorrupt("repair did not reach a resumable durable phase")
     physical = session.classify_repair_physical(facts)
     if physical is RepairPhysicalState.ZERO_HELD:
@@ -1582,9 +1435,7 @@ async def _complete_tail_repair(
         ) -> CoreEventV1:
             status = store.status()
             if status.evidence_head > identity.sequence:
-                raise RepairProtocolError(
-                    "authenticated evidence advanced beyond repair target"
-                )
+                raise RepairProtocolError("authenticated evidence advanced beyond repair target")
             if status.evidence_head == identity.sequence:
                 item, _ref = _exact_authenticated_repair_event(
                     store=store,
@@ -1616,9 +1467,7 @@ async def _complete_tail_repair(
             )
             item = _core_event_from_simulated_proof(proof)
             if repair_event_identity(item) != identity:
-                raise RepairProtocolError(
-                    "repair retry returned a different exact target"
-                )
+                raise RepairProtocolError("repair retry returned a different exact target")
             return item
 
         state = journal.state
@@ -1626,9 +1475,7 @@ async def _complete_tail_repair(
         if state.phase == "truncated":
             authorization = state.authorization
             if authorization is None:
-                raise RepairStateCorrupt(
-                    "truncated repair lacks authorization identity"
-                )
+                raise RepairStateCorrupt("truncated repair lacks authorization identity")
             item = await expected_event(
                 authorization_request(state),
                 authorization,
@@ -1650,9 +1497,7 @@ async def _complete_tail_repair(
         if state.phase == "authorization_appended":
             authorization = state.authorization
             if authorization is None:
-                raise RepairStateCorrupt(
-                    "appended authorization identity is absent"
-                )
+                raise RepairStateCorrupt("appended authorization identity is absent")
             _exact_authenticated_repair_event(
                 store=store,
                 identity=authorization,
@@ -1663,10 +1508,8 @@ async def _complete_tail_repair(
             authorization_ack = store.ack_journal.snapshot()
             if state.completion is None:
                 if (
-                    authorization_status.evidence_head
-                    != authorization.sequence
-                    or authorization_ack.confirmed_through
-                    != authorization.sequence
+                    authorization_status.evidence_head != authorization.sequence
+                    or authorization_ack.confirmed_through != authorization.sequence
                     or authorization_ack.pending is not None
                 ):
                     raise RepairStateCorrupt(
@@ -1681,12 +1524,8 @@ async def _complete_tail_repair(
                     request=completion_request(state),
                 )
                 if type(completion_proof) is not SimulatedRepairCompletion:
-                    raise RepairProtocolError(
-                        "completion preflight returned an inexact proof"
-                    )
-                completion_identity = repair_event_identity(
-                    completion_proof.target
-                )
+                    raise RepairProtocolError("completion preflight returned an inexact proof")
+                completion_identity = repair_event_identity(completion_proof.target)
                 state = record_completion_target(
                     state,
                     completion_identity,
@@ -1698,9 +1537,7 @@ async def _complete_tail_repair(
                 <= authorization_status.evidence_head
                 <= state.completion.sequence
             ):
-                raise RepairStateCorrupt(
-                    "completion delivery prefix contradicts durable phase"
-                )
+                raise RepairStateCorrupt("completion delivery prefix contradicts durable phase")
             completion = state.completion
             assert completion is not None
             item = await expected_event(
@@ -1713,9 +1550,7 @@ async def _complete_tail_repair(
                 or ref.event_id != completion.event_id
                 or ref.content_sha256 != completion.content_sha256
             ):
-                raise RepairProtocolError(
-                    "completion delivery returned a different evidence ref"
-                )
+                raise RepairProtocolError("completion delivery returned a different evidence ref")
             state = advance_completion_appended(state)
             journal.transition(state)
 
@@ -1726,9 +1561,7 @@ async def _complete_tail_repair(
             or state.completion is None
             or state.authorization is None
         ):
-            raise RepairStateCorrupt(
-                "repair did not reach exact durable completion"
-            )
+            raise RepairStateCorrupt("repair did not reach exact durable completion")
         _exact_authenticated_repair_event(
             store=store,
             identity=state.authorization,
@@ -1748,9 +1581,7 @@ async def _complete_tail_repair(
             or completion_ack.confirmed_through != state.completion.sequence
             or completion_ack.pending is not None
         ):
-            raise RepairStateCorrupt(
-                "completion-appended phase lacks exact confirmed evidence"
-            )
+            raise RepairStateCorrupt("completion-appended phase lacks exact confirmed evidence")
 
         final_clear = finalize_completed_repair(
             journal=journal,
@@ -1776,16 +1607,14 @@ async def _complete_tail_repair(
                 await delivery.close()
             except BaseException as cleanup_error:  # noqa: BLE001
                 primary.add_note(
-                    "secondary repair delivery cleanup failure "
-                    f"({type(cleanup_error).__name__})"
+                    f"secondary repair delivery cleanup failure ({type(cleanup_error).__name__})"
                 )
         if coverage is not None:
             try:
                 coverage.close()
             except BaseException as cleanup_error:  # noqa: BLE001
                 primary.add_note(
-                    "secondary repair coverage cleanup failure "
-                    f"({type(cleanup_error).__name__})"
+                    f"secondary repair coverage cleanup failure ({type(cleanup_error).__name__})"
                 )
         raise
 
@@ -1810,7 +1639,6 @@ async def complete_tail_repair(
             await transport.close()
         except BaseException as cleanup_error:  # noqa: BLE001
             primary.add_note(
-                "secondary repair transport cleanup failure "
-                f"({type(cleanup_error).__name__})"
+                f"secondary repair transport cleanup failure ({type(cleanup_error).__name__})"
             )
         raise

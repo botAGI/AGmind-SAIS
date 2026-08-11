@@ -62,9 +62,7 @@ def test_retention_status_fails_closed_for_every_pending_source(
     field: str,
     value: object,
 ) -> None:
-    _key, _acceptance, store, coverage = (
-        _live_store_with_active_routine(tmp_path)
-    )
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(tmp_path)
     try:
         baseline = store.status()
         assert baseline.healthy is True
@@ -97,19 +95,14 @@ def test_authenticated_retention_unlink_is_ordered_and_payload_only(
     case, capability = _issued_case(tmp_path)
     state = case.journal.state
     assert state is not None
-    selected_paths = tuple(
-        tmp_path / entry.segment_relative_path for entry in state.entries
-    )
+    selected_paths = tuple(tmp_path / entry.segment_relative_path for entry in state.entries)
     manifest_bytes = {
-        path: path.read_bytes()
-        for path in sorted((tmp_path / "manifests").iterdir())
+        path: path.read_bytes() for path in sorted((tmp_path / "manifests").iterdir())
     }
     head_bytes = (tmp_path / "chain-head.json").read_bytes()
     manifests_before = tuple(case.store._manifests)
     records_before = tuple(case.store._records)
-    selected_manifest_hashes = {
-        entry.manifest_sha256 for entry in state.entries
-    }
+    selected_manifest_hashes = {entry.manifest_sha256 for entry in state.entries}
     retired_sequences = {
         sequence
         for manifest in manifests_before
@@ -120,9 +113,7 @@ def test_authenticated_retention_unlink_is_ordered_and_payload_only(
         )
     }
     retained_records = tuple(
-        record
-        for record in records_before
-        if record.ref.source_sequence not in retired_sequences
+        record for record in records_before if record.ref.source_sequence not in retired_sequences
     )
     active_before = case.store._active
     unlink_observations: list[tuple[str, bool]] = []
@@ -146,11 +137,9 @@ def test_authenticated_retention_unlink_is_ordered_and_payload_only(
 
     monkeypatch.setattr(segments_module.os, "unlink", traced_unlink)
     try:
-        completion = (
-            case.store._execute_authenticated_retention_unlink(
-                capability,
-                _factory=segments_module._RETENTION_PROOF_FACTORY,
-            )
+        completion = case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
         )
 
         completed = case.journal.state
@@ -163,8 +152,7 @@ def test_authenticated_retention_unlink_is_ordered_and_payload_only(
         )
         assert all(not path.exists() for path in selected_paths)
         assert {
-            path: path.read_bytes()
-            for path in sorted((tmp_path / "manifests").iterdir())
+            path: path.read_bytes() for path in sorted((tmp_path / "manifests").iterdir())
         } == manifest_bytes
         assert (tmp_path / "chain-head.json").read_bytes() == head_bytes
         assert tuple(case.store._manifests) == manifests_before
@@ -174,12 +162,10 @@ def test_authenticated_retention_unlink_is_ordered_and_payload_only(
         assert type(verifier._authority.accepted) is MappingProxyType
         with pytest.raises(TypeError):
             verifier._authority.accepted[min(retired_sequences)] = object()
+        assert all(verifier.accepted_ref(sequence) is None for sequence in retired_sequences)
         assert all(
-            verifier.accepted_ref(sequence) is None
-            for sequence in retired_sequences
-        )
-        assert all(
-            sequence not in case.store._sequences_by_host.get(
+            sequence
+            not in case.store._sequences_by_host.get(
                 verifier.fsm.host_id,
                 (),
             )
@@ -208,9 +194,7 @@ def test_authenticated_retention_unlink_retries_exact_in_progress_before_call(
     case, capability = _issued_case(tmp_path)
     state = case.journal.state
     assert state is not None
-    selected_paths = tuple(
-        tmp_path / entry.segment_relative_path for entry in state.entries
-    )
+    selected_paths = tuple(tmp_path / entry.segment_relative_path for entry in state.entries)
     journal_type = type(case.journal)
     original_prove = journal_type._prove_publication
     binding = case.store._authenticated_retention_tombstone
@@ -226,9 +210,7 @@ def test_authenticated_retention_unlink_retries_exact_in_progress_before_call(
         original_prove(owner, expected)
         if expected == in_progress_raw and not failed:
             failed = True
-            raise EvidenceSealError(
-                "injected failure after durable retention intent"
-            )
+            raise EvidenceSealError("injected failure after durable retention intent")
 
     monkeypatch.setattr(
         journal_type,
@@ -246,10 +228,7 @@ def test_authenticated_retention_unlink_retries_exact_in_progress_before_call(
         assert in_progress is not None
         assert in_progress.phase == "retention_unlink_in_progress"
         assert all(path.exists() for path in selected_paths)
-        assert (
-            case.store._authenticated_retention_tombstone.capability
-            is capability
-        )
+        assert case.store._authenticated_retention_tombstone.capability is capability
 
         monkeypatch.setattr(
             journal_type,
@@ -313,10 +292,7 @@ def test_authenticated_retention_unlink_rejects_hardlink_before_call(
         assert selected.exists()
         assert outside_link.exists()
         assert payload_unlinks == 0
-        assert (
-            case.store._authenticated_retention_tombstone.capability
-            is capability
-        )
+        assert case.store._authenticated_retention_tombstone.capability is capability
     finally:
         outside_link.unlink(missing_ok=True)
         case.coverage.close()
@@ -412,13 +388,8 @@ def test_retention_unlink_uncertain_persist_failure_keeps_intent_and_latch(
         owner: object,
         next_state: object,
     ) -> None:
-        if (
-            getattr(next_state, "phase", None)
-            == "retention_commit_uncertain"
-        ):
-            raise EvidenceSealError(
-                "injected uncertain-state persistence failure"
-            )
+        if getattr(next_state, "phase", None) == "retention_commit_uncertain":
+            raise EvidenceSealError("injected uncertain-state persistence failure")
         original_transition(owner, next_state)
 
     def fail_payload_unlink(
@@ -512,9 +483,7 @@ def test_retention_completion_publishes_exact_cache_then_clears_state(
         assert cache_path.exists()
         assert case.store.status().retention_pending is False
         assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
-        boundary = retention_module.decode_retention_boundary(
-            cache_path.read_bytes()
-        )
+        boundary = retention_module.decode_retention_boundary(cache_path.read_bytes())
         assert boundary.source_evidence_head == case.store.status().evidence_head
         assert len(boundary.tombstones) == 1
         entry = boundary.tombstones[0]
@@ -559,9 +528,7 @@ def test_retention_completion_cache_is_optional_and_never_authority(
         if existing_cache == "oversize":
             assert not cache_path.exists()
         else:
-            boundary = retention_module.decode_retention_boundary(
-                cache_path.read_bytes()
-            )
+            boundary = retention_module.decode_retention_boundary(cache_path.read_bytes())
             assert boundary.tombstones
     finally:
         case.coverage.close()
@@ -595,10 +562,7 @@ def test_retention_completion_rejects_unsafe_cache_namespace(
             )
 
         assert (tmp_path / "root" / "retention-state.json").exists()
-        assert (
-            case.store._retention_finalization_uncertain_latched
-            is False
-        )
+        assert case.store._retention_finalization_uncertain_latched is False
     finally:
         case.coverage.close()
         case.store.close(flush=False)
@@ -615,9 +579,7 @@ def test_retention_completion_failure_keeps_c2d_fence(
 ) -> None:
     case, completion = _completed_case(tmp_path)
     state_path = tmp_path / "retention-state.json"
-    original_boundary_publish = (
-        segments_module._publish_retention_boundary_at
-    )
+    original_boundary_publish = segments_module._publish_retention_boundary_at
     original_rename_noreplace = segments_module._rename_noreplace
     original_unlink = segments_module.os.unlink
     original_fsync = segments_module.os.fsync
@@ -665,11 +627,7 @@ def test_retention_completion_failure_keeps_c2d_fence(
         destination_dir_fd: int,
     ) -> None:
         nonlocal injected
-        if (
-            failure == "state_unlink"
-            and source_name == "retention-state.json"
-            and not injected
-        ):
+        if failure == "state_unlink" and source_name == "retention-state.json" and not injected:
             injected = True
             raise OSError("injected retention-state move ambiguity")
         original_rename_noreplace(

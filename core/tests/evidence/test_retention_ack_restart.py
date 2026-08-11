@@ -47,8 +47,7 @@ def test_retention_unlink_requires_settled_ack_prefix(
     refs = _ordered_refs(case.store)
     journal = AckJournal.create_new(case.store)
     selected_paths = tuple(
-        tmp_path / entry.segment_relative_path
-        for entry in case.journal.state.entries
+        tmp_path / entry.segment_relative_path for entry in case.journal.state.entries
     )
     try:
         if unsafe_ack == "lag":
@@ -162,17 +161,14 @@ def _forge_ack_history(
 def test_ack_restart_rejects_one_ahead_identity_for_retired_sequence(
     tmp_path: Path,
 ) -> None:
-    before_ref, retired_ref, _after_ref = _finalized_acknowledged_run(
-        tmp_path
-    )
+    before_ref, retired_ref, _after_ref = _finalized_acknowledged_run(tmp_path)
     forged_retired = replace(
         retired_ref,
         event_id="evt_" + "4" * 64,
         content_sha256="5" * 64,
     )
     committed_payloads = tuple(
-        canonical_json(_record_value(before_ref, kind))
-        for kind in ("pending_ack", "confirmed_ack")
+        canonical_json(_record_value(before_ref, kind)) for kind in ("pending_ack", "confirmed_ack")
     )
     all_payloads = (
         *committed_payloads,
@@ -196,9 +192,7 @@ def test_ack_restart_rejects_one_ahead_identity_for_retired_sequence(
                     "content_sha256": before_ref.content_sha256,
                 },
                 "journal_prefix_size": len(committed_raw),
-                "journal_prefix_sha256": hashlib.sha256(
-                    committed_raw
-                ).hexdigest(),
+                "journal_prefix_sha256": hashlib.sha256(committed_raw).hexdigest(),
             }
         )
     )

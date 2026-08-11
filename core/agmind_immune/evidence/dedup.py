@@ -60,9 +60,7 @@ def _logical_primary_identity(
     else:
         raise ValueError("logical-primary version is not frozen")
     kind, key = _logical_primary_key(envelope, bind_boot=bind_boot)
-    digest = hashlib.sha256(
-        domain + kind.encode("ascii") + b"\0" + canonical_json(key)
-    ).hexdigest()
+    digest = hashlib.sha256(domain + kind.encode("ascii") + b"\0" + canonical_json(key)).hexdigest()
     return kind, digest
 
 

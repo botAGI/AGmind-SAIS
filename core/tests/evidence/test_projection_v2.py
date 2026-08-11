@@ -180,9 +180,7 @@ def _persist_hostile_row(
         f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders})",
         values,
     )
-    row = connection.execute(
-        f"SELECT {','.join(columns)} FROM {table}"
-    ).fetchone()
+    row = connection.execute(f"SELECT {','.join(columns)} FROM {table}").fetchone()
     assert isinstance(row, sqlite3.Row)
     return connection, row
 
@@ -457,9 +455,7 @@ def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
     root = Path(__file__).parents[2] / "agmind_immune" / "evidence"
     expected_schema_hash = "d4a5d563ca3964cbe4ed276882a4b4def95fb756fc67a6777fddf5de38b1619d"
     assert subject._SCHEMA_V2_SHA256 == expected_schema_hash
-    assert hashlib.sha256((root / "schema.sql").read_bytes()).hexdigest() == (
-        expected_schema_hash
-    )
+    assert hashlib.sha256((root / "schema.sql").read_bytes()).hexdigest() == (expected_schema_hash)
     active = importlib.import_module("agmind_immune.evidence.projection")
     assert active._SCHEMA_META == {
         "schema_version": "agmind.projection-schema.v1",
@@ -485,9 +481,7 @@ def test_schema_v2_bytes_and_active_v1_dormancy_are_frozen() -> None:
         active._create_schema(connection)
         tables = {
             str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_schema WHERE type='table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_schema WHERE type='table'")
         }
         assert "incidents" not in tables
         assert dict(connection.execute("SELECT key,value FROM schema_meta")) == active._SCHEMA_META
@@ -694,9 +688,10 @@ def test_v2_schema_identity_table_order_and_indexes_are_frozen() -> None:
         for table, columns, primary_key in subject._TABLE_LAYOUT_V2:
             info = connection.execute(f"PRAGMA table_info({table})").fetchall()
             assert tuple(str(row[1]) for row in info) == columns
-            assert tuple(
-                str(row[1]) for row in sorted(info, key=lambda row: int(row[5])) if row[5]
-            ) == primary_key
+            assert (
+                tuple(str(row[1]) for row in sorted(info, key=lambda row: int(row[5])) if row[5])
+                == primary_key
+            )
         indexes = {
             tuple(str(item[2]) for item in connection.execute(f"PRAGMA index_info({name})"))
             for name, sql in objects.items()
@@ -999,7 +994,14 @@ def test_candidate_decoder_rejects_hostile_persisted_rows(
         (
             "candidate_evidence",
             "_decode_candidate_evidence",
-            (CANDIDATE_ID, PRIMARY_EVENT_ID, "00000000000000000007", "6" * 64, "primary", SNAPSHOT_EVENT_ID),
+            (
+                CANDIDATE_ID,
+                PRIMARY_EVENT_ID,
+                "00000000000000000007",
+                "6" * 64,
+                "primary",
+                SNAPSHOT_EVENT_ID,
+            ),
         ),
         (
             "candidate_invalidations",
@@ -1046,9 +1048,7 @@ def test_schema_verifier_rejects_every_object_metadata_and_pragma_mutation(
         elif mutation == "index":
             connection.execute("DROP INDEX candidate_invalidations_candidate")
         elif mutation == "meta":
-            connection.execute(
-                "UPDATE schema_meta SET value='changed' WHERE key='reducer_version'"
-            )
+            connection.execute("UPDATE schema_meta SET value='changed' WHERE key='reducer_version'")
         else:
             connection.execute("PRAGMA ignore_check_constraints=ON")
         with pytest.raises(subject.ProjectionConflict):
@@ -1077,12 +1077,9 @@ def test_shuffled_insertion_has_stable_full_pk_order_and_v2_snapshot() -> None:
         first_hash = subject._v2_snapshot_hash(forward)
         assert first_hash == subject._v2_snapshot_hash(reverse)
         assert len(first_hash) == 64
-        assert first_hash != hashlib.sha256(
-            b"AGMIND_PROJECTION_SNAPSHOT_V1\0"
-        ).hexdigest()
+        assert first_hash != hashlib.sha256(b"AGMIND_PROJECTION_SNAPSHOT_V1\0").hexdigest()
         forward.execute(
-            "UPDATE events SET source_signature=source_signature || 'x' "
-            "WHERE event_id=?",
+            "UPDATE events SET source_signature=source_signature || 'x' WHERE event_id=?",
             (PRIMARY_EVENT_ID,),
         )
         assert subject._v2_snapshot_hash(forward) != first_hash
@@ -1128,10 +1125,13 @@ def test_snapshot_hash_conflict_does_not_rollback_caller_owned_transaction() -> 
         with pytest.raises(subject.ProjectionConflict):
             subject._v2_snapshot_hash(connection)
         assert connection.in_transaction
-        assert connection.execute(
-            "SELECT candidate_facts_sha256 FROM candidates WHERE candidate_id=?",
-            (CANDIDATE_ID,),
-        ).fetchone()[0] == "0" * 64
+        assert (
+            connection.execute(
+                "SELECT candidate_facts_sha256 FROM candidates WHERE candidate_id=?",
+                (CANDIDATE_ID,),
+            ).fetchone()[0]
+            == "0" * 64
+        )
         connection.execute("ROLLBACK")
         assert subject._v2_snapshot_hash(connection) == baseline
     finally:

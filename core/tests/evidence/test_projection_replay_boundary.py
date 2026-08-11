@@ -228,23 +228,17 @@ def _build_complete_replay_input_snapshot(
         with store._replay_source_snapshot_gate():
             source_snapshot = store._capture_replay_source_locked(terminal)
         with acknowledgements._replay_ack_snapshot_gate():
-            ack_snapshot = acknowledgements._capture_replay_ack_locked(
-                terminal.source_sequence
-            )
+            ack_snapshot = acknowledgements._capture_replay_ack_locked(terminal.source_sequence)
         issued, binding, predecessor = _build_registered_correlation_authority(
             store,
             generation=base_projection_generation,
         )
-        with authority_module._correlation_projection_snapshot_gate(
-            issued
-        ) as held:
+        with authority_module._correlation_projection_snapshot_gate(issued) as held:
             assert held is binding
-            correlation_snapshot = (
-                authority_module._capture_correlation_replay_locked(
-                    issued,
-                    held,
-                    predecessor,
-                )
+            correlation_snapshot = authority_module._capture_correlation_replay_locked(
+                issued,
+                held,
+                predecessor,
             )
         snapshot = subject._ReplayInputSnapshot(
             source=source_snapshot,
@@ -257,9 +251,7 @@ def _build_complete_replay_input_snapshot(
             ),
             base_projection_generation=base_projection_generation,
             publish_generation=(
-                base_projection_generation + 1
-                if publish_generation is None
-                else publish_generation
+                base_projection_generation + 1 if publish_generation is None else publish_generation
             ),
         )
     except BaseException:
@@ -313,9 +305,7 @@ def _build_replay_orchestration_case(
         )
         assert retention_decision.request is not None
         for sequence in range(3, record_count + 1):
-            ref = acceptance.accept(
-                _item(envelope_value(key, sequence=sequence))
-            )
+            ref = acceptance.accept(_item(envelope_value(key, sequence=sequence)))
             coverage._apply_live_accepted(store, ref, None)
             acknowledgements.record_pending(ref)
             acknowledgements.record_confirmed(ref)
@@ -377,9 +367,9 @@ def _perform_replay_writer(case: dict[str, object], writer: str) -> None:
         )
         coverage._apply_live_accepted(store, ref, None)  # type: ignore[attr-defined]
     elif writer == "retention":
-        retention_module._open_retention_state_journal(
-            store
-        ).prepare_publication(case["retention_decision"])
+        retention_module._open_retention_state_journal(store).prepare_publication(
+            case["retention_decision"]
+        )
     elif writer == "ack":
         acknowledgements.close()
     elif writer == "correlation_authority":
@@ -389,9 +379,7 @@ def _perform_replay_writer(case: dict[str, object], writer: str) -> None:
     elif writer == "journal":
         request = PCCCorrelationSnapshotRequestV1.model_validate(
             {
-                "schema_version": (
-                    "agmind.pcc-correlation-snapshot-request.v1"
-                ),
+                "schema_version": ("agmind.pcc-correlation-snapshot-request.v1"),
                 "trigger_event_id": through.event_id,
                 "trigger_content_sha256": through.content_sha256,
                 "trigger_source_sequence": through.source_sequence,
@@ -460,8 +448,7 @@ def _wait_for_replay_phase(
             break
         time.sleep(0.001)
     raise AssertionError(
-        f"replay never exposed {phase!r} status; "
-        f"last_status={status!r}; errors={errors!r}"
+        f"replay never exposed {phase!r} status; last_status={status!r}; errors={errors!r}"
     )
 
 
@@ -523,9 +510,7 @@ def _controller_projection_row_count(
 ) -> int:
     total = 0
     for table in _CONTROLLER_PROJECTION_STATE_TABLES:
-        value = connection.execute(
-            f"SELECT count(*) FROM {table}"
-        ).fetchone()[0]
+        value = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         assert type(value) is int
         total += value
     return total
@@ -554,12 +539,7 @@ class _ControllerReplay:
         connection = self._connection
         through = self._through
         temporary_root = self._temporary_root
-        if (
-            owner is None
-            or connection is None
-            or through is None
-            or temporary_root is None
-        ):
+        if owner is None or connection is None or through is None or temporary_root is None:
             raise RuntimeError("controller replay ownership already consumed")
         self._owner = None
         self._connection = None
@@ -568,9 +548,7 @@ class _ControllerReplay:
 
         primary_error: BaseException | None = None
         try:
-            subject = importlib.import_module(
-                "agmind_immune.evidence.projection_v2"
-            )
+            subject = importlib.import_module("agmind_immune.evidence.projection_v2")
             if owner._connection is not connection:
                 raise AssertionError("controller replay owner lost its connection")
             try:
@@ -583,16 +561,10 @@ class _ControllerReplay:
 
             active_connection = owner._connection
             if not isinstance(active_connection, sqlite3.Connection):
-                raise TypeError(
-                    "controller replay owner lost its active database"
-                )
+                raise TypeError("controller replay owner lost its active database")
             projection_cursor = subject._current_v2_cursor(active_connection)
-            projection_row_count = _controller_projection_row_count(
-                active_connection
-            )
-            pcc_count = active_connection.execute(
-                "SELECT count(*) FROM candidates"
-            ).fetchone()[0]
+            projection_row_count = _controller_projection_row_count(active_connection)
+            pcc_count = active_connection.execute("SELECT count(*) FROM candidates").fetchone()[0]
             assert type(pcc_count) is int
             self._projection_cursor = projection_cursor
             self._projection_row_count = projection_row_count
@@ -600,9 +572,7 @@ class _ControllerReplay:
             if report is None:
                 return None
             if report.cursor != projection_cursor:
-                raise AssertionError(
-                    "controller replay report cursor differs from owner database"
-                )
+                raise AssertionError("controller replay report cursor differs from owner database")
             return _ControllerReplayReport(
                 pcc_count=pcc_count,
                 projection_row_count=projection_row_count,
@@ -627,10 +597,7 @@ class _ControllerReplay:
 
     @property
     def projection_row_count(self) -> int:
-        if (
-            not self._projection_state_observed
-            or self._projection_row_count is None
-        ):
+        if not self._projection_state_observed or self._projection_row_count is None:
             raise RuntimeError("controller replay state was not observed")
         return self._projection_row_count
 
@@ -650,12 +617,8 @@ def _append_controller_boundary_candidate(
     trigger = _candidate_trigger(key, sequence=trigger_sequence)
     fields = trigger["normalized_fields"]
     assert isinstance(fields, dict)
-    raw_sha256 = hashlib.sha256(
-        f"controller-boundary-trigger-{number}".encode()
-    ).hexdigest()
-    fields["destination_ipv4"] = (
-        f"11.{number >> 16}.{number >> 8 & 255}.{number & 255}"
-    )
+    raw_sha256 = hashlib.sha256(f"controller-boundary-trigger-{number}".encode()).hexdigest()
+    fields["destination_ipv4"] = f"11.{number >> 16}.{number >> 8 & 255}.{number & 255}"
     fields["raw_event_sha256"] = raw_sha256
     fields["event_time"] = NOW
     trigger["source_payload_hash"] = raw_sha256
@@ -692,9 +655,7 @@ def _append_controller_boundary_candidate(
 def build_controller_replay_with_authenticated_pcc_count(
     count: int,
 ) -> _ControllerReplay:
-    temporary_root = TemporaryDirectory(
-        prefix=f"agmind-controller-cap-{count}-"
-    )
+    temporary_root = TemporaryDirectory(prefix=f"agmind-controller-cap-{count}-")
     coordinator = None
     journal = None
     acknowledgements = None
@@ -708,9 +669,7 @@ def build_controller_replay_with_authenticated_pcc_count(
         )
         coordinator = _coordinator(Path(temporary_root.name) / "evidence", key)
         _accept(coordinator, boot_boundary(key))
-        journal = CorrelationRequestJournal.create_new(
-            coordinator.segment_store
-        )
+        journal = CorrelationRequestJournal.create_new(coordinator.segment_store)
         for number in range(count):
             _append_controller_boundary_candidate(
                 coordinator,
@@ -736,9 +695,7 @@ def build_controller_replay_with_authenticated_pcc_count(
         for record in store.iter_authenticated_records():
             acknowledgements.record_pending(record.ref)
             acknowledgements.record_confirmed(record.ref)
-        subject = importlib.import_module(
-            "agmind_immune.evidence.projection_v2"
-        )
+        subject = importlib.import_module("agmind_immune.evidence.projection_v2")
         connection = subject._v2_connection_for_test()
         registry = load_pinned_special_use_registry(_REGISTRY_PATH)
         owner_factory = subject._v2_projection_owner_for_test
@@ -776,13 +733,9 @@ def build_controller_replay_with_authenticated_pcc_count(
             if journal is not None:
                 cleanup_steps.append(("journal", journal.close))
             if acknowledgements is not None:
-                cleanup_steps.append(
-                    ("acknowledgements", acknowledgements.close)
-                )
+                cleanup_steps.append(("acknowledgements", acknowledgements.close))
             if coordinator is not None:
-                cleanup_steps.append(
-                    ("evidence store", coordinator.segment_store.close)
-                )
+                cleanup_steps.append(("evidence store", coordinator.segment_store.close))
         cleanup_steps.append(("temporary root", temporary_root.cleanup))
         _drain_controller_cleanup(error, tuple(cleanup_steps))
         raise
@@ -790,12 +743,8 @@ def build_controller_replay_with_authenticated_pcc_count(
 
 def _pcc_fixture(count: int) -> dict[str, object]:
     records = tuple(_self_close_records(count))
-    assert tuple(record.ref.source_sequence for record in records) == tuple(
-        range(1, count + 1)
-    )
-    assert tuple(record.ref.content_sha256 for record in records) == _PCC_CONTENT_HASHES[
-        :count
-    ]
+    assert tuple(record.ref.source_sequence for record in records) == tuple(range(1, count + 1))
+    assert tuple(record.ref.content_sha256 for record in records) == _PCC_CONTENT_HASHES[:count]
     assert len({record.ref.event_id for record in records}) == count
     return {
         "records": records,
@@ -860,9 +809,7 @@ def _expected_record_literals() -> tuple[bytes, bytes]:
                 "outer": {
                     "sequence": envelope["source_sequence"],
                     "event_id": envelope["event_id"],
-                    "content_sha256": hashlib.sha256(
-                        canonical_json(envelope)
-                    ).hexdigest(),
+                    "content_sha256": hashlib.sha256(canonical_json(envelope)).hexdigest(),
                 },
                 "envelope": envelope,
             }
@@ -913,7 +860,9 @@ def _decode_snapshot_records(snapshot: object) -> tuple[bytes, ...]:
                 record.ref.frame_offset,
             ),
             max_frame=MAX_EVIDENCE_RECORD_BYTES,
-        ).records[0].payload
+        )
+        .records[0]
+        .payload
         for record in snapshot.records
     )
 
@@ -1060,9 +1009,7 @@ def test_ack_snapshot_revision_changes_for_every_sanctioned_writer(
             )
 
         with journal._replay_ack_snapshot_gate():
-            snapshot = journal._capture_replay_ack_locked(
-                refs[-1].source_sequence
-            )
+            snapshot = journal._capture_replay_ack_locked(refs[-1].source_sequence)
 
         if writer == "pending":
             journal.record_pending(refs[1])
@@ -1109,36 +1056,35 @@ def test_ack_snapshot_has_no_callback_and_owns_exact_prefix_descriptor(
     descriptor = -1
     try:
         with journal._replay_ack_snapshot_gate():
-            snapshot = journal._capture_replay_ack_locked(
-                refs[-1].source_sequence
-            )
+            snapshot = journal._capture_replay_ack_locked(refs[-1].source_sequence)
         descriptor = snapshot.descriptor
         descriptor_stat = os.fstat(descriptor)
         assert snapshot.committed_prefix_sha256 == bytes.fromhex(
             "916c45030c830eaf5665c9b8eef95ca5266c40fe4e0058e023ca1e128cce0acb"
         )
-        assert tuple(
-            field.name
-            for field in fields(snapshot)
-            if callable(getattr(snapshot, field.name))
-        ) == ()
+        assert (
+            tuple(
+                field.name for field in fields(snapshot) if callable(getattr(snapshot, field.name))
+            )
+            == ()
+        )
         assert stat.S_ISREG(descriptor_stat.st_mode)
         assert (
             descriptor_stat.st_dev,
             descriptor_stat.st_ino,
             descriptor_stat.st_size,
         ) == (snapshot.device, snapshot.inode, snapshot.size)
+        assert (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) == os.O_RDONLY
         assert (
-            fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
-        ) == os.O_RDONLY
-        assert hashlib.sha256(
-            os.pread(descriptor, snapshot.committed_prefix_size, 0)
-        ).digest() == snapshot.committed_prefix_sha256
+            hashlib.sha256(os.pread(descriptor, snapshot.committed_prefix_size, 0)).digest()
+            == snapshot.committed_prefix_sha256
+        )
 
         journal.close()
-        assert len(
-            os.pread(descriptor, snapshot.committed_prefix_size, 0)
-        ) == snapshot.committed_prefix_size
+        assert (
+            len(os.pread(descriptor, snapshot.committed_prefix_size, 0))
+            == snapshot.committed_prefix_size
+        )
     finally:
         if snapshot is not None:
             ack_journal_module._close_replay_ack_snapshot(snapshot)
@@ -1212,17 +1158,13 @@ def test_source_snapshot_revalidation_rejects_real_descriptor_substitution(
         if replacement_descriptor >= 0:
             os.close(replacement_descriptor)
         store.close()
-    assert _all_descriptor_fstats_fail_with_ebadf(
-        (*owned_fds, replacement_descriptor)
-    )
+    assert _all_descriptor_fstats_fail_with_ebadf((*owned_fds, replacement_descriptor))
 
 
 def test_partial_source_snapshot_failure_closes_every_owned_descriptor(
     tmp_path: Path,
 ) -> None:
-    snapshot, owned_fds = _force_real_second_descriptor_failure(
-        tmp_path / "source"
-    )
+    snapshot, owned_fds = _force_real_second_descriptor_failure(tmp_path / "source")
     assert snapshot is None
     assert _all_descriptor_fstats_fail_with_ebadf(owned_fds)
 
@@ -1289,11 +1231,10 @@ def test_frozen_pcc_kernel_accepts_values_only_and_matches_live_result(
         frozen = pcc_module._freeze_pcc_correlation_input(proof, context)
 
         assert pcc_module._correlate_frozen_pcc(frozen) == expected
-        assert tuple(
-            field.name
-            for field in fields(frozen)
-            if callable(getattr(frozen, field.name))
-        ) == ()
+        assert (
+            tuple(field.name for field in fields(frozen) if callable(getattr(frozen, field.name)))
+            == ()
+        )
         assert pcc_module.authenticated_pcc_input_is_issued(frozen.proof) is False
         registry = frozen.context.special_use_registry
         assert type(registry) is ParsedSpecialUseRegistry
@@ -1307,8 +1248,7 @@ def test_frozen_pcc_kernel_accepts_values_only_and_matches_live_result(
                 "proof_canonical",
                 _mutated_canonical(
                     frozen.proof_canonical,
-                    lambda value: value
-                    == ["int", str(proof.source_sequence)],
+                    lambda value: value == ["int", str(proof.source_sequence)],
                     ["bool", True],
                 ),
             ),
@@ -1316,8 +1256,7 @@ def test_frozen_pcc_kernel_accepts_values_only_and_matches_live_result(
                 "proof_canonical",
                 _mutated_canonical(
                     frozen.proof_canonical,
-                    lambda value: value
-                    == ["int", str(proof.source_sequence)],
+                    lambda value: value == ["int", str(proof.source_sequence)],
                     ["scalar-subclass", str(proof.source_sequence)],
                 ),
             ),
@@ -1341,8 +1280,7 @@ def test_frozen_pcc_kernel_accepts_values_only_and_matches_live_result(
                 "context_canonical",
                 _mutated_canonical(
                     frozen.context_canonical,
-                    lambda value: value
-                    == ["str", context.special_use_registry.entries[0].prefix],
+                    lambda value: value == ["str", context.special_use_registry.entries[0].prefix],
                     ["str", "198.18.0.0/15"],
                 ),
             ),
@@ -1374,9 +1312,7 @@ def test_frozen_pcc_kernel_accepts_values_only_and_matches_live_result(
     finally:
         coordinator.segment_store.close()
 
-    failed_coordinator, failed_proof = _accepted_failed(
-        tmp_path / "frozen-failed"
-    )
+    failed_coordinator, failed_proof = _accepted_failed(tmp_path / "frozen-failed")
     failed_context = pcc_module.CorrelationContext.failed_snapshot()
     try:
         expected_failed = pcc_module._correlate_pcc_kernel(
@@ -1428,17 +1364,11 @@ def test_correlation_snapshot_rechecks_typed_predecessor_revision_and_pins(
     tmp_path: Path,
 ) -> None:
     authority_module, _pcc_module = _correlation_modules()
-    _coordinator, store, terminal = _build_file_backed_source(
-        tmp_path / "correlation"
-    )
+    _coordinator, store, terminal = _build_file_backed_source(tmp_path / "correlation")
     issued = None
     try:
-        issued, binding, expected = _build_registered_correlation_authority(
-            store
-        )
-        with authority_module._correlation_projection_snapshot_gate(
-            issued
-        ) as held:
+        issued, binding, expected = _build_registered_correlation_authority(store)
+        with authority_module._correlation_projection_snapshot_gate(issued) as held:
             assert held is binding
             snapshot = authority_module._capture_correlation_replay_locked(
                 issued,
@@ -1449,11 +1379,12 @@ def test_correlation_snapshot_rechecks_typed_predecessor_revision_and_pins(
         assert len(snapshot.lifecycle_token) == 32
         assert type(snapshot.predecessor_canonical) is bytes
         assert type(snapshot.registry_facts_canonical) is bytes
-        assert tuple(
-            field.name
-            for field in fields(snapshot)
-            if callable(getattr(snapshot, field.name))
-        ) == ()
+        assert (
+            tuple(
+                field.name for field in fields(snapshot) if callable(getattr(snapshot, field.name))
+            )
+            == ()
+        )
 
         successor = authority_module._ProjectionPredecessor(
             generation=0,
@@ -1469,9 +1400,7 @@ def test_correlation_snapshot_rechecks_typed_predecessor_revision_and_pins(
             successor,
         )
         with (
-            authority_module._correlation_projection_snapshot_gate(
-                issued
-            ) as held,
+            authority_module._correlation_projection_snapshot_gate(issued) as held,
             pytest.raises(CorrelationProjectionError),
         ):
             authority_module._revalidate_correlation_replay_locked(
@@ -1489,9 +1418,7 @@ def test_compute_accepts_only_frozen_value_snapshot(
     tmp_path: Path,
 ) -> None:
     subject = importlib.import_module("agmind_immune.evidence.projection_v2")
-    snapshot, resources = _build_complete_replay_input_snapshot(
-        tmp_path / "compute-boundary"
-    )
+    snapshot, resources = _build_complete_replay_input_snapshot(tmp_path / "compute-boundary")
 
     class _WrongSource:
         def __getattribute__(self, name: str) -> object:
@@ -1500,23 +1427,20 @@ def test_compute_accepts_only_frozen_value_snapshot(
     try:
         computation = subject._compute_replay(snapshot)
         assert type(computation) is subject._ReplayComputation
-        assert tuple(
-            field.name
-            for field in fields(snapshot)
-            if callable(getattr(snapshot, field.name))
-        ) == ()
+        assert (
+            tuple(
+                field.name for field in fields(snapshot) if callable(getattr(snapshot, field.name))
+            )
+            == ()
+        )
         assert not any(
             isinstance(getattr(snapshot, field.name), (SegmentStore, AckJournal))
             for field in fields(snapshot)
         )
         with pytest.raises(TypeError):
-            subject._compute_replay(
-                replace(snapshot, source=resources["store"])
-            )
+            subject._compute_replay(replace(snapshot, source=resources["store"]))
         with pytest.raises(TypeError):
-            subject._compute_replay(
-                replace(snapshot, source=_WrongSource())
-            )
+            subject._compute_replay(replace(snapshot, source=_WrongSource()))
     finally:
         _close_complete_replay_input(resources)
 
@@ -1544,9 +1468,7 @@ def test_replay_corruption_fence_drains_after_full_lock_unwind(
     monkeypatch: pytest.MonkeyPatch,
     authority: str,
 ) -> None:
-    correlation_authority = importlib.import_module(
-        "agmind_immune.correlation.authority"
-    )
+    correlation_authority = importlib.import_module("agmind_immune.correlation.authority")
     monkeypatch.setattr(
         correlation_authority,
         "_load_pinned_detector_bundle",
@@ -1566,11 +1488,7 @@ def test_replay_corruption_fence_drains_after_full_lock_unwind(
             through = case["through"]
             assert type(store) is SegmentStore
             assert type(through) is EvidenceRef
-            artifact_name = (
-                "ack-journal.agf"
-                if authority == "ack"
-                else "correlation-requests.agf"
-            )
+            artifact_name = "ack-journal.agf" if authority == "ack" else "correlation-requests.agf"
             replacement = store.root / f"{artifact_name}.replacement"
             replacement.write_bytes(b"")
             replacement.chmod(0o600)
@@ -1612,9 +1530,7 @@ def test_snapshot_cleanup_consumes_fd_ownership_before_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    correlation_authority = importlib.import_module(
-        "agmind_immune.correlation.authority"
-    )
+    correlation_authority = importlib.import_module("agmind_immune.correlation.authority")
     monkeypatch.setattr(
         correlation_authority,
         "_load_pinned_detector_bundle",
@@ -1893,9 +1809,7 @@ def test_compute_rejects_nested_evidence_ref_before_callback(
     tmp_path: Path,
 ) -> None:
     subject = importlib.import_module("agmind_immune.evidence.projection_v2")
-    snapshot, resources = _build_complete_replay_input_snapshot(
-        tmp_path / "compute-nested-ref"
-    )
+    snapshot, resources = _build_complete_replay_input_snapshot(tmp_path / "compute-nested-ref")
     source = snapshot.source
     first = source.records[0]
     hostile_ref = replace(
@@ -1917,9 +1831,7 @@ def test_compute_is_deterministic_and_does_not_mutate_live_projection(
     tmp_path: Path,
 ) -> None:
     subject = importlib.import_module("agmind_immune.evidence.projection_v2")
-    snapshot, resources = _build_complete_replay_input_snapshot(
-        tmp_path / "compute-determinism"
-    )
+    snapshot, resources = _build_complete_replay_input_snapshot(tmp_path / "compute-determinism")
     owner_connection = subject._v2_connection_for_test()
     try:
         before = subject._v2_snapshot_hash(owner_connection)

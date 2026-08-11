@@ -94,8 +94,7 @@ def _projection_authorities(
     current = getattr(store, "_correlation_journal_owner", None)
     correlation_requests = (
         current
-        if type(current) is CorrelationRequestJournal
-        and current._is_bound_to(store)
+        if type(current) is CorrelationRequestJournal and current._is_bound_to(store)
         else CorrelationRequestJournal.create_new(store)
     )
     registry = load_pinned_special_use_registry(
@@ -185,9 +184,7 @@ def test_public_projection_open_activates_new_v1_v2_and_rejects_unknown_exactly(
         acknowledgements,
         correlation_requests,
         registry,
-    ) = _system(
-        tmp_path / case / "evidence"
-    )
+    ) = _system(tmp_path / case / "evidence")
     first = _accept(coordinator, boot_boundary(private_key(11)))
     _confirm(acknowledgements, first)
     path = tmp_path / case / "projection.sqlite3"
@@ -348,9 +345,7 @@ def test_authority_order_and_uint64_text(tmp_path: Path, case: str) -> None:
         assert encoded == ["09223372036854775808", "18446744073709551615"]
         assert encoded == sorted(encoded)
         return
-    coordinator, store, journal, correlation, registry = _system(
-        tmp_path / case / "evidence"
-    )
+    coordinator, store, journal, correlation, registry = _system(tmp_path / case / "evidence")
     key = private_key(11)
     first = _accept(coordinator, boot_boundary(key))
     if case == "signed_gap":
@@ -544,9 +539,7 @@ def test_atomic_apply_retry_and_conflict(
 )
 def test_projection_dedup_is_logical_and_provenanced(tmp_path: Path, case: str) -> None:
     projection = _projection()
-    coordinator, store, journal, correlation, registry = _system(
-        tmp_path / case / "evidence"
-    )
+    coordinator, store, journal, correlation, registry = _system(tmp_path / case / "evidence")
     key = private_key(11)
     first = _accept(coordinator, boot_boundary(key))
     raw_hash = hashlib.sha256(b"same raw event").hexdigest()
@@ -649,9 +642,7 @@ def test_projection_dedup_is_logical_and_provenanced(tmp_path: Path, case: str) 
     with sqlite3.connect(cache.path) as connection:
         reduced_table = "network_observations" if case == "falco" else "coverage_intervals"
         expected = 2 if case == "coverage_changed" else 1
-        assert connection.execute(f"SELECT count(*) FROM {reduced_table}").fetchone() == (
-            expected,
-        )
+        assert connection.execute(f"SELECT count(*) FROM {reduced_table}").fetchone() == (expected,)
         assert connection.execute("SELECT count(*) FROM events").fetchone() == (3,)
     cache.close()
     store.close()
@@ -659,9 +650,7 @@ def test_projection_dedup_is_logical_and_provenanced(tmp_path: Path, case: str) 
 
 def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
     projection = _projection()
-    coordinator, store, journal, correlation, registry = _system(
-        tmp_path / "healthy" / "evidence"
-    )
+    coordinator, store, journal, correlation, registry = _system(tmp_path / "healthy" / "evidence")
     path = tmp_path / "healthy" / "projection.sqlite3"
     cache = projection.ProjectionStore.open(
         path,
@@ -714,9 +703,7 @@ def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
         latched_journal,
         latched_correlation,
         latched_registry,
-    ) = _system(
-        tmp_path / "latched" / "evidence"
-    )
+    ) = _system(tmp_path / "latched" / "evidence")
     latched_path = tmp_path / "latched" / "projection.sqlite3"
     latched = projection.ProjectionStore.open(
         latched_path,
@@ -748,9 +735,7 @@ def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
             candidate_journal,
             candidate_correlation,
             candidate_registry,
-        ) = _system(
-            tmp_path / case / "evidence"
-        )
+        ) = _system(tmp_path / case / "evidence")
         candidate_path = tmp_path / case / "projection.sqlite3"
         candidate = projection.ProjectionStore.open(
             candidate_path,
@@ -814,9 +799,7 @@ def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
         interrupt_journal,
         interrupt_correlation,
         interrupt_registry,
-    ) = _system(
-        tmp_path / "interrupt" / "evidence"
-    )
+    ) = _system(tmp_path / "interrupt" / "evidence")
     interrupt = projection.ProjectionStore.open(
         tmp_path / "interrupt" / "projection.sqlite3",
         evidence=interrupt_store,
@@ -941,11 +924,7 @@ def test_rebuild_revalidates_frozen_ack_authority(
 
     def mutate_authority(step: str) -> None:
         nonlocal changed
-        target = (
-            "parent_fsync"
-            if case == "rollback_after_rename"
-            else "apply"
-        )
+        target = "parent_fsync" if case == "rollback_after_rename" else "apply"
         if step != target or changed:
             return
         changed = True
@@ -1042,10 +1021,7 @@ def test_projection_open_rejects_surviving_tamper_after_retention(
     projection_path = tmp_path / "retained" / "projection.sqlite3"
     cache = None
     try:
-        refs = tuple(
-            record.ref
-            for record in case.store.iter_authenticated_records()
-        )
+        refs = tuple(record.ref for record in case.store.iter_authenticated_records())
         cache = projection.ProjectionStore.open(
             projection_path,
             evidence=case.store,
@@ -1116,9 +1092,7 @@ def _retention_case_with_surviving_falco(
         nonlocal acknowledgements, correlation_requests, registry, cache
         acknowledgements = AckJournal.create_new(store)
         correlation_requests, registry = _projection_authorities(store)
-        initial_refs = tuple(
-            record.ref for record in store.iter_authenticated_records()
-        )
+        initial_refs = tuple(record.ref for record in store.iter_authenticated_records())
         for ref in initial_refs:
             acknowledgements.record_pending(ref)
             acknowledgements.record_confirmed(ref)
@@ -1176,10 +1150,7 @@ def _retention_case_with_surviving_falco(
         case.target_ref,
         _factory=segments_module._RETENTION_PROOF_FACTORY,
     )
-    refs = tuple(
-        record.ref
-        for record in case.store.iter_authenticated_records()
-    )
+    refs = tuple(record.ref for record in case.store.iter_authenticated_records())
     assert [ref.source_sequence for ref in refs] == [1, 2, 3, 4]
     return (
         case,
@@ -1202,9 +1173,7 @@ def test_retention_rebuild_failure_preserves_last_good_projection(
     failure_seam: str,
 ) -> None:
     projection = _projection()
-    raw_hash = hashlib.sha256(
-        f"retention rebuild {failure_seam}".encode()
-    ).hexdigest()
+    raw_hash = hashlib.sha256(f"retention rebuild {failure_seam}".encode()).hexdigest()
     (
         case,
         capability,
@@ -1229,9 +1198,7 @@ def test_retention_rebuild_failure_preserves_last_good_projection(
         if failure_seam == "ack_revalidation":
 
             def fail_ack_revalidation(_snapshot: object) -> None:
-                raise projection.ProjectionAuthorityError(
-                    "injected ACK revalidation failure"
-                )
+                raise projection.ProjectionAuthorityError("injected ACK revalidation failure")
 
             monkeypatch.setattr(
                 acknowledgements,
@@ -1239,9 +1206,7 @@ def test_retention_rebuild_failure_preserves_last_good_projection(
                 fail_ack_revalidation,
             )
         else:
-            original_validation = (
-                case.store._validate_authenticated_retention_completion
-            )
+            original_validation = case.store._validate_authenticated_retention_completion
             validation_calls = 0
 
             def fail_validation(candidate: object, binding: object) -> Any:
@@ -1249,9 +1214,7 @@ def test_retention_rebuild_failure_preserves_last_good_projection(
                 validation_calls += 1
                 target_call = 1 if failure_seam == "pre_validation" else 2
                 if validation_calls == target_call:
-                    raise segments_module.EvidenceSealError(
-                        f"injected {failure_seam}"
-                    )
+                    raise segments_module.EvidenceSealError(f"injected {failure_seam}")
                 return original_validation(candidate, binding)
 
             monkeypatch.setattr(
@@ -1294,9 +1257,7 @@ def test_authenticated_retention_rebuild_promotes_surviving_duplicate(
         tmp_path / "dedup-promotion" / "evidence",
         raw_hash=raw_hash,
     )
-    projection_path = (
-        tmp_path / "dedup-promotion" / "projection.sqlite3"
-    )
+    projection_path = tmp_path / "dedup-promotion" / "projection.sqlite3"
     reopened = None
     try:
         completion = case.store._execute_authenticated_retention_unlink(
@@ -1326,15 +1287,13 @@ def test_authenticated_retention_rebuild_promotes_surviving_duplicate(
         assert reopened._connection is not None
         assert tuple(
             reopened._connection.execute(
-                "SELECT duplicate_of_event_id FROM events "
-                "WHERE source_sequence=?",
+                "SELECT duplicate_of_event_id FROM events WHERE source_sequence=?",
                 (projection._uint64(4),),
             ).fetchone()
         ) == (None,)
         assert tuple(
             reopened._connection.execute(
-                "SELECT primary_event_id,is_primary FROM projection_dedup "
-                "WHERE event_id=?",
+                "SELECT primary_event_id,is_primary FROM projection_dedup WHERE event_id=?",
                 (refs[3].event_id,),
             ).fetchone()
         ) == (refs[3].event_id, 1)
@@ -1367,16 +1326,13 @@ def test_authenticated_retention_rebuilds_container_with_retired_first_event(
         tmp_path / "container-rebuild" / "evidence",
         raw_hash=raw_hash,
     )
-    projection_path = (
-        tmp_path / "container-rebuild" / "projection.sqlite3"
-    )
+    projection_path = tmp_path / "container-rebuild" / "projection.sqlite3"
     reopened = None
     try:
         assert cache._connection is not None
         assert tuple(
             cache._connection.execute(
-                "SELECT first_source_sequence,last_source_sequence "
-                "FROM containers",
+                "SELECT first_source_sequence,last_source_sequence FROM containers",
             ).fetchone()
         ) == (
             projection._uint64(2),
@@ -1448,9 +1404,7 @@ def test_projection_open_rejects_container_tamper_with_retired_first_event(
         tmp_path / "container-tamper" / "evidence",
         raw_hash=raw_hash,
     )
-    projection_path = (
-        tmp_path / "container-tamper" / "projection.sqlite3"
-    )
+    projection_path = tmp_path / "container-tamper" / "projection.sqlite3"
     try:
         completion = case.store._execute_authenticated_retention_unlink(
             capability,

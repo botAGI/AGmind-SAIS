@@ -126,9 +126,7 @@ def _complete_journal(
     proof: AuthenticatedPCCInput,
 ) -> None:
     store = journal._store
-    trigger_ref = store._bound_verifier.accepted_ref(
-        proof.snapshot.trigger.source_sequence
-    )
+    trigger_ref = store._bound_verifier.accepted_ref(proof.snapshot.trigger.source_sequence)
     assert type(trigger_ref) is EvidenceRef
     selected = journal.select(trigger_ref, canonical_json(proof.request))
     snapshot_ref = cast(EvidenceRef, proof.evidence_ref)
@@ -170,9 +168,7 @@ def _owner(
         acknowledgements=acknowledgements,
         journal=journal,
         registry=(
-            load_pinned_special_use_registry(_REGISTRY_PATH)
-            if registry is None
-            else registry
+            load_pinned_special_use_registry(_REGISTRY_PATH) if registry is None else registry
         ),
         step_hook=step_hook,
     )
@@ -197,9 +193,7 @@ def _durable_retention_case(
     path: Path,
 ) -> dict[str, Any]:
     retention = importlib.import_module("tests.evidence.test_retention")
-    key, acceptance, store, coverage = retention._live_store_with_active_routine(
-        path
-    )
+    key, acceptance, store, coverage = retention._live_store_with_active_routine(path)
     journal = CorrelationRequestJournal.create_new(store)
     acknowledgements = store._ack_journal_owner
     assert type(acknowledgements) is AckJournal
@@ -221,9 +215,7 @@ def _durable_retention_case(
     )
     request = decision.request
     assert request is not None
-    retention_journal = retention.retention_module._open_retention_state_journal(
-        store
-    )
+    retention_journal = retention.retention_module._open_retention_state_journal(store)
     retention_journal.prepare_publication(decision)
     target_item = retention._item(
         envelope_value(
@@ -258,9 +250,7 @@ def _durable_retention_case(
         tombstone,
         _factory=segments_module._RETENTION_PROOF_FACTORY,
     )
-    surviving = tuple(
-        store.iter_authenticated_records(through=target_ref.source_sequence)
-    )
+    surviving = tuple(store.iter_authenticated_records(through=target_ref.source_sequence))
     return {
         "retention": retention,
         "store": store,
@@ -535,9 +525,7 @@ def _append_unpublished_complete(
     )
     normalized = trigger["normalized_fields"]
     assert isinstance(normalized, dict)
-    raw_sha256 = hashlib.sha256(
-        f"unpublished-history-{trigger_sequence}".encode()
-    ).hexdigest()
+    raw_sha256 = hashlib.sha256(f"unpublished-history-{trigger_sequence}".encode()).hexdigest()
     normalized["destination_ipv4"] = destination_ipv4
     normalized["raw_event_sha256"] = raw_sha256
     trigger["source_payload_hash"] = raw_sha256
@@ -774,9 +762,7 @@ def _capture_compute_input(
         with store._replay_source_snapshot_gate():
             source_snapshot = store._capture_replay_source_locked(terminal)
         with acknowledgements._replay_ack_snapshot_gate():
-            ack_snapshot = acknowledgements._capture_replay_ack_locked(
-                terminal.source_sequence
-            )
+            ack_snapshot = acknowledgements._capture_replay_ack_locked(terminal.source_sequence)
         predecessor = authority._ProjectionPredecessor(
             generation=1,
             host_id=None,
@@ -817,9 +803,9 @@ def _capture_compute_input(
         if source_snapshot is not None:
             segments_module._close_replay_source_snapshot(source_snapshot)
         if ack_snapshot is not None:
-            importlib.import_module(
-                "agmind_immune.ingest.ack_journal"
-            )._close_replay_ack_snapshot(ack_snapshot)
+            importlib.import_module("agmind_immune.ingest.ack_journal")._close_replay_ack_snapshot(
+                ack_snapshot
+            )
         if issued is not None:
             authority._close_correlation_projection_authority(issued)
         acknowledgements.close()
@@ -836,9 +822,9 @@ def _capture_compute_input(
 
 def _close_compute_input(resources: dict[str, object]) -> None:
     segments_module._close_replay_source_snapshot(resources["source_snapshot"])
-    importlib.import_module(
-        "agmind_immune.ingest.ack_journal"
-    )._close_replay_ack_snapshot(resources["ack_snapshot"])
+    importlib.import_module("agmind_immune.ingest.ack_journal")._close_replay_ack_snapshot(
+        resources["ack_snapshot"]
+    )
     resources["acknowledgements"].close()
     resources["store"].close()
 
@@ -853,14 +839,12 @@ def test_unpublished_replay_supports_empty_confirmed_prefix(
     journal = CorrelationRequestJournal.create_new(store)
     acknowledgements = AckJournal.create_new(store)
 
-    owner, connection, report = (
-        subject._v2_unpublished_projection_from_prefix_for_test(
-            evidence=store,
-            acknowledgements=acknowledgements,
-            journal=journal,
-            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
-            through=None,
-        )
+    owner, connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=None,
     )
     try:
         assert report.cursor is None
@@ -895,24 +879,25 @@ def test_unpublished_replay_caps_at_lagged_confirmed_prefix(
     _confirm_ack(acknowledgements, records[0].ref)
     acknowledgements.record_pending(pending_ref)
 
-    owner, connection, report = (
-        subject._v2_unpublished_projection_from_prefix_for_test(
-            evidence=store,
-            acknowledgements=acknowledgements,
-            journal=journal,
-            registry=load_pinned_special_use_registry(_REGISTRY_PATH),
-            through=records[0].ref,
-        )
+    owner, connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
+        evidence=store,
+        acknowledgements=acknowledgements,
+        journal=journal,
+        registry=load_pinned_special_use_registry(_REGISTRY_PATH),
+        through=records[0].ref,
     )
     try:
         assert report.cursor is not None
         assert report.cursor.source_sequence == 1
         assert report.applied_count == 1
         assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM events WHERE event_id=?",
-            (pending_ref.event_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_id=?",
+                (pending_ref.event_id,),
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         owner.close()
 
@@ -1019,9 +1004,7 @@ def test_unpublished_replay_requires_exact_retention_completion(
 
         from tests.evidence.test_retention_unlink import _completed_case
 
-        foreign_case, foreign_completion = _completed_case(
-            tmp_path / "foreign-evidence"
-        )
+        foreign_case, foreign_completion = _completed_case(tmp_path / "foreign-evidence")
         try:
             with pytest.raises(EvidenceSealError):
                 store._capture_authenticated_retention_replay_scope(
@@ -1052,10 +1035,13 @@ def test_unpublished_replay_requires_exact_retention_completion(
             finally:
                 writer_finished.set()
 
-        with store._authenticated_retention_replay_scope_gate(
-            probe_scope,
-            target_ref,
-        ), store._replay_source_snapshot_gate():
+        with (
+            store._authenticated_retention_replay_scope_gate(
+                probe_scope,
+                target_ref,
+            ),
+            store._replay_source_snapshot_gate(),
+        ):
             writer = Thread(target=bounded_retention_writer)
             writer.start()
             assert writer_started.wait(5)
@@ -1094,9 +1080,7 @@ def test_unpublished_replay_requires_exact_retention_completion(
         assert owner._generation == 1
         assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
 
-        owner._register_replay_status_barrier_for_test(
-            subject._ReplayPhase.COMPUTING
-        )
+        owner._register_replay_status_barrier_for_test(subject._ReplayPhase.COMPUTING)
         replay_errors: list[BaseException] = []
 
         def fail_replay() -> None:
@@ -1114,15 +1098,12 @@ def test_unpublished_replay_requires_exact_retention_completion(
         replay_worker.start()
         with owner._replay_state_condition:
             assert owner._replay_state_condition.wait_for(
-                lambda: owner._replay_status.phase
-                is subject._ReplayPhase.COMPUTING,
+                lambda: owner._replay_status.phase is subject._ReplayPhase.COMPUTING,
                 timeout=5,
             )
             failed_scope = store._authenticated_retention_replay_scope
             assert failed_scope is not None
-        owner._release_replay_status_barrier_for_test(
-            subject._ReplayPhase.COMPUTING
-        )
+        owner._release_replay_status_barrier_for_test(subject._ReplayPhase.COMPUTING)
         replay_worker.join(5)
         assert replay_worker.is_alive() is False
         assert len(replay_errors) == 1
@@ -1135,15 +1116,11 @@ def test_unpublished_replay_requires_exact_retention_completion(
             ),
         ):
             pass
-        retry_after_failure = (
-            store._capture_authenticated_retention_replay_scope(
-                completion,
-                target_ref,
-            )
+        retry_after_failure = store._capture_authenticated_retention_replay_scope(
+            completion,
+            target_ref,
         )
-        store._release_authenticated_retention_replay_scope(
-            retry_after_failure
-        )
+        store._release_authenticated_retention_replay_scope(retry_after_failure)
 
         report = owner._replay_unpublished_prefix(
             target_ref,
@@ -1161,9 +1138,7 @@ def test_unpublished_replay_requires_exact_retention_completion(
                 "SELECT source_sequence FROM events ORDER BY source_sequence"
             )
         )
-        assert projected_sequences == tuple(
-            record.ref.source_sequence for record in surviving
-        )
+        assert projected_sequences == tuple(record.ref.source_sequence for record in surviving)
         assert all(
             not start <= sequence <= end
             for sequence in projected_sequences
@@ -1187,9 +1162,7 @@ def test_unpublished_replay_requires_exact_retention_completion(
         coverage.close()
         owner.close()
 
-    _recovered_coordinator, recovered_store = _reopen_evidence(
-        tmp_path / "evidence"
-    )
+    _recovered_coordinator, recovered_store = _reopen_evidence(tmp_path / "evidence")
     try:
         with pytest.raises(EvidenceSealError):
             recovered_store._capture_authenticated_retention_replay_scope(
@@ -1200,9 +1173,7 @@ def test_unpublished_replay_requires_exact_retention_completion(
         recovered_store.close(flush=False)
 
     fault_key, fault_acceptance, fault_store, fault_coverage = (
-        retention._live_store_with_active_routine(
-            tmp_path / "pre-final-commit"
-        )
+        retention._live_store_with_active_routine(tmp_path / "pre-final-commit")
     )
     fault_journal = CorrelationRequestJournal.create_new(fault_store)
     fault_acknowledgements = fault_store._ack_journal_owner
@@ -1225,9 +1196,7 @@ def test_unpublished_replay_requires_exact_retention_completion(
     )
     fault_request = fault_decision.request
     assert fault_request is not None
-    fault_retention_journal = (
-        retention.retention_module._open_retention_state_journal(fault_store)
-    )
+    fault_retention_journal = retention.retention_module._open_retention_state_journal(fault_store)
     fault_retention_journal.prepare_publication(fault_decision)
     fault_target_item = retention._item(
         envelope_value(
@@ -1263,9 +1232,7 @@ def test_unpublished_replay_requires_exact_retention_completion(
         _factory=segments_module._RETENTION_PROOF_FACTORY,
     )
     fault_surviving = tuple(
-        fault_store.iter_authenticated_records(
-            through=fault_target_ref.source_sequence
-        )
+        fault_store.iter_authenticated_records(through=fault_target_ref.source_sequence)
     )
     try:
         with pytest.raises(KeyboardInterrupt):
@@ -1282,36 +1249,23 @@ def test_unpublished_replay_requires_exact_retention_completion(
         assert fault_owner._generation == 1
         assert fault_owner._connection is fault_connection
         assert fault_owner.status().cursor is None
-        assert fault_connection.execute(
-            "SELECT count(*) FROM events"
-        ).fetchone()[0] == 0
-        assert fault_connection.execute(
-            "SELECT count(*) FROM incidents"
-        ).fetchone()[0] == 0
-        assert fault_connection.execute(
-            "SELECT count(*) FROM candidates"
-        ).fetchone()[0] == 0
+        assert fault_connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        assert fault_connection.execute("SELECT count(*) FROM incidents").fetchone()[0] == 0
+        assert fault_connection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 0
         assert fault_store._authenticated_retention_replay_scope is None
         assert fault_store._authenticated_retention_replay_consumed is None
-        fresh_after_precommit = (
-            fault_store._capture_authenticated_retention_replay_scope(
-                fault_completion,
-                fault_target_ref,
-            )
+        fresh_after_precommit = fault_store._capture_authenticated_retention_replay_scope(
+            fault_completion,
+            fault_target_ref,
         )
-        fault_store._release_authenticated_retention_replay_scope(
-            fresh_after_precommit
-        )
+        fault_store._release_authenticated_retention_replay_scope(fresh_after_precommit)
         fault_report = fault_owner._replay_unpublished_prefix(
             fault_target_ref,
             retention_completion=fault_completion,
             _factory=subject._UNPUBLISHED_REPLAY_FACTORY,
         )
         assert fault_report.cursor is not None
-        assert (
-            fault_report.cursor.source_sequence
-            == fault_target_ref.source_sequence
-        )
+        assert fault_report.cursor.source_sequence == fault_target_ref.source_sequence
         assert fault_report.applied_count == len(fault_surviving)
         assert fault_owner._generation == 2
         retried_status = fault_owner._replay_status_for_test()
@@ -1727,12 +1681,10 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
             assert rebuild_calls == []
             inspection = subject._v2_connection_for_test(published_path)
             try:
-                assert inspection.execute(
-                    "SELECT count(*) FROM candidate_evidence"
-                ).fetchone()[0] == 0
-                assert inspection.execute(
-                    "SELECT count(*) FROM candidates"
-                ).fetchone()[0] == 0
+                assert (
+                    inspection.execute("SELECT count(*) FROM candidate_evidence").fetchone()[0] == 0
+                )
+                assert inspection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 0
             finally:
                 inspection.close()
         elif commit_kind == "unrelated_memory":
@@ -2027,9 +1979,7 @@ def test_historical_pin_mismatch_returns_no_artifact(
         ttl_seconds=120,
         snapshot_change=mismatch_snapshot,
     )
-    registry_mismatch = proof.snapshot.model_copy(
-        update={"special_use_registry_sha256": "0" * 64}
-    )
+    registry_mismatch = proof.snapshot.model_copy(update={"special_use_registry_sha256": "0" * 64})
     with pytest.raises(ValueError):
         PCCCorrelationSnapshotV1.model_validate_json(
             canonical_json(registry_mismatch),
@@ -2151,9 +2101,7 @@ def _with_conservative_sequence_gap(
         )
         assert not decoded_ack.torn_tail
         previous_hash = (
-            bytes(32)
-            if not decoded_ack.records
-            else decoded_ack.records[-1].record_hash
+            bytes(32) if not decoded_ack.records else decoded_ack.records[-1].record_hash
         )
         appended: list[bytes] = []
         for kind in ("pending_ack", "confirmed_ack"):
@@ -2359,9 +2307,7 @@ def test_compute_projection_parity_scenarios(
     if proof is None:
         frozen_inputs: tuple[object, ...] = ()
     elif case.startswith("compact-"):
-        frozen_inputs = (
-            _frozen_compute_pcc_input(proof, records),
-        )
+        frozen_inputs = (_frozen_compute_pcc_input(proof, records),)
     else:
         frozen_inputs = (
             _frozen_compute_pcc_input(
@@ -2402,9 +2348,7 @@ def test_compute_projection_parity_scenarios(
                     "SELECT result_kind FROM incidents ORDER BY incident_id"
                 )
             )
-            candidate_count = connection.execute(
-                "SELECT count(*) FROM candidates"
-            ).fetchone()[0]
+            candidate_count = connection.execute("SELECT count(*) FROM candidates").fetchone()[0]
             invalidation_count = connection.execute(
                 "SELECT count(*) FROM candidate_invalidations"
             ).fetchone()[0]
@@ -2424,16 +2368,12 @@ def test_compute_projection_parity_scenarios(
                 assert incident_kinds == ("candidate",)
                 assert candidate_count == 1
                 expected_invalidations = (
-                    1
-                    if case
-                    in {"late-critical", "sequence-range", "transport-duplicate"}
-                    else 0
+                    1 if case in {"late-critical", "sequence-range", "transport-duplicate"} else 0
                 )
                 assert invalidation_count == expected_invalidations
                 if case == "transport-duplicate":
                     duplicate_rows = connection.execute(
-                        "SELECT count(*) FROM events "
-                        "WHERE duplicate_of_event_id IS NOT NULL"
+                        "SELECT count(*) FROM events WHERE duplicate_of_event_id IS NOT NULL"
                     ).fetchone()[0]
                     assert duplicate_rows == 1
         finally:
@@ -2458,19 +2398,16 @@ def _forge_later_logical_primary(
         (second_event_id,),
     )
     connection.execute(
-        "UPDATE projection_dedup SET primary_event_id=?,is_primary=0 "
-        "WHERE event_id=?",
+        "UPDATE projection_dedup SET primary_event_id=?,is_primary=0 WHERE event_id=?",
         (second_event_id, first_event_id),
     )
     connection.execute(
-        "UPDATE projection_dedup SET primary_event_id=?,is_primary=1 "
-        "WHERE event_id=?",
+        "UPDATE projection_dedup SET primary_event_id=?,is_primary=1 WHERE event_id=?",
         (second_event_id, second_event_id),
     )
     for table in ("process_observations", "network_observations"):
         connection.execute(
-            f"UPDATE {table} SET event_id=?,source_sequence=?,content_sha256=? "
-            "WHERE event_id=?",
+            f"UPDATE {table} SET event_id=?,source_sequence=?,content_sha256=? WHERE event_id=?",
             (
                 second_event_id,
                 f"{second.ref.source_sequence:020d}",
@@ -2512,12 +2449,8 @@ def test_direct_investigation_incident_waits_only_for_no_pcc(
     owner, connection = _owner(subject, coordinator, journal)
     try:
         _apply_all(owner, coordinator)
-        rows = connection.execute(
-            "SELECT result_kind,authority_event_id FROM incidents"
-        ).fetchall()
-        assert [tuple(row) for row in rows] == [
-            ("investigation", authenticated.event_id)
-        ]
+        rows = connection.execute("SELECT result_kind,authority_event_id FROM incidents").fetchall()
+        assert [tuple(row) for row in rows] == [("investigation", authenticated.event_id)]
         assert connection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 0
     finally:
         owner.close()
@@ -2585,8 +2518,7 @@ def test_completed_safe_pcc_persists_candidate_and_primary_evidence(
         assert incident is not None
         assert tuple(incident) == ("candidate", proof.event_id)
         candidate = connection.execute(
-            "SELECT candidate_id,primary_event_id,correlation_snapshot_event_id "
-            "FROM candidates"
+            "SELECT candidate_id,primary_event_id,correlation_snapshot_event_id FROM candidates"
         ).fetchone()
         assert candidate is not None
         candidate_id = str(candidate["candidate_id"])
@@ -2646,9 +2578,7 @@ def test_late_critical_coverage_inclusively_invalidates_completed_candidate(
     try:
         _apply_all(owner, coordinator)
 
-        candidate_id = connection.execute(
-            "SELECT candidate_id FROM candidates"
-        ).fetchone()[0]
+        candidate_id = connection.execute("SELECT candidate_id FROM candidates").fetchone()[0]
         rows = connection.execute(
             "SELECT candidate_id,coverage_event_id,coverage_source_sequence,"
             "coverage_content_sha256,reason_code FROM candidate_invalidations"
@@ -2727,10 +2657,13 @@ def test_fresh_unpublished_replay_reproduces_late_invalidation_rows_and_hash(
     )
     try:
         assert report.cursor.source_sequence == coverage_ref.source_sequence
-        assert subject._v2_ordered_table_rows(
-            replay_connection,
-            "candidate_invalidations",
-        ) == expected_rows
+        assert (
+            subject._v2_ordered_table_rows(
+                replay_connection,
+                "candidate_invalidations",
+            )
+            == expected_rows
+        )
         assert replay_owner.snapshot_hash() == expected_hash
     finally:
         replay_owner.close()
@@ -2748,9 +2681,7 @@ def test_unpublished_replay_uses_exact_compact_primary_history(
         "_load_pinned_detector_bundle",
         lambda: _DETECTOR_HASH,
     )
-    coordinator, stale_proofs = _accepted_unpublished_compact_history(
-        tmp_path / "evidence"
-    )
+    coordinator, stale_proofs = _accepted_unpublished_compact_history(tmp_path / "evidence")
     store, journal, acknowledgements, records = _unpublished_resources(
         coordinator,
         stale_proofs,
@@ -2840,9 +2771,7 @@ def test_frozen_replay_compact_selector_tracks_boot_transition_occurrences(
     tmp_path: Path,
 ) -> None:
     historical = importlib.import_module("agmind_immune.coverage.historical")
-    coordinator, proofs = _accepted_unpublished_compact_history(
-        tmp_path / "evidence"
-    )
+    coordinator, proofs = _accepted_unpublished_compact_history(tmp_path / "evidence")
     store, journal, acknowledgements, records = _unpublished_resources(
         coordinator,
         proofs,
@@ -2852,18 +2781,14 @@ def test_frozen_replay_compact_selector_tracks_boot_transition_occurrences(
         return_index = 10
         prepared[return_index] = replace(
             prepared[return_index],
-            envelope=prepared[return_index].envelope.model_copy(
-                update={"boot_id": BOOT_A}
-            ),
+            envelope=prepared[return_index].envelope.model_copy(update={"boot_id": BOOT_A}),
         )
         entries = historical._build_frozen_replay_entries(
             records,
             tuple(prepared),
         )
         compact_sequences = tuple(
-            entry.record.ref.source_sequence
-            for entry in entries
-            if entry.compact_member
+            entry.record.ref.source_sequence for entry in entries if entry.compact_member
         )
         assert compact_sequences == (1, 2, 4, 7, 8, 11, 12, 13, 14)
     finally:
@@ -3042,17 +2967,21 @@ def test_different_host_candidate_is_not_invalidated_by_committed_coverage(
         result = owner.apply(coverage_ref)
 
         assert result.cursor.source_sequence == coverage_ref.source_sequence
-        assert connection.execute(
-            "SELECT count(*) FROM events WHERE event_id=?",
-            (coverage_ref.event_id,),
-        ).fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM coverage_intervals WHERE event_id=?",
-            (coverage_ref.event_id,),
-        ).fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM candidate_invalidations"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_id=?",
+                (coverage_ref.event_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM coverage_intervals WHERE event_id=?",
+                (coverage_ref.event_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert connection.execute("SELECT count(*) FROM candidate_invalidations").fetchone()[0] == 0
     finally:
         owner.close()
 
@@ -3168,10 +3097,13 @@ def test_late_invalidation_survives_close_event_and_exact_retry(
         retry = owner.apply(closed)
 
         assert retry.reducer_applied is False
-        assert subject._v2_ordered_table_rows(
-            connection,
-            "candidate_invalidations",
-        ) == before
+        assert (
+            subject._v2_ordered_table_rows(
+                connection,
+                "candidate_invalidations",
+            )
+            == before
+        )
         assert {row[1] for row in before} == {opened.event_id, closed.event_id}
     finally:
         owner.close()
@@ -3278,28 +3210,28 @@ def test_invalidation_write_crash_rolls_back_coverage_event_and_cursor(
         with pytest.raises(_Crash):
             owner.apply(coverage)
 
-        assert connection.execute(
-            "SELECT count(*) FROM events WHERE event_id=?",
-            (coverage.event_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM coverage_intervals WHERE event_id=?",
-            (coverage.event_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM candidate_invalidations"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_id=?",
+                (coverage.event_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM coverage_intervals WHERE event_id=?",
+                (coverage.event_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT count(*) FROM candidate_invalidations").fetchone()[0] == 0
         assert owner.status().cursor.source_sequence == proofs[-1].source_sequence
 
         armed = False
         owner.apply(coverage)
-        assert connection.execute(
-            "SELECT count(*) FROM candidate_invalidations"
-        ).fetchone()[0] == 3
+        assert connection.execute("SELECT count(*) FROM candidate_invalidations").fetchone()[0] == 3
     finally:
         owner.close()
-
-
 
 
 def test_complete_pcc_without_completed_journal_rolls_back_event_and_cursor(
@@ -3329,13 +3261,17 @@ def test_complete_pcc_without_completed_journal_rolls_back_event_and_cursor(
             owner.apply(cast(EvidenceRef, proof.evidence_ref))
 
         assert owner.snapshot_hash() == before
-        assert connection.execute(
-            "SELECT source_sequence FROM ingest_cursors"
-        ).fetchone()[0] == "00000000000000000002"
-        assert connection.execute(
-            "SELECT count(*) FROM events WHERE event_id=?",
-            (proof.event_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT source_sequence FROM ingest_cursors").fetchone()[0]
+            == "00000000000000000002"
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_id=?",
+                (proof.event_id,),
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         owner.close()
 
@@ -3372,9 +3308,7 @@ def test_safe_pin_mismatch_persists_rejection_and_advances_cursor(
     owner, connection = _owner(subject, coordinator, journal)
     try:
         _apply_all(owner, coordinator)
-        row = connection.execute(
-            "SELECT result_kind,reason_codes FROM incidents"
-        ).fetchone()
+        row = connection.execute("SELECT result_kind,reason_codes FROM incidents").fetchone()
         assert row is not None
         assert tuple(row) == (
             "rejected",
@@ -3418,9 +3352,7 @@ def test_safely_loaded_special_use_hash_mismatch_persists_rejection(
     )
     try:
         _apply_all(owner, coordinator)
-        row = connection.execute(
-            "SELECT result_kind,reason_codes FROM incidents"
-        ).fetchone()
+        row = connection.execute("SELECT result_kind,reason_codes FROM incidents").fetchone()
         assert row is not None
         assert tuple(row) == (
             "rejected",
@@ -3967,9 +3899,7 @@ def test_duplicate_primary_equal_to_current_trigger_order_is_conflict(
             strict=True,
         )
         values = subject._encode_candidate(altered)
-        assignments = ",".join(
-            f"{column}=?" for column in subject._CANDIDATE_COLUMNS
-        )
+        assignments = ",".join(f"{column}=?" for column in subject._CANDIDATE_COLUMNS)
         connection.execute(
             f"UPDATE candidates SET {assignments} WHERE candidate_id=?",
             (*values, candidate.candidate_id),
@@ -4090,10 +4020,13 @@ def test_acceptance_cursor_change_inside_transaction_rolls_back(
             owner.apply(records[2].ref)
 
         assert subject._v2_snapshot_hash(connection) == before
-        assert connection.execute(
-            "SELECT count(*) FROM events WHERE event_id=?",
-            (proof.event_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_id=?",
+                (proof.event_id,),
+            ).fetchone()[0]
+            == 0
+        )
         assert owner.status().cursor is not None
         assert owner.status().cursor.source_sequence == 2
     finally:
@@ -4265,17 +4198,13 @@ def test_candidate_write_crash_points_roll_back_and_retry_exactly(
         assert owner.status().cursor.source_sequence == 2
         assert connection.execute("SELECT count(*) FROM incidents").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM candidate_evidence"
-        ).fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM candidate_evidence").fetchone()[0] == 0
 
         owner._step_hook = lambda _step: None
         owner.apply(records[2].ref)
         assert connection.execute("SELECT count(*) FROM incidents").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM candidate_evidence"
-        ).fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM candidate_evidence").fetchone()[0] == 2
     finally:
         owner.close()
 
@@ -4306,9 +4235,7 @@ def test_postcommit_failure_latches_unhealthy_with_complete_atomic_rows(
         owner.apply(records[1].ref)
         if failure == "commit-hook":
             owner._step_hook = lambda step: (
-                (_ for _ in ()).throw(_Crash("postcommit"))
-                if step == "commit"
-                else None
+                (_ for _ in ()).throw(_Crash("postcommit")) if step == "commit" else None
             )
         else:
             monkeypatch.setattr(
@@ -4325,9 +4252,7 @@ def test_postcommit_failure_latches_unhealthy_with_complete_atomic_rows(
         assert owner.status().cursor.source_sequence == proof.source_sequence
         assert connection.execute("SELECT count(*) FROM incidents").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM candidates").fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM candidate_evidence"
-        ).fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM candidate_evidence").fetchone()[0] == 2
     finally:
         owner.close()
 
@@ -4507,10 +4432,13 @@ def test_ack_boundary_drift_inside_transaction_rolls_back(
             owner.apply(records[2].ref)
 
         assert subject._v2_snapshot_hash(connection) == before
-        assert connection.execute(
-            "SELECT count(*) FROM events WHERE event_id=?",
-            (proof.event_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_id=?",
+                (proof.event_id,),
+            ).fetchone()[0]
+            == 0
+        )
         assert owner.status().cursor is not None
         assert owner.status().cursor.source_sequence == 2
     finally:
@@ -4685,11 +4613,13 @@ def test_exact_retry_rejects_missing_candidate_evidence_closure(
             owner.apply(records[-1].ref)
 
         assert owner.status().healthy is False
-        assert connection.execute(
-            "SELECT count(*) FROM candidate_evidence "
-            "WHERE authority_snapshot_event_id=?",
-            (proof.event_id,),
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM candidate_evidence WHERE authority_snapshot_event_id=?",
+                (proof.event_id,),
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         owner.close()
 
@@ -4729,9 +4659,7 @@ def test_exact_retry_rejects_same_id_candidate_with_altered_facts(
             strict=True,
         )
         values = subject._encode_candidate(altered)
-        assignments = ",".join(
-            f"{column}=?" for column in subject._CANDIDATE_COLUMNS
-        )
+        assignments = ",".join(f"{column}=?" for column in subject._CANDIDATE_COLUMNS)
         connection.execute(
             f"UPDATE candidates SET {assignments} WHERE candidate_id=?",
             (*values, candidate.candidate_id),
@@ -4992,10 +4920,13 @@ def test_file_backed_reopen_preserves_authenticated_late_invalidation(
         registry=load_pinned_special_use_registry(_REGISTRY_PATH),
     )
     try:
-        assert subject._v2_ordered_table_rows(
-            recovered_connection,
-            "candidate_invalidations",
-        ) == before
+        assert (
+            subject._v2_ordered_table_rows(
+                recovered_connection,
+                "candidate_invalidations",
+            )
+            == before
+        )
         assert recovered_owner.snapshot_hash() == before_hash
     finally:
         recovered_owner.close()
@@ -5185,6 +5116,7 @@ def test_pcc_authority_unavailable_rolls_back_without_cursor_advance(
         before = owner.snapshot_hash()
 
         if unavailable == "detector":
+
             def detector_unavailable() -> str:
                 raise OSError("detector bundle unavailable")
 
@@ -5194,10 +5126,9 @@ def test_pcc_authority_unavailable_rolls_back_without_cursor_advance(
                 detector_unavailable,
             )
         else:
+
             def history_unavailable(*_args: object) -> object:
-                raise subject.HistoricalCoverageUnavailable(
-                    "historical coverage unavailable"
-                )
+                raise subject.HistoricalCoverageUnavailable("historical coverage unavailable")
 
             monkeypatch.setattr(
                 subject,
@@ -5253,10 +5184,13 @@ def test_authenticated_source_order_cannot_be_rewritten_to_later_primary(
     )
     for record in records:
         owner.apply(record.ref)
-    assert connection.execute(
-        "SELECT duplicate_of_event_id FROM events WHERE event_id=?",
-        (records[2].ref.event_id,),
-    ).fetchone()[0] == records[1].ref.event_id
+    assert (
+        connection.execute(
+            "SELECT duplicate_of_event_id FROM events WHERE event_id=?",
+            (records[2].ref.event_id,),
+        ).fetchone()[0]
+        == records[1].ref.event_id
+    )
     _forge_later_logical_primary(connection, records[1], records[2])
 
     if entrypoint == "retry":
@@ -5320,9 +5254,7 @@ def test_duplicate_retry_reauthenticates_rehashed_primary_candidate(
             strict=True,
         )
         values = subject._encode_candidate(altered)
-        assignments = ",".join(
-            f"{column}=?" for column in subject._CANDIDATE_COLUMNS
-        )
+        assignments = ",".join(f"{column}=?" for column in subject._CANDIDATE_COLUMNS)
         connection.execute(
             f"UPDATE candidates SET {assignments} WHERE candidate_id=?",
             (*values, candidate.candidate_id),
@@ -5714,8 +5646,7 @@ def test_factory_retries_cleanup_and_annotates_the_primary_error(
         assert close_calls == 2
         assert closed_authorities[0] is closed_authorities[1]
         assert any(
-            "factory cleanup failure" in note
-            for note in getattr(raised.value, "__notes__", ())
+            "factory cleanup failure" in note for note in getattr(raised.value, "__notes__", ())
         )
         assert store._closed is True
         assert journal._closed is True

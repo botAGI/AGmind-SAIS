@@ -118,9 +118,7 @@ def test_finalized_retention_run_restarts_with_fresh_verifier(
             VerifierCommitError,
             match="cannot begin",
         ):
-            fresh_verifier._begin_retention_recovery(
-                restarted_store._lifecycle_identity
-            )
+            fresh_verifier._begin_retention_recovery(restarted_store._lifecycle_identity)
         with pytest.raises(
             VerifierCommitError,
             match="recovering verifier authority",
@@ -139,15 +137,11 @@ def test_finalized_retention_run_restarts_with_fresh_verifier(
 def test_missing_payload_without_signed_tombstone_rejects(
     tmp_path: Path,
 ) -> None:
-    _key, _acceptance, store, coverage = _live_store_with_active_routine(
-        tmp_path
-    )
+    _key, _acceptance, store, coverage = _live_store_with_active_routine(tmp_path)
     try:
         store.flush_security_boundary()
         routine_manifest = next(
-            manifest
-            for manifest in store._manifests
-            if manifest.evidence_priority == "routine"
+            manifest for manifest in store._manifests if manifest.evidence_priority == "routine"
         )
         payload_path = tmp_path / routine_manifest.segment_relative_path
     finally:
@@ -228,16 +222,10 @@ def test_restart_completed_state_rebuilds_cache_and_clears_state(
     completed = case.journal.state
     assert completed is not None
     assert completed.phase == "completed"
-    selected_paths = tuple(
-        tmp_path / entry.segment_relative_path for entry in completed.entries
-    )
+    selected_paths = tuple(tmp_path / entry.segment_relative_path for entry in completed.entries)
     expected_head = case.store.status().evidence_head
     expected_target = case.target_ref
-    temporary_cache = (
-        tmp_path
-        / ".retention-boundary.json."
-        "33333333-3333-4333-8333-333333333333.tmp"
-    )
+    temporary_cache = tmp_path / ".retention-boundary.json.33333333-3333-4333-8333-333333333333.tmp"
     temporary_cache.write_bytes(b'{"partial":')
     temporary_cache.chmod(0o600)
     assert selected_paths
@@ -258,16 +246,12 @@ def test_restart_completed_state_rebuilds_cache_and_clears_state(
         )
 
         assert restarted.verifier is fresh_verifier
-        assert restarted.verifier.fsm.last_sequence == (
-            expected_target.source_sequence
-        )
+        assert restarted.verifier.fsm.last_sequence == (expected_target.source_sequence)
         assert restarted_store.status().healthy is True
         assert not state_path.exists()
         assert not temporary_cache.exists()
         assert cache_path.exists()
-        boundary = retention_module.decode_retention_boundary(
-            cache_path.read_bytes()
-        )
+        boundary = retention_module.decode_retention_boundary(cache_path.read_bytes())
         assert boundary.source_evidence_head == expected_head
         assert [
             (
@@ -300,12 +284,8 @@ def test_retention_unlink_defers_when_ack_equals_selected_end(
     state = case.journal.state
     assert state is not None
     assert state.phase == "evidence_appended"
-    selected_paths = tuple(
-        tmp_path / entry.segment_relative_path for entry in state.entries
-    )
-    refs = tuple(
-        record.ref for record in case.store.iter_authenticated_records()
-    )
+    selected_paths = tuple(tmp_path / entry.segment_relative_path for entry in state.entries)
+    refs = tuple(record.ref for record in case.store.iter_authenticated_records())
     assert [ref.source_sequence for ref in refs] == [1, 2, 3]
     assert selected_paths
     assert all(path.exists() for path in selected_paths)
@@ -342,12 +322,8 @@ def test_retention_unlink_permits_ack_strictly_after_selected_end(
     acknowledgements = AckJournal.create_new(case.store)
     state = case.journal.state
     assert state is not None
-    selected_paths = tuple(
-        tmp_path / entry.segment_relative_path for entry in state.entries
-    )
-    refs = tuple(
-        record.ref for record in case.store.iter_authenticated_records()
-    )
+    selected_paths = tuple(tmp_path / entry.segment_relative_path for entry in state.entries)
+    refs = tuple(record.ref for record in case.store.iter_authenticated_records())
     assert [ref.source_sequence for ref in refs] == [1, 2, 3]
     try:
         for ref in refs:
@@ -374,9 +350,7 @@ def test_retention_unlink_permits_ack_strictly_after_selected_end(
 def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
     tmp_path: Path,
 ) -> None:
-    projection = importlib.import_module(
-        "agmind_immune.evidence.projection"
-    )
+    projection = importlib.import_module("agmind_immune.evidence.projection")
     evidence_path = tmp_path / "evidence"
     projection_path = tmp_path / "projection.sqlite3"
     acknowledgements: AckJournal | None = None
@@ -388,9 +362,7 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
         nonlocal acknowledgements, correlation_requests, registry, cache
         acknowledgements = AckJournal.create_new(store)
         correlation_requests, registry = _projection_authorities(store)
-        refs = tuple(
-            record.ref for record in store.iter_authenticated_records()
-        )
+        refs = tuple(record.ref for record in store.iter_authenticated_records())
         for ref in refs:
             acknowledgements.record_pending(ref)
             acknowledgements.record_confirmed(ref)
@@ -421,10 +393,7 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
     assert cache is not None
     reopened = None
     try:
-        refs = tuple(
-            record.ref
-            for record in case.store.iter_authenticated_records()
-        )
+        refs = tuple(record.ref for record in case.store.iter_authenticated_records())
         assert [ref.source_sequence for ref in refs] == [1, 2, 3]
         for ref in refs[2:]:
             acknowledgements.record_pending(ref)
@@ -433,25 +402,21 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
 
         with closing(sqlite3.connect(projection_path)) as connection:
             assert connection.execute(
-                "SELECT source_sequence FROM events "
-                "ORDER BY source_sequence"
+                "SELECT source_sequence FROM events ORDER BY source_sequence"
             ).fetchall() == [
                 (projection._uint64(1),),
                 (projection._uint64(2),),
             ]
-            assert connection.execute(
-                "SELECT count(*) FROM network_observations"
-            ).fetchone() == (1,)
-
-        completion = (
-            case.store._execute_authenticated_retention_unlink(
-                capability,
-                _factory=segments_module._RETENTION_PROOF_FACTORY,
+            assert connection.execute("SELECT count(*) FROM network_observations").fetchone() == (
+                1,
             )
+
+        completion = case.store._execute_authenticated_retention_unlink(
+            capability,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
         )
         assert [
-            record.ref.source_sequence
-            for record in case.store.iter_authenticated_records()
+            record.ref.source_sequence for record in case.store.iter_authenticated_records()
         ] == [1, 3]
 
         cache._rebuild_after_authenticated_retention(
@@ -464,18 +429,15 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
         assert cache.status().cursor.source_sequence == 3
         with closing(sqlite3.connect(projection_path)) as connection:
             assert connection.execute(
-                "SELECT source_sequence FROM events "
-                "ORDER BY source_sequence"
+                "SELECT source_sequence FROM events ORDER BY source_sequence"
             ).fetchall() == [
                 (projection._uint64(1),),
                 (projection._uint64(3),),
             ]
-            assert connection.execute(
-                "SELECT count(*) FROM projection_dedup"
-            ).fetchone() == (2,)
-            assert connection.execute(
-                "SELECT count(*) FROM network_observations"
-            ).fetchone() == (0,)
+            assert connection.execute("SELECT count(*) FROM projection_dedup").fetchone() == (2,)
+            assert connection.execute("SELECT count(*) FROM network_observations").fetchone() == (
+                0,
+            )
 
         case.store._finalize_authenticated_retention_completion(
             completion,
@@ -509,9 +471,7 @@ def test_authenticated_retention_rebuild_projects_survivors_and_reopens(
 def test_projection_open_rejects_stale_v2_retention_crash_window_without_repair(
     tmp_path: Path,
 ) -> None:
-    projection = importlib.import_module(
-        "agmind_immune.evidence.projection"
-    )
+    projection = importlib.import_module("agmind_immune.evidence.projection")
     evidence_path = tmp_path / "evidence"
     projection_path = tmp_path / "projection.sqlite3"
     acknowledgements: AckJournal | None = None
@@ -523,9 +483,7 @@ def test_projection_open_rejects_stale_v2_retention_crash_window_without_repair(
         nonlocal acknowledgements, correlation_requests, registry, cache
         acknowledgements = AckJournal.create_new(store)
         correlation_requests, registry = _projection_authorities(store)
-        refs = tuple(
-            record.ref for record in store.iter_authenticated_records()
-        )
+        refs = tuple(record.ref for record in store.iter_authenticated_records())
         for ref in refs:
             acknowledgements.record_pending(ref)
             acknowledgements.record_confirmed(ref)
@@ -555,10 +513,7 @@ def test_projection_open_rejects_stale_v2_retention_crash_window_without_repair(
     assert type(registry) is SpecialUseRegistry
     assert cache is not None
     try:
-        refs = tuple(
-            record.ref
-            for record in case.store.iter_authenticated_records()
-        )
+        refs = tuple(record.ref for record in case.store.iter_authenticated_records())
         for ref in refs[2:]:
             acknowledgements.record_pending(ref)
             acknowledgements.record_confirmed(ref)
@@ -584,9 +539,7 @@ def test_projection_open_rejects_stale_v2_retention_crash_window_without_repair(
             _fresh_verifier(),
             restarted_store,
         )
-        restarted_acknowledgements = AckJournal.open_and_recover(
-            restarted_store
-        )
+        restarted_acknowledgements = AckJournal.open_and_recover(restarted_store)
         restarted_correlation, restarted_registry = _projection_authorities(
             restarted_store,
             recover=True,
@@ -650,9 +603,7 @@ def test_authenticated_rebuild_repairs_retired_projection_cursor_before_reopen(
         _retention_case_with_surviving_falco,
     )
 
-    projection = importlib.import_module(
-        "agmind_immune.evidence.projection"
-    )
+    projection = importlib.import_module("agmind_immune.evidence.projection")
     case_path = tmp_path / "retired-cursor"
     evidence_path = case_path / "evidence"
     projection_path = case_path / "projection.sqlite3"
@@ -665,11 +616,9 @@ def test_authenticated_rebuild_repairs_retired_projection_cursor_before_reopen(
         _registry,
         refs,
         cache,
-    ) = (
-        _retention_case_with_surviving_falco(
-            evidence_path,
-            raw_hash=raw_hash,
-        )
+    ) = _retention_case_with_surviving_falco(
+        evidence_path,
+        raw_hash=raw_hash,
     )
     try:
         assert [ref.source_sequence for ref in refs] == [1, 2, 3, 4]
@@ -711,9 +660,7 @@ def test_authenticated_rebuild_repairs_retired_projection_cursor_before_reopen(
             _fresh_verifier(),
             restarted_store,
         )
-        restarted_acknowledgements = AckJournal.open_and_recover(
-            restarted_store
-        )
+        restarted_acknowledgements = AckJournal.open_and_recover(restarted_store)
         restarted_correlation, restarted_registry = _projection_authorities(
             restarted_store,
             recover=True,
@@ -732,8 +679,7 @@ def test_authenticated_rebuild_repairs_retired_projection_cursor_before_reopen(
         assert status.cursor.source_sequence == 4
         with closing(sqlite3.connect(projection_path)) as connection:
             assert connection.execute(
-                "SELECT source_sequence FROM events "
-                "ORDER BY source_sequence"
+                "SELECT source_sequence FROM events ORDER BY source_sequence"
             ).fetchall() == [
                 (projection._uint64(1),),
                 (projection._uint64(3),),
@@ -757,18 +703,14 @@ def test_restart_evidence_appended_with_ack_lag_is_ready_and_pending(
         acknowledge=False,
     )
     acknowledgements = AckJournal.create_new(case.store)
-    refs = tuple(
-        record.ref for record in case.store.iter_authenticated_records()
-    )
+    refs = tuple(record.ref for record in case.store.iter_authenticated_records())
     for ref in refs[:2]:
         acknowledgements.record_pending(ref)
         acknowledgements.record_confirmed(ref)
     state = case.journal.state
     assert state is not None
     assert state.phase == "evidence_appended"
-    selected_paths = tuple(
-        tmp_path / entry.segment_relative_path for entry in state.entries
-    )
+    selected_paths = tuple(tmp_path / entry.segment_relative_path for entry in state.entries)
     ack_snapshot = acknowledgements.snapshot()
     assert ack_snapshot.confirmed_through == 2
     assert ack_snapshot.pending is None
@@ -790,18 +732,14 @@ def test_restart_evidence_appended_with_ack_lag_is_ready_and_pending(
         )
 
         assert restarted.verifier is fresh_verifier
-        assert restarted.verifier.fsm.last_sequence == (
-            expected_target.source_sequence
-        )
+        assert restarted.verifier.fsm.last_sequence == (expected_target.source_sequence)
         status = restarted_store.status()
         assert status.healthy is True
         assert status.retention_pending is True
         assert all(path.exists() for path in selected_paths)
         state_path = tmp_path / "retention-state.json"
         assert state_path.exists()
-        durable = retention_module.decode_retention_state(
-            state_path.read_bytes()
-        )
+        durable = retention_module.decode_retention_state(state_path.read_bytes())
         assert durable.phase == "evidence_appended"
         assert fresh_verifier.accepted_ref(2) is not None
     finally:
@@ -825,9 +763,7 @@ def test_restart_in_progress_with_payload_present_finishes_unlink(
     ) -> None:
         original_prove(owner, expected)
         if expected == in_progress_raw:
-            raise EvidenceSealError(
-                "injected crash after durable retention unlink intent"
-            )
+            raise EvidenceSealError("injected crash after durable retention unlink intent")
 
     with monkeypatch.context() as crash_cut:
         crash_cut.setattr(
@@ -842,14 +778,9 @@ def test_restart_in_progress_with_payload_present_finishes_unlink(
             )
 
     state_path = tmp_path / "retention-state.json"
-    in_progress = retention_module.decode_retention_state(
-        state_path.read_bytes()
-    )
+    in_progress = retention_module.decode_retention_state(state_path.read_bytes())
     assert in_progress.phase == "retention_unlink_in_progress"
-    selected_paths = tuple(
-        tmp_path / entry.segment_relative_path
-        for entry in in_progress.entries
-    )
+    selected_paths = tuple(tmp_path / entry.segment_relative_path for entry in in_progress.entries)
     expected_target = case.target_ref
     assert selected_paths
     assert all(path.exists() for path in selected_paths)
@@ -869,9 +800,7 @@ def test_restart_in_progress_with_payload_present_finishes_unlink(
         )
 
         assert restarted.verifier is fresh_verifier
-        assert restarted.verifier.fsm.last_sequence == (
-            expected_target.source_sequence
-        )
+        assert restarted.verifier.fsm.last_sequence == (expected_target.source_sequence)
         assert restarted_store.status().healthy is True
         assert all(not path.exists() for path in selected_paths)
         assert not (tmp_path / "retention-state.json").exists()
@@ -894,16 +823,13 @@ def test_restart_in_progress_rejects_ack_rollback_to_selected_end(
         acknowledge=False,
     )
     acknowledgements = AckJournal.create_new(case.store)
-    refs = tuple(
-        record.ref for record in case.store.iter_authenticated_records()
-    )
+    refs = tuple(record.ref for record in case.store.iter_authenticated_records())
     assert [ref.source_sequence for ref in refs] == [1, 2, 3]
     for ref in refs[:2]:
         acknowledgements.record_pending(ref)
         acknowledgements.record_confirmed(ref)
     ack_rollback = {
-        name: (tmp_path / name).read_bytes()
-        for name in ("ack-commitment.json", "ack-journal.agf")
+        name: (tmp_path / name).read_bytes() for name in ("ack-commitment.json", "ack-journal.agf")
     }
     acknowledgements.record_pending(refs[2])
     acknowledgements.record_confirmed(refs[2])
@@ -920,9 +846,7 @@ def test_restart_in_progress_rejects_ack_rollback_to_selected_end(
     ) -> None:
         original_prove(owner, expected)
         if expected == in_progress_raw:
-            raise EvidenceSealError(
-                "injected crash after durable retention unlink intent"
-            )
+            raise EvidenceSealError("injected crash after durable retention unlink intent")
 
     with monkeypatch.context() as crash_cut:
         crash_cut.setattr(
@@ -940,10 +864,7 @@ def test_restart_in_progress_rejects_ack_rollback_to_selected_end(
         (tmp_path / "retention-state.json").read_bytes()
     )
     assert in_progress.phase == "retention_unlink_in_progress"
-    selected_paths = tuple(
-        tmp_path / entry.segment_relative_path
-        for entry in in_progress.entries
-    )
+    selected_paths = tuple(tmp_path / entry.segment_relative_path for entry in in_progress.entries)
     assert selected_paths
     assert all(path.exists() for path in selected_paths)
     acknowledgements.close()
@@ -1136,9 +1057,7 @@ def test_restart_target_bound_to_conflicting_authenticated_event_rejects(
         state_value,
         strict=True,
     )
-    conflicting_raw = retention_module.encode_retention_state(
-        conflicting_state
-    )
+    conflicting_raw = retention_module.encode_retention_state(conflicting_state)
     try:
         case.coverage.close()
     finally:
@@ -1176,14 +1095,10 @@ def test_restart_unlink_rejects_canonical_date_directory_swap(
     binding = case.store._authenticated_retention_tombstone
     assert binding is not None
     case.journal._transition(
-        retention_module.decode_retention_state(
-            binding.unlink_in_progress_state_raw
-        )
+        retention_module.decode_retention_state(binding.unlink_in_progress_state_raw)
     )
     selected_entry = state.entries[0]
-    _, date_name, selected_name = (
-        selected_entry.segment_relative_path.split("/")
-    )
+    _, date_name, selected_name = selected_entry.segment_relative_path.split("/")
     state_path = tmp_path / "retention-state.json"
     try:
         case.coverage.close()
@@ -1231,9 +1146,7 @@ def test_restart_unlink_rejects_canonical_date_directory_swap(
     try:
         assert swapped is True
         assert state_path.exists()
-        durable = retention_module.decode_retention_state(
-            state_path.read_bytes()
-        )
+        durable = retention_module.decode_retention_state(state_path.read_bytes())
         assert durable.phase == "retention_commit_uncertain"
         assert restarted_store.status().healthy is False
     finally:

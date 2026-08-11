@@ -123,17 +123,13 @@ class _V2RebuildOldReopener:
 
     def __call__(self) -> projection_v2._ReopenedV2Old:
         if self.used:
-            raise projection.ProjectionAuthorityError(
-                "old Projection V2 reopener is one-shot"
-            )
+            raise projection.ProjectionAuthorityError("old Projection V2 reopener is one-shot")
         self.used = True
         state = self.state
         namespace = state.namespace
         old = state.v2_artifact
         if old is None or state.namespace_attempted:
-            raise projection.ProjectionConflict(
-                "old Projection V2 rebase is no longer pre-arm"
-            )
+            raise projection.ProjectionConflict("old Projection V2 rebase is no longer pre-arm")
         _validate_namespace(namespace)
         _require_held_artifact(
             namespace.parent_descriptor,
@@ -142,9 +138,7 @@ class _V2RebuildOldReopener:
             links=frozenset({1}),
         )
         if _any_sidecar(namespace.parent_descriptor, namespace.main_name):
-            raise projection.ProjectionConflict(
-                "old Projection V2 sidecar survived suspension"
-            )
+            raise projection.ProjectionConflict("old Projection V2 sidecar survived suspension")
         before = _open_descriptor_snapshot()
         connection: sqlite3.Connection | None = None
         proof_descriptor = -1
@@ -165,11 +159,7 @@ class _V2RebuildOldReopener:
                     continue
                 if (
                     stat.S_ISREG(info.st_mode)
-                    and (
-                        fcntl.fcntl(descriptor, fcntl.F_GETFL)
-                        & os.O_ACCMODE
-                    )
-                    == os.O_RDWR
+                    and (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) == os.O_RDWR
                     and header == b"SQLite format 3\x00"
                 ):
                     candidates.append((descriptor, info))
@@ -323,9 +313,7 @@ def _finish_cleanup(
         return
     if primary is not None:
         for cleanup_issue in errors:
-            primary.add_note(
-                f"{label}: {type(cleanup_issue).__name__}: {cleanup_issue}"
-            )
+            primary.add_note(f"{label}: {type(cleanup_issue).__name__}: {cleanup_issue}")
         return
     raise BaseExceptionGroup(label, errors)
 
@@ -410,14 +398,8 @@ def _unlink_held_artifact(
         if unlink_error is not None:
             unlink_error.add_note(f"post-unlink descriptor check failed: {error!r}")
             raise unlink_error
-        raise projection.ProjectionConflict(
-            f"{label} descriptor could not prove unlink"
-        ) from error
-    if (
-        named is not None
-        or _inode(opened) != artifact.binding
-        or opened.st_nlink != links_after
-    ):
+        raise projection.ProjectionConflict(f"{label} descriptor could not prove unlink") from error
+    if named is not None or _inode(opened) != artifact.binding or opened.st_nlink != links_after:
         if unlink_error is not None:
             raise unlink_error
         raise projection.ProjectionConflict(f"{label} unlink was not exact")
@@ -461,8 +443,7 @@ def _validate_namespace(namespace: _StableProjectionNamespace) -> None:
     if (
         _inode(lock_opened) != namespace.lock_binding
         or _inode(lock_named) != namespace.lock_binding
-        or fcntl.fcntl(namespace.lock_descriptor, fcntl.F_GETFL) & os.O_ACCMODE
-        != os.O_RDWR
+        or fcntl.fcntl(namespace.lock_descriptor, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDWR
     ):
         raise projection.ProjectionConflict("projection stable lock changed")
     try:
@@ -487,7 +468,8 @@ def _stable_namespace(
         not isinstance(path, Path)
         or not path.is_absolute()
         or Path(os.path.normpath(path)) != path
-        or image_kind not in (
+        or image_kind
+        not in (
             projection._ProjectionImageKind.NEW,
             projection._ProjectionImageKind.V1,
             projection._ProjectionImageKind.V2,
@@ -523,9 +505,7 @@ def _stable_namespace(
             lock_binding=_inode(lock_info),
             image_kind=image_kind,
             original_main_binding=(
-                None
-                if main_binding is None
-                else _projection_binding(main_binding)
+                None if main_binding is None else _projection_binding(main_binding)
             ),
         )
         acquisition.namespace = namespace
@@ -533,9 +513,7 @@ def _stable_namespace(
         current = _lstat(owned_parent, path.name)
         if image_kind is projection._ProjectionImageKind.NEW:
             if current is not None or _any_sidecar(owned_parent, path.name):
-                raise projection.ProjectionConflict(
-                    "NEW projection destination is not absent"
-                )
+                raise projection.ProjectionConflict("NEW projection destination is not absent")
         else:
             assert namespace.original_main_binding is not None
             if current is None:
@@ -546,12 +524,9 @@ def _stable_namespace(
                 links=frozenset({1}),
             )
             if _inode(current) != namespace.original_main_binding:
-                raise projection.ProjectionConflict(
-                    "existing projection identity changed"
-                )
-            if (
-                image_kind is projection._ProjectionImageKind.V1
-                and _any_sidecar(owned_parent, path.name)
+                raise projection.ProjectionConflict("existing projection identity changed")
+            if image_kind is projection._ProjectionImageKind.V1 and _any_sidecar(
+                owned_parent, path.name
             ):
                 raise projection.ProjectionConflict(
                     "V1 projection sidecar exists before publication"
@@ -620,9 +595,7 @@ def _create_temp(
         )
         named = _lstat(namespace.parent_descriptor, name)
         if named is None or _inode(named) != _inode(info):
-            raise projection.ProjectionConflict(
-                "temporary projection changed during creation"
-            )
+            raise projection.ProjectionConflict("temporary projection changed during creation")
         return artifact
     finally:
         if descriptor >= 0:
@@ -687,9 +660,7 @@ def _open_held_v1_read_only(artifact: _HeldArtifact) -> sqlite3.Connection:
         or held_path_info.st_ino != descriptor_info.st_ino
         or descriptor_flags & os.O_ACCMODE != os.O_RDONLY
     ):
-        raise projection.ProjectionConflict(
-            "held V1 projection descriptor identity changed"
-        )
+        raise projection.ProjectionConflict("held V1 projection descriptor identity changed")
 
     connection = sqlite3.connect(
         f"{held_path.as_uri()}?mode=ro&immutable=1",
@@ -710,9 +681,7 @@ def _open_held_v1_read_only(artifact: _HeldArtifact) -> sqlite3.Connection:
         )
         for pragma, expected in expected_pragmas:
             if connection.execute(f"PRAGMA {pragma}").fetchone()[0] != expected:
-                raise projection.ProjectionConflict(
-                    f"held V1 projection PRAGMA {pragma} is unsafe"
-                )
+                raise projection.ProjectionConflict(f"held V1 projection PRAGMA {pragma} is unsafe")
         main_rows = [
             row
             for row in connection.execute("PRAGMA database_list").fetchall()
@@ -728,9 +697,7 @@ def _open_held_v1_read_only(artifact: _HeldArtifact) -> sqlite3.Connection:
             _inode(current_descriptor_info) != artifact.binding
             or current_held_path_info.st_ino != current_descriptor_info.st_ino
         ):
-            raise projection.ProjectionConflict(
-                "held V1 projection descriptor changed during open"
-            )
+            raise projection.ProjectionConflict("held V1 projection descriptor changed during open")
     except BaseException:
         connection.close()
         raise
@@ -752,9 +719,7 @@ def _bind_v1_baseline(
     if artifact.binding != namespace.original_main_binding:
         raise projection.ProjectionConflict("V1 projection identity changed")
     if _any_sidecar(namespace.parent_descriptor, namespace.main_name):
-        raise projection.ProjectionConflict(
-            "V1 projection sidecar exists before immutable open"
-        )
+        raise projection.ProjectionConflict("V1 projection sidecar exists before immutable open")
     size, digest = _hash_descriptor(artifact.descriptor)
     baseline = _V1Baseline(artifact, size, digest)
     acquisition.v1_baseline = baseline
@@ -811,9 +776,7 @@ def _bind_sidecars(
             )
             artifacts.append(artifact)
             if require_empty and os.fstat(artifact.descriptor).st_size != 0:
-                raise projection.ProjectionConflict(
-                    "temporary projection sidecar is not empty"
-                )
+                raise projection.ProjectionConflict("temporary projection sidecar is not empty")
         return artifacts
     except BaseException as primary:
         _finish_cleanup(
@@ -900,12 +863,9 @@ def _prepublish_validate(state: _PublicationState) -> None:
     if namespace.image_kind is projection._ProjectionImageKind.V1:
         _require_v1_unchanged(namespace, state.v1_baseline)
         if _any_sidecar(namespace.parent_descriptor, namespace.main_name):
-            raise projection.ProjectionConflict(
-                "V1 projection sidecar appeared before publication"
-            )
-    elif (
-        _lstat(namespace.parent_descriptor, namespace.main_name) is not None
-        or _any_sidecar(namespace.parent_descriptor, namespace.main_name)
+            raise projection.ProjectionConflict("V1 projection sidecar appeared before publication")
+    elif _lstat(namespace.parent_descriptor, namespace.main_name) is not None or _any_sidecar(
+        namespace.parent_descriptor, namespace.main_name
     ):
         raise projection.ProjectionConflict("NEW projection destination is not absent")
 
@@ -1023,13 +983,8 @@ def _publish_namespace(
 def _prepublish_validate_v2_rebuild(state: _PublicationState) -> None:
     namespace = state.namespace
     old = state.v2_artifact
-    if (
-        namespace.image_kind is not projection._ProjectionImageKind.V2
-        or old is None
-    ):
-        raise projection.ProjectionConflict(
-            "Projection V2 rebuild publication state is not exact"
-        )
+    if namespace.image_kind is not projection._ProjectionImageKind.V2 or old is None:
+        raise projection.ProjectionConflict("Projection V2 rebuild publication state is not exact")
     _validate_namespace(namespace)
     _require_held_artifact(
         namespace.parent_descriptor,
@@ -1043,13 +998,10 @@ def _prepublish_validate_v2_rebuild(state: _PublicationState) -> None:
         label="temporary Projection V2",
         links=frozenset({1}),
     )
-    if (
-        _any_sidecar(namespace.parent_descriptor, namespace.main_name)
-        or _any_sidecar(namespace.parent_descriptor, state.temp.name)
+    if _any_sidecar(namespace.parent_descriptor, namespace.main_name) or _any_sidecar(
+        namespace.parent_descriptor, state.temp.name
     ):
-        raise projection.ProjectionConflict(
-            "Projection V2 rebuild sidecar survived suspension"
-        )
+        raise projection.ProjectionConflict("Projection V2 rebuild sidecar survived suspension")
 
 
 def _v2_replace_completed(state: _PublicationState) -> bool:
@@ -1113,9 +1065,7 @@ def _publish_v2_rebuild_namespace(
             latch._arm_namespace_publication()
         raise syscall_error
     if not completed:
-        raise projection.ProjectionConflict(
-            "Projection V2 replacement state is ambiguous"
-        )
+        raise projection.ProjectionConflict("Projection V2 replacement state is ambiguous")
     _fsync_parent(state.namespace)
     return _open_existing_sqlite(state.namespace.path, configure_v2=True)
 
@@ -1186,10 +1136,7 @@ def _publish_staged_v2_filesystem(
     _factory: object,
 ) -> projection_v2._UnpublishedV2ReplayReport:
     """Materialize and durably publish one already-staged V2 replay."""
-    if (
-        _factory is not _PUBLICATION_FACTORY
-        or image_kind is projection._ProjectionImageKind.V2
-    ):
+    if _factory is not _PUBLICATION_FACTORY or image_kind is projection._ProjectionImageKind.V2:
         raise projection.ProjectionAuthorityError(
             "durable Projection V2 publication route is not exact"
         )
@@ -1400,9 +1347,7 @@ def _publish_staged_v2_rebuild_filesystem(
         )
         acquisition.v2_artifact = old
         if old.binding != _projection_binding(main_binding):
-            raise projection.ProjectionConflict(
-                "old Projection V2 inode changed before guard"
-            )
+            raise projection.ProjectionConflict("old Projection V2 inode changed before guard")
         guard_requested = True
         guard = owner._bind_staged_v2_rebuild_namespace(
             stage,
@@ -1417,9 +1362,7 @@ def _publish_staged_v2_rebuild_filesystem(
             or guarded_binding.rebuild is None
             or guarded_binding.rebuild.guard is not guard
         ):
-            raise projection.ProjectionAuthorityError(
-                "Projection V2 rebuild guard handoff changed"
-            )
+            raise projection.ProjectionAuthorityError("Projection V2 rebuild guard handoff changed")
         publish_generation = guarded_binding.reservation.publish_generation
         temp = _create_temp(namespace, acquisition=acquisition)
         state = _PublicationState(
@@ -1440,8 +1383,7 @@ def _publish_staged_v2_rebuild_filesystem(
                 _factory=projection_v2._STAGED_REPLAY_FACTORY,
                 _fault_phase=(
                     _fault_phase
-                    if _fault_phase
-                    is projection_v2._ReplayFaultPhase.REBUILD_MATERIALIZE
+                    if _fault_phase is projection_v2._ReplayFaultPhase.REBUILD_MATERIALIZE
                     else None
                 ),
             )
@@ -1494,14 +1436,10 @@ def _publish_staged_v2_rebuild_filesystem(
         primary = error
         binding = owner._staged_replay
         bound_rebuild = (
-            None
-            if binding is None or binding.capability is not stage
-            else binding.rebuild
+            None if binding is None or binding.capability is not stage else binding.rebuild
         )
         effective_guard = (
-            guard
-            if guard is not None
-            else (None if bound_rebuild is None else bound_rebuild.guard)
+            guard if guard is not None else (None if bound_rebuild is None else bound_rebuild.guard)
         )
         already_rebased = (
             publish_generation is not None
@@ -1542,18 +1480,12 @@ def _publish_staged_v2_rebuild_filesystem(
             )
         elif guard_requested:
             owner._latch_unhealthy(error)
-        elif (
-            guard is None
-            and binding is not None
-            and binding.capability is stage
-        ):
+        elif guard is None and binding is not None and binding.capability is stage:
             owner._abort_staged_replay(
                 stage,
                 _factory=projection_v2._STAGED_REPLAY_FACTORY,
             )
-        cleanup_namespace = (
-            state.namespace if state is not None else acquisition.namespace
-        )
+        cleanup_namespace = state.namespace if state is not None else acquisition.namespace
         cleanup_temp = state.temp if state is not None else acquisition.temp
         if (
             (state is None or not state.namespace_attempted)
@@ -1603,9 +1535,7 @@ def _publish_staged_v2_rebuild_filesystem(
 def _temp_groups(namespace: _StableProjectionNamespace) -> dict[str, set[str]]:
     prefix = f".{namespace.main_name}.projection."
     main_pattern = re.compile(rf"^{re.escape(prefix)}{_TEMP_UUID}\.tmp$")
-    sidecar_pattern = re.compile(
-        rf"^({re.escape(prefix)}{_TEMP_UUID}\.tmp)(-(?:wal|shm|journal))$"
-    )
+    sidecar_pattern = re.compile(rf"^({re.escape(prefix)}{_TEMP_UUID}\.tmp)(-(?:wal|shm|journal))$")
     groups: dict[str, set[str]] = {}
     for name in os.listdir(namespace.parent_descriptor):
         if name == namespace.lock_name or not name.startswith(prefix):
@@ -1615,9 +1545,7 @@ def _temp_groups(namespace: _StableProjectionNamespace) -> dict[str, set[str]]:
             continue
         match = sidecar_pattern.fullmatch(name)
         if match is None:
-            raise projection.ProjectionConflict(
-                "unexpected Projection V2 publication artifact"
-            )
+            raise projection.ProjectionConflict("unexpected Projection V2 publication artifact")
         temp_name = match.group(1)
         groups.setdefault(temp_name, set()).add(name)
     if any(temp_name not in names for temp_name, names in groups.items()):
@@ -1650,11 +1578,7 @@ def _recovery_namespace(
     lock_fd: int,
     acquisition: _PublicationAcquisition,
 ) -> _StableProjectionNamespace:
-    if (
-        not isinstance(path, Path)
-        or not path.is_absolute()
-        or Path(os.path.normpath(path)) != path
-    ):
+    if not isinstance(path, Path) or not path.is_absolute() or Path(os.path.normpath(path)) != path:
         raise projection.ProjectionConflict("invalid recovery namespace")
     owned_parent = _dup_cloexec(parent_fd)
     owned_lock = -1
@@ -1757,9 +1681,7 @@ def _recover_v2_publication_locked(
                 namespace.parent_descriptor,
                 namespace.main_name,
             ):
-                raise projection.ProjectionConflict(
-                    "linked Projection V2 publication has sidecars"
-                )
+                raise projection.ProjectionConflict("linked Projection V2 publication has sidecars")
             temp = _open_held_artifact(
                 namespace.parent_descriptor,
                 temp_name,

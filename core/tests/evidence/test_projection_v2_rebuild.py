@@ -89,9 +89,7 @@ def _live_retention_v2_case(
         evidence=store,
         acknowledgements=acknowledgements,
         journal=journal,
-        registry=pcc_helpers.load_pinned_special_use_registry(
-            pcc_helpers._REGISTRY_PATH
-        ),
+        registry=pcc_helpers.load_pinned_special_use_registry(pcc_helpers._REGISTRY_PATH),
     )
     old_through = tuple(store.iter_authenticated_records())[-1].ref
     path = tmp_path / "projection.sqlite3"
@@ -107,9 +105,7 @@ def _live_retention_v2_case(
     )
     request = decision.request
     assert request is not None
-    retention_journal = retention.retention_module._open_retention_state_journal(
-        store
-    )
+    retention_journal = retention.retention_module._open_retention_state_journal(store)
     retention_journal.prepare_publication(decision)
     target_item = retention._item(
         envelope_value(
@@ -318,9 +314,7 @@ def test_v2_rebuild_prearm_failure_rebases_exact_old_inode_and_fresh_authority(
             root,
             monkeypatch,
         )
-        authority_module = importlib.import_module(
-            "agmind_immune.correlation.authority"
-        )
+        authority_module = importlib.import_module("agmind_immune.correlation.authority")
         old_authority = owner._authority
         old_connection = owner._connection
         old_binding = path.stat(follow_symlinks=False)
@@ -525,11 +519,7 @@ def test_v2_rebuild_suspend_replace_crash_matrix_fails_conservatively(
         fault_phase = (
             v2._ReplayFaultPhase.REBUILD_STAGED_CLOSE
             if failure == "staged_close_ambiguous"
-            else (
-                v2._ReplayFaultPhase.REBUILD_CLOSE
-                if failure == "close_ambiguous"
-                else None
-            )
+            else (v2._ReplayFaultPhase.REBUILD_CLOSE if failure == "close_ambiguous" else None)
         )
         try:
             with pytest.MonkeyPatch.context() as patch:
@@ -566,9 +556,7 @@ def test_v2_rebuild_suspend_replace_crash_matrix_fails_conservatively(
             if failure in ("staged_close_ambiguous", "close_ambiguous"):
                 assert suspended_observations == []
             else:
-                assert suspended_observations == [
-                    (v2._ReplayPhase.SUSPENDED, None)
-                ]
+                assert suspended_observations == [(v2._ReplayPhase.SUSPENDED, None)]
             if failure == "old_hardlink":
                 assert os.fstat(old_descriptor).st_nlink == 2
                 hardlink.unlink()
@@ -685,9 +673,7 @@ def test_v2_rebuild_success_adopts_reopened_g_plus_one_and_consumes_retention_on
         )
 
         final_edge_phases: list[Any] = []
-        original_consume = (
-            type(store)._commit_prevalidated_retention_replay_consumption_locked
-        )
+        original_consume = type(store)._commit_prevalidated_retention_replay_consumption_locked
 
         def observe_consumption(selected_store: Any, consumed: Any) -> None:
             if selected_store is store:
@@ -738,21 +724,16 @@ def test_v2_rebuild_success_adopts_reopened_g_plus_one_and_consumes_retention_on
                 fallback_authority,
                 v2._predecessor_v2(3, old_cursor),
             )
-        authority_module = importlib.import_module(
-            "agmind_immune.correlation.authority"
-        )
+        authority_module = importlib.import_module("agmind_immune.correlation.authority")
         final_authority = owner._authority
-        final_authority_binding = authority_module._authority_binding(
-            final_authority
-        )
+        final_authority_binding = authority_module._authority_binding(final_authority)
         with authority_module._ISSUED_AUTHORITIES_LOCK:
             live_for_store = [
                 registered
                 for reference, registered in authority_module._ISSUED_AUTHORITIES.values()
                 if reference() is not None
                 and registered.store is final_authority_binding.store
-                and registered.store_lifecycle
-                is final_authority_binding.store_lifecycle
+                and registered.store_lifecycle is final_authority_binding.store_lifecycle
                 and not registered.closed
             ]
         assert live_for_store == [final_authority_binding]

@@ -58,10 +58,7 @@ from tests.phase5b_helpers import (
 
 REPAIR_ID = "11111111-1111-4111-8111-111111111111"
 SEGMENT_ID = "22222222-2222-4222-8222-222222222222"
-OPEN_PATH = (
-    "segments/2026-07-29/00000000000000000042-"
-    f"{SEGMENT_ID}.open"
-)
+OPEN_PATH = f"segments/2026-07-29/00000000000000000042-{SEGMENT_ID}.open"
 AUTHORIZATION = RepairEventIdentity(
     sequence=81,
     event_id="evt_" + "a" * 64,
@@ -173,9 +170,7 @@ class _RepairLifecycleTransport:
 
     @staticmethod
     def _item(envelope: dict[str, object]) -> CoreEventV1:
-        return decode_events_page(
-            canonical_json(page_value(envelope))
-        ).events[0]
+        return decode_events_page(canonical_json(page_value(envelope))).events[0]
 
     async def publish_repair_authorization(self, canonical_body: bytes) -> bytes:
         fields = json.loads(canonical_body)
@@ -188,9 +183,7 @@ class _RepairLifecycleTransport:
                     normalized_fields=fields,
                 )
             )
-        assert canonical_json(self._authorization.envelope["normalized_fields"]) == (
-            canonical_body
-        )
+        assert canonical_json(self._authorization.envelope["normalized_fields"]) == (canonical_body)
         return canonical_json(self._authorization.model_dump(mode="python"))
 
     async def publish_repair_completion(self, canonical_body: bytes) -> bytes:
@@ -204,9 +197,7 @@ class _RepairLifecycleTransport:
                     normalized_fields=fields,
                 )
             )
-        assert canonical_json(self._completion.envelope["normalized_fields"]) == (
-            canonical_body
-        )
+        assert canonical_json(self._completion.envelope["normalized_fields"]) == (canonical_body)
         return canonical_json(self._completion.model_dump(mode="python"))
 
     async def fetch_events(self, *, after: int, limit: int) -> bytes:
@@ -350,9 +341,7 @@ def test_repair_state_journal_enforces_exact_transition_graph_and_cas() -> None:
     assert authority.raw == encode_repair_state(completed)
     assert journal.state == completed
 
-    compromised = RepairStateJournal.open(
-        _MemoryRepairAuthority(encode_repair_state(detected))
-    )
+    compromised = RepairStateJournal.open(_MemoryRepairAuthority(encode_repair_state(detected)))
     compromised._state = completed
     with pytest.raises(RepairStateCorrupt, match="durable bytes"):
         compromised.clear_completed(object())  # type: ignore[arg-type]
@@ -375,10 +364,7 @@ def test_repair_requests_are_exact_derivations_of_durable_state() -> None:
     assert authorize.discarded_bytes == detected.discarded_bytes
     assert authorize.discarded_sha256 == detected.discarded_sha256
     assert authorize.last_verified_frame_sha256 == detected.last_verified_frame_sha256
-    assert (
-        authorize.current_chain_head_sha256
-        == detected.current_chain_head_sha256
-    )
+    assert authorize.current_chain_head_sha256 == detected.current_chain_head_sha256
 
     with pytest.raises(RepairProtocolError, match="authorization"):
         completion_request(detected)
@@ -479,9 +465,7 @@ def _authorization_preflight_context(
         EnvelopeVerifier(root, chain),
         store,
     )
-    boot = decode_events_page(
-        canonical_json(page_value(boot_boundary(key)))
-    ).events[0]
+    boot = decode_events_page(canonical_json(page_value(boot_boundary(key)))).events[0]
     boot_ref = acceptance.accept(boot)
     journal = AckJournal.create_new(store)
     journal.record_pending(boot_ref)
@@ -506,9 +490,7 @@ def _authorization_preflight_context(
         event_type="evidence_repair_authorized",
         normalized_fields=request.model_dump(),
     )
-    direct = decode_events_page(
-        canonical_json(page_value(authorization))
-    ).events[0]
+    direct = decode_events_page(canonical_json(page_value(authorization))).events[0]
     return verifier, store, journal, request, authorization, direct
 
 
@@ -516,8 +498,8 @@ def _authorization_preflight_context(
 async def test_authorization_preflight_binds_direct_page_ack_and_live_authority(
     tmp_path: Path,
 ) -> None:
-    verifier, store, journal, request, authorization, direct = (
-        _authorization_preflight_context(tmp_path)
+    verifier, store, journal, request, authorization, direct = _authorization_preflight_context(
+        tmp_path
     )
     page = page_value(
         authorization,
@@ -551,8 +533,8 @@ async def test_authorization_preflight_rejects_page_over_requested_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    verifier, store, journal, request, authorization, direct = (
-        _authorization_preflight_context(tmp_path)
+    verifier, store, journal, request, authorization, direct = _authorization_preflight_context(
+        tmp_path
     )
     later = envelope_value(private_key(11), sequence=3)
     page = page_value(authorization, later)
@@ -581,8 +563,8 @@ async def test_authorization_preflight_rejects_page_over_requested_bound(
 async def test_authorization_preflight_rejects_transient_verifier_race(
     tmp_path: Path,
 ) -> None:
-    verifier, store, journal, request, authorization, direct = (
-        _authorization_preflight_context(tmp_path)
+    verifier, store, journal, request, authorization, direct = _authorization_preflight_context(
+        tmp_path
     )
     page = page_value(authorization)
     page["acked_through"] = 1
@@ -633,9 +615,7 @@ async def test_complete_tail_repair_runs_signed_two_phase_protocol_same_lock(
         store,
     )
     journal = AckJournal.create_new(store)
-    boot = decode_events_page(
-        canonical_json(page_value(boot_boundary(key)))
-    ).events[0]
+    boot = decode_events_page(canonical_json(page_value(boot_boundary(key)))).events[0]
     boot_ref = acceptance.accept(boot)
     store.flush_security_boundary()
     journal.record_pending(boot_ref)
