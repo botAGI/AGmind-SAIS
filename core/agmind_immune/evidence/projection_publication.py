@@ -637,15 +637,33 @@ def _hash_descriptor(descriptor: int) -> tuple[int, str]:
     return info.st_size, digest.hexdigest()
 
 
-def _open_held_v1_read_only(artifact: _HeldArtifact) -> sqlite3.Connection:
-    """Open the exact held V1 inode without resolving its namespace entry again."""
+def _open_held_v1_read_only(
+    artifact: _HeldArtifact,
+    *,
+    size: int,
+    sha256: str,
+) -> tuple[sqlite3.Connection, str]:
+    """Load the exact held V1 inode without resolving any namespace entry again.
+
+    SQLite is never handed a path (not even /dev/fd, whose symlink target SQLite
+    >= 3.31 canonicalises): the image bytes are pread() from the already-validated
+    descriptor, checked against the size and digest _bind_v1_baseline computed
+    from that same descriptor, and loaded with Connection.deserialize into a
+    query-only in-memory connection.  The connection is therefore bound to the
+    held inode by construction; a concurrent namespace swap cannot redirect it.
+    Holding the full image in memory is acceptable because _bind_v1_baseline
+    already materialises the same image via Connection.serialize() for its
+    byte-equality check, and this module places no larger documented bound on a
+    V1 image than the fstat-validated size enforced here.
+
+    Returns the connection plus the hex digest of the exact bytes handed to
+    deserialize, so the caller can prove Connection.serialize() round-trips them.
+    """
     if artifact.descriptor < 0:
         raise projection.ProjectionConflict("V1 projection descriptor was detached")
-    held_path = Path("/dev/fd") / str(artifact.descriptor)
     try:
         descriptor_info = os.fstat(artifact.descriptor)
         descriptor_flags = fcntl.fcntl(artifact.descriptor, fcntl.F_GETFL)
-        held_path_info = os.stat(held_path)
     except (OSError, TypeError, ValueError) as error:
         raise projection.ProjectionConflict(
             "held V1 projection descriptor is unavailable"
@@ -657,21 +675,45 @@ def _open_held_v1_read_only(artifact: _HeldArtifact) -> sqlite3.Connection:
     )
     if (
         _inode(descriptor_info) != artifact.binding
-        or held_path_info.st_ino != descriptor_info.st_ino
+        or descriptor_info.st_size != size
         or descriptor_flags & os.O_ACCMODE != os.O_RDONLY
     ):
         raise projection.ProjectionConflict("held V1 projection descriptor identity changed")
 
-    connection = sqlite3.connect(
-        f"{held_path.as_uri()}?mode=ro&immutable=1",
-        uri=True,
-        isolation_level=None,
-    )
+    image = bytearray()
+    while len(image) < size:
+        block = os.pread(
+            artifact.descriptor,
+            min(1024 * 1024, size - len(image)),
+            len(image),
+        )
+        if not block:
+            raise projection.ProjectionConflict("held V1 projection bytes changed during read")
+        image += block
+    if hashlib.sha256(image).hexdigest() != sha256:
+        raise projection.ProjectionConflict(
+            "held V1 projection bytes are not the validated baseline"
+        )
+    if len(image) >= 20 and image[18] == 2 and image[19] == 2:
+        # A cleanly-checkpointed WAL image keeps format version 2 in header
+        # bytes 18-19; the in-memory VFS cannot run WAL, so reset both to the
+        # rollback-journal format (the exact bytes SQLite writes when it
+        # converts wal -> delete, which is also what an immutable file open
+        # reports).  This two-byte transform is the ONLY divergence from the
+        # digest-verified baseline; the returned image digest lets the caller
+        # prove the connection serialises back to exactly these bytes.
+        image[18:20] = b"\x01\x01"
+    frozen_image = bytes(image)
+    image_sha256 = hashlib.sha256(frozen_image).hexdigest()
+
+    connection = sqlite3.connect(":memory:", isolation_level=None)
     try:
         connection.row_factory = sqlite3.Row
+        connection.deserialize(frozen_image)
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA query_only=ON")
         expected_pragmas: tuple[tuple[str, int], ...] = (
             ("busy_timeout", 5000),
@@ -687,21 +729,22 @@ def _open_held_v1_read_only(artifact: _HeldArtifact) -> sqlite3.Connection:
             for row in connection.execute("PRAGMA database_list").fetchall()
             if str(row[1]) == "main"
         ]
-        if len(main_rows) != 1 or Path(str(main_rows[0][2])) != held_path:
+        # A deserialized main database reports an empty file path; anything else
+        # means SQLite was handed a filesystem path and the inode binding is void.
+        if len(main_rows) != 1 or str(main_rows[0][2]) != "":
             raise projection.ProjectionConflict(
-                "SQLite did not open the held V1 projection descriptor"
+                "SQLite did not open the held V1 projection image in memory"
             )
         current_descriptor_info = os.fstat(artifact.descriptor)
-        current_held_path_info = os.stat(held_path)
         if (
             _inode(current_descriptor_info) != artifact.binding
-            or current_held_path_info.st_ino != current_descriptor_info.st_ino
+            or current_descriptor_info.st_size != size
         ):
             raise projection.ProjectionConflict("held V1 projection descriptor changed during open")
     except BaseException:
         connection.close()
         raise
-    return connection
+    return connection, image_sha256
 
 
 def _bind_v1_baseline(
@@ -724,7 +767,11 @@ def _bind_v1_baseline(
     baseline = _V1Baseline(artifact, size, digest)
     acquisition.v1_baseline = baseline
     acquisition.v1_artifact = None
-    connection = _open_held_v1_read_only(artifact)
+    connection, image_digest = _open_held_v1_read_only(
+        artifact,
+        size=size,
+        sha256=digest,
+    )
     acquisition.v1_connection = connection
     projection._verify_v1_schema(connection, immutable_read_only=True)
     serialized = connection.serialize()
@@ -735,10 +782,14 @@ def _bind_v1_baseline(
         links=frozenset({1}),
     )
     current_size, current_digest = _hash_descriptor(artifact.descriptor)
+    # serialize() must round-trip the digest-verified deserialize input
+    # (image_digest differs from the raw baseline digest only by the two-byte
+    # wal -> delete header reset); the held inode itself must still hash to the
+    # raw baseline digest.
     if (
         type(serialized) is not bytes
         or len(serialized) != size
-        or hashlib.sha256(serialized).hexdigest() != digest
+        or hashlib.sha256(serialized).hexdigest() != image_digest
         or current_size != size
         or current_digest != digest
         or _any_sidecar(namespace.parent_descriptor, namespace.main_name)

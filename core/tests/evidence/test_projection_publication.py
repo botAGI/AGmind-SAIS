@@ -552,39 +552,51 @@ def test_v1_replace_crash_matrix_preserves_prearm_inode_and_latches_postarm(
         original_prepare = type(owner)._prepare_staged_replay_for_publication
         original_publish = type(owner)._publish_staged_replay
         original_replace = publication.os.replace
-        original_connect = publication.sqlite3.connect
+        original_open_held = publication._open_held_v1_read_only
         main_sidecar = Path(f"{path}-journal")
         alternate = root / "alternate-v1.sqlite3"
         hidden = root / "held-original.sqlite3"
-        immutable_open_targets: list[str] = []
-        immutable_open_bindings: list[tuple[int, int]] = []
+        held_open_bindings: list[tuple[int, int]] = []
 
         if case == "connection_swap":
-            alternate.write_bytes(before_bytes)
+            # Same size as the held image but different bytes: any reintroduced
+            # path-based reopen inside _open_held_v1_read_only would read these
+            # bytes during the swap window below, fail the baseline digest (or
+            # schema) verification, and turn this case's success assertion red.
+            alternate.write_bytes(bytes(len(before_bytes)))
             alternate.chmod(0o600)
 
-        def connect_substituted_v1(
-            database: Any,
-            *args: Any,
-            **kwargs: Any,
-        ) -> sqlite3.Connection:
-            if type(database) is not str or not database.startswith("file:///dev/fd/"):
-                return original_connect(database, *args, **kwargs)
-            raw_path, separator, query = database.partition("?")
-            assert separator == "?"
-            assert query == "mode=ro&immutable=1"
-            descriptor = int(Path(raw_path.removeprefix("file://")).name)
-            opened = os.fstat(descriptor)
-            immutable_open_targets.append(database)
-            immutable_open_bindings.append((opened.st_dev, opened.st_ino))
+        def swap_during_held_open(
+            artifact: Any,
+            *,
+            size: int,
+            sha256: str,
+        ) -> tuple[sqlite3.Connection, str]:
+            opened = os.fstat(artifact.descriptor)
+            held_open_bindings.append((opened.st_dev, opened.st_ino))
             os.replace(path, hidden)
             os.replace(alternate, path)
             try:
-                result = original_connect(database, *args, **kwargs)
+                # The namespace entry now points at the alternate image for the
+                # whole open; only a read genuinely bound to the held descriptor
+                # (deserialize of its pread bytes) can still succeed.
+                held_connection, image_digest = original_open_held(
+                    artifact,
+                    size=size,
+                    sha256=sha256,
+                )
             finally:
                 os.replace(path, alternate)
                 os.replace(hidden, path)
-            return result
+            # Any reintroduced file-backed reopen (a real path OR /dev/fd)
+            # would surface here as a non-empty main database path.
+            main_files = [
+                str(row[2])
+                for row in held_connection.execute("PRAGMA database_list")
+                if str(row[1]) == "main"
+            ]
+            assert main_files == [""]
+            return held_connection, image_digest
 
         def late_v1_sidecar(
             selected: Any,
@@ -630,9 +642,9 @@ def test_v1_replace_crash_matrix_preserves_prearm_inode_and_latches_postarm(
                 patch.setattr(publication.uuid, "uuid4", lambda: token)
                 if case == "connection_swap":
                     patch.setattr(
-                        publication.sqlite3,
-                        "connect",
-                        connect_substituted_v1,
+                        publication,
+                        "_open_held_v1_read_only",
+                        swap_during_held_open,
                     )
                 elif case == "initial_main_sidecar":
                     main_sidecar.write_bytes(b"initial-v1-sidecar")
@@ -655,8 +667,7 @@ def test_v1_replace_crash_matrix_preserves_prearm_inode_and_latches_postarm(
                         _factory=publication._PUBLICATION_FACTORY,
                     )
                     assert report.cursor is not None
-                    assert len(immutable_open_targets) == 1
-                    assert immutable_open_bindings == [(before.st_dev, before.st_ino)]
+                    assert held_open_bindings == [(before.st_dev, before.st_ino)]
                 elif case in (
                     "initial_main_sidecar",
                     "late_main_sidecar",
