@@ -13,6 +13,8 @@ Hunter — локальная обесцензуренная модель на �
 
 ## Главный инвариант M1
 
+> M1 — первая фаза проекта: один выделенный Docker-хост.
+
 ```text
 signed evidence
   -> deterministic correlation
@@ -35,14 +37,19 @@ table, chain и drop-правило при этом остаются в netns к
 ## Архитектура одного хоста
 
 - `agmind-observerd` — host-сенсор, Docker inventory и подписанные события.
-- Falco + redacting adapter — monitor-only detection без доступа к секретам.
+- Falco + redacting adapter — monitor-only detection: сам Falco остаётся
+  привилегированным syscall-сенсором в изолированной internal-сети, а adapter
+  непривилегирован и редактирует события до выхода из sensor-контура; секреты
+  AGmind в detection-канал не попадают.
 - Core — evidence, correlation, OPA, durable intents, проверяемое зеркало
   действий и authenticated read-only API; без Docker socket и `CAP_NET_ADMIN`.
-- OPA — policy admission gate: валидирует candidate и выдаёт только
-  `manual_approval_required` или `deny`; сформировать команду исполнения она
-  не может. Жёсткие лимиты — TTL, запрещённые назначения, docker-сети —
-  actuator независимо проверяет ещё раз (`host/actuatord/limits.go`), поэтому
-  граница остаётся fail-closed даже при подмене policy.
+- OPA — policy admission gate: валидирует форму candidate и границы TTL и
+  выдаёт только `manual_approval_required` или `deny`; сформировать команду
+  исполнения она не может. Запрещённые назначения и docker-сети проверяет
+  детерминированная корреляция Core, а все жёсткие лимиты — TTL, запрещённые
+  назначения, docker-сети — actuator независимо проверяет ещё раз
+  (`host/actuatord/limits.go`), поэтому граница остаётся fail-closed даже при
+  подмене policy.
 - Hunter — изолированный запрос к локальной модели через фиксированный relay;
   результат не входит в policy, intent или approval.
 - `agmind-actuatord` — минимальная root-boundary, повторно проверяющая identity
@@ -89,6 +96,10 @@ agmindctl kill-switch disable
 `enable` и `disable` требуют точного интерактивного подтверждения. Отключение
 ручного режима не снимает автоматические fail-closed блокировки actuator.
 
+Команды `agmindctl` доступны только пользователю `root` или члену группы
+`agmind-admin`, причём после установки членство в группе активно лишь в новой
+login-сессии.
+
 ## Ротация Core API token
 
 ```sh
@@ -103,7 +114,8 @@ sudo agmindctl token rotate
 
 Один итоговый gate создаёт отдельные target/control контейнеры, требует реальное
 локальное подтверждение и связывает target-only TTL, signed `EXPIRED`, offline
-proof и фактический read-only ответ `dspark` в один отчёт:
+proof и фактический read-only ответ Hunter-модели (endpoint обязан отдавать
+модель с id `dspark`) в один отчёт:
 
 ```sh
 sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
@@ -121,8 +133,8 @@ M1. Инструкции: [`docs/runbooks/native-acceptance.md`](docs/runbooks/n
 
 ```sh
 sudo /opt/agmind-sais/scripts/export-proof-linux.sh \
-  --action-id act_0123456789abcdef0123456789abcdef \
-  --output /var/lib/agmind-sais/exports/act_0123456789abcdef0123456789abcdef
+  --action-id act_<32-hex-id действия из signed action journal> \
+  --output /var/lib/agmind-sais/exports/act_<тот-же-id>
 ```
 
 Экспорт кратко приостанавливает AGmind-сервисы для согласованного снимка, затем
