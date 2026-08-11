@@ -3185,7 +3185,12 @@ func (spool *Spool) Ack(
 		if sequence == 0 ||
 			eventID != snapshot.AckEventID ||
 			contentSHA256 != snapshot.AckContentSHA256 {
-			_ = spool.state.PersistReadOnly("observer_ack_identity_conflict")
+			// The durable anchor is the observer's own committed state; a
+			// retry that names a different identity is a CLIENT claim error,
+			// not evidence of local corruption. Reject it and keep serving —
+			// a corrected retry must still be able to succeed. Fencing here
+			// would hand a compromised Core a one-ack kill switch for the
+			// sensor.
 			return ErrSpoolCorrupt
 		}
 		// The first anchor write may have failed after the synced journal
@@ -3228,10 +3233,10 @@ func (spool *Spool) Ack(
 		return ErrAckInvalid
 	}
 	item := spool.items[sequence]
-	if item.EventID != eventID || item.ContentSHA256 != contentSHA256 {
-		_ = spool.state.PersistReadOnly("observer_ack_identity_conflict")
-		return ErrSpoolCorrupt
-	}
+	// The observer's own frame-vs-memory cross-check runs FIRST: a mismatch
+	// between local state and disk is corruption and stays fail-stop. Only
+	// once the observer has proven its own state intact may a mismatch be
+	// attributed to the caller's claim below.
 	diskEvent, diskCanonical, diskHash, diskBytes, diskIdentity, diskErr :=
 		readStandaloneFrame(item.path, spool.keys)
 	if diskErr != nil ||
@@ -3243,6 +3248,14 @@ func (spool *Spool) Ack(
 		!diskIdentity.Same(item.identity) ||
 		!bytes.Equal(diskCanonical, item.Canonical) {
 		_ = spool.state.PersistReadOnly("observer_ack_disk_identity_changed")
+		return ErrSpoolCorrupt
+	}
+	if item.EventID != eventID || item.ContentSHA256 != contentSHA256 {
+		// Local state just verified against disk, so this mismatch is the
+		// CLIENT's claim, not corruption. Reject the ack, retain the event,
+		// and keep serving: a corrected ack must succeed. Fencing here would
+		// let one malformed ack from a compromised Core silence the sensor
+		// permanently.
 		return ErrSpoolCorrupt
 	}
 	if err := validatePublicationItem(item); err != nil {
