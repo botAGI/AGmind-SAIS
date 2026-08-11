@@ -506,6 +506,52 @@ func pccValidateGenesis(
 	return true, pccVerifyArchiveEnvelope(event, keyring)
 }
 
+// pccValidateGenesisRotation identifies the genesis-B origin shape: on a
+// fresh state, offline rotation makes the key-transition envelope itself
+// BootHistory[0], so it has no predecessor and PCCBootTransitionHopV1 makes
+// a predecessor-less hop unrepresentable. Like observer_genesis it stays
+// outside the transition archive, but only after the full rotation-pair
+// validation (envelope signatures, keyring, epoch adjacency, exact flags)
+// passes and only while the archive is still empty; rotations chained at
+// BootHistory index >= 1 keep taking the record path unchanged.
+func pccValidateGenesisRotation(
+	boundary contracts.EventEnvelopeV1,
+	companion *contracts.EventEnvelopeV1,
+	snapshot ObserverState,
+	anchor PCCBoundaryArchiveAnchor,
+	recordCount int,
+	keyring *Keyring,
+) (bool, error) {
+	if boundary.EventType != "observer_key_transition" ||
+		companion == nil ||
+		anchor.Count != 0 ||
+		recordCount != 0 ||
+		len(snapshot.BootHistory) == 0 {
+		return false, nil
+	}
+	first := snapshot.BootHistory[0]
+	if first.BoundaryEventID != boundary.EventID ||
+		first.BoundaryEventType != boundary.EventType ||
+		first.BootID != boundary.BootID ||
+		first.FirstSequence != boundary.SourceSequence {
+		return false, nil
+	}
+	if err := pccVerifyArchiveEnvelope(boundary, keyring); err != nil {
+		return true, err
+	}
+	if err := pccVerifyArchiveEnvelope(*companion, keyring); err != nil {
+		return true, err
+	}
+	if _, _, err := pccValidateRotationPair(
+		boundary,
+		*companion,
+		keyring,
+	); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 func clonePCCBoundaryRecord(
 	record PCCBoundaryArchiveRecord,
 ) (PCCBoundaryArchiveRecord, error) {
@@ -545,6 +591,24 @@ func (archive *PCCBoundaryArchive) RetainsCommittedEvent(
 		snapshot.PCCBoundaryHeadHash != archive.anchor.HeadHash ||
 		archive.anchor.Count != uint64(len(archive.records)) {
 		return ErrPCCJournalCorrupt
+	}
+	genesisRotation, err := pccValidateGenesisRotation(
+		event,
+		following,
+		snapshot,
+		archive.anchor,
+		len(archive.records),
+		archive.keyring,
+	)
+	if err != nil {
+		return err
+	}
+	if genesisRotation {
+		// The genesis-B transition IS BootHistory[0]; RecordCommittedBoundary
+		// keeps it outside the transition archive because a predecessor-less
+		// hop is unrepresentable, so retention is proven by the validated pair
+		// plus the V5 boot history instead of an archive record.
+		return nil
 	}
 	want, err := contracts.CanonicalJSON(event)
 	if err != nil {
@@ -670,6 +734,20 @@ func (archive *PCCBoundaryArchive) RecordCommittedBoundary(
 		return archive.failPreAnchor(err)
 	}
 	if genesis {
+		return nil
+	}
+	genesisRotation, err := pccValidateGenesisRotation(
+		boundary,
+		rotationCompanion,
+		archive.state.Snapshot(),
+		archive.anchor,
+		len(archive.records),
+		archive.keyring,
+	)
+	if err != nil {
+		return archive.failPreAnchor(err)
+	}
+	if genesisRotation {
 		return nil
 	}
 	record := PCCBoundaryArchiveRecord{
