@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -85,6 +86,15 @@ func assertOptionalNulls[T Contract](
 		t.Run(field, func(t *testing.T) {
 			omitted := mutateFixture(t, fixture, func(document map[string]any) {
 				delete(document, field)
+				if _, sensor := FalcoSensorRequiredFields[field]; sensor {
+					// Dropping a sensor fact is permitted ONLY when the omission is
+					// declared: the validator requires missing_required_fields to equal
+					// the set of absent sensor facts, so a blind spot can never be
+					// silently indistinguishable from an observation. Declaring it keeps
+					// this document coherent, which is what makes this test about
+					// OPTIONALITY. The undeclared case has its own test below.
+					document["missing_required_fields"] = declaredMissing(document, field)
+				}
 				if rebind != nil {
 					rebind(document)
 				}
@@ -651,5 +661,51 @@ func TestStructuredNearValidMutationsForEveryPositiveFixture(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+// declaredMissing returns missing_required_fields with field added, kept sorted and unique as the
+// contract requires.
+func declaredMissing(document map[string]any, field string) []string {
+	seen := map[string]struct{}{field: {}}
+	if existing, ok := document["missing_required_fields"].([]any); ok {
+		for _, value := range existing {
+			if name, isString := value.(string); isString {
+				seen[name] = struct{}{}
+			}
+		}
+	}
+	declared := make([]string, 0, len(seen))
+	for name := range seen {
+		declared = append(declared, name)
+	}
+	sort.Strings(declared)
+	return declared
+}
+
+// TestUndeclaredSensorOmissionIsRejected is the security-relevant half of the rule the test above
+// deliberately keeps coherent: an absent sensor fact that is NOT declared must be refused, or an
+// event that observed nothing would be accepted as an event that observed everything.
+func TestUndeclaredSensorOmissionIsRejected(t *testing.T) {
+	var document map[string]any
+	if err := json.Unmarshal(fixtureBytes(t, "falco.investigation.valid.json"), &document); err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	checked := 0
+	for field := range FalcoSensorRequiredFields {
+		if _, present := document[field]; !present {
+			continue
+		}
+		raw := mutateFixture(t, "falco.investigation.valid.json", func(mutated map[string]any) {
+			delete(mutated, field)
+			mutated["missing_required_fields"] = []string{}
+		})
+		if _, err := DecodeStrict[FalcoConnectV1](bytes.NewReader(raw), 65536); err == nil {
+			t.Fatalf("undeclared omission of sensor fact %q was accepted", field)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("the fixture carries no sensor facts, so this proved nothing; fix the fixture")
 	}
 }

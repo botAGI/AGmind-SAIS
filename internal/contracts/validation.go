@@ -266,6 +266,20 @@ func (event EventEnvelopeV1) Validate() error {
 	return nil
 }
 
+// FalcoSensorRequiredFields is the set of Falco sensor facts whose absence must be DECLARED in
+// missing_required_fields. It is exported so tests can build coherent documents from the same
+// source the validator enforces, instead of restating the list and drifting from it.
+var FalcoSensorRequiredFields = map[string]struct{}{
+	"falco_container_id_prefix": {},
+	"falco_container_start_ts":  {},
+	"proc_name":                 {},
+	"proc_exe_path":             {},
+	"proc_parent_name":          {},
+	"destination_ipv4":          {},
+	"destination_port":          {},
+	"l4_protocol":               {},
+}
+
 func (event FalcoConnectV1) Validate() error {
 	if event.RepoDigests == nil || event.MissingRequiredFields == nil {
 		return fmt.Errorf("required Falco collections must not be nil")
@@ -342,6 +356,8 @@ func (event FalcoConnectV1) Validate() error {
 			return fmt.Errorf("invalid missing field")
 		}
 	}
+	// Keys MUST stay identical to FalcoSensorRequiredFields below; the mirrored Python model
+	// expresses the same rule as FALCO_SENSOR_REQUIRED_FIELDS.
 	sensorFacts := map[string]bool{
 		"falco_container_id_prefix": event.FalcoContainerIDPrefix != nil,
 		"falco_container_start_ts":  event.FalcoContainerStartTS != nil,

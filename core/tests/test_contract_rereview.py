@@ -158,6 +158,16 @@ def test_omitted_optional_fields_are_allowed_but_explicit_top_level_null_is_reje
         omitted.pop(field, None)
         if family == "action":
             omitted = _rebind_action(omitted)
+        if field in contracts.FALCO_SENSOR_REQUIRED_FIELDS:
+            # Dropping a sensor fact is permitted ONLY when the omission is declared: the model
+            # requires missing_required_fields to equal the set of absent sensor facts, so a
+            # blind spot can never be silently indistinguishable from an observation. Declaring
+            # it here keeps the document coherent, which is what makes this test about
+            # OPTIONALITY rather than about the sensor-omission rule. The undeclared case is a
+            # separate invariant with its own coverage below.
+            omitted["missing_required_fields"] = sorted(
+                {*omitted.get("missing_required_fields", []), field}
+            )
         contracts.decode_strict(_wire(omitted), model, 65_536)
 
         explicit_null = copy.deepcopy(document)
@@ -165,6 +175,31 @@ def test_omitted_optional_fields_are_allowed_but_explicit_top_level_null_is_reje
         assert not contract_schema_validator(schema).is_valid(explicit_null), field
         with pytest.raises(ValueError, match="null"):
             contracts.decode_strict(_wire(explicit_null), model, 65_536)
+
+
+def test_undeclared_sensor_omission_is_rejected() -> None:
+    """A sensor blind spot must be declared, never silently indistinguishable from a fact.
+
+    The optionality test above keeps its documents coherent on purpose, so this is where the
+    security-relevant half of the invariant lives: dropping a sensor fact WITHOUT listing it in
+    missing_required_fields has to fail. Without this, an event that observed nothing would be
+    accepted as an event that observed everything.
+    """
+    document = _fixture("falco.investigation.valid.json")
+    checked = 0
+    for field in sorted(contracts.FALCO_SENSOR_REQUIRED_FIELDS):
+        if field not in document:
+            continue
+        undeclared = copy.deepcopy(document)
+        undeclared.pop(field)
+        undeclared["missing_required_fields"] = []
+        with pytest.raises(ValueError, match="missing_required_fields"):
+            contracts.decode_strict(_wire(undeclared), contracts.FalcoConnectV1, 65_536)
+        checked += 1
+    assert checked > 0, (
+        "the fixture carries no sensor facts, so this test proved nothing — "
+        "fix the fixture, do not delete the assertion"
+    )
 
 
 def test_shared_contradictory_falco_result_is_rejected_everywhere() -> None:
