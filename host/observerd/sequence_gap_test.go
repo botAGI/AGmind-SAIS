@@ -122,6 +122,17 @@ func rewriteObserverStateAsLegacyForTest(
 	}
 	value["schema_version"] = schema
 	delete(value, "sequence_gap_protocol")
+	// V4 introduced control-receipt anchors and V5 the pcc anchors; a genuine
+	// V1/V2 state predates all nine fields, and DecodeStrict rejects unknowns.
+	delete(value, "control_receipt_count")
+	delete(value, "control_receipt_bytes")
+	delete(value, "control_receipt_head_sha256")
+	delete(value, "pcc_boundary_count")
+	delete(value, "pcc_boundary_bytes")
+	delete(value, "pcc_boundary_head_sha256")
+	delete(value, "pcc_receipt_count")
+	delete(value, "pcc_receipt_bytes")
+	delete(value, "pcc_receipt_head_sha256")
 	if schema == observerStateSchemaV1 {
 		delete(value, "boot_boundary_state")
 		delete(value, "pending_boot_boundary")
@@ -143,6 +154,20 @@ func rewriteObserverStateAsLegacyForTest(
 	}
 	if err := durablefile.AtomicWrite(path, legacy); err != nil {
 		t.Fatal(err)
+	}
+	// The fixture daemon already wrote the modern journals, but a V1-V3 era
+	// host has none, and requireLegacyControlReceiptJournalAbsent /
+	// requireLegacyPCCJournalsAbsent fail migration when they exist.
+	spoolRoot := filepath.Join(filepath.Dir(path), "spool")
+	for _, journal := range []string{
+		"control-receipts.agf",
+		"pcc-boundaries.agf",
+		"pcc-receipts.agf",
+	} {
+		err := os.Remove(filepath.Join(spoolRoot, journal))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
 	}
 }
 
