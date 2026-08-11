@@ -29,6 +29,7 @@ from agmind_immune.ingest.ack_journal import (
 )
 from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import AuthenticatedPCCInput
+from tests.correlation.test_authority import _FakeFilesystem
 from tests.correlation.test_pcc import (
     _accepted_complete,
     _accepted_direct_falco,
@@ -829,11 +830,31 @@ def _close_compute_input(resources: dict[str, object]) -> None:
     resources["store"].close()
 
 
+def _hermetic_detector_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route the fixed detector-bundle walk through hermetic fake nodes.
+
+    The pytest container ships no /etc/falco/rules.d/agmind-pcc.yaml, so the
+    loader is rebuilt around the authority module's own _Filesystem seam: the
+    production O_NOFOLLOW walk still executes in full, only the nodes are
+    fakes carrying the pinned root-owned facts.
+    """
+    authority = importlib.import_module("agmind_immune.correlation.authority")
+    monkeypatch.setattr(
+        authority,
+        "_load_pinned_detector_bundle",
+        authority._detector_bundle_loader(
+            _FakeFilesystem(b"- rule: hermetic pytest detector bundle\n")
+        ),
+    )
+
+
 def test_unpublished_replay_supports_empty_confirmed_prefix(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches requiring a non-empty terminal instead of the confirmed prefix."""
     subject = _subject()
+    _hermetic_detector_bundle(monkeypatch)
     coordinator = _coordinator(tmp_path / "evidence", private_key(11))
     store = coordinator.segment_store
     journal = CorrelationRequestJournal.create_new(store)
@@ -862,9 +883,11 @@ def test_unpublished_replay_supports_empty_confirmed_prefix(
 
 def test_unpublished_replay_caps_at_lagged_confirmed_prefix(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches projecting the acceptance head or authenticated pending ACK."""
     subject = _subject()
+    _hermetic_detector_bundle(monkeypatch)
     coordinator = _coordinator(tmp_path / "evidence", private_key(11))
     _accept(coordinator, boot_boundary(private_key(11)))
     pending_ref = cast(
@@ -904,9 +927,11 @@ def test_unpublished_replay_caps_at_lagged_confirmed_prefix(
 
 def test_unpublished_replay_requires_exact_retention_completion(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches replacing the one-store completion proof with a pending Boolean."""
     subject = _subject()
+    _hermetic_detector_bundle(monkeypatch)
     sparse_coordinator = _coordinator(
         tmp_path / "sparse-without-scope",
         private_key(11),
@@ -1413,6 +1438,9 @@ def test_durable_stage_abort_releases_exact_resources_and_allows_actual_retry(
                 isolation_level=None,
                 check_same_thread=False,
             )
+            # The physical-binding capture accepts only owner-private 0600
+            # candidates, exactly as the production publisher creates them.
+            (case_root / "candidate.sqlite3").chmod(0o600)
             if failure_kind == "materialize":
                 candidate.execute("CREATE TABLE attacker(value TEXT)")
                 with pytest.raises(subject.ProjectionConflict):
@@ -1425,6 +1453,14 @@ def test_durable_stage_abort_releases_exact_resources_and_allows_actual_retry(
                 seal = owner._copy_staged_replay_into(
                     stage,
                     candidate,
+                    _factory=subject._STAGED_REPLAY_FACTORY,
+                )
+                # Publication is only reachable from the prepared state: the
+                # owner checkpoints and closes the candidate exactly as the
+                # production publisher does before its callback runs.
+                owner._prepare_staged_replay_for_publication(
+                    stage,
+                    seal,
                     _factory=subject._STAGED_REPLAY_FACTORY,
                 )
 
@@ -1495,6 +1531,9 @@ def test_durable_stage_materialization_is_exact_one_shot_and_unforgeable(
         isolation_level=None,
         check_same_thread=False,
     )
+    # Candidates must carry the production publisher's owner-private 0600
+    # mode so materialization fails only for the forgery under test.
+    (tmp_path / "candidate.sqlite3").chmod(0o600)
     try:
         assert not hasattr(stage, "connection")
         assert not hasattr(stage, "database_image")
@@ -1512,6 +1551,7 @@ def test_durable_stage_materialization_is_exact_one_shot_and_unforgeable(
             isolation_level=None,
             check_same_thread=False,
         )
+        (tmp_path / "forged.sqlite3").chmod(0o600)
         with pytest.raises(ProjectionAuthorityError):
             owner._copy_staged_replay_into(
                 forged,
@@ -1550,6 +1590,7 @@ def test_durable_stage_materialization_is_exact_one_shot_and_unforgeable(
             isolation_level=None,
             check_same_thread=False,
         )
+        (tmp_path / "laundered.sqlite3").chmod(0o600)
         with pytest.raises(ProjectionAuthorityError):
             owner._copy_staged_replay_into(
                 stage,
@@ -1567,7 +1608,16 @@ def test_durable_stage_materialization_is_exact_one_shot_and_unforgeable(
             called = True
             raise AssertionError("mutated staged image reached publisher")
 
+        # The prepared-publication protocol validates the materialized image
+        # against its seal at the preparation edge, so the mutation must
+        # conflict there, discard the stage, and starve the publisher.
         with pytest.raises(subject.ProjectionConflict):
+            owner._prepare_staged_replay_for_publication(
+                stage,
+                seal,
+                _factory=subject._STAGED_REPLAY_FACTORY,
+            )
+        with pytest.raises(ProjectionAuthorityError):
             owner._publish_staged_replay(
                 stage,
                 seal,
@@ -1636,9 +1686,20 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
         isolation_level=None,
         check_same_thread=False,
     )
+    # The physical-binding capture accepts only owner-private 0600
+    # candidates, exactly as the production publisher creates them.
+    candidate_path.chmod(0o600)
     seal = owner._copy_staged_replay_into(
         stage,
         target,
+        _factory=subject._STAGED_REPLAY_FACTORY,
+    )
+    # Publication is only reachable from the prepared state: the owner
+    # checkpoints and closes the candidate exactly as the production
+    # publisher does, so callbacks below act on the file, not on target.
+    owner._prepare_staged_replay_for_publication(
+        stage,
+        seal,
         _factory=subject._STAGED_REPLAY_FACTORY,
     )
     authority_before = owner._authority
@@ -1660,9 +1721,10 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
         if commit_kind == "missing_pcc":
 
             def publish_missing(latch: Any) -> sqlite3.Connection:
-                target.execute("DELETE FROM candidate_evidence")
-                target.execute("DELETE FROM candidates")
-                target.close()
+                mutating = sqlite3.connect(candidate_path, isolation_level=None)
+                mutating.execute("DELETE FROM candidate_evidence")
+                mutating.execute("DELETE FROM candidates")
+                mutating.close()
                 latch._arm_namespace_publication()
                 os.replace(candidate_path, published_path)
                 result = subject._v2_connection_for_test(published_path)
@@ -1691,8 +1753,9 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
 
             def publish_unrelated(latch: Any) -> sqlite3.Connection:
                 unrelated = subject._v2_connection_for_test()
-                target.backup(unrelated)
-                target.close()
+                source = sqlite3.connect(candidate_path, isolation_level=None)
+                source.backup(unrelated)
+                source.close()
                 latch._arm_namespace_publication()
                 os.replace(candidate_path, published_path)
                 reopened.append(unrelated)
@@ -1711,7 +1774,6 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
         elif commit_kind == "temp_shadow":
 
             def publish_temp_shadow(latch: Any) -> sqlite3.Connection:
-                target.close()
                 latch._arm_namespace_publication()
                 os.replace(candidate_path, published_path)
                 result = subject._v2_connection_for_test(published_path)
@@ -1761,7 +1823,6 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
         elif commit_kind == "post_callback":
 
             def interrupt_after_callback(latch: Any) -> sqlite3.Connection:
-                target.close()
                 latch._arm_namespace_publication()
                 os.replace(candidate_path, published_path)
                 result = subject._v2_connection_for_test(published_path)
@@ -1783,7 +1844,6 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
         elif commit_kind == "post_latch":
 
             def crash_after_latch(latch: Any) -> sqlite3.Connection:
-                target.close()
                 latch._arm_namespace_publication()
                 os.replace(candidate_path, published_path)
                 raise KeyboardInterrupt("injected post-latch failure")
@@ -1802,7 +1862,6 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
         elif commit_kind == "armed_no_namespace":
 
             def fail_namespace_without_mutation(latch: Any) -> sqlite3.Connection:
-                target.close()
                 latch._arm_namespace_publication()
                 raise OSError("injected namespace syscall failure")
 
@@ -1844,7 +1903,6 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
             def must_not_publish(latch: Any) -> sqlite3.Connection:
                 nonlocal callback_called
                 callback_called = True
-                target.close()
                 latch._arm_namespace_publication()
                 os.replace(candidate_path, published_path)
                 result = subject._v2_connection_for_test(published_path)
@@ -1895,7 +1953,6 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
             monkeypatch.setattr(subject.os, "close", interrupt_after_physical_close)
 
             def publish_before_fd_interrupt(latch: Any) -> sqlite3.Connection:
-                target.close()
                 latch._arm_namespace_publication()
                 os.replace(candidate_path, published_path)
                 result = subject._v2_connection_for_test(published_path)
@@ -1923,7 +1980,6 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
         else:
 
             def publish_exact(latch: Any) -> sqlite3.Connection:
-                target.close()
                 latch._arm_namespace_publication()
                 os.replace(candidate_path, published_path)
                 result = subject._v2_connection_for_test(published_path)
@@ -1964,9 +2020,11 @@ def test_durable_stage_commits_only_verified_reopened_image_at_final_edge(
 
 def test_historical_pin_mismatch_returns_no_artifact(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches reducing a protected PCC under replacement fixed pin authority."""
     subject = _subject()
+    _hermetic_detector_bundle(monkeypatch)
     authority = importlib.import_module("agmind_immune.correlation.authority")
     detector_bundle_sha256 = authority._load_pinned_detector_bundle()
     assert detector_bundle_sha256 != "0" * 64
@@ -2712,7 +2770,11 @@ def test_unpublished_replay_uses_exact_compact_primary_history(
     assert full_assessments[proofs[2].event_id].coverage_snapshot_sha256 == (
         "5027ed17dc74a7f4b47495ae67ccf6cc3424a338222c6b8b91c5a04383d9350a"
     )
-    real_reduce = historical._reduce_historical_coverage
+    # The frozen replay calls _reduce_historical_coverage_result through the
+    # projection module's own imported name, so the interception must live on
+    # that seam: patching the historical-module wrapper would never observe
+    # the reductions replay actually performs.
+    real_reduce = subject._reduce_historical_coverage_result
     reduced_sequences: dict[str, list[tuple[int, ...]]] = {
         proof.snapshot.trigger.event_id: [] for proof in proofs
     }
@@ -2732,12 +2794,12 @@ def test_unpublished_replay_uses_exact_compact_primary_history(
             reduced_sequences[trigger_event_id].append(
                 tuple(record.ref.source_sequence for record in selected)
             )
-            reduced_assessments[trigger_event_id].append(result.assessment)
+            reduced_assessments[trigger_event_id].append(result.timeline.assessment)
         return result
 
     monkeypatch.setattr(
-        historical,
-        "_reduce_historical_coverage",
+        subject,
+        "_reduce_historical_coverage_result",
         capture_reduction,
     )
     owner, connection, report = subject._v2_unpublished_projection_from_prefix_for_test(
