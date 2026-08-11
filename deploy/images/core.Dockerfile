@@ -29,6 +29,12 @@ COPY --from=builder --chown=0:0 /build/.venv /opt/venv
 COPY --chown=0:0 core/agmind_immune /app/core/agmind_immune
 COPY --chown=0:0 contracts/v1 /app/contracts/v1
 COPY --chown=0:0 contracts/v2 /app/contracts/v2
+# Create the parent directories 0755 FIRST. A bare COPY --chmod=0444 into a
+# not-yet-existing path stamps that same 0444 onto the directories it implicitly
+# creates, leaving them non-traversable (dr--r--r--); the non-root USER below
+# then cannot enter them to read the 0444 files inside. The root Dockerfile
+# already does this; the production image must match.
+RUN install -d -o root -g root -m 0755 /usr/share/agmind-sais /etc/falco /etc/falco/rules.d
 COPY --chown=0:0 --chmod=0444 policies/pcc.rego /usr/share/agmind-sais/pcc.rego
 COPY --chown=0:0 --chmod=0444 contracts/v1/ipv4-special-use.csv /usr/share/agmind-sais/ipv4-special-use.csv
 COPY --chown=0:0 --chmod=0444 deploy/falco/rules.d/agmind-pcc.yaml /etc/falco/rules.d/agmind-pcc.yaml
