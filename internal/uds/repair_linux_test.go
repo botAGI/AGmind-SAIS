@@ -96,30 +96,72 @@ func TestOwnedSocketCrashLikeRestartRecoversExactStaleInode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var stale unix.Stat_t
-	if err := unix.Lstat(path, &stale); err != nil {
-		t.Fatal(err)
-	}
 	if err := first.listener.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.abandon(); err != nil {
 		t.Fatal(err)
 	}
+	var stale unix.Stat_t
+	if err := unix.Lstat(path, &stale); err != nil {
+		t.Fatal(err)
+	}
+	if !activeSocketSafe(stale, 0o600, 0) {
+		t.Fatalf("crash-like abandon left no stale socket: %+v", stale)
+	}
+	if connection, dialErr := net.Dial("unix", path); dialErr == nil {
+		_ = connection.Close()
+		t.Fatal("stale socket accepted a connection before restart")
+	}
 
-	second, err := listenOwned(path, 0o600, 0)
+	// ext4/overlayfs hand a freed inode number straight back, so comparing
+	// the recovered socket's dev+ino against the stale one proves nothing in
+	// either direction. Nothing in production relies on the socket path's
+	// inode identity across restarts; the recovery guarantee is behavioral:
+	// the stale file is unlinked BEFORE the fresh bind (observed at the
+	// stale-unlink boundary), and afterwards the path names the live
+	// listener with the configured mode and owner.
+	staleUnlinkSeen := false
+	var pathAtStaleUnlink error
+	second, err := listenOwnedWithOptions(
+		path,
+		0o600,
+		0,
+		listenOwnedOptions{boundary: func(boundary socketOwnershipBoundary) {
+			if boundary != socketBoundaryStaleUnlinked {
+				return
+			}
+			staleUnlinkSeen = true
+			var gone unix.Stat_t
+			pathAtStaleUnlink = unix.Lstat(path, &gone)
+		}},
+	)
 	if err != nil {
-		t.Fatalf("restart did not recover exact stale socket: %v", err)
+		t.Fatalf("restart did not recover stale socket path: %v", err)
 	}
 	defer second.remove()
 	defer second.listener.Close()
+	if !staleUnlinkSeen {
+		t.Fatal("restart never crossed the stale-unlink boundary")
+	}
+	if !errors.Is(pathAtStaleUnlink, unix.ENOENT) {
+		t.Fatalf(
+			"stale socket still present at unlink boundary: %v",
+			pathAtStaleUnlink,
+		)
+	}
 	var current unix.Stat_t
 	if err := unix.Lstat(path, &current); err != nil {
 		t.Fatal(err)
 	}
-	if current.Dev == stale.Dev && current.Ino == stale.Ino {
-		t.Fatal("restart retained stale socket inode")
+	if !activeSocketSafe(current, 0o600, 0) {
+		t.Fatalf("recovered socket is not owned-safe: %+v", current)
 	}
+	connection, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("recovered path does not name the live listener: %v", err)
+	}
+	_ = connection.Close()
 }
 
 func TestOwnedSocketLiveLockPreventsConcurrentUnlink(t *testing.T) {

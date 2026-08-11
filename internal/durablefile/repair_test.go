@@ -112,6 +112,32 @@ func TestRemoveIfIdentityRefusesReplacementInode(t *testing.T) {
 	if err := durablefile.CreateOnly(path, raw); err != nil {
 		t.Fatal(err)
 	}
+	// ext4/overlayfs hand the freed inode number straight back, so a
+	// byte-identical recreate can land on the exact (device, inode, size)
+	// triple the recorded identity names — that file IS the identity, so
+	// refusing it would be wrong. Park the recycled inode under a pinned
+	// sibling name and recreate once more, forcing the replacement onto a
+	// provably different inode.
+	var replacement unix.Stat_t
+	if err := unix.Lstat(path, &replacement); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(replacement.Dev) == identity.Device &&
+		uint64(replacement.Ino) == identity.Inode {
+		if err := os.Rename(path, path+".inode-pin"); err != nil {
+			t.Fatal(err)
+		}
+		if err := durablefile.CreateOnly(path, raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Lstat(path, &replacement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if uint64(replacement.Dev) == identity.Device &&
+		uint64(replacement.Ino) == identity.Inode {
+		t.Fatal("pinned sibling did not force a fresh replacement inode")
+	}
 	if err := durablefile.RemoveIfIdentity(path, identity); !errors.Is(
 		err,
 		durablefile.ErrUnsafePath,

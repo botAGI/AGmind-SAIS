@@ -314,13 +314,44 @@ func TestAckRevalidatesExactDiskIdentityAfterFetch(t *testing.T) {
 	if err := durablefile.CreateOnly(item.path, raw); err != nil {
 		t.Fatal(err)
 	}
+	// ext4/overlayfs hand the freed inode number straight back, so a
+	// byte-identical recreate can land on the exact (device, inode, size)
+	// triple the compare-only revalidation recorded — indistinguishable by
+	// construction, not a checker defect. Park the recycled inode under a
+	// pinned sibling name and recreate once more, which forces the
+	// replacement onto a provably different inode.
+	var replacement unix.Stat_t
+	if err := unix.Lstat(item.path, &replacement); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(replacement.Dev) == item.identity.Device &&
+		uint64(replacement.Ino) == item.identity.Inode {
+		if err := os.Rename(item.path, item.path+".inode-pin"); err != nil {
+			t.Fatal(err)
+		}
+		if err := durablefile.CreateOnly(item.path, raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Lstat(item.path, &replacement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if uint64(replacement.Dev) == item.identity.Device &&
+		uint64(replacement.Ino) == item.identity.Inode {
+		t.Fatal("pinned sibling did not force a fresh replacement inode")
+	}
 
 	err = spool.Ack(item.Sequence, item.EventID, item.ContentSHA256)
 	if !errors.Is(err, ErrSpoolCorrupt) {
 		t.Fatalf("ack accepted byte-identical replacement inode: %v", err)
 	}
-	if !state.Snapshot().MutationReadOnly {
-		t.Fatal("disk identity replacement did not persist read-only")
+	snapshot := state.Snapshot()
+	if !snapshot.MutationReadOnly ||
+		snapshot.ReadOnlyReason != "observer_ack_disk_identity_changed" {
+		t.Fatalf(
+			"disk identity replacement did not persist the exact fence: %+v",
+			snapshot,
+		)
 	}
 }
 
