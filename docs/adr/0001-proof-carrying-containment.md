@@ -70,7 +70,7 @@ MCP, no model-managed memory, no redirects, 3 s/45 s timeouts, and a circuit bre
 arguments, environment, labels, filenames, raw logs, credentials, approval/action fields, or
 namespace internals. Output must be exactly one JSON object matching `HunterOutputV1` with
 `supporting_evidence_ids` a subset of the submitted IDs; anything else is a typed non-authoritative
-failure. Only Core may reach the DGX URL, and its resolved IPs are pinned into the management
+failure. Only Core may reach the Hunter model-host URL, and its resolved IPs are pinned into the management
 denylist hashed into every plan, so the containment primitive can never be aimed at the model host.
 
 Consequences: unknown evidence IDs, action fields, commands, tool calls, and schema extensions
@@ -347,7 +347,7 @@ Address Registry snapshot (SHA-256
 `e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73`), uses longest-prefix match, and
 permits only addresses whose most-specific entry has Globally Reachable=True; it additionally
 denies multicast, limited broadcast, current Docker network subnets and gateways, the operator
-denylist, and management destinations (including the resolved DGX model-endpoint IPs). Hardcoded
+denylist, and management destinations (including the resolved Hunter model-endpoint IPs). Hardcoded
 CIDR lists rot and disagree between languages; pinning the registry by hash makes the decision
 reproducible and cross-language identical. Every prepared plan embeds
 `special_use_registry_sha256`, `management_denylist_sha256`, `docker_network_snapshot_sha256`, and
@@ -544,11 +544,11 @@ image being pulled locally.
 
 `scripts/preflight-linux.sh` emits one read-only JSON support report (systemd, cgroup v2, rootful
 single-daemon Docker, kernel >= 5.8 with BTF, tracefs, nftables, bridge networks, disk/RAM floors,
-safe socket parents, digest-correct images, DGX resolution matching the pinned management list);
+safe socket parents, digest-correct images, model-host resolution matching the pinned management list);
 active containment is refused unless all gates pass. `scripts/install-linux.sh` requires root plus
 a clean preflight; installs atomically; creates users and groups (agmind-observer/core/sensor
 users; agmind-core/sensor/admin groups); generates observer and actuator Ed25519 keys only if
-absent; resolves and hash-pins DGX addresses; starts services in dependency order; and reports
+absent; resolves and hash-pins the Hunter model-host addresses; starts services in dependency order; and reports
 mutation readiness only after reconcile/key/evidence/journal health. Re-running preserves keys,
 host ID, and journals — nothing rotates implicitly. An installer that silently rotates keys or
 half-installs would break the pinned trust root and the evidence chain. The original design gave
@@ -569,7 +569,7 @@ lowercase UUIDv4 at `/var/lib/agmind-sais/identity/host-id`. Evidence: `deploy/v
 ### Native Linux acceptance is the only acceptance; Darwin can never satisfy it
 
 Production-impacting claims require the native gate on a dedicated rootful Linux host (reference:
-one Beelink GTR9 Pro; the preflight, not the hardware name, decides support): real Falco field
+one dedicated lab host; the preflight, not the hardware name, decides support): real Falco field
 validation, identity races, target-only blocking with an unaffected control container at exactly
 1.1.1.1:443, actuator and Core death after apply with kernel TTL expiry, foreign-nft collision,
 evidence replay, resource caps (under 2 GiB combined RSS), and a two-phase explicitly authorized

@@ -28,8 +28,8 @@ fi
 if [[ ! -t 0 || ! -t 1 ]]; then
   block "interactive_tty_required"
 fi
-if [[ -z "${AGMIND_DGX_URL:-}" ]]; then
-  block "dgx_url_required"
+if [[ -z "${AGMIND_HUNTER_URL:-}" ]]; then
+  block "hunter_url_required"
 fi
 
 for required_command in \
@@ -46,7 +46,7 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 preflight_report=""
 if ! preflight_report="$(
   "${script_dir}/preflight-linux.sh" \
-    --dgx-url "${AGMIND_DGX_URL}" \
+    --hunter-url "${AGMIND_HUNTER_URL}" \
     --runtime-env /etc/agmind-sais/runtime.env \
     --management-denylist /etc/agmind-sais/management-destinations.json
 )"; then

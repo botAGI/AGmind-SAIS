@@ -3,7 +3,7 @@
 This profile runs `agmind-observerd` and `agmind-actuatord` natively on one
 rootful Linux Docker host. Core, OPA, the redacting adapter, and the pinned
 monitor-only Falco sensor run under Docker Compose.
-It is a deployment scaffold for the Beelink lab, not native-acceptance proof.
+It is a deployment scaffold for the dedicated lab host, not native-acceptance proof.
 
 ## Fixed layout
 
@@ -17,11 +17,13 @@ It is a deployment scaffold for the Beelink lab, not native-acceptance proof.
 
 The Core container never receives the Docker socket, host namespaces,
 `CAP_NET_ADMIN`, the actuator admin socket, or the observer private socket.
-The DGX model is an untrusted read-only enrichment endpoint. Its one pinned IPv4
-address must appear in both `runtime.env` and `management-destinations.json`.
+The Hunter model host is an untrusted read-only enrichment endpoint. Its one
+pinned IPv4 address must appear in both `runtime.env` and
+`management-destinations.json`.
 Core has no external network: it can reach only a pinned, read-only HAProxy TCP
-relay, and that relay has exactly one configured upstream, the DGX IPv4 on port
-8000. The Hunter model therefore cannot turn its output into general Core egress.
+relay, and that relay has exactly one configured upstream, the model-host IPv4 on
+port 8000. The Hunter model therefore cannot turn its output into general Core
+egress.
 The current M1 observer binary is host-root because its PCC safety-pin loader
 and owned-socket implementation enforce a root EUID; the unit constrains that
 process and does not claim the planned post-M1 non-root privilege split.
@@ -42,30 +44,31 @@ after validating the same filesystem.
 ## Install and start
 
 Run the installer from the repository checkout as root. The operator must be an
-existing login account. The DGX URL must be canonical and resolve to exactly one
-safe IPv4 address. The endpoint must expose the Hunter model under the id
-`dspark`; the examples below write `<model-host>` where your host goes:
+existing login account. The Hunter model-host URL must be canonical and resolve
+to exactly one safe IPv4 address. The endpoint must expose the Hunter model
+under the id `dspark`; the examples below write `<model-host>` where your host
+goes:
 
 ```sh
 sudo ./scripts/install-linux.sh \
   --admin-user <existing-login-account> \
-  --dgx-url http://<model-host>:8000/v1
+  --hunter-url http://<model-host>:8000/v1
 ```
 
-If the DGX endpoint requires an API token, import it from a root-owned,
+If the Hunter endpoint requires an API token, import it from a root-owned,
 single-link file with mode `0400`, `0440`, `0600`, or `0640`:
 
 ```sh
 sudo ./scripts/install-linux.sh \
   --admin-user <existing-login-account> \
-  --dgx-url http://<model-host>:8000/v1 \
-  --dgx-token-file /root/dgx-api.token
+  --hunter-url http://<model-host>:8000/v1 \
+  --hunter-token-file /root/hunter-api.token
 ```
 
 The installer copies only the production source/runtime allowlist, creates the
 fixed users and directories, builds the four host binaries in the pinned Go
 container, builds the two Python images, pulls the pinned runtime images,
-creates or validates the installation identity, writes the exact DGX denylist,
+creates or validates the installation identity, writes the exact model-host denylist,
 runs the read-only preflight, installs the units, and waits for `/ready`.
 
 Re-running is an update operation: it preserves the host ID, keys, tokens, and
@@ -113,7 +116,7 @@ requires typing the hash suffix shown by the real CLI.
 sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
 sudo env \
   AGMIND_DEDICATED_TEST_HOST=1 \
-  AGMIND_DGX_URL=http://<model-host>:8000/v1 \
+  AGMIND_HUNTER_URL=http://<model-host>:8000/v1 \
   /opt/agmind-sais/scripts/verify-linux-integration.sh \
   --output /var/lib/agmind-sais/acceptance/run-001
 ```
@@ -121,7 +124,7 @@ sudo env \
 Only `acceptance-report.json` with `"status":"PASS"` is native M1 evidence.
 Darwin, Docker Desktop, OrbStack, WSL, rootless Docker, a degraded preflight, or
 a non-interactive invocation cannot satisfy this gate. Full operator procedure
-and artifact semantics are in `docs/runbooks/beelink-lab.md`.
+and artifact semantics are in `docs/runbooks/native-acceptance.md`.
 
 ## Kubernetes migration boundary
 

@@ -18,14 +18,14 @@ readonly adapter_image="agmind-sais-falco-adapter:0.1.0"
 usage() {
   cat <<'EOF'
 Usage:
-  install-linux.sh --admin-user EXISTING --dgx-url http://host:8000/v1 [options]
+  install-linux.sh --admin-user EXISTING --hunter-url http://host:8000/v1 [options]
 
 Required:
   --admin-user USER       Existing local operator account to add to agmind-admin
-  --dgx-url URL           Exact HTTP endpoint; must resolve to one safe IPv4
+  --hunter-url URL           Exact HTTP endpoint; must resolve to one safe IPv4
 
 Options:
-  --dgx-token-file PATH   Import a protected, root-owned DGX API token
+  --hunter-token-file PATH   Import a protected, root-owned Hunter API token
   --prepare-only          Install and preflight, but do not reload/start systemd
   -h, --help              Show this help and exit without changing the host
 EOF
@@ -41,12 +41,12 @@ status() {
 }
 
 admin_user=""
-dgx_url=""
-dgx_token_file=""
+hunter_url=""
+hunter_token_file=""
 prepare_only=0
 seen_admin=0
-seen_dgx_url=0
-seen_dgx_token=0
+seen_hunter_url=0
+seen_hunter_token=0
 
 while (($# > 0)); do
   case "$1" in
@@ -61,18 +61,18 @@ while (($# > 0)); do
       seen_admin=1
       shift 2
       ;;
-    --dgx-url)
-      (($# >= 2)) || die "--dgx-url requires a value"
-      ((seen_dgx_url == 0)) || die "--dgx-url may be specified only once"
-      dgx_url="$2"
-      seen_dgx_url=1
+    --hunter-url)
+      (($# >= 2)) || die "--hunter-url requires a value"
+      ((seen_hunter_url == 0)) || die "--hunter-url may be specified only once"
+      hunter_url="$2"
+      seen_hunter_url=1
       shift 2
       ;;
-    --dgx-token-file)
-      (($# >= 2)) || die "--dgx-token-file requires a value"
-      ((seen_dgx_token == 0)) || die "--dgx-token-file may be specified only once"
-      dgx_token_file="$2"
-      seen_dgx_token=1
+    --hunter-token-file)
+      (($# >= 2)) || die "--hunter-token-file requires a value"
+      ((seen_hunter_token == 0)) || die "--hunter-token-file may be specified only once"
+      hunter_token_file="$2"
+      seen_hunter_token=1
       shift 2
       ;;
     --prepare-only)
@@ -91,7 +91,7 @@ while (($# > 0)); do
 done
 
 ((seen_admin == 1)) || die "--admin-user is required"
-((seen_dgx_url == 1)) || die "--dgx-url is required"
+((seen_hunter_url == 1)) || die "--hunter-url is required"
 
 [[ "$(uname -s)" == "Linux" ]] || die "this installer supports Linux only"
 ((EUID == 0)) || die "EUID 0 is required"
@@ -126,22 +126,22 @@ case "$account_shell" in
   */false|*/nologin) die "operator account has a non-login shell" ;;
 esac
 
-if [[ -n "$dgx_token_file" ]]; then
-  [[ "$dgx_token_file" == /* ]] ||
-    die "--dgx-token-file must be a clean absolute path"
-  python3 - "$dgx_token_file" <<'PY' || die "--dgx-token-file must be a clean absolute path"
+if [[ -n "$hunter_token_file" ]]; then
+  [[ "$hunter_token_file" == /* ]] ||
+    die "--hunter-token-file must be a clean absolute path"
+  python3 - "$hunter_token_file" <<'PY' || die "--hunter-token-file must be a clean absolute path"
 import os
 import sys
 
 path = sys.argv[1]
 raise SystemExit(0 if os.path.normpath(path) == path else 1)
 PY
-  [[ -f "$dgx_token_file" && ! -L "$dgx_token_file" ]] ||
-    die "DGX token source must be a regular non-symlink file"
-  token_metadata="$(stat -Lc '%u:%h:%a' -- "$dgx_token_file")"
+  [[ -f "$hunter_token_file" && ! -L "$hunter_token_file" ]] ||
+    die "Hunter token source must be a regular non-symlink file"
+  token_metadata="$(stat -Lc '%u:%h:%a' -- "$hunter_token_file")"
   case "$token_metadata" in
     0:1:400|0:1:440|0:1:600|0:1:640) ;;
-    *) die "DGX token source must be root-owned, single-link, and mode 0400/0440/0600/0640" ;;
+    *) die "Hunter token source must be root-owned, single-link, and mode 0400/0440/0600/0640" ;;
   esac
 fi
 
@@ -188,7 +188,7 @@ for pinned_image in \
   [[ "$pinned_image" =~ @sha256:[0-9a-f]{64}$ ]] || die "versions.env contains an unpinned image reference"
 done
 
-dgx_ipv4="$(python3 - "$dgx_url" <<'PY'
+hunter_ipv4="$(python3 - "$hunter_url" <<'PY'
 from __future__ import annotations
 
 import ipaddress
@@ -202,7 +202,7 @@ try:
     parsed = urlsplit(raw)
     port = parsed.port
 except ValueError as error:
-    raise SystemExit(f"invalid --dgx-url: {error}")
+    raise SystemExit(f"invalid --hunter-url: {error}")
 host = parsed.hostname or ""
 canonical = f"http://{host}:{port}/v1" if host and port is not None else ""
 if (
@@ -219,7 +219,7 @@ if (
     or len(host) > 253
     or not re.fullmatch(r"[a-z0-9.-]+", host)
 ):
-    raise SystemExit("--dgx-url must be canonical http://host:8000/v1")
+    raise SystemExit("--hunter-url must be canonical http://host:8000/v1")
 try:
     ipaddress.IPv4Address(host)
 except ipaddress.AddressValueError:
@@ -231,7 +231,7 @@ except ipaddress.AddressValueError:
         or label[-1] == "-"
         for label in labels
     ):
-        raise SystemExit("--dgx-url contains an invalid DNS name")
+        raise SystemExit("--hunter-url contains an invalid DNS name")
 
 resolved: set[ipaddress._BaseAddress] = set()
 try:
@@ -243,12 +243,12 @@ try:
     ):
         resolved.add(ipaddress.ip_address(item[4][0]))
 except (OSError, ValueError) as error:
-    raise SystemExit(f"DGX resolution failed: {error}")
+    raise SystemExit(f"Hunter endpoint resolution failed: {error}")
 if len(resolved) != 1:
-    raise SystemExit("DGX endpoint must resolve to exactly one address")
+    raise SystemExit("Hunter endpoint must resolve to exactly one address")
 address = next(iter(resolved))
 if not isinstance(address, ipaddress.IPv4Address):
-    raise SystemExit("DGX endpoint must resolve only to IPv4")
+    raise SystemExit("Hunter endpoint must resolve only to IPv4")
 if (
     address.is_loopback
     or address.is_link_local
@@ -256,11 +256,11 @@ if (
     or address.is_unspecified
     or address.is_reserved
 ):
-    raise SystemExit("DGX endpoint resolved to an unsafe IPv4 address")
+    raise SystemExit("Hunter endpoint resolved to an unsafe IPv4 address")
 print(address)
 PY
 )"
-[[ "$dgx_ipv4" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "DGX resolution returned a malformed IPv4"
+[[ "$hunter_ipv4" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Hunter endpoint resolution returned a malformed IPv4"
 
 work_dir=""
 cleanup() {
@@ -500,7 +500,7 @@ atomic_install_file \
   "${install_root}/policies/pcc.rego" \
   "${share_root}/pcc.rego" 0444 root root
 
-printf '{"denied_addresses":["%s"],"denied_networks":[]}\n' "$dgx_ipv4" >"${work_dir}/management-destinations.json"
+printf '{"denied_addresses":["%s"],"denied_networks":[]}\n' "$hunter_ipv4" >"${work_dir}/management-destinations.json"
 atomic_install_file \
   "${work_dir}/management-destinations.json" \
   "${config_root}/management-destinations.json" 0444 root root
@@ -515,13 +515,13 @@ printf '%s\n' \
   "AGMIND_FALCO_IMAGE=${falco_image}" \
   "AGMIND_OPA_IMAGE=${opa_image}" \
   "AGMIND_HAPROXY_IMAGE=${haproxy_image}" \
-  "AGMIND_DGX_IPV4=${dgx_ipv4}" >"${work_dir}/runtime.env"
+  "AGMIND_HUNTER_IPV4=${hunter_ipv4}" >"${work_dir}/runtime.env"
 atomic_install_file "${work_dir}/runtime.env" "${config_root}/runtime.env" 0444 root root
 
 status "initializing or validating the existing installation identity"
 bootstrap_arguments=(init)
-if [[ -n "$dgx_token_file" ]]; then
-  bootstrap_arguments+=(--dgx-token-file "$dgx_token_file")
+if [[ -n "$hunter_token_file" ]]; then
+  bootstrap_arguments+=(--hunter-token-file "$hunter_token_file")
 fi
 "${libexec_root}/agmind-bootstrap" "${bootstrap_arguments[@]}" >/dev/null
 
@@ -541,7 +541,7 @@ secure_artifact "${secrets_root}/actuator-ed25519.key" 0400 root root
 secure_artifact "${public_root}/actuator-ed25519.pub" 0444 root root
 secure_artifact "${config_root}/observer-trust-root.json" 0444 root root
 secure_artifact "${secrets_root}/core-api.token" 0640 root agmind-core
-secure_artifact "${secrets_root}/dgx-api.token" 0640 root agmind-core
+secure_artifact "${secrets_root}/hunter-api.token" 0640 root agmind-core
 
 usermod -a -G agmind-admin "$admin_user"
 
@@ -581,18 +581,18 @@ falco_runtime_image_id="$(runtime_image_id "$falco_image")"
 opa_runtime_image_id="$(runtime_image_id "$opa_image")"
 haproxy_runtime_image_id="$(runtime_image_id "$haproxy_image")"
 printf \
-  '{"schema_version":"agmind.runtime-image-ids.v1","services":{"core":"%s","dgx-relay":"%s","falco":"%s","falco-adapter":"%s","opa":"%s"}}\n' \
-  "$core_runtime_image_id" "$haproxy_runtime_image_id" \
-  "$falco_runtime_image_id" "$adapter_runtime_image_id" "$opa_runtime_image_id" \
+  '{"schema_version":"agmind.runtime-image-ids.v1","services":{"core":"%s","falco":"%s","falco-adapter":"%s","hunter-relay":"%s","opa":"%s"}}\n' \
+  "$core_runtime_image_id" "$falco_runtime_image_id" \
+  "$adapter_runtime_image_id" "$haproxy_runtime_image_id" "$opa_runtime_image_id" \
   >"${work_dir}/runtime-image-ids.json"
 atomic_install_file \
   "${work_dir}/runtime-image-ids.json" \
   "${config_root}/runtime-image-ids.json" 0444 root root
 
-status "running the full read-only host and DGX preflight"
+status "running the full read-only host and Hunter endpoint preflight"
 DOCKER_CONFIG="${runtime_root}/docker-config" \
   "${install_root}/scripts/preflight-linux.sh" \
-  --dgx-url "$dgx_url" \
+  --hunter-url "$hunter_url" \
   --runtime-env "${config_root}/runtime.env" \
   --management-denylist "${config_root}/management-destinations.json"
 

@@ -79,7 +79,7 @@ def _config() -> HunterConfigV1:
         schema_version="agmind.hunter-config.v1",
         base_url="http://127.0.0.1:8000/v1",
         model="deepseek-v4-flash",
-        api_token_file="/run/secrets/dgx-api-token",
+        api_token_file="/run/secrets/hunter-api-token",
         max_input_bytes=32_768,
         max_output_bytes=16_384,
         max_output_tokens=2_048,

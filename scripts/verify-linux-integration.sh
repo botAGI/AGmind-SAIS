@@ -9,7 +9,7 @@ unset BASH_ENV CDPATH ENV PYTHONHOME PYTHONPATH
 output=""
 output_ready=0
 transcript=""
-readonly schema="agmind.beelink-acceptance.v1"
+readonly schema="agmind.native-acceptance.v1"
 readonly docker_config="/run/agmind-sais/docker-config"
 readonly proof_root="/var/lib/agmind-sais/exports"
 
@@ -36,7 +36,7 @@ for name in ("topology-before.json", "api-boundary.json", "smoke-result.json", "
         raise SystemExit(1)
     artifacts[name] = hashlib.sha256(raw).hexdigest()
 document = {"artifact_sha256": artifacts, "reason_code": reason,
-            "schema_version": "agmind.beelink-acceptance.v1", "status": status}
+            "schema_version": "agmind.native-acceptance.v1", "status": status}
 if status == "PASS":
     if len(artifacts) != 4:
         raise SystemExit(1)
@@ -120,15 +120,15 @@ if any(re.fullmatch(r"[A-Z][A-Z0-9_]*", key) is None or not value or value != va
 runtime_values = dict(runtime_pairs)
 if len(runtime_values) != len(runtime_pairs):
     raise SystemExit(1)
-dgx_ipv4 = runtime_values.get("AGMIND_DGX_IPV4", "")
+hunter_ipv4 = runtime_values.get("AGMIND_HUNTER_IPV4", "")
 try:
-    if str(ipaddress.IPv4Address(dgx_ipv4)) != dgx_ipv4:
+    if str(ipaddress.IPv4Address(hunter_ipv4)) != hunter_ipv4:
         raise ValueError
 except ValueError:
     raise SystemExit(1)
 image_keys = {
     "core": "AGMIND_CORE_IMAGE",
-    "dgx-relay": "AGMIND_HAPROXY_IMAGE",
+    "hunter-relay": "AGMIND_HAPROXY_IMAGE",
     "falco": "AGMIND_FALCO_IMAGE",
     "falco-adapter": "AGMIND_ADAPTER_IMAGE",
     "opa": "AGMIND_OPA_IMAGE",
@@ -219,7 +219,7 @@ for short_id in ids:
         raise SystemExit(1)
     containers.append({"container_id": container_id, "image_id": image_id, "service": service})
     container_ids[service] = container_id
-if {item["service"] for item in containers} != {"core", "dgx-relay", "falco", "falco-adapter", "opa"}:
+if {item["service"] for item in containers} != {"core", "hunter-relay", "falco", "falco-adapter", "opa"}:
     raise SystemExit(1)
 def inspect(service):
     value = json.loads(run(docker + ["container", "inspect", container_ids[service]]))
@@ -247,8 +247,8 @@ expected_mounts = {
         ("bind", "/etc/agmind-sais/public/actuator-ed25519.pub", "/etc/agmind-sais/public/actuator-ed25519.pub", False, "rprivate"),
         ("bind", "/etc/agmind-sais/secrets", "/run/secrets", False, "rprivate"),
     },
-    "dgx-relay": {
-        ("bind", "/opt/agmind-sais/deploy/config/dgx-relay.cfg", "/usr/local/etc/haproxy/haproxy.cfg", False, "rprivate"),
+    "hunter-relay": {
+        ("bind", "/opt/agmind-sais/deploy/config/hunter-relay.cfg", "/usr/local/etc/haproxy/haproxy.cfg", False, "rprivate"),
     },
     "falco": {
         ("bind", "/sys/kernel/tracing", "/sys/kernel/tracing", False, "rprivate"),
@@ -268,28 +268,28 @@ expected_mounts = {
 }
 expected_users = {
     "core": f"{core_uid}:{core_gid}",
-    "dgx-relay": "99:99",
+    "hunter-relay": "99:99",
     "falco": "0:0",
     "falco-adapter": f"{sensor_uid}:{sensor_gid}",
     "opa": "65532:65532",
 }
 expected_groups = {
     "core": {core_gid},
-    "dgx-relay": set(),
+    "hunter-relay": set(),
     "falco": set(),
     "falco-adapter": {sensor_gid},
     "opa": set(),
 }
 expected_cap_add = {
     "core": set(),
-    "dgx-relay": set(),
+    "hunter-relay": set(),
     "falco": {"SYS_ADMIN", "SYS_RESOURCE", "SYS_PTRACE"},
     "falco-adapter": set(),
     "opa": set(),
 }
 expected_service_networks = {
     "core": {"agmind-sais_control_internal"},
-    "dgx-relay": {"agmind-sais_control_internal", "agmind-sais_inference"},
+    "hunter-relay": {"agmind-sais_control_internal", "agmind-sais_inference"},
     "falco": {"agmind-sais_sensor_internal"},
     "falco-adapter": {"agmind-sais_sensor_internal"},
     "opa": {"agmind-sais_control_internal"},
@@ -358,13 +358,13 @@ for service, value in service_values.items():
         checks["init_enabled"] = host.get("Init") is True
     else:
         checks["no_published_ports"] = no_published_ports(host, network)
-    if service == "dgx-relay":
-        relay_dgx = [
+    if service == "hunter-relay":
+        relay_hunter = [
             item.split("=", 1)[1]
             for item in config.get("Env", [])
-            if isinstance(item, str) and item.startswith("AGMIND_DGX_IPV4=")
+            if isinstance(item, str) and item.startswith("AGMIND_HUNTER_IPV4=")
         ]
-        checks["dgx_ipv4_matches_runtime"] = relay_dgx == [dgx_ipv4]
+        checks["hunter_ipv4_matches_runtime"] = relay_hunter == [hunter_ipv4]
     if not all(checks.values()):
         raise SystemExit(1)
     security_boundaries[service.replace("-", "_")] = checks
@@ -372,11 +372,11 @@ networks = []
 expected_networks = {
     "agmind-sais_control_internal": {
         "internal": True,
-        "members": {container_ids["core"], container_ids["dgx-relay"], container_ids["opa"]},
+        "members": {container_ids["core"], container_ids["hunter-relay"], container_ids["opa"]},
     },
     "agmind-sais_inference": {
         "internal": False,
-        "members": {container_ids["dgx-relay"]},
+        "members": {container_ids["hunter-relay"]},
     },
     "agmind-sais_sensor_internal": {
         "internal": True,
@@ -610,7 +610,7 @@ output="$2"
 ((EUID == 0)) || block "root_required"
 [[ -t 0 && -t 1 ]] || block "interactive_tty_required"
 [[ "${AGMIND_DEDICATED_TEST_HOST:-}" == "1" ]] || block "dedicated_test_host_ack_required"
-[[ -n "${AGMIND_DGX_URL:-}" && "${AGMIND_DGX_URL}" != *$'\n'* && "${AGMIND_DGX_URL}" != *$'\r'* ]] || block "dgx_url_required"
+[[ -n "${AGMIND_HUNTER_URL:-}" && "${AGMIND_HUNTER_URL}" != *$'\n'* && "${AGMIND_HUNTER_URL}" != *$'\r'* ]] || block "hunter_url_required"
 for command in cat docker nft python3 realpath rm script sha256sum stat systemctl uname; do
   command -v "${command}" >/dev/null 2>&1 || block "required_command_unavailable"
 done
@@ -640,7 +640,7 @@ check_api_boundary "${output}/api-boundary.json" || block "api_boundary_failed"
 transcript="${output}/.smoke-session"
 printf '[agmind-acceptance] interactive native smoke starting\n' >&2
 if ! /usr/bin/env -i PATH="${PATH}" LC_ALL=C LANG=C SHELL=/bin/sh TERM=dumb \
-  DOCKER_CONFIG="${docker_config}" AGMIND_DEDICATED_TEST_HOST=1 AGMIND_DGX_URL="${AGMIND_DGX_URL}" \
+  DOCKER_CONFIG="${docker_config}" AGMIND_DEDICATED_TEST_HOST=1 AGMIND_HUNTER_URL="${AGMIND_HUNTER_URL}" \
   /usr/bin/script --quiet --return --flush --command "${smoke}" "${transcript}"; then
   block "smoke_failed"
 fi

@@ -1,16 +1,16 @@
-# Native Beelink acceptance
+# Native acceptance on the dedicated lab host
 
-This is the narrow M1 native gate for one dedicated Beelink Linux host. It
+This is the narrow M1 native gate for one dedicated Linux lab host. It
 wraps the interactive target-only containment smoke, verifies the protected
 Core API boundary, records an allowlisted production-topology snapshot, and
 writes one canonical acceptance report. It does not install or update AGmind,
-run unit/race suites, perform reboot tests, or modify the DGX host.
+run unit/race suites, perform reboot tests, or modify the Hunter model host.
 
 ## Preconditions
 
 Use a dedicated rootful Linux host with the installed M1 services active. The
 host needs systemd, cgroup v2, nftables, rootful Docker, util-linux `script`, a
-real TTY, and outbound TCP reachability to `1.1.1.1:443`. `AGMIND_DGX_URL` must
+real TTY, and outbound TCP reachability to `1.1.1.1:443`. `AGMIND_HUNTER_URL` must
 be the same canonical endpoint used for installation. The smoke briefly stops
 and restores Core and the actuator while proving native kernel TTL expiry, and
 local approval still requires typing the plan-hash suffix shown by
@@ -22,7 +22,7 @@ Create only the parent directory. Every run must use a new child path:
 sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
 sudo env \
   AGMIND_DEDICATED_TEST_HOST=1 \
-  AGMIND_DGX_URL=http://<model-host>:8000/v1 \
+  AGMIND_HUNTER_URL=http://<model-host>:8000/v1 \
   /opt/agmind-sais/scripts/verify-linux-integration.sh \
   --output /var/lib/agmind-sais/acceptance/run-001
 ```
@@ -85,7 +85,7 @@ topology-after.json
 acceptance-report.json
 ```
 
-`acceptance-report.json` has schema `agmind.beelink-acceptance.v1`, status
+`acceptance-report.json` has schema `agmind.native-acceptance.v1`, status
 `PASS`, the complete validated smoke result, and SHA-256 hashes of the four safe
 artifacts. The proof bundle remains at the exact `proof_path` recorded in the
 smoke result and is independently bound by `proof_bundle_sha256`.

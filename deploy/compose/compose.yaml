@@ -124,12 +124,12 @@ services:
         max-size: 10m
         max-file: "3"
 
-  dgx-relay:
+  hunter-relay:
     image: ${AGMIND_HAPROXY_IMAGE:-haproxy:3.2.21-alpine3.24@sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a}
     pull_policy: never
     user: "99:99"
     environment:
-      AGMIND_DGX_IPV4: ${AGMIND_DGX_IPV4:?set the pinned DGX management IPv4}
+      AGMIND_HUNTER_IPV4: ${AGMIND_HUNTER_IPV4:?set the pinned Hunter model-host management IPv4}
     command:
       - haproxy
       - -W
@@ -144,7 +144,7 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=8m
     volumes:
-      - ../config/dgx-relay.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ../config/hunter-relay.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     expose:
       - "8000"
     networks:
@@ -193,7 +193,7 @@ services:
         condition: service_started
       falco-adapter:
         condition: service_healthy
-      dgx-relay:
+      hunter-relay:
         condition: service_started
       opa:
         condition: service_healthy

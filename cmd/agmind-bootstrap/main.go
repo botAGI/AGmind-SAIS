@@ -28,7 +28,7 @@ const (
 	actuatorKeyPath     = "/etc/agmind-sais/secrets/actuator-ed25519.key"
 	actuatorPublicPath  = "/etc/agmind-sais/public/actuator-ed25519.pub"
 	coreAPITokenPath    = "/etc/agmind-sais/secrets/core-api.token"
-	dgxAPITokenPath     = "/etc/agmind-sais/secrets/dgx-api.token"
+	hunterAPITokenPath  = "/etc/agmind-sais/secrets/hunter-api.token"
 	maxTrustRootBytes   = int64(4_096)
 	maxTokenBytes       = 4_096
 	generatedTokenBytes = 32
@@ -95,9 +95,9 @@ var (
 		maxBytes:     maxTokenBytes + 1,
 		allowedModes: []fs.FileMode{0o600, 0o640},
 	}
-	dgxTokenArtifact = artifactSpec{
-		name:         "dgx_api_token",
-		path:         dgxAPITokenPath,
+	hunterTokenArtifact = artifactSpec{
+		name:         "hunter_api_token",
+		path:         hunterAPITokenPath,
 		maxBytes:     maxTokenBytes + 1,
 		allowedModes: []fs.FileMode{0o600, 0o640},
 	}
@@ -127,7 +127,7 @@ func readAllArtifacts() (map[string]artifactState, error) {
 		actuatorKeyArtifact,
 		actuatorPublicArtifact,
 		coreTokenArtifact,
-		dgxTokenArtifact,
+		hunterTokenArtifact,
 	} {
 		state, err := readArtifact(spec)
 		if err != nil {
@@ -252,7 +252,7 @@ func generateToken() ([]byte, error) {
 	return []byte(encoded + "\n"), nil
 }
 
-func readDGXTokenSource(path string) ([]byte, error) {
+func readHunterTokenSource(path string) ([]byte, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -265,9 +265,9 @@ func readDGXTokenSource(path string) ([]byte, error) {
 		0o640,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("DGX token source is unsafe or unreadable: %w", err)
+		return nil, fmt.Errorf("Hunter token source is unsafe or unreadable: %w", err)
 	}
-	value, err := tokenValue(raw, "DGX token source")
+	value, err := tokenValue(raw, "Hunter token source")
 	if err != nil {
 		return nil, err
 	}
@@ -302,12 +302,12 @@ func publishExpected(
 	return "created", nil
 }
 
-func initialize(dgxSourcePath string) (bootstrapResultV1, error) {
+func initialize(hunterSourcePath string) (bootstrapResultV1, error) {
 	states, err := readAllArtifacts()
 	if err != nil {
 		return bootstrapResultV1{}, err
 	}
-	dgxSource, err := readDGXTokenSource(dgxSourcePath)
+	hunterSource, err := readHunterTokenSource(hunterSourcePath)
 	if err != nil {
 		return bootstrapResultV1{}, err
 	}
@@ -391,28 +391,28 @@ func initialize(dgxSourcePath string) (bootstrapResultV1, error) {
 		}
 	}
 
-	dgxTokenState := states[dgxTokenArtifact.name]
-	var dgxTokenPayload []byte
-	if dgxTokenState.present {
-		existingToken, tokenErr := tokenValue(dgxTokenState.raw, "DGX API token")
+	hunterTokenState := states[hunterTokenArtifact.name]
+	var hunterTokenPayload []byte
+	if hunterTokenState.present {
+		existingToken, tokenErr := tokenValue(hunterTokenState.raw, "Hunter API token")
 		if tokenErr != nil {
 			return bootstrapResultV1{}, tokenErr
 		}
-		if dgxSource != nil {
-			sourceToken, sourceErr := tokenValue(dgxSource, "DGX token source")
+		if hunterSource != nil {
+			sourceToken, sourceErr := tokenValue(hunterSource, "Hunter token source")
 			if sourceErr != nil {
 				return bootstrapResultV1{}, sourceErr
 			}
 			if len(existingToken) != len(sourceToken) ||
 				subtle.ConstantTimeCompare(existingToken, sourceToken) != 1 {
-				return bootstrapResultV1{}, fmt.Errorf("DGX API token conflicts with the supplied source")
+				return bootstrapResultV1{}, fmt.Errorf("Hunter API token conflicts with the supplied source")
 			}
 		}
-		dgxTokenPayload = dgxTokenState.raw
-	} else if dgxSource != nil {
-		dgxTokenPayload = dgxSource
+		hunterTokenPayload = hunterTokenState.raw
+	} else if hunterSource != nil {
+		hunterTokenPayload = hunterSource
 	} else {
-		dgxTokenPayload, err = generateToken()
+		hunterTokenPayload, err = generateToken()
 		if err != nil {
 			return bootstrapResultV1{}, err
 		}
@@ -430,7 +430,7 @@ func initialize(dgxSourcePath string) (bootstrapResultV1, error) {
 		{actuatorKeyArtifact, actuatorKeyState, actuatorPrivate},
 		{actuatorPublicArtifact, actuatorPublicState, actuatorPublic},
 		{coreTokenArtifact, coreTokenState, coreTokenPayload},
-		{dgxTokenArtifact, dgxTokenState, dgxTokenPayload},
+		{hunterTokenArtifact, hunterTokenState, hunterTokenPayload},
 	}
 	for _, publication := range publications {
 		status, publishErr := publishExpected(
@@ -459,16 +459,16 @@ func initialize(dgxSourcePath string) (bootstrapResultV1, error) {
 
 func parseArguments(args []string) (string, error) {
 	if len(args) < 1 || args[0] != "init" {
-		return "", fmt.Errorf("usage: agmind-bootstrap init [--dgx-token-file PATH]")
+		return "", fmt.Errorf("usage: agmind-bootstrap init [--hunter-token-file PATH]")
 	}
 	flags := flag.NewFlagSet("agmind-bootstrap init", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	var dgxSourcePath string
-	flags.StringVar(&dgxSourcePath, "dgx-token-file", "", "")
+	var hunterSourcePath string
+	flags.StringVar(&hunterSourcePath, "hunter-token-file", "", "")
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
-		return "", fmt.Errorf("usage: agmind-bootstrap init [--dgx-token-file PATH]")
+		return "", fmt.Errorf("usage: agmind-bootstrap init [--hunter-token-file PATH]")
 	}
-	return dgxSourcePath, nil
+	return hunterSourcePath, nil
 }
 
 func run(args []string, stdout io.Writer) error {
@@ -478,11 +478,11 @@ func run(args []string, stdout io.Writer) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("agmind-bootstrap requires EUID 0")
 	}
-	dgxSourcePath, err := parseArguments(args)
+	hunterSourcePath, err := parseArguments(args)
 	if err != nil {
 		return err
 	}
-	result, err := initialize(dgxSourcePath)
+	result, err := initialize(hunterSourcePath)
 	if err != nil {
 		return err
 	}

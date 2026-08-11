@@ -72,7 +72,7 @@ production-хост не являются валидным acceptance-окруж
 ```sh
 sudo ./scripts/install-linux.sh \
   --admin-user <существующий-локальный-пользователь> \
-  --dgx-url http://<хост-модели>:8000/v1
+  --hunter-url http://<хост-модели>:8000/v1
 ```
 
 Полные prerequisites, фиксированные пути и безопасное обновление описаны в
@@ -109,13 +109,13 @@ proof и фактический read-only ответ `dspark` в один отч
 sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
 sudo env \
   AGMIND_DEDICATED_TEST_HOST=1 \
-  AGMIND_DGX_URL=http://<хост-модели>:8000/v1 \
+  AGMIND_HUNTER_URL=http://<хост-модели>:8000/v1 \
   /opt/agmind-sais/scripts/verify-linux-integration.sh \
   --output /var/lib/agmind-sais/acceptance/run-001
 ```
 
 Только финальный отчёт со `"status":"PASS"` считается нативным доказательством
-M1. Инструкции: [`docs/runbooks/beelink-lab.md`](docs/runbooks/beelink-lab.md).
+M1. Инструкции: [`docs/runbooks/native-acceptance.md`](docs/runbooks/native-acceptance.md).
 
 ## Экспорт доказательства действия
 

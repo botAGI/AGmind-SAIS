@@ -35,7 +35,7 @@ tests, then the Go tests and two fuzz targets. Notes:
   not only what failed.
 
 The release gate is separate: `scripts/verify-linux-integration.sh` on a
-dedicated Linux host (see [docs/runbooks/beelink-lab.md](docs/runbooks/beelink-lab.md)).
+dedicated Linux host (see [docs/runbooks/native-acceptance.md](docs/runbooks/native-acceptance.md)).
 Green unit gates are not native proof.
 
 ## Tests

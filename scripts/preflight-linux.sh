@@ -161,18 +161,18 @@ def load_json_object(path: Path) -> tuple[dict[str, object], bool]:
 
 
 parser = argparse.ArgumentParser(description="Read-only AGmind-SAIS Linux preflight")
-parser.add_argument("--dgx-url", default=None, help="fixed DeepSeek /v1 endpoint")
+parser.add_argument("--hunter-url", default=None, help="fixed DeepSeek /v1 endpoint")
 parser.add_argument(
     "--runtime-env",
     type=Path,
     default=None,
-    help="root-owned Compose runtime.env paired with --dgx-url",
+    help="root-owned Compose runtime.env paired with --hunter-url",
 )
 parser.add_argument(
     "--management-denylist",
     type=Path,
     default=None,
-    help="root-owned management destination JSON paired with --dgx-url",
+    help="root-owned management destination JSON paired with --hunter-url",
 )
 arguments = parser.parse_args(sys.argv[2:])
 versions_path = Path(sys.argv[1]).resolve()
@@ -192,7 +192,7 @@ def require(condition: bool, reason: str) -> None:
 asset_specs = {
     "actuator_config": ("ACTUATOR_CONFIG_SHA256", "deploy/config/actuator.json"),
     "core_config": ("CORE_CONFIG_SHA256", "deploy/config/core.json"),
-    "dgx_relay_config": ("DGX_RELAY_CONFIG_SHA256", "deploy/config/dgx-relay.cfg"),
+    "hunter_relay_config": ("HUNTER_RELAY_CONFIG_SHA256", "deploy/config/hunter-relay.cfg"),
     "falco_config": ("FALCO_CONFIG_SHA256", "deploy/falco/falco.yaml"),
     "falco_rules": ("FALCO_RULES_SHA256", "deploy/falco/rules.d/agmind-pcc.yaml"),
     "hunter_config": ("HUNTER_CONFIG_SHA256", "deploy/config/hunter.json"),
@@ -251,12 +251,12 @@ for asset_name, (version_key, absolute_path) in installed_asset_specs.items():
 facts["invalid_installed_assets"] = sorted(invalid_installed_assets)
 require(not invalid_installed_assets, "installed_asset_hash_mismatch")
 
-dgx_inputs = (
-    arguments.dgx_url is not None,
+hunter_inputs = (
+    arguments.hunter_url is not None,
     arguments.runtime_env is not None,
     arguments.management_denylist is not None,
 )
-require(not any(dgx_inputs) or all(dgx_inputs), "dgx_inputs_incomplete")
+require(not any(hunter_inputs) or all(hunter_inputs), "hunter_inputs_incomplete")
 
 runtime_values: dict[str, str] = {}
 runtime_env_valid = arguments.runtime_env is None
@@ -505,7 +505,7 @@ if arguments.runtime_env is not None:
         )
     except OSError:
         secret_boundary_valid = False
-    for token_name in ("core-api.token", "dgx-api.token"):
+    for token_name in ("core-api.token", "hunter-api.token"):
         try:
             token_info = (Path("/etc/agmind-sais/secrets") / token_name).lstat()
             secret_boundary_valid = secret_boundary_valid and (
@@ -536,13 +536,13 @@ if arguments.runtime_env is not None:
     facts["core_secret_directory_mode"] = "0710" if secret_boundary_valid else ""
     require(secret_boundary_valid, "core_secret_boundary_unsafe")
 
-if all(dgx_inputs):
-    assert arguments.dgx_url is not None
+if all(hunter_inputs):
+    assert arguments.hunter_url is not None
     assert arguments.runtime_env is not None
     assert arguments.management_denylist is not None
 
     try:
-        parsed = urlsplit(arguments.dgx_url)
+        parsed = urlsplit(arguments.hunter_url)
         parsed_port = parsed.port
     except ValueError:
         parsed = urlsplit("")
@@ -553,10 +553,10 @@ if all(dgx_inputs):
         if parsed_host and parsed_port is not None
         else ""
     )
-    dgx_url_valid = (
-        len(arguments.dgx_url) <= 2048
-        and arguments.dgx_url.isascii()
-        and arguments.dgx_url == canonical_url
+    hunter_url_valid = (
+        len(arguments.hunter_url) <= 2048
+        and arguments.hunter_url.isascii()
+        and arguments.hunter_url == canonical_url
         and parsed.scheme == "http"
         and parsed_port == 8000
         and parsed.username is None
@@ -569,20 +569,20 @@ if all(dgx_inputs):
             for character in parsed_host
         )
     )
-    require(dgx_url_valid, "dgx_url_invalid")
+    require(hunter_url_valid, "hunter_url_invalid")
 
-    runtime_ipv4_text = runtime_values.get("AGMIND_DGX_IPV4", "")
+    runtime_ipv4_text = runtime_values.get("AGMIND_HUNTER_IPV4", "")
     try:
         runtime_ipv4 = ipaddress.IPv4Address(runtime_ipv4_text)
     except ipaddress.AddressValueError:
         runtime_ipv4 = None
     require(
         runtime_ipv4 is not None and str(runtime_ipv4) == runtime_ipv4_text,
-        "dgx_runtime_ipv4_invalid",
+        "hunter_runtime_ipv4_invalid",
     )
 
     resolved_addresses: set[str] = set()
-    if dgx_url_valid:
+    if hunter_url_valid:
         try:
             for item in socket.getaddrinfo(
                 parsed_host,
@@ -593,11 +593,11 @@ if all(dgx_inputs):
                 resolved_addresses.add(str(ipaddress.ip_address(item[4][0])))
         except (OSError, ValueError):
             pass
-    require(bool(resolved_addresses), "dgx_resolution_failed")
+    require(bool(resolved_addresses), "hunter_resolution_failed")
     require(
         runtime_ipv4 is not None
         and resolved_addresses == {str(runtime_ipv4)},
-        "dgx_resolution_not_exact",
+        "hunter_resolution_not_exact",
     )
     require(
         all(
@@ -607,7 +607,7 @@ if all(dgx_inputs):
             and not ipaddress.ip_address(value).is_unspecified
             for value in resolved_addresses
         ),
-        "dgx_resolution_unsafe",
+        "hunter_resolution_unsafe",
     )
 
     management, management_valid = load_json_object(arguments.management_denylist)
@@ -642,16 +642,16 @@ if all(dgx_inputs):
         runtime_ipv4 is not None
         and denied_addresses == {str(runtime_ipv4)}
         and resolved_addresses == denied_addresses,
-        "dgx_management_denylist_not_exact",
+        "hunter_management_denylist_not_exact",
     )
 
-    facts["dgx_ipv4"] = sorted(resolved_addresses)
+    facts["hunter_ipv4"] = sorted(resolved_addresses)
     facts["management_denylist_sha256"] = (
         sha256_regular_file(arguments.management_denylist) or ""
     )
     facts["runtime_env_sha256"] = sha256_regular_file(arguments.runtime_env) or ""
 else:
-    degraded.add("dgx_endpoint_not_checked")
+    degraded.add("hunter_endpoint_not_checked")
 
 document = {
     "schema_version": "agmind.preflight.v1",
