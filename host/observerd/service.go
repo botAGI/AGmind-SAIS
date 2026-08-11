@@ -470,7 +470,11 @@ func validDockerReconcileReason(reason string) bool {
 	switch reason {
 	case "observer_startup",
 		"docker_event_stream_error",
-		"docker_event_reconcile_retry":
+		"docker_event_reconcile_retry",
+		// "docker_inventory_event" is the routine dirty-signal reconcile
+		// emitted by monitorDockerOnce; Core's _DOCKER_OPEN_REASONS must
+		// enumerate the identical set.
+		"docker_inventory_event":
 		return true
 	default:
 		return false
