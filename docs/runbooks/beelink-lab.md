@@ -22,7 +22,7 @@ Create only the parent directory. Every run must use a new child path:
 sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
 sudo env \
   AGMIND_DEDICATED_TEST_HOST=1 \
-  AGMIND_DGX_URL=http://192.168.1.45:8000/v1 \
+  AGMIND_DGX_URL=http://<model-host>:8000/v1 \
   /opt/agmind-sais/scripts/verify-linux-integration.sh \
   --output /var/lib/agmind-sais/acceptance/run-001
 ```

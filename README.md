@@ -56,8 +56,8 @@ M1 ориентирован на один выделенный Linux Docker-хо
 реализован вместе с hardened Compose/systemd installer, проверяемым Core
 actuator mirror, authenticated read-only API, постоянным ручным kill switch и
 quiesced proof export с offline replay. Единственный незакрытый release gate —
-нативный acceptance на Beelink. До его успешного прохождения проект не является
-production-ready.
+нативный acceptance на выделенном лабораторном хосте. До его успешного
+прохождения проект не является production-ready.
 
 Kubernetes, multi-node coordination и DaemonSet actuator относятся к следующей
 фазе. M1 специально сохраняет границы, которые можно перенести: Core/OPA как
@@ -71,8 +71,8 @@ production-хост не являются валидным acceptance-окруж
 
 ```sh
 sudo ./scripts/install-linux.sh \
-  --admin-user testbot \
-  --dgx-url http://192.168.1.45:8000/v1
+  --admin-user <существующий-локальный-пользователь> \
+  --dgx-url http://<хост-модели>:8000/v1
 ```
 
 Полные prerequisites, фиксированные пути и безопасное обновление описаны в
@@ -109,7 +109,7 @@ proof и фактический read-only ответ `dspark` в один отч
 sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
 sudo env \
   AGMIND_DEDICATED_TEST_HOST=1 \
-  AGMIND_DGX_URL=http://192.168.1.45:8000/v1 \
+  AGMIND_DGX_URL=http://<хост-модели>:8000/v1 \
   /opt/agmind-sais/scripts/verify-linux-integration.sh \
   --output /var/lib/agmind-sais/acceptance/run-001
 ```

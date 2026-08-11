@@ -43,13 +43,13 @@ after validating the same filesystem.
 
 Run the installer from the repository checkout as root. The operator must be an
 existing login account. The DGX URL must be canonical and resolve to exactly one
-safe IPv4 address. This lab currently exposes the Hunter model as `dspark` at
-`192.168.1.45:8000`:
+safe IPv4 address. The endpoint must expose the Hunter model under the id
+`dspark`; the examples below write `<model-host>` where your host goes:
 
 ```sh
 sudo ./scripts/install-linux.sh \
-  --admin-user testbot \
-  --dgx-url http://192.168.1.45:8000/v1
+  --admin-user <existing-login-account> \
+  --dgx-url http://<model-host>:8000/v1
 ```
 
 If the DGX endpoint requires an API token, import it from a root-owned,
@@ -57,8 +57,8 @@ single-link file with mode `0400`, `0440`, `0600`, or `0640`:
 
 ```sh
 sudo ./scripts/install-linux.sh \
-  --admin-user testbot \
-  --dgx-url http://192.168.1.45:8000/v1 \
+  --admin-user <existing-login-account> \
+  --dgx-url http://<model-host>:8000/v1 \
   --dgx-token-file /root/dgx-api.token
 ```
 
@@ -104,7 +104,7 @@ cannot list it or read the root-only observer/actuator private keys.
 
 ## Native M1 acceptance
 
-Run the single consolidated gate only on a dedicated Beelink test host. It wraps
+Run the single consolidated gate only on the dedicated lab test host. It wraps
 the target-only TTL smoke, signed Core mirror, offline proof, authenticated API,
 and real `dspark` Hunter boundary into one root-owned report. Approval still
 requires typing the hash suffix shown by the real CLI.
@@ -113,7 +113,7 @@ requires typing the hash suffix shown by the real CLI.
 sudo install -d -o root -g root -m 0700 /var/lib/agmind-sais/acceptance
 sudo env \
   AGMIND_DEDICATED_TEST_HOST=1 \
-  AGMIND_DGX_URL=http://192.168.1.45:8000/v1 \
+  AGMIND_DGX_URL=http://<model-host>:8000/v1 \
   /opt/agmind-sais/scripts/verify-linux-integration.sh \
   --output /var/lib/agmind-sais/acceptance/run-001
 ```
