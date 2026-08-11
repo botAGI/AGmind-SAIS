@@ -50,7 +50,14 @@ ReadWritePaths=/var/lib/agmind-sais/observer /run/agmind-sais
 InaccessiblePaths=-/run/agmind-sais/actuator-intent -/run/agmind-sais/actuator-admin
 TasksMax=128
 MemoryMax=256M
-LimitNOFILE=4096
+# Every live spool item pins its frame and publication inode for as long as it
+# is unacked, because a removal must prove it unlinks that exact inode and a
+# freed inode number is reissued immediately by ext4/overlayfs. The spool grows
+# while Core cannot ack (a Core outage is expected to be survivable), so the
+# descriptor budget must cover a large backlog: at 4096 the observer exhausted
+# its descriptors after ~2000 unacked events and fenced itself read-only during
+# publication promote.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=agmind-sais.target
