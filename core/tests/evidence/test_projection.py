@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import os
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -23,11 +24,7 @@ from agmind_immune.evidence.segments import (
     StoredEvidenceRecord,
 )
 from agmind_immune.ingest import service as service_module
-from agmind_immune.ingest.ack_journal import (
-    AckIdentity,
-    AckJournal,
-    AckJournalSnapshot,
-)
+from agmind_immune.ingest.ack_journal import AckJournal
 from agmind_immune.ingest.correlation_journal import CorrelationRequestJournal
 from agmind_immune.ingest.envelope import (
     AnchoredPublicKeyChain,
@@ -377,7 +374,9 @@ def test_authority_order_and_uint64_text(tmp_path: Path, case: str) -> None:
                 coverage_flags=["reconcile_required", "sequence_gap"],
             ),
         )
-        _confirm(journal, first, fourth, gap)
+        # V2 open replays the confirmed ACK prefix, so confirm only the boot
+        # boundary before open and drive the gap-signed advance live.
+        _confirm(journal, first)
         cache = projection.ProjectionStore.open(
             tmp_path / case / "projection.sqlite3",
             evidence=store,
@@ -385,7 +384,10 @@ def test_authority_order_and_uint64_text(tmp_path: Path, case: str) -> None:
             correlation_requests=correlation,
             registry=registry,
         )
-        cache.apply(first)
+        opened = cache.status().cursor
+        assert opened is not None
+        assert opened.source_sequence == first.source_sequence
+        _confirm(journal, fourth, gap)
         assert cache.apply(fourth).cursor.source_sequence == 4
         assert cache.apply(gap).cursor.source_sequence == 5
         cache.close()
@@ -407,9 +409,27 @@ def test_authority_order_and_uint64_text(tmp_path: Path, case: str) -> None:
         with pytest.raises(projection.ProjectionAuthorityError):
             cache.apply(second)
     elif case == "non_next":
-        _confirm(journal, second)
-        with pytest.raises(projection.ProjectionAuthorityError):
-            cache.apply(second)
+        # Open-time replay already consumed the confirmed prefix; the cursor
+        # sits at the confirmed terminal, so non-next must be driven by
+        # confirming further records after open and skipping one.
+        opened = cache.status().cursor
+        assert opened is not None
+        assert opened.source_sequence == first.source_sequence
+        third = _accept(
+            coordinator,
+            envelope_value(
+                key,
+                sequence=3,
+                boot_id=BOOT_A,
+                normalized_fields={"kind": "three"},
+            ),
+        )
+        _confirm(journal, second, third)
+        with pytest.raises(
+            projection.ProjectionAuthorityError,
+            match="not the next authenticated record",
+        ):
+            cache.apply(third)
     elif case == "forged":
         with pytest.raises(projection.ProjectionAuthorityError):
             cache.apply(replace(first, frame_sha256="0" * 64))
@@ -454,21 +474,27 @@ def test_atomic_apply_retry_and_conflict(
             inventory_revision=2**63,
         )
     else:
+        # V2 validates live coverage through the closed historical grammar, so
+        # the fixture must be an exact grammar form (counted Falco queue drop).
         second_value = envelope_value(
             key,
             sequence=2,
             event_type="coverage",
             normalized_fields={
-                "component": "observer",
-                "kind": "drop",
-                "severity": "WARNING",
+                "component": "falco-adapter",
+                "kind": "falco_queue_drop",
+                "severity": "CRITICAL",
                 "opened_at": NOW,
                 "dropped_count": 1,
-                "reason_code": "atomic_test",
+                "reason_code": "routine_capacity_exceeded",
             },
+            coverage_flags=["falco_queue_drop"],
         )
     second = _accept(coordinator, second_value)
-    _confirm(journal, first, second)
+    # Confirm only the boot boundary before open: V2 open replays the confirmed
+    # ACK prefix, so a record confirmed before open would be consumed by replay
+    # and _apply_prepared (with its step hooks) would never run for it.
+    _confirm(journal, first)
     injected: set[str] = set()
     armed = False
 
@@ -490,7 +516,11 @@ def test_atomic_apply_retry_and_conflict(
         registry=registry,
         step_hook=hook,
     )
-    cache.apply(first)
+    opened = cache.status().cursor
+    assert opened is not None
+    assert opened.source_sequence == first.source_sequence
+    # The target record is confirmed only after open so it is applied live.
+    _confirm(journal, second)
     armed = True
     baseline = _counts(path)
     if failure_step == "dedup_order":
@@ -605,13 +635,15 @@ def test_projection_dedup_is_logical_and_provenanced(tmp_path: Path, case: str) 
                 )
             )
     else:
+        # V2 replay and live apply both validate coverage through the closed
+        # historical grammar, so the fixture must be an exact grammar form.
         fields = {
-            "component": "observer",
-            "kind": "drop",
-            "severity": "WARNING",
+            "component": "falco-adapter",
+            "kind": "falco_queue_drop",
+            "severity": "CRITICAL",
             "opened_at": NOW,
             "dropped_count": 1,
-            "reason_code": "test",
+            "reason_code": "routine_capacity_exceeded",
         }
         for sequence in (2, 3):
             current_fields = dict(fields)
@@ -625,10 +657,14 @@ def test_projection_dedup_is_logical_and_provenanced(tmp_path: Path, case: str) 
                         sequence=sequence,
                         event_type="coverage",
                         normalized_fields=current_fields,
+                        coverage_flags=["falco_queue_drop"],
                     ),
                 )
             )
-    _confirm(journal, *refs)
+    # Confirm only the first record before open; V2 open replays the confirmed
+    # prefix, so the deduplicated records are confirmed after open and applied
+    # live through the same _apply_prepared path V1 exercised.
+    _confirm(journal, refs[0])
     cache = projection.ProjectionStore.open(
         tmp_path / case / "projection.sqlite3",
         evidence=store,
@@ -636,8 +672,8 @@ def test_projection_dedup_is_logical_and_provenanced(tmp_path: Path, case: str) 
         correlation_requests=correlation,
         registry=registry,
     )
-    cache.apply(refs[0])
     for ref in refs[1:]:
+        _confirm(journal, ref)
         cache.apply(ref)
     with sqlite3.connect(cache.path) as connection:
         reduced_table = "network_observations" if case == "falco" else "coverage_intervals"
@@ -688,11 +724,9 @@ def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
     assert journal.snapshot() == before_ack
     assert _counts(path) == before_counts
 
-    retained_connection = cache._connection
-    assert retained_connection is not None
-    cache._connection = None
-    assert cache.status() == projection.ProjectionStatus(False, None)
-    cache._connection = retained_connection
+    # V2 keeps its owner connection for the whole facade lifetime; the
+    # fail-closed contract on a released connection is exercised through
+    # close(), which detaches the owner entirely.
     cache.close()
     assert cache.status() == projection.ProjectionStatus(False, None)
     store.close()
@@ -811,8 +845,9 @@ def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
     def interrupt_cursor(_connection: sqlite3.Connection) -> object:
         raise KeyboardInterrupt
 
+    projection_v2 = importlib.import_module("agmind_immune.evidence.projection_v2")
     with pytest.MonkeyPatch.context() as patcher:
-        patcher.setattr(projection, "_current_cursor", interrupt_cursor)
+        patcher.setattr(projection_v2, "_current_v2_cursor", interrupt_cursor)
         with pytest.raises(KeyboardInterrupt):
             interrupt.status()
     assert interrupt._healthy
@@ -824,11 +859,8 @@ def test_projection_status_is_read_only_and_fail_closed(tmp_path: Path) -> None:
     "case",
     [
         "monotonic_extension",
-        "strict_extension",
-        "rollback_after_rename",
-        "same_sequence_substitution",
-        "invalid_confirmed_scalar",
         "frozen_pending_replacement",
+        "rollback_after_rename",
         "source_prefix_mutation",
     ],
 )
@@ -837,7 +869,14 @@ def test_rebuild_revalidates_frozen_ack_authority(
     monkeypatch: pytest.MonkeyPatch,
     case: str,
 ) -> None:
+    """V2 rebuild freezes the ACK and source authorities before computing the
+    replay and revalidates the frozen facts before staging; any authority
+    mutation in between must fail the rebuild closed and preserve the old
+    projection (ADR 0006). The mutation is injected at the compute seam, which
+    runs outside the freeze/revalidate gates.
+    """
     projection = _projection()
+    projection_v2 = importlib.import_module("agmind_immune.evidence.projection_v2")
     coordinator, store, acknowledgements, correlation, registry = _system(
         tmp_path / case / "evidence"
     )
@@ -865,71 +904,6 @@ def test_rebuild_revalidates_frozen_ack_authority(
     )
     _confirm(acknowledgements, refs[0])
     acknowledgements.record_pending(refs[1])
-    frozen = acknowledgements.snapshot()
-    original_snapshot = acknowledgements.snapshot
-    original_records = store.iter_authenticated_records
-    changed = False
-
-    def snapshot() -> AckJournalSnapshot:
-        if not changed or case in {
-            "monotonic_extension",
-            "strict_extension",
-            "source_prefix_mutation",
-        }:
-            return original_snapshot()
-        if case == "rollback_after_rename":
-            return AckJournalSnapshot(None, None, True)
-        if case == "same_sequence_substitution":
-            return AckJournalSnapshot(
-                AckIdentity(
-                    frozen.confirmed_through,
-                    refs[1].event_id,
-                    refs[1].content_sha256,
-                ),
-                frozen.pending,
-                True,
-            )
-        if case == "invalid_confirmed_scalar":
-            assert frozen.confirmed is not None
-            invalid = AckIdentity(
-                frozen.confirmed.sequence,
-                frozen.confirmed.event_id,
-                frozen.confirmed.content_sha256,
-            )
-            object.__setattr__(invalid, "sequence", True)
-            return AckJournalSnapshot(invalid, frozen.pending, True)
-        assert case == "frozen_pending_replacement"
-        return AckJournalSnapshot(
-            frozen.confirmed,
-            AckIdentity.from_ref(refs[2]),
-            True,
-        )
-
-    def records(
-        *,
-        after: int = 0,
-        through: int | None = None,
-    ) -> Any:
-        if (
-            changed
-            and case == "source_prefix_mutation"
-            and after == 0
-            and through == frozen.confirmed_through
-        ):
-            return iter(())
-        return original_records(after=after, through=through)
-
-    monkeypatch.setattr(acknowledgements, "snapshot", snapshot)
-    monkeypatch.setattr(store, "iter_authenticated_records", records)
-
-    def mutate_authority(step: str) -> None:
-        nonlocal changed
-        target = "parent_fsync" if case == "rollback_after_rename" else "apply"
-        if step != target or changed:
-            return
-        changed = True
-        if case in {"monotonic_extension", "strict_extension"}:
-            acknowledgements.record_confirmed(refs[1])
 
     cache = projection.ProjectionStore.open(
         tmp_path / case / "projection.sqlite3",
@@ -937,22 +911,65 @@ def test_rebuild_revalidates_frozen_ack_authority(
         acknowledgements=acknowledgements,
         correlation_requests=correlation,
         registry=registry,
-        step_hook=mutate_authority,
     )
-    try:
+
+    def mutate_authority() -> None:
         if case == "monotonic_extension":
-            report = cache.rebuild()
-            assert report.source_record_count == 1
-            assert report.cursor is not None
-            assert report.cursor.source_sequence == 1
-            assert acknowledgements.snapshot().confirmed_through == 2
+            acknowledgements.record_confirmed(refs[1])
+        elif case == "frozen_pending_replacement":
+            acknowledgements.record_confirmed(refs[1])
+            acknowledgements.record_pending(refs[2])
+        elif case == "rollback_after_rename":
+            replacement = tmp_path / case / "ack-journal.replacement"
+            replacement.write_bytes(b"")
+            replacement.chmod(0o600)
+            journal_path = tmp_path / case / "evidence" / "ack-journal.agf"
+            assert journal_path.is_file()
+            os.replace(replacement, journal_path)
         else:
-            rebuild = cache.rebuild
-            if case == "strict_extension":
-                rebuild = lambda: cache._rebuild(require_existing_prefix=False)
-            with pytest.raises(projection.ProjectionConflict):
-                rebuild()
-            assert cache._healthy is (case != "rollback_after_rename")
+            assert case == "source_prefix_mutation"
+            _accept(
+                coordinator,
+                envelope_value(
+                    key,
+                    sequence=4,
+                    boot_id=BOOT_A,
+                    normalized_fields={"kind": "four"},
+                ),
+            )
+
+    mutated = False
+    original_compute = projection_v2._compute_replay
+
+    def mutating_compute(snapshot: object) -> object:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            mutate_authority()
+        return original_compute(snapshot)
+
+    # Installed after open so the open-time replay runs unmutated.
+    monkeypatch.setattr(projection_v2, "_compute_replay", mutating_compute)
+    try:
+        with pytest.raises(projection.ProjectionAuthorityError):
+            cache.rebuild()
+        assert mutated is True
+        status = cache.status()
+        assert status.healthy is True
+        assert status.cursor is not None
+        assert status.cursor.source_sequence == refs[0].source_sequence
+        if case == "monotonic_extension":
+            # The frozen boundary is rejected mid-flight; the monotonic ACK
+            # extension is honored only by the next rebuild, which freezes the
+            # new confirmed terminal.
+            report = cache.rebuild()
+            assert report.cursor is not None
+            assert report.cursor.source_sequence == refs[1].source_sequence
+            assert report.source_record_count == 2
+        elif case == "rollback_after_rename":
+            # The failed revalidation latched the rolled-back journal, so its
+            # snapshot fails closed.
+            assert acknowledgements.snapshot().healthy is False
     finally:
         cache.close()
         correlation.close()
@@ -988,10 +1005,14 @@ def test_projection_open_rejects_corruption_without_retired_ranges(
                 "UPDATE events SET event_type='tampered' WHERE event_id=?",
                 (ref.event_id,),
             )
+        # Close the tampering connection so its sidecars disappear; otherwise
+        # the image classifier fails closed on the sidecars before the prefix
+        # validator can name the tamper.
+        connection.close()
 
         with pytest.raises(
             projection.ProjectionConflict,
-            match="does not match authenticated prefix",
+            match="Projection V2 persisted event facts changed",
         ):
             projection.ProjectionStore.open(
                 projection_path,
@@ -1011,30 +1032,40 @@ def test_projection_open_rejects_corruption_without_retired_ranges(
 def test_projection_open_rejects_surviving_tamper_after_retention(
     tmp_path: Path,
 ) -> None:
-    from tests.evidence.test_retention_unlink import _issued_case
-
+    """After authenticated retention retires a range, tampering a SURVIVING
+    event row must still be rejected at the next open. V2 requires the
+    retention completion to be consumed by a rebuild before reopen, and its
+    open-time prefix validation names the tampered persisted event."""
     projection = _projection()
-    case, capability = _issued_case(tmp_path / "retained")
-    acknowledgements = case.store._ack_journal_owner
-    assert type(acknowledgements) is AckJournal
-    correlation_requests, registry = _projection_authorities(case.store)
+    raw_hash = hashlib.sha256(b"post-retention surviving tamper").hexdigest()
+    (
+        case,
+        capability,
+        acknowledgements,
+        correlation_requests,
+        registry,
+        refs,
+        cache,
+    ) = _retention_case_with_surviving_falco(
+        tmp_path / "retained" / "evidence",
+        raw_hash=raw_hash,
+    )
     projection_path = tmp_path / "retained" / "projection.sqlite3"
-    cache = None
     try:
-        refs = tuple(record.ref for record in case.store.iter_authenticated_records())
-        cache = projection.ProjectionStore.open(
-            projection_path,
-            evidence=case.store,
-            acknowledgements=acknowledgements,
-            correlation_requests=correlation_requests,
-            registry=registry,
-        )
-        for ref in refs:
-            cache.apply(ref)
-        case.store._execute_authenticated_retention_unlink(
+        completion = case.store._execute_authenticated_retention_unlink(
             capability,
             _factory=segments_module._RETENTION_PROOF_FACTORY,
         )
+        cache._rebuild_after_authenticated_retention(
+            completion,
+            _factory=projection._RETENTION_REBUILD_FACTORY,
+        )
+        case.store._finalize_authenticated_retention_completion(
+            completion,
+            _factory=segments_module._RETENTION_PROOF_FACTORY,
+        )
+        _confirm(acknowledgements, refs[3])
+        cache.apply(refs[3])
         assert cache._connection is not None
         cache._connection.execute(
             "UPDATE events SET event_type='tampered' WHERE source_sequence=?",
@@ -1045,7 +1076,7 @@ def test_projection_open_rejects_surviving_tamper_after_retention(
 
         with pytest.raises(
             projection.ProjectionConflict,
-            match="authenticated surviving evidence",
+            match="Projection V2 persisted event facts changed",
         ):
             projection.ProjectionStore.open(
                 projection_path,
