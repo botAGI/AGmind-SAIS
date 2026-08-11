@@ -3,7 +3,9 @@ include deploy/versions.env
 .PHONY: contracts observer sensor fmt iana-check test-core-detector-pin-image
 
 UV_RUN = docker run --rm --mount "type=image,src=$(UV_IMAGE),dst=/uv-image" -v "$(PWD):/src" -w /src "$(PYTHON_IMAGE)" /uv-image/uv
-GO_RUN = docker run --rm -v "$(PWD):/src" -w /src -e GOFLAGS=-mod=readonly "$(GO_IMAGE)"
+# -buildvcs=false: inside the container git refuses the bind-mounted worktree owned by another
+# uid ("dubious ownership"), and unlike go test, go build stamps VCS info by default.
+GO_RUN = docker run --rm -v "$(PWD):/src" -w /src -e "GOFLAGS=-mod=readonly -buildvcs=false" "$(GO_IMAGE)"
 
 contracts:
 	$(UV_RUN) lock --check --python "$(PYTHON_VERSION)"
