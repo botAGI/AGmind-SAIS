@@ -168,9 +168,7 @@ def _authorities(
         Path(__file__).resolve().parents[2] / "contracts/v1/ipv4-special-use.csv"
     )
     refs = tuple(
-        acceptance.accept(
-            decode_events_page(canonical_json(page_value(value))).events[0]
-        )
+        acceptance.accept(decode_events_page(canonical_json(page_value(value))).events[0])
         for value in seed
     )
     for ref in refs:
@@ -333,13 +331,9 @@ def test_controller_requires_projection_correlation_and_registry_from_same_root(
         foreign_projection,
         _,
     ) = foreign
-    selected_correlation = (
-        foreign_correlation if substitution == "correlation" else correlation
-    )
+    selected_correlation = foreign_correlation if substitution == "correlation" else correlation
     selected_registry = foreign_registry if substitution == "registry" else registry
-    selected_projection = (
-        foreign_projection if substitution == "projection" else projection
-    )
+    selected_projection = foreign_projection if substitution == "projection" else projection
     try:
         with pytest.raises(CoreControllerAuthorityError):
             CoreController.create(
@@ -455,8 +449,14 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         _Transport([_page(acked=1, reserved=1)]),
         _Clock(),
     )
+    # Open-time replay already projected the pre-confirmed record when
+    # ProjectionStore.open ran, so the poll has nothing left to project;
+    # the cursor proves the record materialized rather than being skipped.
+    open_status = lag_projection.status()
+    assert open_status.cursor is not None
+    assert open_status.cursor.source_sequence == lag_refs[-1].source_sequence
     lag_result = await lag_controller.poll_once()
-    assert lag_result.projected == 1
+    assert lag_result.projected == 0
     assert lag_projection.status().cursor is not None
     assert lag_projection.status().cursor.source_sequence == lag_refs[-1].source_sequence
     await lag_controller.close()
@@ -654,13 +654,23 @@ async def test_controller_projection_catchup_and_readiness_matrix(
         capped_coverage,
         capped_projection,
         capped_refs,
-    ) = _authorities(
-        tmp_path / "frozen-cap",
-        boot_boundary(key),
-        envelope_value(key, sequence=2, normalized_fields={"kind": "second"}),
+    ) = _authorities(tmp_path / "frozen-cap")
+    # Accept and confirm AFTER ProjectionStore.open: open-time replay would
+    # otherwise project pre-confirmed records itself, leaving nothing for
+    # the frozen-cap catch-up under test.
+    assert capped_refs == ()
+    capped_refs = tuple(
+        capped_acceptance.accept(decode_events_page(canonical_json(page_value(value))).events[0])
+        for value in (
+            boot_boundary(key),
+            envelope_value(key, sequence=2, normalized_fields={"kind": "second"}),
+        )
     )
     second = capped_refs[1]
-    capped_journal._confirmed = AckIdentity.from_ref(capped_refs[0])
+    for capped_ref in capped_refs:
+        capped_coverage._apply_live_accepted(_capped_store, capped_ref, None)
+    capped_journal.record_pending(capped_refs[0])
+    capped_journal.record_confirmed(capped_refs[0])
     original_apply = capped_projection.apply
 
     def advance_during_apply(ref: EvidenceRef) -> object:

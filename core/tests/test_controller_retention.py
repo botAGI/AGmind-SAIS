@@ -71,12 +71,15 @@ def _issued_registry() -> SpecialUseRegistry:
 class _ProjectionBeforeRetention:
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._authorities: tuple[
-            AckJournal,
-            CorrelationRequestJournal,
-            SpecialUseRegistry,
-            ProjectionStore,
-        ] | None = None
+        self._authorities: (
+            tuple[
+                AckJournal,
+                CorrelationRequestJournal,
+                SpecialUseRegistry,
+                ProjectionStore,
+            ]
+            | None
+        ) = None
 
     def __call__(self, store: SegmentStore) -> None:
         acknowledgements = store._ack_journal_owner
@@ -162,9 +165,7 @@ def _publish_retention_state(
     authority = store._open_retention_state_authority(
         _factory=segments_module._RETENTION_STATE_AUTHORITY_FACTORY,
     )
-    authority.publish_initial_retention_state(
-        retention_module.encode_retention_state(state)
-    )
+    authority.publish_initial_retention_state(retention_module.encode_retention_state(state))
 
 
 @pytest.mark.asyncio
@@ -259,7 +260,7 @@ async def test_retention_pending_ack_precedes_selection_state_and_post(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, refs = _authorities(
         tmp_path / "pending",
         boot_boundary(key),
     )
@@ -303,7 +304,14 @@ async def test_retention_pending_ack_precedes_selection_state_and_post(
             unlinked_bytes=0,
             projection_rebuilt=False,
         )
-        assert execution.projected == 1
+        # The confirmed boot record was projected by open-time replay in
+        # ProjectionStore.open, so the retention pass projects nothing new;
+        # the cursor proves the record IS materialized (the still-pending
+        # sequence-2 record must not have advanced it).
+        assert execution.projected == 0
+        projection_cursor = projection.status().cursor
+        assert projection_cursor is not None
+        assert projection_cursor.source_sequence == refs[-1].source_sequence
         assert clock.samples == 1
         assert transport.posts == []
         assert not (store.root / "retention-state.json").exists()
@@ -376,7 +384,7 @@ async def test_retention_not_due_is_one_exact_noop(
     tmp_path: Path,
 ) -> None:
     key = private_key(11)
-    acceptance, store, journal, correlation, registry, coverage, projection, _ = _authorities(
+    acceptance, store, journal, correlation, registry, coverage, projection, refs = _authorities(
         tmp_path / "not-due",
         boot_boundary(key),
     )
@@ -406,7 +414,13 @@ async def test_retention_not_due_is_one_exact_noop(
             unlinked_bytes=0,
             projection_rebuilt=False,
         )
-        assert execution.projected == 1
+        # Open-time replay in ProjectionStore.open already projected the
+        # confirmed boot record, so an exact noop projects nothing new;
+        # the cursor proves the record IS materialized, not skipped.
+        assert execution.projected == 0
+        projection_cursor = projection.status().cursor
+        assert projection_cursor is not None
+        assert projection_cursor.source_sequence == refs[-1].source_sequence
         assert transport.posts == []
         assert not (store.root / "retention-state.json").exists()
     finally:
@@ -660,10 +674,7 @@ async def test_retention_requires_selected_prefix_then_one_surviving_ack(
             acknowledgements.record_pending(ref)
             acknowledgements.record_confirmed(ref)
         projection = ProjectionStore.open(
-            (
-                tmp_path
-                / f"ack-prefix-{confirmed_through}.sqlite3"
-            ).absolute(),
+            (tmp_path / f"ack-prefix-{confirmed_through}.sqlite3").absolute(),
             evidence=store,
             acknowledgements=acknowledgements,
             correlation_requests=correlation,
@@ -698,10 +709,7 @@ async def test_retention_requires_selected_prefix_then_one_surviving_ack(
     )
     state = case.journal.state
     assert type(state) is retention_module.RetentionStateV1
-    selected_paths = tuple(
-        case.store.root / entry.segment_relative_path
-        for entry in state.entries
-    )
+    selected_paths = tuple(case.store.root / entry.segment_relative_path for entry in state.entries)
     try:
         execution = await controller._run_retention_once()
 
@@ -709,9 +717,7 @@ async def test_retention_requires_selected_prefix_then_one_surviving_ack(
         assert execution.observation.retry_reason == "ack_prefix_lag"
         assert execution.observation.request_kind == "tombstone"
         assert execution.observation.request_id == case.request.tombstone_id
-        assert execution.observation.target_sequence == (
-            case.target_ref.source_sequence
-        )
+        assert execution.observation.target_sequence == (case.target_ref.source_sequence)
         assert execution.observation.projection_rebuilt is False
         assert clock.samples == 1
         assert all(path.exists() for path in selected_paths)
@@ -744,9 +750,7 @@ async def test_retention_selected_prefix_lag_blocks_post(
     )
     request = decision.request
     assert request is not None
-    retention_journal = retention_module._open_retention_state_journal(
-        store
-    )
+    retention_journal = retention_module._open_retention_state_journal(store)
     acknowledgements = AckJournal.create_new(store)
     correlation = CorrelationRequestJournal.create_new(store)
     registry = _issued_registry()
@@ -859,9 +863,7 @@ async def test_retention_retryable_rejects_cache_that_differs_from_durable_raw(
     assert type(state) is retention_module.RetentionStateV1
     altered_document = state.model_dump(exclude_none=False)
     altered_request = dict(altered_document["request"])
-    altered_request["blocked_id"] = (
-        "22222222-2222-4222-8222-222222222222"
-    )
+    altered_request["blocked_id"] = "22222222-2222-4222-8222-222222222222"
     altered_document["request"] = altered_request
     altered = retention_module.RetentionStateV1.model_validate(
         altered_document,
@@ -926,10 +928,7 @@ async def test_retention_cancellation_propagates_with_selected_state_intact(
     state_journal.prepare_publication(decision)
     state = state_journal.state
     assert type(state) is retention_module.RetentionStateV1
-    selected_paths = tuple(
-        store.root / entry.segment_relative_path
-        for entry in state.entries
-    )
+    selected_paths = tuple(store.root / entry.segment_relative_path for entry in state.entries)
     transport = _CancellingTombstoneTransport()
     controller = controller_module.CoreController.create(
         acceptance,
@@ -977,15 +976,11 @@ async def test_retention_restart_only_phases_propagate(
         event_id="evt_" + "1" * 64,
         content_sha256="2" * 64,
     )
-    evidence_appended = (
-        retention_module.advance_retention_evidence_appended(
-            selected,
-            target,
-        )
+    evidence_appended = retention_module.advance_retention_evidence_appended(
+        selected,
+        target,
     )
-    execution_states = retention_module._retention_execution_states(
-        evidence_appended
-    )
+    execution_states = retention_module._retention_execution_states(evidence_appended)
     by_phase = {state.phase: state for state in execution_states}
     _publish_retention_state(store, by_phase[restart_phase])
     controller = controller_module.CoreController.create(
@@ -1013,17 +1008,13 @@ async def test_retention_aborts_before_unlink_when_projection_catchup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    preopened = _ProjectionBeforeRetention(
-        tmp_path / "projection-prefix.sqlite3"
-    )
+    preopened = _ProjectionBeforeRetention(tmp_path / "projection-prefix.sqlite3")
     case = _retention_proof_case(
         tmp_path / "projection-prefix-evidence",
         acknowledge=True,
         before_retention_prepare=preopened,
     )
-    acknowledgements, correlation, registry, projection = (
-        preopened.authorities()
-    )
+    acknowledgements, correlation, registry, projection = preopened.authorities()
     verifier = case.store._bound_verifier
     assert type(verifier) is EnvelopeVerifier
     acceptance = AcceptanceCoordinator(
@@ -1043,10 +1034,7 @@ async def test_retention_aborts_before_unlink_when_projection_catchup_fails(
     )
     state = case.journal.state
     assert type(state) is retention_module.RetentionStateV1
-    selected_paths = tuple(
-        case.store.root / entry.segment_relative_path
-        for entry in state.entries
-    )
+    selected_paths = tuple(case.store.root / entry.segment_relative_path for entry in state.entries)
 
     def fail_status() -> object:
         raise ProjectionError("injected prefix failure")
@@ -1076,9 +1064,7 @@ async def test_retention_completes_unlink_rebuild_and_finalization(
         acknowledge=True,
         before_retention_prepare=preopened,
     )
-    acknowledgements, correlation, registry, projection = (
-        preopened.authorities()
-    )
+    acknowledgements, correlation, registry, projection = preopened.authorities()
     verifier = case.store._bound_verifier
     assert type(verifier) is EnvelopeVerifier
     acceptance = AcceptanceCoordinator(
@@ -1099,10 +1085,7 @@ async def test_retention_completes_unlink_rebuild_and_finalization(
     )
     state = case.journal.state
     assert type(state) is retention_module.RetentionStateV1
-    selected_paths = tuple(
-        case.store.root / entry.segment_relative_path
-        for entry in state.entries
-    )
+    selected_paths = tuple(case.store.root / entry.segment_relative_path for entry in state.entries)
     try:
         execution = await controller._run_retention_once()
 
@@ -1114,9 +1097,7 @@ async def test_retention_completes_unlink_rebuild_and_finalization(
             target_sequence=case.target_ref.source_sequence,
             target_event_id=case.target_ref.event_id,
             target_content_sha256=case.target_ref.content_sha256,
-            unlinked_manifest_count=len(
-                case.request.removed_manifest_hashes
-            ),
+            unlinked_manifest_count=len(case.request.removed_manifest_hashes),
             unlinked_bytes=case.request.removed_bytes,
             projection_rebuilt=True,
         )
@@ -1136,17 +1117,13 @@ async def test_retention_rebuild_failure_latches_and_does_not_finalize(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    preopened = _ProjectionBeforeRetention(
-        tmp_path / "rebuild-failure.sqlite3"
-    )
+    preopened = _ProjectionBeforeRetention(tmp_path / "rebuild-failure.sqlite3")
     case = _retention_proof_case(
         tmp_path / "rebuild-failure-evidence",
         acknowledge=True,
         before_retention_prepare=preopened,
     )
-    acknowledgements, correlation, registry, projection = (
-        preopened.authorities()
-    )
+    acknowledgements, correlation, registry, projection = preopened.authorities()
     verifier = case.store._bound_verifier
     assert type(verifier) is EnvelopeVerifier
     acceptance = AcceptanceCoordinator(
@@ -1166,10 +1143,7 @@ async def test_retention_rebuild_failure_latches_and_does_not_finalize(
     )
     state = case.journal.state
     assert type(state) is retention_module.RetentionStateV1
-    selected_paths = tuple(
-        case.store.root / entry.segment_relative_path
-        for entry in state.entries
-    )
+    selected_paths = tuple(case.store.root / entry.segment_relative_path for entry in state.entries)
 
     def fail_rebuild(
         _completion: object,

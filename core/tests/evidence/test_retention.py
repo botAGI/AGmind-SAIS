@@ -758,11 +758,14 @@ def test_selection_rejects_valid_value_post_freeze_tamper() -> None:
 
 
 def test_selection_prior_exact_retry_is_idempotent() -> None:
+    # Production emits each control-event sequence exactly once, strictly
+    # increasing (SegmentStore._retention_prior_controls), so an "exact retry"
+    # arrives as ONE accepted outcome — not two copies of the same body.
     base = _snapshot(_FactSpec(EXPIRED, 1))
     accepted = _accepted(_tombstone(base, (0,)))
     snapshot = _snapshot(
         _FactSpec(EXPIRED, 1),
-        prior=(accepted, _accepted(accepted.request)),
+        prior=(accepted,),
     )
 
     decision = select_retention(snapshot, request_id=OTHER_REQUEST_ID)
@@ -770,6 +773,18 @@ def test_selection_prior_exact_retry_is_idempotent() -> None:
     assert decision.request is None
     assert decision.routine_bytes == 0
     assert decision.protected_bytes == 0
+
+    # The old fixture shape — the same body accepted twice at one source
+    # sequence — is a shape production cannot emit, and the validator now
+    # rejects it as an ordering corruption instead of tolerating it.
+    with pytest.raises(RetentionCorruption, match="order"):
+        select_retention(
+            _snapshot(
+                _FactSpec(EXPIRED, 1),
+                prior=(accepted, _accepted(accepted.request)),
+            ),
+            request_id=OTHER_REQUEST_ID,
+        )
 
 
 def test_selection_prior_historical_h0_allows_append_only_suffix() -> None:
@@ -835,7 +850,10 @@ def test_selection_prior_retry_requires_same_authenticated_outer_identity() -> N
     base = _snapshot(_FactSpec(EXPIRED, 1))
     request = _tombstone(base, (0,))
 
-    with pytest.raises(RetentionCorruption, match="outer identity"):
+    # Same body, second authenticated outer identity: the outcome validator
+    # now rejects this at the ID-authority check ("conflicting authority")
+    # before the per-tombstone outer-identity comparison is reached.
+    with pytest.raises(RetentionCorruption, match="conflicting authority"):
         select_retention(
             _snapshot(
                 _FactSpec(EXPIRED, 1),
