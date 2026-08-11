@@ -21,7 +21,7 @@ The DGX model is an untrusted read-only enrichment endpoint. Its one pinned IPv4
 address must appear in both `runtime.env` and `management-destinations.json`.
 Core has no external network: it can reach only a pinned, read-only HAProxy TCP
 relay, and that relay has exactly one configured upstream, the DGX IPv4 on port
-8000. DeepSeek therefore cannot turn model output into general Core egress.
+8000. The Hunter model therefore cannot turn its output into general Core egress.
 The current M1 observer binary is host-root because its PCC safety-pin loader
 and owned-socket implementation enforce a root EUID; the unit constrains that
 process and does not claim the planned post-M1 non-root privilege split.
@@ -43,7 +43,7 @@ after validating the same filesystem.
 
 Run the installer from the repository checkout as root. The operator must be an
 existing login account. The DGX URL must be canonical and resolve to exactly one
-safe IPv4 address. This lab currently exposes DeepSeek as model `dspark` at
+safe IPv4 address. This lab currently exposes the Hunter model as `dspark` at
 `192.168.1.45:8000`:
 
 ```sh
@@ -87,7 +87,7 @@ agmindctl plans pending --json --limit 10
 ```
 
 Local approval remains host-only and interactive through `agmindctl`; Core and
-DeepSeek cannot approve or apply a plan.
+the Hunter model cannot approve or apply a plan.
 
 The Core management API token is read afresh for every protected request. Rotate
 it locally as root without restarting the stack:

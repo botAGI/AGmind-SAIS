@@ -48,7 +48,7 @@ targets hostile serialized inputs and sanctioned concurrency instead.
 
 ### The model adapter is untrusted, annotation-only, and read-only
 
-The DeepSeek adapter (on DGX Spark) is explicitly outside the TCB. It receives only an
+The Hunter model adapter (on a separate model host) is explicitly outside the TCB. It receives only an
 incident-scoped, field-allowlisted, read-only investigation snapshot. Its response is annotation
 data only: it cannot create evidence, policy decisions, approvals, or actions, and it has no
 import, callback, plugin, filesystem-write, Docker, policy-publication, approval, or actuator

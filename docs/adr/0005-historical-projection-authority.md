@@ -72,7 +72,7 @@ pure correlation kernel; the Projection V2 transaction and verified logical snap
 
 Explicitly untrusted: SQLite bytes before schema/logical-prefix verification; public
 Pydantic/dataclass constructors; PCC request callers and network responses before durable
-verification; OPA, DeepSeek, model text, labels, prompts, HTTP metadata; Docker live state after
+verification; OPA, the Hunter model, model text, labels, prompts, HTTP metadata; Docker live state after
 the signed snapshot; wall-clock or monotonic time not carried by the signed proof; candidate IDs
 without the exact canonical candidate bytes.
 

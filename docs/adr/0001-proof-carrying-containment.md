@@ -61,7 +61,7 @@ function does not even accept a model parameter, and candidate bytes must be byt
 the model output is benign, hostile, or absent. The legacy prototype's confidence-driven automation
 is explicitly not carried forward.
 
-The model (DeepSeek V4 Flash served from the DGX Spark) is reached through a fixed
+The model (a locally hosted, uncensored model on operator hardware) is reached through a fixed
 OpenAI-compatible endpoint with concurrency exactly 1, a bounded queue (32 items, 60 s TTL),
 bounded input (32 KiB) and output (16 KiB, 2,048 tokens), temperature 0, no streaming, no tools, no
 MCP, no model-managed memory, no redirects, 3 s/45 s timeouts, and a circuit breaker (3 failures in
@@ -88,7 +88,7 @@ Observation (`agmind-observerd`, a Go host service owning the Docker socket), de
 decision-making (`agmind-core`, an unprivileged Python container), policy (OPA, unprivileged), and
 privileged mutation (`agmind-actuatord`, a separate Go root host service) are separate processes
 with typed, bounded Unix-socket contracts between them. The deployment is one product and one
-installer, not one privileged container; the DGX Spark is never in the privileged path. Folding
+installer, not one privileged container; the model host is never in the privileged path. Folding
 observation and mutation into one privileged process would make every parser in it a root attack
 surface.
 
