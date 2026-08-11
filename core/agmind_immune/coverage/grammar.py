@@ -69,6 +69,11 @@ _DOCKER_OPEN_REASONS = frozenset(
         "observer_startup",
         "docker_event_stream_error",
         "docker_event_reconcile_retry",
+        # The routine dirty-signal reconcile the observer has emitted since its
+        # first commit (host/observerd/service.go: monitorDockerOnce). Core must
+        # accept what the observer legitimately signs, or every event-driven
+        # reconcile receipt is rejected and coverage recovery fails closed.
+        "docker_inventory_event",
     }
 )
 _FALCO_OPEN_REASONS: dict[str, frozenset[str]] = {

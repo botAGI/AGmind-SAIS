@@ -182,6 +182,7 @@ def test_classifier_locks_docker_sequence_and_falco_lifecycle_forms() -> None:
         "observer_startup",
         "docker_event_stream_error",
         "docker_event_reconcile_retry",
+        "docker_inventory_event",
     ],
 )
 def test_classifier_accepts_only_production_docker_open_reasons(reason: str) -> None:
