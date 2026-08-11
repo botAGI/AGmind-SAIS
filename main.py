@@ -80,7 +80,29 @@ class SAISApp:
             self._server.should_exit = True
 
 
+# The legacy sensor predates the proof-carrying design and is retained until native acceptance
+# passes (docs/superpowers/plans/2026-07-27-proof-carrying-containment.md). It serves an
+# unauthenticated REST/WebSocket surface on 0.0.0.0:8080 with wildcard CORS, and it is what a
+# plain `docker build . && docker run` at the repo root produces — a control panel nobody
+# deliberately asked for. No shipped deployment starts it: the installer copies an explicit
+# allowlist that excludes app/ and main.py, and the compose stack runs
+# deploy/images/core.Dockerfile instead.
+#
+# So the code stays and the image stays buildable for `make test-core-detector-pin-image`, but
+# running it now requires saying so out loud. Deleting the tree instead would contradict a
+# recorded decision; leaving it startable would keep shipping the surface.
+LEGACY_OPT_IN = "AGMIND_LEGACY_SENSOR"
+
+
 async def main():
+    if os.environ.get(LEGACY_OPT_IN) != "1":
+        logger.error(
+            "refusing to start the legacy sensor: it exposes an unauthenticated API on "
+            "0.0.0.0:8080 and is superseded by the proof-carrying stack "
+            "(deploy/compose/compose.yaml). Set %s=1 only for deliberate legacy testing.",
+            LEGACY_OPT_IN,
+        )
+        raise SystemExit(2)
     app = SAISApp(os.environ.get("SAIS_CONFIG", "config/config.yaml"))
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

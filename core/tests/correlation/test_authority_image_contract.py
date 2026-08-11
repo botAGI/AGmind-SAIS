@@ -52,7 +52,13 @@ def test_runtime_image_installs_fixed_rule_before_non_root_default() -> None:
     assert dockerfile.index(directory_command) < user_offset
     assert dockerfile.index(rule_copy) < user_offset
     assert dockerfile.rfind("USER ") == user_offset
-    assert dockerfile.rfind('CMD ["python3", "main.py"]') > user_offset
+    # The property that matters is ORDER: the image must drop to the unprivileged user before it
+    # declares anything to run. Deriving the CMD position instead of restating the command keeps
+    # this assertion about privilege ordering, so changing the entrypoint cannot silently make it
+    # vacuous — nor does it force the entrypoint to stay what it happened to be.
+    cmd_offset = dockerfile.rfind("\nCMD ")
+    assert cmd_offset > 0, "Dockerfile declares no CMD"
+    assert cmd_offset > user_offset
 
 
 def test_runtime_image_packages_fixed_v2_pin_inputs_before_non_root() -> None:
