@@ -759,6 +759,13 @@ func controlReceiptProofsMissingFrom(
 ) ([]ControlReceiptLiveProof, error) {
 	missing := make([]ControlReceiptLiveProof, 0, 1)
 	for _, spoolItem := range items {
+		// Mirrors the acked-receipt skip in
+		// validateRecoveredControlReceiptSet: an acked crash leftover has
+		// no frame to derive a proof from and is deleted by
+		// cleanupAckedLocked on this same restart.
+		if spoolItem.ackedLeftover {
+			continue
+		}
 		proof, control, err := controlReceiptProofFromLiveSpoolItem(
 			spoolItem,
 			keys,

@@ -742,6 +742,13 @@ func (receipts *PCCReceiptStore) validateLiveItems(
 		return ErrPCCReceiptCorrupt
 	}
 	for _, item := range items {
+		// Acked crash leftovers admitted by scanPublications carry no
+		// frame, so there is no canonical event to bind a receipt to;
+		// cleanupAckedLocked removes them on this same restart. Live
+		// items keep the full ownership check.
+		if item.ackedLeftover {
+			continue
+		}
 		if err := receipts.requireItemOwned(item); err != nil {
 			return err
 		}

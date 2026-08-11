@@ -58,6 +58,12 @@ type SpoolItem struct {
 	publicationPath     string
 	publicationIdentity durablefile.FileIdentity
 	publicationHash     string
+	// ackedLeftover marks the synthetic item scanPublications builds for an
+	// acked, frame-less "published" marker left behind by an ack-base commit
+	// crash. It is the ONLY shape the receipt validators may exempt, and it
+	// is set exclusively inside that recovery carve-out so no other
+	// construction path can reach the exemption.
+	ackedLeftover bool
 }
 
 func cloneSpoolItem(item SpoolItem) SpoolItem {
@@ -905,6 +911,12 @@ func scanPublications(
 						fmt.Sprintf("%020d.agf", sequence),
 					),
 					publication: record,
+					// The frame was removed by the interrupted cleanup;
+					// only the acked marker survives. Flag it so the
+					// receipt validators skip what cleanupAckedLocked is
+					// about to delete instead of failing recovery on a
+					// frame that legitimately no longer exists.
+					ackedLeftover: true,
 				}
 			} else {
 				return 0, 0, ErrSpoolCorrupt
@@ -2973,11 +2985,17 @@ func (spool *Spool) cleanupAckedLocked(sequence uint64) error {
 	})
 	for _, itemSequence := range sequences {
 		item := spool.items[itemSequence]
-		if err := spool.requireControlReceiptLocked(item); err != nil {
-			return err
-		}
-		if err := spool.requirePCCReceiptLocked(item); err != nil {
-			return err
+		// An acked crash leftover has no frame, so no canonical bytes to
+		// derive a receipt obligation from; both receipt checks would
+		// misread its absence as corruption. Everything else must still
+		// prove its receipts before removal.
+		if !item.ackedLeftover {
+			if err := spool.requireControlReceiptLocked(item); err != nil {
+				return err
+			}
+			if err := spool.requirePCCReceiptLocked(item); err != nil {
+				return err
+			}
 		}
 		publicationErr := validatePublicationItem(item)
 		if errors.Is(publicationErr, os.ErrNotExist) {
