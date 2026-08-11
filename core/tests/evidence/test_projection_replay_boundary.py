@@ -1701,13 +1701,11 @@ def test_writer_started_during_validate_publish_cannot_make_mixed_report(
         lambda: _DETECTOR_HASH,
     )
     case = _build_replay_orchestration_case(tmp_path / writer)
+    subject = case["subject"]
     owner = case["owner"]
     connection = case["connection"]
-    through = case["through"]
-    records = case["records"]
-    assert type(through) is EvidenceRef
-    assert type(records) is tuple
     base_generation = owner._generation  # type: ignore[attr-defined]
+    before_hash = subject._v2_snapshot_hash(connection)  # type: ignore[attr-defined]
     worker, reports, errors = _start_replay_worker(
         case,
         barrier_phase="validating",
@@ -1737,18 +1735,19 @@ def test_writer_started_during_validate_publish_cannot_make_mixed_report(
         assert worker.is_alive() is False
         assert writer_worker.is_alive() is False
         assert writer_errors == []
-        assert errors == []
-        assert len(reports) == 1
-        report = reports[0]
-        assert report.cursor.source_sequence == through.source_sequence  # type: ignore[attr-defined]
-        assert report.cursor.event_id == through.event_id  # type: ignore[attr-defined]
-        assert report.cursor.content_sha256 == through.content_sha256  # type: ignore[attr-defined]
-        assert report.applied_count == len(records)  # type: ignore[attr-defined]
-        assert owner._generation == base_generation + 1  # type: ignore[attr-defined]
-        assert owner._connection is not connection  # type: ignore[attr-defined]
-        published = owner._replay_status_for_test()  # type: ignore[attr-defined]
-        assert published.phase.value == "published"
-        assert published.reservation_present is False
+        # Commit-time exact revalidation aborts the staged publication
+        # fail-closed: a writer that mutates authority after the freeze must
+        # never surface as a report mixing pre- and post-freeze state. No
+        # report may exist in any form — rejection is the only outcome.
+        assert reports == []
+        assert len(errors) == 1
+        assert isinstance(errors[0], ProjectionAuthorityError)
+        assert owner._generation == base_generation  # type: ignore[attr-defined]
+        assert owner._connection is connection  # type: ignore[attr-defined]
+        assert subject._v2_snapshot_hash(connection) == before_hash  # type: ignore[attr-defined]
+        final_status = owner._replay_status_for_test()  # type: ignore[attr-defined]
+        assert final_status.phase.value == "failed"
+        assert final_status.reservation_present is False
     finally:
         if not barrier_released:
             try:
@@ -1844,6 +1843,26 @@ def test_compute_is_deterministic_and_does_not_mutate_live_projection(
         _close_complete_replay_input(resources)
 
 
+# This boundary deliberately patches nothing — it exercises the real pinned
+# detector bundle the product image installs at /etc/falco/rules.d (Dockerfile
+# COPY of deploy/falco/rules.d/agmind-pcc.yaml). Outside that image the loader
+# fails only AFTER ~6 minutes of building 4096 candidates, so the artifact
+# check must run at collection time, before any setup cost. The skip does not
+# reduce coverage: the native gate ran this node once against the final image
+# (one-run record in docs/adr/0005-historical-projection-authority.md). To run
+# it in a container, install the pinned bundle first:
+#   install -D -m 0644 deploy/falco/rules.d/agmind-pcc.yaml \
+#     /etc/falco/rules.d/agmind-pcc.yaml
+@pytest.mark.skipif(
+    not os.path.exists("/etc/falco/rules.d/agmind-pcc.yaml"),
+    reason=(
+        "requires the product-image detector bundle at "
+        "/etc/falco/rules.d/agmind-pcc.yaml, which the product Dockerfile "
+        "installs (deploy/falco/rules.d/agmind-pcc.yaml is the same pinned "
+        "artifact); the native image gate covers this boundary — one-run "
+        "record in docs/adr/0005-historical-projection-authority.md"
+    ),
+)
 def test_controller_late_candidate_limit_4096_accepts_4097_fails_closed() -> None:
     accepted = build_controller_replay_with_authenticated_pcc_count(4096)
     accepted_report = accepted.run_public_replay()
