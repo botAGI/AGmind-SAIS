@@ -151,7 +151,7 @@ func TestDockerReconcileRetryReusesTheOneSignedGapWindow(t *testing.T) {
 	}
 	if opens[0].openedAt != closes[0].openedAt ||
 		opens[0].generation != closes[0].generation ||
-		closes[0].sequence &lt;= opens[0].sequence {
+		closes[0].sequence <= opens[0].sequence {
 		t.Fatalf("unpaired Docker reconcile window: %+v", decoded)
 	}
 	if opens[0].openedAt != window.OpenedAt ||
