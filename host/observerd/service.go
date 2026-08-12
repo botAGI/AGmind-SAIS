@@ -517,35 +517,116 @@ func (service *Service) finishDockerReconcileLocked(
 	return err
 }
 
+// retireDockerReconcileWindow closes a window whose reconcile already landed
+// durably but whose close was never signed — the commit aborts after the
+// snapshot is adopted whenever the subscribed event session died. The window
+// cannot be carried into the next reconcile because that reconcile will advance
+// the generation past the one the open announced, and Core pairs an open with a
+// close on (opened_at, reconcile_generation).
+func (service *Service) retireDockerReconcileWindow(
+	ctx context.Context,
+	window PendingDockerReconcile,
+) error {
+	openedAt, err := time.Parse(time.RFC3339Nano, window.OpenedAt)
+	if err != nil {
+		return err
+	}
+	openedAt = openedAt.UTC()
+	closedAt := service.now().UTC()
+	if closedAt.Before(openedAt) {
+		return errors.Join(
+			fmt.Errorf("Docker recovery closed_at precedes opened_at"),
+			service.openDockerReconcileFences(),
+		)
+	}
+	if err := service.daemon.state.clearDockerReconcileWindow(); err != nil {
+		return err
+	}
+	return service.signDockerCoverage(
+		ctx,
+		"docker_reconcile_recovered",
+		"INFO",
+		"docker_full_reconcile_succeeded",
+		openedAt,
+		&closedAt,
+		window.Generation,
+	)
+}
+
 func (service *Service) finishDockerReconcileLockedReceipt(
 	ctx context.Context,
 	reason string,
 	session *dockerEventSession,
 ) (dockerReconcileReceipt, error) {
-	openedAt := service.now().UTC()
-	targetGeneration := service.inventory.Generation()
-	if targetGeneration != ^uint64(0) {
-		targetGeneration++
+	state := service.daemon.state
+	pending := state.Snapshot().PendingDockerReconcile
+	if pending != nil &&
+		service.inventory.Generation() >= pending.Generation {
+		if err := service.retireDockerReconcileWindow(
+			ctx,
+			*pending,
+		); err != nil {
+			return dockerReconcileReceipt{}, err
+		}
+		pending = nil
 	}
-	if err := service.signDockerCoverage(
-		ctx,
-		"docker_reconcile_gap",
-		"CRITICAL",
-		reason,
-		openedAt,
-		nil,
-		targetGeneration,
-	); err != nil {
-		return dockerReconcileReceipt{}, err
+	var openedAt time.Time
+	var targetGeneration uint64
+	if pending != nil {
+		// A failed reconcile never advances the inventory generation, so the
+		// window signed by the failed attempt still describes exactly this gap.
+		// Reuse it: signing a second open would leave the first one unpaired
+		// forever, and Core latches mutation_readiness on any unpaired open.
+		parsed, err := time.Parse(time.RFC3339Nano, pending.OpenedAt)
+		if err != nil {
+			return dockerReconcileReceipt{}, err
+		}
+		openedAt = parsed.UTC()
+		targetGeneration = pending.Generation
+	} else {
+		openedAt = service.now().UTC()
+		targetGeneration = service.inventory.Generation()
+		if targetGeneration != ^uint64(0) {
+			targetGeneration++
+		}
+		if err := service.signDockerCoverage(
+			ctx,
+			"docker_reconcile_gap",
+			"CRITICAL",
+			reason,
+			openedAt,
+			nil,
+			targetGeneration,
+		); err != nil {
+			return dockerReconcileReceipt{}, err
+		}
+		if err := state.beginDockerReconcile(PendingDockerReconcile{
+			OpenedAt:   openedAt.Format(time.RFC3339Nano),
+			Generation: targetGeneration,
+		}); err != nil {
+			return dockerReconcileReceipt{}, errors.Join(
+				err,
+				service.openDockerReconcileFences(),
+			)
+		}
 	}
 	if err := service.inventory.Reconcile(ctx); err != nil {
 		return dockerReconcileReceipt{}, err
+	}
+	if service.inventory.Generation() != targetGeneration {
+		// The close must report the generation the open announced. Fail closed
+		// rather than sign a pair Core cannot match; the retry retires the
+		// window above and starts a fresh one.
+		return dockerReconcileReceipt{}, errors.Join(
+			fmt.Errorf("Docker reconcile generation diverged from signed open"),
+			service.openDockerReconcileFences(),
+		)
 	}
 	if service.inventory.LoggingUnavailable() {
 		if err := service.signDockerLoggingCoverage(
 			ctx,
 			service.now().UTC(),
-			service.inventory.Generation(),
+			targetGeneration,
 		); err != nil {
 			return dockerReconcileReceipt{}, err
 		}
@@ -559,6 +640,13 @@ func (service *Service) finishDockerReconcileLockedReceipt(
 	}
 	var receipt dockerReconcileReceipt
 	commit := func() error {
+		// Release the window before the close is signed. A lost signature then
+		// leaves one unpaired open, which the next reconcile supersedes; the
+		// reverse order would let a retry sign a SECOND close for an open Core
+		// has already matched, which is an unrecoverable coverage conflict.
+		if err := state.clearDockerReconcileWindow(); err != nil {
+			return err
+		}
 		event, err := service.signDockerCoverageEnvelope(
 			ctx,
 			"docker_reconcile_recovered",
@@ -566,7 +654,7 @@ func (service *Service) finishDockerReconcileLockedReceipt(
 			"docker_full_reconcile_succeeded",
 			openedAt,
 			&closedAt,
-			service.inventory.Generation(),
+			targetGeneration,
 		)
 		if err != nil {
 			return err
@@ -577,7 +665,7 @@ func (service *Service) finishDockerReconcileLockedReceipt(
 			ClosedAt:       event.EventTime,
 			openedAt:       openedAt.Format(time.RFC3339Nano),
 		}
-		return service.daemon.state.completeDockerReconcile()
+		return state.completeDockerReconcile()
 	}
 	if session == nil {
 		if err := commit(); err != nil {

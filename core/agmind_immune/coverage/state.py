@@ -523,11 +523,22 @@ def _apply_generic_critical(
         raise CoverageConflict("generic critical close is ambiguous")
     opened = matching[0]
     if classification.counter_required:
+        # The counter is a cumulative loss meter that keeps advancing while the
+        # window is open, and the emitter's bounded outbox coalesces pending
+        # records by kind, so intermediate opens are dropped by design and the
+        # close legitimately carries a HIGHER total than the last delivered
+        # open. Demanding equality was unsatisfiable across that channel and
+        # rejected the whole evidence stream. What must never happen is the
+        # reverse: a close reporting FEWER drops than an already-signed open
+        # would let a compromised emitter hide events it dropped. That is the
+        # check kept here, and it is the same monotonicity rule the open-update
+        # path above already applies to this channel.
         if (
             opened.dropped_count is None
-            or coverage.dropped_count != opened.dropped_count
+            or coverage.dropped_count is None
+            or coverage.dropped_count < opened.dropped_count
         ):
-            raise CoverageConflict("generic critical close changed its counter")
+            raise CoverageConflict("generic critical close lowered its counter")
     elif opened.dropped_count is not None or coverage.dropped_count is not None:
         raise CoverageConflict("uncounted generic critical gained a counter")
     return replace(

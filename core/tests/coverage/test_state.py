@@ -1648,6 +1648,84 @@ def test_exact_falco_cumulative_updates_and_saturation_rules() -> None:
             coverage.CoverageState.rebuild(history)
 
 
+def test_counted_close_accepts_the_counts_the_coalescing_outbox_skips() -> None:
+    """The shape a live host actually produces, and its inverse.
+
+    The falco adapter counts every rejection but its bounded outbox coalesces
+    pending records by kind, so intermediate opens never reach the wire and the
+    close carries the true cumulative total. This exact sequence — opens 1 and 2
+    delivered, 3 and 4 coalesced away, close 5 — was decoded from a real
+    observer spool (source sequences 2448, 2462, 2463) after it stopped Core in
+    a restart loop. Accepting it must not cost the property that matters: a
+    close reporting FEWER drops than an already-signed open still has to fail,
+    because that is the direction in which a compromised emitter would hide
+    dropped events.
+    """
+    coverage = _coverage_module()
+    key = private_key(11)
+
+    def interval(
+        sequence: int,
+        *,
+        dropped_count: int,
+        payload: str,
+        reason: str = "invalid_falco_body",
+        closed_at: str | None = None,
+    ) -> StoredEvidenceRecord:
+        kind = "falco_parse_rejection"
+        fields: dict[str, object] = {
+            "component": "falco-adapter",
+            "kind": kind,
+            "severity": "CRITICAL",
+            "opened_at": T0,
+            "reason_code": reason,
+            "dropped_count": dropped_count,
+        }
+        if closed_at is not None:
+            fields["closed_at"] = closed_at
+        return _stored(
+            _coverage(
+                key,
+                sequence,
+                fields,
+                coverage_flags=[] if closed_at is not None else [kind],
+                source_payload_hash=payload * 64,
+            )
+        )
+
+    boot = _stored(boot_boundary(key))
+    skipped = coverage.CoverageState.rebuild(
+        [
+            boot,
+            interval(2, dropped_count=1, payload="1"),
+            interval(3, dropped_count=2, payload="2"),
+            interval(
+                4,
+                dropped_count=5,
+                reason="valid_heartbeat_recovered",
+                closed_at=T1,
+                payload="3",
+            ),
+        ]
+    )
+    assert skipped._snapshot.open_critical_intervals == ()
+
+    with pytest.raises(coverage.CoverageConflict, match="lowered its counter"):
+        coverage.CoverageState.rebuild(
+            [
+                boot,
+                interval(2, dropped_count=5, payload="1"),
+                interval(
+                    3,
+                    dropped_count=4,
+                    reason="valid_heartbeat_recovered",
+                    closed_at=T1,
+                    payload="2",
+                ),
+            ]
+        )
+
+
 def test_counted_falco_exact_transport_replay_below_maximum_is_idempotent() -> None:
     coverage = _coverage_module()
     key = private_key(11)

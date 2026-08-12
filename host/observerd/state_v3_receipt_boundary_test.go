@@ -193,7 +193,7 @@ func assertObserverStateBytesUnchanged(
 	}
 }
 
-func TestObserverStateV4MigratesToV5OnlyWithBothPCCJournalsAbsent(
+func TestObserverStateV4MigratesToCurrentOnlyWithBothPCCJournalsAbsent(
 	t *testing.T,
 ) {
 	t.Run("both absent", func(t *testing.T) {
@@ -203,14 +203,14 @@ func TestObserverStateV4MigratesToV5OnlyWithBothPCCJournalsAbsent(
 			t.Fatal(err)
 		}
 		snapshot := state.Snapshot()
-		if snapshot.SchemaVersion != "agmind.observer-state.v5" ||
+		if snapshot.SchemaVersion != "agmind.observer-state.v6" ||
 			snapshot.PCCBoundaryCount != 0 ||
 			snapshot.PCCBoundaryBytes != 0 ||
 			snapshot.PCCBoundaryHeadHash != zeroPCCJournalHash ||
 			snapshot.PCCReceiptCount != 0 ||
 			snapshot.PCCReceiptBytes != 0 ||
 			snapshot.PCCReceiptHeadHash != zeroPCCJournalHash {
-			t.Fatalf("unexpected migrated V5 anchor: %+v", snapshot)
+			t.Fatalf("unexpected migrated PCC anchor: %+v", snapshot)
 		}
 	})
 

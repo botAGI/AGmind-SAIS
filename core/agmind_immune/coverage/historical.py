@@ -817,8 +817,16 @@ def _reduce_historical_coverage_result(
                     )
             elif active_opened is not None:
                 if prepared.fact.classification.counter_required:
-                    if coverage.dropped_count != active_opened.dropped_count:
-                        raise HistoricalCoverageConflict("critical close changed counter")
+                    # Same monotonicity rule as the live reducer: the cumulative
+                    # counter advances while the window is open and the emitter's
+                    # outbox coalesces intermediate opens, so only a close that
+                    # LOWERS the reported loss is a conflict.
+                    if (
+                        coverage.dropped_count is None
+                        or active_opened.dropped_count is None
+                        or coverage.dropped_count < active_opened.dropped_count
+                    ):
+                        raise HistoricalCoverageConflict("critical close lowered counter")
                 elif (
                     active_opened.dropped_count is not None
                     or coverage.dropped_count is not None

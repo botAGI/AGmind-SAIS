@@ -28,7 +28,8 @@ const observerStateSchemaV1 = "agmind.observer-state.v1"
 const observerStateSchemaV2 = "agmind.observer-state.v2"
 const observerStateSchemaV3 = "agmind.observer-state.v3"
 const observerStateSchemaV4 = "agmind.observer-state.v4"
-const observerStateSchema = "agmind.observer-state.v5"
+const observerStateSchemaV5 = "agmind.observer-state.v5"
+const observerStateSchema = "agmind.observer-state.v6"
 const sequenceGapProtocolC8 = "proof_carrying_containment_c8"
 const sequenceGapProtocolLegacyUnproven = "legacy_unproven"
 const zeroPublicationHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -59,7 +60,66 @@ type PendingBootBoundary struct {
 	PreviousSourceSequence uint64  `json:"previous_source_sequence"`
 }
 
+// PendingDockerReconcile is the one Docker reconcile window whose CRITICAL
+// docker_reconcile_gap open has been signed and whose matching
+// docker_reconcile_recovered close has not. The window is SINGULAR and OWNED:
+// it is recorded durably the moment the open is signed and dropped in the
+// commit that signs the close, so a failed reconcile — or an observer restart
+// mid-window — resumes THIS window instead of signing a second open that
+// nothing will ever close. Core pairs opens and closes on
+// (opened_at, reconcile_generation) and latches "docker_reconcile_missing"
+// forever on an unpaired open, so an abandoned window is unrepresentable here
+// by construction rather than by convention.
+type PendingDockerReconcile struct {
+	OpenedAt   string `json:"opened_at"`
+	Generation uint64 `json:"reconcile_generation"`
+}
+
 type ObserverState struct {
+	SchemaVersion           string                  `json:"schema_version"`
+	HostID                  string                  `json:"host_id"`
+	BootID                  string                  `json:"boot_id"`
+	KeyID                   string                  `json:"key_id"`
+	KeyEpoch                uint64                  `json:"key_epoch"`
+	LastSequence            uint64                  `json:"last_sequence"`
+	MutationReadOnly        bool                    `json:"mutation_read_only"`
+	ReadOnlyReason          string                  `json:"read_only_reason"`
+	ReconcileRequired       bool                    `json:"reconcile_required"`
+	RoutineDropped          uint64                  `json:"routine_dropped"`
+	DropEventPending        bool                    `json:"drop_event_pending"`
+	AckSequence             uint64                  `json:"ack_sequence"`
+	AckEventID              string                  `json:"ack_event_id"`
+	AckContentSHA256        string                  `json:"ack_content_sha256"`
+	AckRecordHash           string                  `json:"ack_record_hash"`
+	AckPayloadSHA256        string                  `json:"ack_payload_sha256"`
+	LastCoveredGapEnd       uint64                  `json:"last_covered_gap_end"`
+	SequenceGapProtocol     string                  `json:"sequence_gap_protocol"`
+	BootHistory             []BootBoundary          `json:"boot_history,omitempty"`
+	AckRepairPending        bool                    `json:"ack_repair_pending"`
+	AckRepairReason         string                  `json:"ack_repair_reason"`
+	PublicationBaseSequence uint64                  `json:"publication_base_sequence"`
+	PublicationBaseHash     string                  `json:"publication_base_hash"`
+	PublicationHeadSequence uint64                  `json:"publication_head_sequence"`
+	PublicationHeadHash     string                  `json:"publication_head_hash"`
+	ControlReceiptCount     uint64                  `json:"control_receipt_count"`
+	ControlReceiptBytes     uint64                  `json:"control_receipt_bytes"`
+	ControlReceiptHeadHash  string                  `json:"control_receipt_head_sha256"`
+	PCCBoundaryCount        uint64                  `json:"pcc_boundary_count"`
+	PCCBoundaryBytes        uint64                  `json:"pcc_boundary_bytes"`
+	PCCBoundaryHeadHash     string                  `json:"pcc_boundary_head_sha256"`
+	PCCReceiptCount         uint64                  `json:"pcc_receipt_count"`
+	PCCReceiptBytes         uint64                  `json:"pcc_receipt_bytes"`
+	PCCReceiptHeadHash      string                  `json:"pcc_receipt_head_sha256"`
+	BootBoundaryState       string                  `json:"boot_boundary_state"`
+	PendingBootBoundary     *PendingBootBoundary    `json:"pending_boot_boundary,omitempty"`
+	PendingDockerReconcile  *PendingDockerReconcile `json:"pending_docker_reconcile,omitempty"`
+}
+
+// observerStateV5 is the exact pre-Docker-reconcile-window state contract. A V5
+// state predates the durable window, so any Docker gap it left open is already
+// unowned; migration records no pending window and the startup reconcile opens
+// a fresh one.
+type observerStateV5 struct {
 	SchemaVersion           string               `json:"schema_version"`
 	HostID                  string               `json:"host_id"`
 	BootID                  string               `json:"boot_id"`
@@ -96,6 +156,54 @@ type ObserverState struct {
 	PCCReceiptHeadHash      string               `json:"pcc_receipt_head_sha256"`
 	BootBoundaryState       string               `json:"boot_boundary_state"`
 	PendingBootBoundary     *PendingBootBoundary `json:"pending_boot_boundary,omitempty"`
+}
+
+func observerStateFromV5(legacy observerStateV5) ObserverState {
+	return ObserverState{
+		SchemaVersion:           observerStateSchema,
+		HostID:                  legacy.HostID,
+		BootID:                  legacy.BootID,
+		KeyID:                   legacy.KeyID,
+		KeyEpoch:                legacy.KeyEpoch,
+		LastSequence:            legacy.LastSequence,
+		MutationReadOnly:        legacy.MutationReadOnly,
+		ReadOnlyReason:          legacy.ReadOnlyReason,
+		ReconcileRequired:       legacy.ReconcileRequired,
+		RoutineDropped:          legacy.RoutineDropped,
+		DropEventPending:        legacy.DropEventPending,
+		AckSequence:             legacy.AckSequence,
+		AckEventID:              legacy.AckEventID,
+		AckContentSHA256:        legacy.AckContentSHA256,
+		AckRecordHash:           legacy.AckRecordHash,
+		AckPayloadSHA256:        legacy.AckPayloadSHA256,
+		LastCoveredGapEnd:       legacy.LastCoveredGapEnd,
+		SequenceGapProtocol:     legacy.SequenceGapProtocol,
+		BootHistory:             append([]BootBoundary(nil), legacy.BootHistory...),
+		AckRepairPending:        legacy.AckRepairPending,
+		AckRepairReason:         legacy.AckRepairReason,
+		PublicationBaseSequence: legacy.PublicationBaseSequence,
+		PublicationBaseHash:     legacy.PublicationBaseHash,
+		PublicationHeadSequence: legacy.PublicationHeadSequence,
+		PublicationHeadHash:     legacy.PublicationHeadHash,
+		ControlReceiptCount:     legacy.ControlReceiptCount,
+		ControlReceiptBytes:     legacy.ControlReceiptBytes,
+		ControlReceiptHeadHash:  legacy.ControlReceiptHeadHash,
+		PCCBoundaryCount:        legacy.PCCBoundaryCount,
+		PCCBoundaryBytes:        legacy.PCCBoundaryBytes,
+		PCCBoundaryHeadHash:     legacy.PCCBoundaryHeadHash,
+		PCCReceiptCount:         legacy.PCCReceiptCount,
+		PCCReceiptBytes:         legacy.PCCReceiptBytes,
+		PCCReceiptHeadHash:      legacy.PCCReceiptHeadHash,
+		BootBoundaryState:       legacy.BootBoundaryState,
+		PendingBootBoundary:     legacy.PendingBootBoundary,
+	}
+}
+
+func (legacy observerStateV5) Validate() error {
+	if legacy.SchemaVersion != observerStateSchemaV5 {
+		return fmt.Errorf("invalid V5 observer state")
+	}
+	return observerStateFromV5(legacy).Validate()
 }
 
 // observerStateV4 is the exact pre-PCC-journal state contract. Migration is
@@ -485,6 +593,18 @@ func decodeObserverState(raw []byte) (ObserverState, bool, error) {
 			65_536,
 		)
 		return state, false, err
+	case observerStateSchemaV5:
+		legacy, err := contracts.DecodeStrict[observerStateV5](
+			bytes.NewReader(raw),
+			65_536,
+		)
+		if err != nil {
+			return ObserverState{}, false, err
+		}
+		if err := legacy.Validate(); err != nil {
+			return ObserverState{}, false, err
+		}
+		return observerStateFromV5(legacy), true, nil
 	case observerStateSchemaV4:
 		legacy, err := contracts.DecodeStrict[observerStateV4](
 			bytes.NewReader(raw),
@@ -741,6 +861,16 @@ func (state ObserverState) Validate() error {
 	) {
 		return fmt.Errorf("invalid PCC receipt anchor")
 	}
+	if pending := state.PendingDockerReconcile; pending != nil {
+		// An unclosed Docker gap window and an open admission fence are the same
+		// fact. Persisting one without the other would let the observer answer
+		// identity questions while Core still holds the gap open.
+		if !state.ReconcileRequired ||
+			pending.Generation == 0 ||
+			!canonicalUTCTimestamp(pending.OpenedAt) {
+			return fmt.Errorf("invalid pending Docker reconcile window")
+		}
+	}
 	if len(state.BootHistory) == 0 ||
 		len(state.BootHistory) > 1_024 ||
 		state.BootHistory[0].FirstSequence != 1 ||
@@ -884,6 +1014,10 @@ func cloneObserverState(state ObserverState) ObserverState {
 			pending.PreviousBootID = &previous
 		}
 		cloned.PendingBootBoundary = &pending
+	}
+	if state.PendingDockerReconcile != nil {
+		window := *state.PendingDockerReconcile
+		cloned.PendingDockerReconcile = &window
 	}
 	return cloned
 }
@@ -1592,9 +1726,46 @@ func (store *StateStore) requireDockerReconcile() error {
 	return store.persistLocked(next)
 }
 
+// beginDockerReconcile takes ownership of the one Docker gap window. It is
+// called only after the CRITICAL open has been signed, because a durable window
+// with no open frame behind it would make the next attempt sign a close that
+// Core cannot pair with any open — a hard CoverageConflict — whereas the
+// reverse residue is only an unpaired open.
+func (store *StateStore) beginDockerReconcile(
+	window PendingDockerReconcile,
+) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.state.PendingDockerReconcile != nil {
+		return fmt.Errorf("Docker reconcile window is already open")
+	}
+	next := cloneObserverState(store.state)
+	next.PendingDockerReconcile = &window
+	return store.replaceLocked(next)
+}
+
+// clearDockerReconcileWindow releases ownership of the window WITHOUT lifting
+// the reconcile fence. It runs immediately before the close is signed: if the
+// signature then fails the window is merely unpaired (Core latches and the next
+// reconcile recovers), while releasing it after the signature would let a retry
+// sign a second close for an open that is already matched.
+func (store *StateStore) clearDockerReconcileWindow() error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.state.PendingDockerReconcile == nil {
+		return nil
+	}
+	next := cloneObserverState(store.state)
+	next.PendingDockerReconcile = nil
+	return store.replaceLocked(next)
+}
+
 func (store *StateStore) completeDockerReconcile() error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
+	if store.state.PendingDockerReconcile != nil {
+		return fmt.Errorf("Docker reconcile window remains unclosed")
+	}
 	next := cloneObserverState(store.state)
 	next.ReconcileRequired = next.MutationReadOnly ||
 		next.AckRepairPending ||
