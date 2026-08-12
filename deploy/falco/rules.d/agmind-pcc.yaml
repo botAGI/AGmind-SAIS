@@ -23,6 +23,7 @@
     evt.type=connect
     and container.id != host
     and proc.name in (agmind_pcc_suspicious_processes)
+    and not fd.typechar=6
     and ((fd.typechar=4 and fd.rip != "0.0.0.0") or evt.rawres < 0)
   output: >-
     evt.type=%evt.type

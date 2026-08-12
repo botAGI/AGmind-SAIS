@@ -61,7 +61,7 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 _RULE_PATH = "/etc/falco/rules.d/agmind-pcc.yaml"
 _PARENTS = ("/", "/etc", "/etc/falco", "/etc/falco/rules.d")
 _MAX_RULE_BYTES = 65_536
-_PINNED_RULE_HASH = "9adde9efa900af138a8785b7f313582e8e3688e6ec39fd8045c275841b3880cc"
+_PINNED_RULE_HASH = "f0e265b5e4fa1df7807fea424c8c0e4c8c58cd2ff31886d82e789c0d8acabb1c"
 _PCC_DETECTOR_HASH = "1" * 64
 _REGISTRY_PATH = Path("contracts/v1/ipv4-special-use.csv")
 
