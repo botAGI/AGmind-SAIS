@@ -105,8 +105,13 @@ func validatePCCDeniedNetworks(networks []string) error {
 
 type pccSafetyPinReader func(string, int64) ([]byte, error)
 
+// All four pinned artifacts are shipped by the INSTALLER, root-owned and non-secret, at 0444 —
+// not written by observerd. Reading them with readSingleLinkRegular, which demands the 0600 that
+// durablefile.AtomicWrite produces, made every pin load fail with ErrUnsafePath on a real host,
+// so every correlation snapshot recorded outcome "failed" and no candidate could ever reach OPA.
+// readInstalledConfig is the helper that already encodes the installer's mode set.
 func LoadPCCSafetyPinSnapshot() (PCCSafetyPinSnapshot, error) {
-	return loadPCCSafetyPinSnapshot(readSingleLinkRegular, os.Geteuid())
+	return loadPCCSafetyPinSnapshot(readInstalledConfig, os.Geteuid())
 }
 
 func loadPCCSafetyPinSnapshot(
