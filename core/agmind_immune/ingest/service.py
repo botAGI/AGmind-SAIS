@@ -116,18 +116,10 @@ class AcceptanceCoordinator:
     ) -> None:
         if (
             (_factory is _COORDINATOR_FACTORY and _repair_mode is not False)
-            or (
-                _factory is _REPAIR_ACCEPTANCE_FACTORY
-                and _repair_mode is not True
-            )
-            or (
-                _factory is not _COORDINATOR_FACTORY
-                and _factory is not _REPAIR_ACCEPTANCE_FACTORY
-            )
+            or (_factory is _REPAIR_ACCEPTANCE_FACTORY and _repair_mode is not True)
+            or (_factory is not _COORDINATOR_FACTORY and _factory is not _REPAIR_ACCEPTANCE_FACTORY)
         ):
-            raise TypeError(
-                "use AcceptanceCoordinator.create_empty() or open_and_recover()"
-            )
+            raise TypeError("use AcceptanceCoordinator.create_empty() or open_and_recover()")
         self._verifier = verifier
         self._segment_store = segment_store
         self._repair_mode = _repair_mode
@@ -167,13 +159,8 @@ class AcceptanceCoordinator:
 
     def accept(self, item: CoreEventV1) -> EvidenceRef:
         status = self._segment_store.status()
-        if self._repair_mode or (
-            type(status) is EvidenceStatus
-            and status.repair_pending is True
-        ):
-            raise DeliveryFatalError(
-                "repair-resumed acceptance requires repair delivery authority"
-            )
+        if self._repair_mode or (type(status) is EvidenceStatus and status.repair_pending is True):
+            raise DeliveryFatalError("repair-resumed acceptance requires repair delivery authority")
         return self._accept_bound(item)
 
     def accept_pcc(
@@ -185,13 +172,8 @@ class AcceptanceCoordinator:
         if type(request) is not PCCCorrelationSnapshotRequestV1:
             raise TypeError("PCC acceptance requires the exact request contract")
         status = self._segment_store.status()
-        if self._repair_mode or (
-            type(status) is EvidenceStatus
-            and status.repair_pending is True
-        ):
-            raise DeliveryFatalError(
-                "repair-resumed acceptance requires repair delivery authority"
-            )
+        if self._repair_mode or (type(status) is EvidenceStatus and status.repair_pending is True):
+            raise DeliveryFatalError("repair-resumed acceptance requires repair delivery authority")
         return self._accept_bound(
             item,
             pcc_context=PCCCorrelationVerificationContext(request=request),
@@ -203,21 +185,11 @@ class AcceptanceCoordinator:
         request: PCCCorrelationSnapshotRequestV1,
     ) -> AuthenticatedPCCInput:
         """Export one already-committed PCC as immutable correlation authority."""
-        if (
-            type(ref) is not EvidenceRef
-            or type(request) is not PCCCorrelationSnapshotRequestV1
-        ):
-            raise TypeError(
-                "PCC correlation authority requires exact ref and request contracts"
-            )
+        if type(ref) is not EvidenceRef or type(request) is not PCCCorrelationSnapshotRequestV1:
+            raise TypeError("PCC correlation authority requires exact ref and request contracts")
         status = self._segment_store.status()
-        if self._repair_mode or (
-            type(status) is EvidenceStatus
-            and status.repair_pending is True
-        ):
-            raise DeliveryFatalError(
-                "repair-resumed evidence cannot issue correlation authority"
-            )
+        if self._repair_mode or (type(status) is EvidenceStatus and status.repair_pending is True):
+            raise DeliveryFatalError("repair-resumed evidence cannot issue correlation authority")
         return self._segment_store._authenticated_pcc_input(
             self._verifier,
             ref,
@@ -232,13 +204,8 @@ class AcceptanceCoordinator:
         if type(ref) is not EvidenceRef:
             raise TypeError("Falco authority requires an exact evidence ref")
         status = self._segment_store.status()
-        if self._repair_mode or (
-            type(status) is EvidenceStatus
-            and status.repair_pending is True
-        ):
-            raise DeliveryFatalError(
-                "repair-resumed evidence cannot issue Falco authority"
-            )
+        if self._repair_mode or (type(status) is EvidenceStatus and status.repair_pending is True):
+            raise DeliveryFatalError("repair-resumed evidence cannot issue Falco authority")
         return self._segment_store._authenticated_falco_input(
             self._verifier,
             ref,
@@ -268,9 +235,7 @@ class AcceptanceCoordinator:
             or status.repair_pending is not True
             or not self._segment_store._is_bound_verifier(self._verifier)
         ):
-            raise DeliveryFatalError(
-                "repair acceptance is outside its resumed delivery lifecycle"
-            )
+            raise DeliveryFatalError("repair acceptance is outside its resumed delivery lifecycle")
         return self._accept_bound(item)
 
     def _finish_repair_resume(self, *, _factory: object) -> None:
@@ -284,9 +249,7 @@ class AcceptanceCoordinator:
             or status.repair_pending is not False
             or not self._segment_store._is_bound_verifier(self._verifier)
         ):
-            raise DeliveryFatalError(
-                "repair acceptance cannot become ordinary before gate clear"
-            )
+            raise DeliveryFatalError("repair acceptance cannot become ordinary before gate clear")
         self._repair_mode = False
 
     @classmethod
@@ -327,9 +290,7 @@ class AcceptanceCoordinator:
             or segment_store.status().repair_pending is not True
             or not segment_store._is_bound_verifier(verifier)
         ):
-            raise DeliveryFatalError(
-                "repair acceptance requires one resumed bound store"
-            )
+            raise DeliveryFatalError("repair acceptance requires one resumed bound store")
         return cls(
             verifier,
             segment_store,
@@ -500,24 +461,16 @@ class HTTPXObserverCoreTransport:
             async with self._client.stream("GET", path) as response:
                 if "content-encoding" in response.headers:
                     await self._discard_error_body(response)
-                    raise DeliveryFatalError(
-                        "observer fetch response has Content-Encoding"
-                    )
+                    raise DeliveryFatalError("observer fetch response has Content-Encoding")
                 if 500 <= response.status_code <= 599:
                     await self._discard_error_body(response)
-                    raise DeliveryRetryableError(
-                        f"observer fetch returned {response.status_code}"
-                    )
+                    raise DeliveryRetryableError(f"observer fetch returned {response.status_code}")
                 if response.status_code != 200:
                     await self._discard_error_body(response)
-                    raise DeliveryFatalError(
-                        f"observer fetch returned {response.status_code}"
-                    )
+                    raise DeliveryFatalError(f"observer fetch returned {response.status_code}")
                 if response.headers.get("Content-Type") != "application/json":
                     await self._discard_error_body(response)
-                    raise DeliveryFatalError(
-                        "observer fetch Content-Type is not exact JSON"
-                    )
+                    raise DeliveryFatalError("observer fetch Content-Type is not exact JSON")
                 raw = await self._read_raw_bounded(
                     response,
                     MAX_EVENTS_PAGE_BYTES + 1,
@@ -538,9 +491,7 @@ class HTTPXObserverCoreTransport:
             async with self._client.stream("GET", "/v1/public-keys") as response:
                 if "content-encoding" in response.headers:
                     await self._discard_error_body(response)
-                    raise DeliveryFatalError(
-                        "observer public-key response has Content-Encoding"
-                    )
+                    raise DeliveryFatalError("observer public-key response has Content-Encoding")
                 if 500 <= response.status_code <= 599:
                     await self._discard_error_body(response)
                     raise DeliveryRetryableError(
@@ -553,15 +504,11 @@ class HTTPXObserverCoreTransport:
                     )
                 if response.headers.get_list("content-type") != ["application/json"]:
                     await self._discard_error_body(response)
-                    raise DeliveryFatalError(
-                        "observer public-key Content-Type is not exact JSON"
-                    )
+                    raise DeliveryFatalError("observer public-key Content-Type is not exact JSON")
                 lengths = response.headers.get_list("content-length")
                 if len(lengths) > 1:
                     await self._discard_error_body(response)
-                    raise DeliveryFatalError(
-                        "observer public-key Content-Length is duplicated"
-                    )
+                    raise DeliveryFatalError("observer public-key Content-Length is duplicated")
                 declared: int | None = None
                 if lengths:
                     raw_length = lengths[0]
@@ -571,37 +518,28 @@ class HTTPXObserverCoreTransport:
                         or str(int(raw_length)) != raw_length
                     ):
                         await self._discard_error_body(response)
-                        raise DeliveryFatalError(
-                            "observer public-key Content-Length is invalid"
-                        )
+                        raise DeliveryFatalError("observer public-key Content-Length is invalid")
                     declared = int(raw_length)
                     if declared > MAX_PUBLIC_KEY_METADATA_BYTES + 1:
                         await self._discard_error_body(response)
-                        raise DeliveryFatalError(
-                            "observer public-key response exceeds bound"
-                        )
+                        raise DeliveryFatalError("observer public-key response exceeds bound")
                 raw = await self._read_raw_bounded(
                     response,
                     MAX_PUBLIC_KEY_METADATA_BYTES + 2,
                 )
                 if (
                     (declared is not None and declared != len(raw))
-                    or
-                    len(raw) > MAX_PUBLIC_KEY_METADATA_BYTES + 1
+                    or len(raw) > MAX_PUBLIC_KEY_METADATA_BYTES + 1
                     or len(raw) < 3
                     or not raw.endswith(b"\n")
                     or raw.endswith(b"\n\n")
                 ):
-                    raise DeliveryFatalError(
-                        "observer public-key response framing is invalid"
-                    )
+                    raise DeliveryFatalError("observer public-key response framing is invalid")
                 return raw[:-1]
         except DeliveryError:
             raise
         except (httpx.HTTPError, OSError, TimeoutError) as error:
-            raise DeliveryRetryableError(
-                "observer public-key transport failed"
-            ) from error
+            raise DeliveryRetryableError("observer public-key transport failed") from error
 
     async def ack_event(self, body: bytes) -> None:
         if self._closed:
@@ -615,26 +553,18 @@ class HTTPXObserverCoreTransport:
             ) as response:
                 if "content-encoding" in response.headers:
                     await self._discard_error_body(response)
-                    raise DeliveryFatalError(
-                        "observer ACK response has Content-Encoding"
-                    )
+                    raise DeliveryFatalError("observer ACK response has Content-Encoding")
                 if response.status_code == 204:
                     delivered = await self._read_raw_bounded(response, 1)
                     if delivered:
-                        raise DeliveryFatalError(
-                            "observer ACK 204 delivered a response body"
-                        )
+                        raise DeliveryFatalError("observer ACK 204 delivered a response body")
                     return
                 await self._discard_error_body(response)
                 if 500 <= response.status_code <= 599:
-                    raise DeliveryAmbiguousAck(
-                        f"observer ACK returned {response.status_code}"
-                    )
+                    raise DeliveryAmbiguousAck(f"observer ACK returned {response.status_code}")
                 if response.status_code == 409:
                     raise DeliveryFatalError("observer rejected exact ACK authority")
-                raise DeliveryFatalError(
-                    f"observer ACK returned {response.status_code}"
-                )
+                raise DeliveryFatalError(f"observer ACK returned {response.status_code}")
         except DeliveryError:
             raise
         except (httpx.HTTPError, OSError, TimeoutError) as error:
@@ -653,17 +583,11 @@ class HTTPXObserverCoreTransport:
         if self._closed:
             raise DeliveryFatalError("observer transport is closed")
         if type(canonical_body) is not bytes or not canonical_body:
-            raise DeliveryFatalError(
-                f"{operation} request body must be exact nonempty bytes"
-            )
+            raise DeliveryFatalError(f"{operation} request body must be exact nonempty bytes")
         if request_limit is not None and len(canonical_body) > request_limit:
             if request_limit_label is None:
-                raise DeliveryFatalError(
-                    f"{operation} request body exceeds its bound"
-                )
-            raise DeliveryFatalError(
-                f"{operation} request body exceeds {request_limit_label}"
-            )
+                raise DeliveryFatalError(f"{operation} request body exceeds its bound")
+            raise DeliveryFatalError(f"{operation} request body exceeds {request_limit_label}")
         try:
             async with self._client.stream(
                 "POST",
@@ -673,9 +597,7 @@ class HTTPXObserverCoreTransport:
             ) as response:
                 if "content-encoding" in response.headers:
                     await self._discard_error_body(response)
-                    raise DeliveryFatalError(
-                        f"observer {operation} response has Content-Encoding"
-                    )
+                    raise DeliveryFatalError(f"observer {operation} response has Content-Encoding")
                 if response.status_code in (200, 201):
                     if response.headers.get("Content-Type") != "application/json":
                         await self._discard_error_body(response)
@@ -687,14 +609,9 @@ class HTTPXObserverCoreTransport:
                         MAX_CORE_EVENT_RESPONSE_BYTES + 1,
                     )
                     if len(raw) > MAX_CORE_EVENT_RESPONSE_BYTES:
-                        raise DeliveryFatalError(
-                            f"observer {operation} response exceeds bound"
-                        )
+                        raise DeliveryFatalError(f"observer {operation} response exceeds bound")
                     return raw
-                if (
-                    terminal_refusal is not None
-                    and response.status_code == terminal_refusal[0]
-                ):
+                if terminal_refusal is not None and response.status_code == terminal_refusal[0]:
                     # Read, do not discard: the terminal claim is only accepted
                     # when the observer's exact stated artifact is delivered.
                     # A truncated, padded, or differently-worded body is
@@ -713,14 +630,11 @@ class HTTPXObserverCoreTransport:
                             f"permanently unresolvable"
                         )
                     raise DeliveryFatalError(
-                        f"observer {operation} POST returned "
-                        f"{response.status_code}"
+                        f"observer {operation} POST returned {response.status_code}"
                     )
                 await self._discard_error_body(response)
                 if response.status_code == 409:
-                    raise DeliveryFatalError(
-                        f"observer rejected exact {operation} authority"
-                    )
+                    raise DeliveryFatalError(f"observer rejected exact {operation} authority")
                 if response.status_code == 408 or 500 <= response.status_code <= 599:
                     raise DeliveryRetryableError(
                         f"observer {operation} POST returned {response.status_code}"
@@ -731,9 +645,7 @@ class HTTPXObserverCoreTransport:
         except DeliveryError:
             raise
         except (httpx.HTTPError, OSError, TimeoutError) as error:
-            raise DeliveryRetryableError(
-                f"observer {operation} POST transport failed"
-            ) from error
+            raise DeliveryRetryableError(f"observer {operation} POST transport failed") from error
 
     async def _publish_repair(self, path: str, canonical_body: bytes) -> bytes:
         return await self._publish_control(
@@ -829,14 +741,8 @@ class _DeliveryLock:
 
     def release(self) -> None:
         task = asyncio.current_task()
-        if (
-            task is None
-            or self._owner is not task
-            or self._lock.locked() is not True
-        ):
-            raise RuntimeError(
-                "delivery lock can only be released by its exact task owner"
-            )
+        if task is None or self._owner is not task or self._lock.locked() is not True:
+            raise RuntimeError("delivery lock can only be released by its exact task owner")
         self._lock.release()
         self._owner = None
         self._epoch += 1
@@ -970,28 +876,16 @@ class DeliveryCoordinator:
     ) -> None:
         if (
             (_factory is _DELIVERY_FACTORY and _repair_mode is not False)
-            or (
-                _factory is _REPAIR_DELIVERY_FACTORY
-                and _repair_mode is not True
-            )
-            or (
-                _factory is not _DELIVERY_FACTORY
-                and _factory is not _REPAIR_DELIVERY_FACTORY
-            )
+            or (_factory is _REPAIR_DELIVERY_FACTORY and _repair_mode is not True)
+            or (_factory is not _DELIVERY_FACTORY and _factory is not _REPAIR_DELIVERY_FACTORY)
         ):
             raise TypeError("use DeliveryCoordinator.create()")
         if type(delivery_lease) is not AckDeliveryLease:
             raise TypeError("delivery requires an exact ACK-journal lease")
         if (
-            (
-                _repair_mode is False
-                and type(correlation_requests) is not CorrelationRequestJournal
-            )
-            or (_repair_mode is True and correlation_requests is not None)
-        ):
-            raise TypeError(
-                "ordinary delivery requires an exact correlation-request journal"
-            )
+            _repair_mode is False and type(correlation_requests) is not CorrelationRequestJournal
+        ) or (_repair_mode is True and correlation_requests is not None):
+            raise TypeError("ordinary delivery requires an exact correlation-request journal")
         if type(coverage_adapter) is not _CoverageDeliveryAdapter:
             raise TypeError("delivery requires its exact coverage adapter")
         if (
@@ -1097,13 +991,9 @@ class DeliveryCoordinator:
             raise TypeError("delivery requires exact ACK authority")
         if repair_mode:
             if correlation_requests is not None:
-                raise TypeError(
-                    "repair delivery must remain correlation-journal-free"
-                )
+                raise TypeError("repair delivery must remain correlation-journal-free")
         elif type(correlation_requests) is not CorrelationRequestJournal:
-            raise TypeError(
-                "ordinary delivery requires exact correlation-request authority"
-            )
+            raise TypeError("ordinary delivery requires exact correlation-request authority")
         if type(coverage) is not CoverageState:
             raise TypeError("delivery requires exact coverage authority")
         mode_status = store.status()
@@ -1112,9 +1002,7 @@ class DeliveryCoordinator:
             or type(mode_status.repair_pending) is not bool
             or mode_status.repair_pending is not repair_mode
         ):
-            raise DeliveryFatalError(
-                "delivery mode does not match the evidence repair gate"
-            )
+            raise DeliveryFatalError("delivery mode does not match the evidence repair gate")
         if (
             acceptance.segment_store is not store
             or acceptance.verifier is not verifier
@@ -1122,16 +1010,10 @@ class DeliveryCoordinator:
             or not store._is_bound_verifier(verifier)
         ):
             raise DeliveryFatalError("acceptance authority binding is invalid")
-        if (
-            correlation_requests is not None
-            and not correlation_requests._is_bound_to(store)
-        ):
-            raise DeliveryFatalError(
-                "correlation-request authority binding is invalid"
-            )
-        if (
-            not callable(getattr(clock, "live_receipt_monotonic", None))
-            or not callable(getattr(clock, "decision_sample", None))
+        if correlation_requests is not None and not correlation_requests._is_bound_to(store):
+            raise DeliveryFatalError("correlation-request authority binding is invalid")
+        if not callable(getattr(clock, "live_receipt_monotonic", None)) or not callable(
+            getattr(clock, "decision_sample", None)
         ):
             raise TypeError("delivery requires one typed Core clock provider")
         barrier = coverage.ack_barrier_capability()
@@ -1174,9 +1056,7 @@ class DeliveryCoordinator:
                     store.status(),
                 )
             ):
-                raise DeliveryFatalError(
-                    "acceptance authority changed during delivery composition"
-                )
+                raise DeliveryFatalError("acceptance authority changed during delivery composition")
             return delivery
         except BaseException as primary:
             try:
@@ -1247,11 +1127,7 @@ class DeliveryCoordinator:
             return None
         if value is None:
             return None
-        if (
-            type(value) is not float
-            or not math.isfinite(value)
-            or value < 0
-        ):
+        if type(value) is not float or not math.isfinite(value) or value < 0:
             return None
         return value
 
@@ -1303,6 +1179,9 @@ class DeliveryCoordinator:
         evidence_head: int,
         acceptance_cursor: int,
         confirmed_through: int,
+        intended_through: int,
+        driven_correlation: str | None,
+        hold_observed_proofs: bool,
     ) -> int:
         try:
             barrier = self._coverage_adapter.first_unclosed_sequence_gap()
@@ -1323,24 +1202,29 @@ class DeliveryCoordinator:
                 limit=1,
             )
             if len(bound) != 1 or bound[0].source_sequence != barrier:
-                raise self._latch(
-                    "evidence-derived ACK barrier lacks an authenticated ref"
-                )
+                raise self._latch("evidence-derived ACK barrier lacks an authenticated ref")
             ceiling = min(ceiling, barrier - 1)
         ceiling = self._correlation_ack_ceiling(
             ceiling=ceiling,
             evidence_head=evidence_head,
+            # An ACK that is already durable -- confirmed, or recorded as a
+            # pending intent this coordinator is obliged to replay -- is past
+            # the point a ceiling can prevent.  Lowering the ceiling under it
+            # would not un-do the anchor, only brick every later poll.
+            hold_floor=max(confirmed_through, intended_through),
+            driven_correlation=driven_correlation,
+            hold_observed_proofs=hold_observed_proofs,
         )
         if ceiling < confirmed_through:
-            raise self._latch(
-                "correlation ACK barrier is behind durable confirmation"
-            )
+            raise self._latch("correlation ACK barrier is behind durable confirmation")
         return ceiling
 
     def _local_state(
         self,
         *,
         apply_coverage_barrier: bool,
+        driven_correlation: str | None = None,
+        hold_observed_proofs: bool = True,
     ) -> _DeliveryState:
         self._raise_if_unavailable()
         try:
@@ -1352,9 +1236,7 @@ class DeliveryCoordinator:
             if type(status) is not EvidenceStatus or not status.healthy:
                 raise self._latch("evidence status is unhealthy")
             if not self._status_matches_repair_mode(status):
-                raise self._latch(
-                    "delivery mode does not match the evidence repair gate"
-                )
+                raise self._latch("delivery mode does not match the evidence repair gate")
             pending_body = self._ack_journal.pending_request_body()
             evidence_head = status.evidence_head
             acceptance_cursor = status.acceptance_cursor
@@ -1373,11 +1255,18 @@ class DeliveryCoordinator:
             )
         except Exception as error:  # noqa: BLE001 - store authority boundary
             raise self._latch("evidence store is unavailable for delivery", error)
+        intent = snapshot.pending
+        intended_through = (
+            intent.sequence if type(intent) is AckIdentity and type(intent.sequence) is int else 0
+        )
         delivery_ceiling = (
             self._barrier_ceiling(
                 evidence_head=evidence_head,
                 acceptance_cursor=acceptance_cursor,
                 confirmed_through=confirmed_through,
+                intended_through=intended_through,
+                driven_correlation=driven_correlation,
+                hold_observed_proofs=hold_observed_proofs,
             )
             if apply_coverage_barrier
             else acceptance_cursor
@@ -1391,10 +1280,7 @@ class DeliveryCoordinator:
             if (
                 pending_body is None
                 or not confirmed_through < pending.sequence <= acceptance_cursor
-                or (
-                    apply_coverage_barrier
-                    and pending.sequence > delivery_ceiling
-                )
+                or (apply_coverage_barrier and pending.sequence > delivery_ceiling)
             ):
                 raise self._latch("pending ACK is outside local delivery authority")
             first = self._authenticated_refs(
@@ -1403,9 +1289,7 @@ class DeliveryCoordinator:
                 limit=1,
             )
             if len(first) != 1 or not self._identity_matches(first[0], pending):
-                raise self._latch(
-                    "pending ACK is not the next authenticated evidence ref"
-                )
+                raise self._latch("pending ACK is not the next authenticated evidence ref")
             pending_ref = first[0]
             if apply_coverage_barrier:
                 try:
@@ -1429,11 +1313,7 @@ class DeliveryCoordinator:
         )
 
     async def _post_pending(self, state: _DeliveryState) -> None:
-        if (
-            state.pending is None
-            or state.pending_ref is None
-            or state.pending_body is None
-        ):
+        if state.pending is None or state.pending_ref is None or state.pending_body is None:
             raise self._latch("pending ACK lacks exact durable identity")
         try:
             await self._transport.ack_event(state.pending_body)
@@ -1442,9 +1322,7 @@ class DeliveryCoordinator:
         except DeliveryAmbiguousAck:
             raise
         except DeliveryRetryableError as error:
-            raise DeliveryAmbiguousAck(
-                "observer ACK result is ambiguous"
-            ) from error
+            raise DeliveryAmbiguousAck("observer ACK result is ambiguous") from error
         except DeliveryFatalError as error:
             raise self._latch("observer ACK failed fatally", error)
         except (httpx.HTTPError, OSError, TimeoutError) as error:
@@ -1486,8 +1364,7 @@ class DeliveryCoordinator:
         if len(page.events) > limit:
             raise DeliveryFatalError("observer returned more events than requested")
         if any(
-            event.sequence <= after or event.sequence <= page.acked_through
-            for event in page.events
+            event.sequence <= after or event.sequence <= page.acked_through for event in page.events
         ):
             raise DeliveryFatalError("observer event is outside the fetch request")
         if any(gap.start <= after for gap in page.uncovered_gaps):
@@ -1514,9 +1391,7 @@ class DeliveryCoordinator:
             raise self._latch("observer fetch transport violated its contract", error)
         try:
             if type(raw) is not bytes:
-                raise DeliveryFatalError(
-                    "observer fetch returned a non-exact byte response"
-                )
+                raise DeliveryFatalError("observer fetch returned a non-exact byte response")
             page = decode_events_page(raw)
             self._validate_page_binding(
                 page,
@@ -1558,13 +1433,9 @@ class DeliveryCoordinator:
             or type(self) is not DeliveryCoordinator
             or self._repair_mode
         ):
-            raise TypeError(
-                "retention preflight requires the exact ordinary delivery factory"
-            )
+            raise TypeError("retention preflight requires the exact ordinary delivery factory")
         if self._retention_lock_owner is not None:
-            raise TypeError(
-                "retention preflight already has an exact lock owner"
-            )
+            raise TypeError("retention preflight already has an exact lock owner")
         self._raise_if_unavailable()
         task = asyncio.current_task()
         if task is None:
@@ -1582,9 +1453,7 @@ class DeliveryCoordinator:
                 or self._retention_lock_owner is not None
                 or self._retention_lock_authority is not None
             ):
-                raise TypeError(
-                    "retention preflight already has an exact lock owner"
-                )
+                raise TypeError("retention preflight already has an exact lock owner")
             authority = object()
             self._retention_lock_owner = task
             self._retention_lock_authority = authority
@@ -1600,13 +1469,10 @@ class DeliveryCoordinator:
                 and lock._owner is task
                 and lock._epoch == lock_epoch
             )
-            owner_unchanged = (
-                not scope_entered
-                or (
-                    asyncio.current_task() is task
-                    and self._retention_lock_owner is task
-                    and self._retention_lock_authority is authority
-                )
+            owner_unchanged = not scope_entered or (
+                asyncio.current_task() is task
+                and self._retention_lock_owner is task
+                and self._retention_lock_authority is authority
             )
             if scope_entered:
                 self._retention_lock_owner = None
@@ -1630,9 +1496,7 @@ class DeliveryCoordinator:
             or type(self) is not DeliveryCoordinator
             or self._repair_mode
         ):
-            raise TypeError(
-                "retention target delivery requires its exact factory"
-            )
+            raise TypeError("retention target delivery requires its exact factory")
         task = asyncio.current_task()
         if (
             task is None
@@ -1642,9 +1506,7 @@ class DeliveryCoordinator:
             or self._retention_lock_authority is None
             or _lock_authority is not self._retention_lock_authority
         ):
-            raise TypeError(
-                "retention target delivery requires its exact locked scope"
-            )
+            raise TypeError("retention target delivery requires its exact locked scope")
         self._raise_if_unavailable()
 
     def _require_retention_preflight(
@@ -1658,9 +1520,7 @@ class DeliveryCoordinator:
             or type(self) is not DeliveryCoordinator
             or self._repair_mode
         ):
-            raise TypeError(
-                "retention preflight requires the exact ordinary delivery factory"
-            )
+            raise TypeError("retention preflight requires the exact ordinary delivery factory")
         task = asyncio.current_task()
         if (
             task is None
@@ -1670,9 +1530,7 @@ class DeliveryCoordinator:
             or self._retention_lock_authority is None
             or _lock_authority is not self._retention_lock_authority
         ):
-            raise TypeError(
-                "retention preflight requires its exact current-task lock owner"
-            )
+            raise TypeError("retention preflight requires its exact current-task lock owner")
         self._raise_if_unavailable()
 
     @staticmethod
@@ -1684,20 +1542,14 @@ class DeliveryCoordinator:
         bytes,
     ]:
         if type(canonical_body) is not bytes or not canonical_body:
-            raise DeliveryFatalError(
-                "retention preflight body must be exact nonempty bytes"
-            )
-        request_type: type[
-            RetentionTombstoneV2 | RetentionBlockedV1
-        ]
+            raise DeliveryFatalError("retention preflight body must be exact nonempty bytes")
+        request_type: type[RetentionTombstoneV2 | RetentionBlockedV1]
         if type(request) is RetentionTombstoneV2:
             request_type = RetentionTombstoneV2
         elif type(request) is RetentionBlockedV1:
             request_type = RetentionBlockedV1
         else:
-            raise TypeError(
-                "retention preflight requires an exact request type"
-            )
+            raise TypeError("retention preflight requires an exact request type")
         try:
             encoded = canonical_json(request.model_dump(mode="python"))
             decoded = request_type.model_validate_json(
@@ -1712,18 +1564,14 @@ class DeliveryCoordinator:
             UnicodeError,
             ValueError,
         ) as error:
-            raise DeliveryFatalError(
-                "retention preflight exact request is invalid"
-            ) from error
+            raise DeliveryFatalError("retention preflight exact request is invalid") from error
         if (
             type(decoded) is not request_type
             or decoded != request
             or expected != encoded
             or canonical_body != expected
         ):
-            raise DeliveryFatalError(
-                "retention preflight body differs from the exact request"
-            )
+            raise DeliveryFatalError("retention preflight body differs from the exact request")
         return decoded, expected
 
     def _capture_retention_preflight_invariant(
@@ -1745,17 +1593,11 @@ class DeliveryCoordinator:
             verifier_key_chain=self._verifier.key_chain,
             verifier_authority=self._verifier._authority,
             verifier_bound_lifecycle=self._verifier._bound_lifecycle,
-            verifier_repair_lifecycle=(
-                self._verifier._repair_lifecycle_identity
-            ),
+            verifier_repair_lifecycle=(self._verifier._repair_lifecycle_identity),
             verifier_repair_owner=self._verifier._repair_owner_identity,
             verifier_staged=dict(self._verifier._staged),
-            verifier_authorizations=dict(
-                self._verifier._authorizations
-            ),
-            verifier_transient_generation=(
-                self._verifier._repair_transient_generation
-            ),
+            verifier_authorizations=dict(self._verifier._authorizations),
+            verifier_transient_generation=(self._verifier._repair_transient_generation),
             ack_journal=self._ack_journal,
             ack_store=self._ack_journal._store,
             ack_lifecycle=self._ack_journal._lifecycle_identity,
@@ -1786,48 +1628,34 @@ class DeliveryCoordinator:
             return (
                 self._acceptance is not before.acceptance
                 or self._store is not before.store
-                or self._store._lifecycle_identity
-                is not before.store_lifecycle
-                or self._store._bound_verifier
-                is not before.store_bound_verifier
+                or self._store._lifecycle_identity is not before.store_lifecycle
+                or self._store._bound_verifier is not before.store_bound_verifier
                 or self._acceptance.segment_store is not self._store
                 or self._acceptance.verifier is not self._verifier
                 or self._acceptance._repair_mode is not False
                 or self._verifier is not before.verifier
                 or self._verifier.root is not before.verifier_root
                 or self._verifier.key_chain is not before.verifier_key_chain
-                or self._verifier._authority
-                is not before.verifier_authority
-                or self._verifier._bound_lifecycle
-                is not before.verifier_bound_lifecycle
-                or self._verifier._repair_lifecycle_identity
-                is not before.verifier_repair_lifecycle
-                or self._verifier._repair_owner_identity
-                is not before.verifier_repair_owner
+                or self._verifier._authority is not before.verifier_authority
+                or self._verifier._bound_lifecycle is not before.verifier_bound_lifecycle
+                or self._verifier._repair_lifecycle_identity is not before.verifier_repair_lifecycle
+                or self._verifier._repair_owner_identity is not before.verifier_repair_owner
                 or self._verifier._staged != before.verifier_staged
-                or self._verifier._authorizations
-                != before.verifier_authorizations
+                or self._verifier._authorizations != before.verifier_authorizations
                 or self._verifier._repair_transient_generation
                 != before.verifier_transient_generation
                 or self._ack_journal is not before.ack_journal
                 or self._ack_journal._store is not before.ack_store
-                or self._ack_journal._lifecycle_identity
-                is not before.ack_lifecycle
-                or self._ack_journal._delivery_lease
-                is not before.ack_delivery_lease
-                or self._coverage_adapter
-                is not before.coverage_adapter
-                or self._coverage_adapter._barrier
-                is not before.coverage_barrier
-                or self._coverage_adapter._evidence
-                is not before.coverage_adapter_evidence
+                or self._ack_journal._lifecycle_identity is not before.ack_lifecycle
+                or self._ack_journal._delivery_lease is not before.ack_delivery_lease
+                or self._coverage_adapter is not before.coverage_adapter
+                or self._coverage_adapter._barrier is not before.coverage_barrier
+                or self._coverage_adapter._evidence is not before.coverage_adapter_evidence
                 or coverage is not before.coverage
                 or coverage._snapshot is not before.coverage_snapshot
                 or coverage._evidence is not before.coverage_evidence
-                or coverage._lifecycle_identity
-                is not before.coverage_lifecycle
-                or coverage._capability_token
-                is not before.coverage_capability
+                or coverage._lifecycle_identity is not before.coverage_lifecycle
+                or coverage._capability_token is not before.coverage_capability
                 or coverage._healthy is not before.coverage_healthy
                 or coverage._closed is not before.coverage_closed
                 or self._lock is not before.lock
@@ -1836,14 +1664,11 @@ class DeliveryCoordinator:
                 or before.lock._owner is not before.delivery_lock_owner
                 or before.delivery_lock_owner is not before.lock_owner
                 or self._retention_lock_owner is not before.lock_owner
-                or self._retention_lock_authority
-                is not before.lock_authority
+                or self._retention_lock_authority is not before.lock_authority
                 or asyncio.current_task() is not before.lock_owner
                 or self._store.status() != before.status
-                or self._ack_journal.snapshot()
-                != before.ack_snapshot
-                or self._ack_journal.pending_request_body()
-                != before.pending_body
+                or self._ack_journal.snapshot() != before.ack_snapshot
+                or self._ack_journal.pending_request_body() != before.pending_body
             )
         except BaseException:  # noqa: BLE001 - invariant loss fails closed
             return True
@@ -1866,9 +1691,7 @@ class DeliveryCoordinator:
         )
         state = self._local_state(apply_coverage_barrier=False)
         if state.pending is not None:
-            raise DeliveryRetryableError(
-                "retention preflight requires pending ACK recovery"
-            )
+            raise DeliveryRetryableError("retention preflight requires pending ACK recovery")
         invariant = self._capture_retention_preflight_invariant(state)
         try:
             proof = await self._preflight_retention_inner(
@@ -1885,9 +1708,7 @@ class DeliveryCoordinator:
                 )
             raise
         if self._retention_preflight_invariant_changed(invariant):
-            raise self._latch(
-                "retention preflight changed live authority"
-            )
+            raise self._latch("retention preflight changed live authority")
         return proof
 
     async def _preflight_retention_inner(
@@ -1908,9 +1729,7 @@ class DeliveryCoordinator:
         )
         state_before = self._local_state(apply_coverage_barrier=False)
         if state_before.pending is not None:
-            raise DeliveryRetryableError(
-                "retention preflight requires pending ACK recovery"
-            )
+            raise DeliveryRetryableError("retention preflight requires pending ACK recovery")
         status_before = self._store.status()
         ack_before = self._ack_journal.snapshot()
         authority_before = self._verifier._authority
@@ -1920,17 +1739,11 @@ class DeliveryCoordinator:
         simulation = self._verifier._new_control_simulation()
         try:
             if type(request) is RetentionTombstoneV2:
-                direct_raw = (
-                    await self._transport.publish_retention_tombstone(body)
-                )
+                direct_raw = await self._transport.publish_retention_tombstone(body)
             elif type(request) is RetentionBlockedV1:
-                direct_raw = await self._transport.publish_retention_blocked(
-                    body
-                )
+                direct_raw = await self._transport.publish_retention_blocked(body)
             else:
-                raise TypeError(
-                    "retention preflight requires an exact request type"
-                )
+                raise TypeError("retention preflight requires an exact request type")
         except asyncio.CancelledError:
             raise
         except DeliveryRetryableError:
@@ -1938,9 +1751,7 @@ class DeliveryCoordinator:
         except DeliveryFatalError as error:
             raise self._latch("retention POST failed fatally", error)
         except (httpx.HTTPError, OSError, TimeoutError) as error:
-            raise DeliveryRetryableError(
-                "retention POST transport failed"
-            ) from error
+            raise DeliveryRetryableError("retention POST transport failed") from error
         except Exception as error:  # noqa: BLE001 - transport protocol boundary
             raise self._latch(
                 "retention POST transport violated its contract",
@@ -1948,13 +1759,9 @@ class DeliveryCoordinator:
             )
         try:
             if type(direct_raw) is not bytes:
-                raise DeliveryFatalError(
-                    "retention POST returned a non-exact byte response"
-                )
+                raise DeliveryFatalError("retention POST returned a non-exact byte response")
             direct = decode_core_event(direct_raw)
-            direct_canonical = canonical_json(
-                direct.model_dump(mode="python")
-            )
+            direct_canonical = canonical_json(direct.model_dump(mode="python"))
         except (
             IngestVerificationError,
             RecursionError,
@@ -1967,22 +1774,16 @@ class DeliveryCoordinator:
                 error,
             )
         if direct.sequence <= state_before.evidence_head:
-            raise self._latch(
-                "retention preflight target is not ahead of evidence"
-            )
+            raise self._latch("retention preflight target is not ahead of evidence")
 
         after = state_before.evidence_head
         total_events = 0
         total_response_bytes = 0
         fetched: list[CoreEventV1] = []
         for _page_number in range(_MAX_RETENTION_PREFLIGHT_PAGES):
-            remaining_events = (
-                _MAX_RETENTION_PREFLIGHT_EVENTS - total_events
-            )
+            remaining_events = _MAX_RETENTION_PREFLIGHT_EVENTS - total_events
             if remaining_events <= 0:
-                raise self._latch(
-                    "retention preflight event bound exhausted"
-                )
+                raise self._latch("retention preflight event bound exhausted")
             page, response_bytes = await self._fetch_page_with_size(
                 after=after,
                 limit=min(
@@ -1994,33 +1795,20 @@ class DeliveryCoordinator:
             )
             total_response_bytes += response_bytes
             total_events += len(page.events)
-            if (
-                total_response_bytes
-                > _MAX_RETENTION_PREFLIGHT_RESPONSE_BYTES
-            ):
-                raise self._latch(
-                    "retention preflight response-byte bound exhausted"
-                )
+            if total_response_bytes > _MAX_RETENTION_PREFLIGHT_RESPONSE_BYTES:
+                raise self._latch("retention preflight response-byte bound exhausted")
             if total_events > _MAX_RETENTION_PREFLIGHT_EVENTS:
-                raise self._latch(
-                    "retention preflight event bound exhausted"
-                )
+                raise self._latch("retention preflight event bound exhausted")
             if page.reserved_through < direct.sequence:
-                raise self._latch(
-                    "observer reservation does not include retention target"
-                )
+                raise self._latch("observer reservation does not include retention target")
             if not page.events:
-                raise self._latch(
-                    "observer returned no path to the retention target"
-                )
+                raise self._latch("observer returned no path to the retention target")
 
             target_found = False
             normalized_page: list[CoreEventV1] = []
             for item in page.events:
                 try:
-                    normalized = decode_core_event(
-                        canonical_json(item.model_dump(mode="python"))
-                    )
+                    normalized = decode_core_event(canonical_json(item.model_dump(mode="python")))
                 except (
                     IngestVerificationError,
                     RecursionError,
@@ -2033,24 +1821,13 @@ class DeliveryCoordinator:
                         error,
                     )
                 if normalized.sequence <= after:
-                    raise self._latch(
-                        "retention preflight local cursor did not advance"
-                    )
+                    raise self._latch("retention preflight local cursor did not advance")
                 if not target_found:
                     if normalized.sequence > direct.sequence:
-                        raise self._latch(
-                            "observer passed the exact retention target"
-                        )
+                        raise self._latch("observer passed the exact retention target")
                     if normalized.sequence == direct.sequence:
-                        if (
-                            canonical_json(
-                                normalized.model_dump(mode="python")
-                            )
-                            != direct_canonical
-                        ):
-                            raise self._latch(
-                                "observer returned a different retention target"
-                            )
+                        if canonical_json(normalized.model_dump(mode="python")) != direct_canonical:
+                            raise self._latch("observer returned a different retention target")
                         target_found = True
                 normalized_page.append(normalized)
             fetched.extend(normalized_page)
@@ -2059,20 +1836,13 @@ class DeliveryCoordinator:
                 continue
             try:
                 if type(request) is RetentionTombstoneV2:
-                    tombstone_proof = (
-                        simulation.verify_exact_retention_tombstone(
-                            request,
-                            direct,
-                            tuple(fetched),
-                        )
+                    tombstone_proof = simulation.verify_exact_retention_tombstone(
+                        request,
+                        direct,
+                        tuple(fetched),
                     )
-                    proof: (
-                        SimulatedRetentionTombstone
-                        | SimulatedRetentionBlocked
-                    ) = tombstone_proof
-                    self._verifier._validate_retention_tombstone_proof(
-                        tombstone_proof
-                    )
+                    proof: SimulatedRetentionTombstone | SimulatedRetentionBlocked = tombstone_proof
+                    self._verifier._validate_retention_tombstone_proof(tombstone_proof)
                 else:
                     blocked_request = cast(RetentionBlockedV1, request)
                     blocked_proof = simulation.verify_exact_retention_blocked(
@@ -2081,31 +1851,23 @@ class DeliveryCoordinator:
                         tuple(fetched),
                     )
                     proof = blocked_proof
-                    self._verifier._validate_retention_blocked_proof(
-                        blocked_proof
-                    )
+                    self._verifier._validate_retention_blocked_proof(blocked_proof)
             except (IngestVerificationError, VerifierCommitError) as error:
                 raise self._latch(
                     "retention simulation proof is invalid",
                     error,
                 )
-            state_after = self._local_state(
-                apply_coverage_barrier=False
-            )
+            state_after = self._local_state(apply_coverage_barrier=False)
             if (
                 self._verifier._authority is not authority_before
                 or self._verifier._staged != stages_before
-                or self._verifier._authorizations
-                != authorizations_before
-                or self._verifier._repair_transient_generation
-                != transient_before
+                or self._verifier._authorizations != authorizations_before
+                or self._verifier._repair_transient_generation != transient_before
                 or self._store.status() != status_before
                 or self._ack_journal.snapshot() != ack_before
                 or state_after != state_before
             ):
-                raise self._latch(
-                    "retention preflight changed live authority"
-                )
+                raise self._latch("retention preflight changed live authority")
             return proof
         raise self._latch("retention preflight page bound exhausted")
 
@@ -2118,9 +1880,7 @@ class DeliveryCoordinator:
         _lock_authority: object,
     ) -> SimulatedRetentionTombstone:
         if type(request) is not RetentionTombstoneV2:
-            raise TypeError(
-                "retention tombstone preflight requires its exact request"
-            )
+            raise TypeError("retention tombstone preflight requires its exact request")
         proof = await self._preflight_retention(
             request,
             canonical_body,
@@ -2128,9 +1888,7 @@ class DeliveryCoordinator:
             _lock_authority=_lock_authority,
         )
         if type(proof) is not SimulatedRetentionTombstone:
-            raise DeliveryFatalError(
-                "retention tombstone preflight returned the wrong proof"
-            )
+            raise DeliveryFatalError("retention tombstone preflight returned the wrong proof")
         return proof
 
     async def _preflight_retention_blocked(
@@ -2142,9 +1900,7 @@ class DeliveryCoordinator:
         _lock_authority: object,
     ) -> SimulatedRetentionBlocked:
         if type(request) is not RetentionBlockedV1:
-            raise TypeError(
-                "retention blocked preflight requires its exact request"
-            )
+            raise TypeError("retention blocked preflight requires its exact request")
         proof = await self._preflight_retention(
             request,
             canonical_body,
@@ -2152,9 +1908,7 @@ class DeliveryCoordinator:
             _lock_authority=_lock_authority,
         )
         if type(proof) is not SimulatedRetentionBlocked:
-            raise DeliveryFatalError(
-                "retention blocked preflight returned the wrong proof"
-            )
+            raise DeliveryFatalError("retention blocked preflight returned the wrong proof")
         return proof
 
     def _retention_journal_state(
@@ -2162,26 +1916,19 @@ class DeliveryCoordinator:
         journal: RetentionStateJournal,
     ) -> RetentionStateV1:
         if type(journal) is not RetentionStateJournal:
-            raise TypeError(
-                "retention target delivery requires the exact journal type"
-            )
+            raise TypeError("retention target delivery requires the exact journal type")
         authority = journal._authority
         if (
             type(authority) is not _RetentionStateAuthority
             or authority._store is not self._store
-            or authority._lifecycle_identity
-            is not self._store._lifecycle_identity
+            or authority._lifecycle_identity is not self._store._lifecycle_identity
             or self._store._retention_state_authority is not authority
             or authority._retention_journal is not journal
         ):
-            raise TypeError(
-                "retention target delivery requires the cached same-store journal"
-            )
+            raise TypeError("retention target delivery requires the cached same-store journal")
         try:
             if authority._require() is not self._store:
-                raise DeliveryFatalError(
-                    "retention journal lost its exact store lifecycle"
-                )
+                raise DeliveryFatalError("retention journal lost its exact store lifecycle")
             journal._assert_consistent()
             state = journal.state
         except DeliveryFatalError as error:
@@ -2195,24 +1942,13 @@ class DeliveryCoordinator:
                 error,
             )
         if type(state) is not RetentionStateV1:
-            raise self._latch(
-                "retention target delivery has no exact selected state"
-            )
+            raise self._latch("retention target delivery has no exact selected state")
         if (
-            (
-                type(state.request) is RetentionTombstoneV2
-                and state.operation != "tombstone"
-            )
-            or (
-                type(state.request) is RetentionBlockedV1
-                and state.operation != "blocked"
-            )
-            or type(state.request)
-            not in {RetentionTombstoneV2, RetentionBlockedV1}
+            (type(state.request) is RetentionTombstoneV2 and state.operation != "tombstone")
+            or (type(state.request) is RetentionBlockedV1 and state.operation != "blocked")
+            or type(state.request) not in {RetentionTombstoneV2, RetentionBlockedV1}
         ):
-            raise self._latch(
-                "retention state request and operation differ"
-            )
+            raise self._latch("retention state request and operation differ")
         return state
 
     @staticmethod
@@ -2231,22 +1967,16 @@ class DeliveryCoordinator:
         request: RetentionTombstoneV2 | RetentionBlockedV1,
     ) -> tuple[CoreEventV1, EvidenceRef]:
         if type(target) is not RetentionTargetV1:
-            raise TypeError(
-                "retention evidence lookup requires the exact target type"
-            )
+            raise TypeError("retention evidence lookup requires the exact target type")
         expected_event_type = self._retention_event_type(request)
-        expected_request = canonical_json(
-            request.model_dump(mode="python")
-        )
+        expected_request = canonical_json(request.model_dump(mode="python"))
         refs = self._authenticated_refs(
             after=target.sequence - 1,
             through=target.sequence,
             limit=1,
         )
         if len(refs) != 1 or refs[0].source_sequence != target.sequence:
-            raise self._latch(
-                "exact retention target is absent from authenticated evidence"
-            )
+            raise self._latch("exact retention target is absent from authenticated evidence")
         ref = refs[0]
         try:
             record = self._store.resolve_authenticated_ref(ref)
@@ -2261,9 +1991,7 @@ class DeliveryCoordinator:
                 )
             )
             canonical_envelope = canonical_json(item.envelope)
-            normalized_fields = canonical_json(
-                item.envelope.get("normalized_fields")
-            )
+            normalized_fields = canonical_json(item.envelope.get("normalized_fields"))
         except Exception as error:  # noqa: BLE001 - authenticated store boundary
             raise self._latch(
                 "exact retention target evidence lookup failed",
@@ -2282,9 +2010,7 @@ class DeliveryCoordinator:
             or normalized_fields != expected_request
             or self._verifier.accepted_ref(target.sequence) != ref
         ):
-            raise self._latch(
-                "authenticated evidence differs from the exact retention target"
-            )
+            raise self._latch("authenticated evidence differs from the exact retention target")
         return item, ref
 
     def _accept_retention_item(
@@ -2299,14 +2025,10 @@ class DeliveryCoordinator:
             _lock_authority=_lock_authority,
         )
         if type(item) is not CoreEventV1:
-            raise TypeError(
-                "retention target delivery accepts exact CoreEventV1 items only"
-            )
+            raise TypeError("retention target delivery accepts exact CoreEventV1 items only")
         receipt = self._live_receipt()
         try:
-            state_before = self._local_state(
-                apply_coverage_barrier=False
-            )
+            state_before = self._local_state(apply_coverage_barrier=False)
             if state_before.pending is not None:
                 raise DeliveryRetryableError(
                     "retention target delivery requires pending ACK recovery"
@@ -2320,9 +2042,7 @@ class DeliveryCoordinator:
                 or status_before.evidence_head != state_before.evidence_head
                 or item.sequence <= status_before.evidence_head
             ):
-                raise DeliveryFatalError(
-                    "retention item is outside the exact evidence head"
-                )
+                raise DeliveryFatalError("retention item is outside the exact evidence head")
             ref = self._acceptance.accept(item)
             self._validate_acceptance_binding()
             status_after = self._store.status()
@@ -2353,9 +2073,7 @@ class DeliveryCoordinator:
             self._coverage_adapter.apply_live_accepted(ref, receipt)
             coverage = self._coverage_adapter._coverage
             coverage_snapshot = coverage._snapshot
-            state_after = self._local_state(
-                apply_coverage_barrier=False
-            )
+            state_after = self._local_state(apply_coverage_barrier=False)
             if (
                 coverage._healthy is not True
                 or coverage._closed is not False
@@ -2387,9 +2105,7 @@ class DeliveryCoordinator:
             self._validate_acceptance_binding()
             before = self._store.status()
             if type(before) is not EvidenceStatus or not before.healthy:
-                raise DeliveryFatalError(
-                    "pre-settlement retention evidence status is unhealthy"
-                )
+                raise DeliveryFatalError("pre-settlement retention evidence status is unhealthy")
             self._store.flush_security_boundary()
             self._validate_acceptance_binding()
             after = self._store.status()
@@ -2399,9 +2115,7 @@ class DeliveryCoordinator:
                 or after.evidence_head != before.evidence_head
                 or after.acceptance_cursor != before.acceptance_cursor
             ):
-                raise DeliveryFatalError(
-                    "retention settlement changed acceptance authority"
-                )
+                raise DeliveryFatalError("retention settlement changed acceptance authority")
         except Exception as error:  # noqa: BLE001 - evidence settlement boundary
             raise self._latch(
                 "retention evidence settlement failed",
@@ -2424,10 +2138,7 @@ class DeliveryCoordinator:
                 through=status.evidence_head,
                 limit=1,
             )
-            if (
-                len(refs) == 1
-                and refs[0].source_sequence == status.evidence_head
-            ):
+            if len(refs) == 1 and refs[0].source_sequence == status.evidence_head:
                 head_ref = refs[0]
         if (
             type(ref) is not EvidenceRef
@@ -2438,21 +2149,14 @@ class DeliveryCoordinator:
             or coverage._healthy is not True
             or coverage._closed is not False
             or coverage._evidence is not self._store
-            or coverage._lifecycle_identity
-            is not self._store._lifecycle_identity
+            or coverage._lifecycle_identity is not self._store._lifecycle_identity
             or snapshot.head_sequence != status.evidence_head
             or snapshot.head_ref != head_ref
             or (
-                not allow_later
-                and (
-                    status.evidence_head != ref.source_sequence
-                    or head_ref != ref
-                )
+                not allow_later and (status.evidence_head != ref.source_sequence or head_ref != ref)
             )
         ):
-            raise self._latch(
-                "retention target lacks exact same-store coverage"
-            )
+            raise self._latch("retention target lacks exact same-store coverage")
 
     def _advance_retention_evidence_appended(
         self,
@@ -2470,9 +2174,7 @@ class DeliveryCoordinator:
                 error,
             )
         if advanced.phase != "evidence_appended" or advanced.target != target:
-            raise self._latch(
-                "retention journal did not publish exact evidence authority"
-            )
+            raise self._latch("retention journal did not publish exact evidence authority")
 
     @staticmethod
     def _retention_ack_changed(
@@ -2503,13 +2205,13 @@ class DeliveryCoordinator:
         request = state.request
         body = canonical_json(request.model_dump(mode="python"))
         if type(request) is RetentionTombstoneV2:
-            proof: SimulatedRetentionTombstone | SimulatedRetentionBlocked = (
-                await self._preflight_retention_tombstone(
-                    request,
-                    body,
-                    _factory=_RETENTION_PREFLIGHT_FACTORY,
-                    _lock_authority=_lock_authority,
-                )
+            proof: (
+                SimulatedRetentionTombstone | SimulatedRetentionBlocked
+            ) = await self._preflight_retention_tombstone(
+                request,
+                body,
+                _factory=_RETENTION_PREFLIGHT_FACTORY,
+                _lock_authority=_lock_authority,
             )
         elif type(request) is RetentionBlockedV1:
             proof = await self._preflight_retention_blocked(
@@ -2519,14 +2221,10 @@ class DeliveryCoordinator:
                 _lock_authority=_lock_authority,
             )
         else:
-            raise TypeError(
-                "retention target delivery has the wrong request type"
-            )
+            raise TypeError("retention target delivery has the wrong request type")
         simulated_target = proof.target
         if type(simulated_target) is not SimulatedEvent:
-            raise self._latch(
-                "retention proof has no exact simulated target"
-            )
+            raise self._latch("retention proof has no exact simulated target")
         try:
             target = RetentionTargetV1(
                 sequence=simulated_target.sequence,
@@ -2539,9 +2237,7 @@ class DeliveryCoordinator:
                 error,
             )
         if state.target is not None and state.target != target:
-            raise self._latch(
-                "retention proof differs from the durable target"
-            )
+            raise self._latch("retention proof differs from the durable target")
         try:
             journal.bind_target(target)
         except Exception as error:  # noqa: BLE001 - journal CAS boundary
@@ -2551,22 +2247,14 @@ class DeliveryCoordinator:
             )
         rebound = self._retention_journal_state(journal)
         if rebound.phase != "target_bound" or rebound.target != target:
-            raise self._latch(
-                "retention journal did not bind the exact proof target"
-            )
+            raise self._latch("retention journal did not bind the exact proof target")
         try:
             if type(proof) is SimulatedRetentionTombstone:
-                path = self._verifier._consume_retention_tombstone_proof(
-                    proof
-                )
+                path = self._verifier._consume_retention_tombstone_proof(proof)
             elif type(proof) is SimulatedRetentionBlocked:
-                path = self._verifier._consume_retention_blocked_proof(
-                    proof
-                )
+                path = self._verifier._consume_retention_blocked_proof(proof)
             else:
-                raise TypeError(
-                    "retention preflight returned the wrong proof type"
-                )
+                raise TypeError("retention preflight returned the wrong proof type")
         except (IngestVerificationError, VerifierCommitError) as error:
             raise self._latch(
                 "retention proof consumption failed",
@@ -2579,12 +2267,9 @@ class DeliveryCoordinator:
             or path[-1].sequence != target.sequence
             or path[-1].event_id != target.event_id
             or path[-1].content_sha256 != target.content_sha256
-            or canonical_json(path[-1].envelope)
-            != simulated_target._canonical_envelope
+            or canonical_json(path[-1].envelope) != simulated_target._canonical_envelope
         ):
-            raise self._latch(
-                "retention proof did not consume its exact prefix"
-            )
+            raise self._latch("retention proof did not consume its exact prefix")
         target_ref: EvidenceRef | None = None
         for item in path:
             target_ref = self._accept_retention_item(
@@ -2593,30 +2278,22 @@ class DeliveryCoordinator:
                 _lock_authority=_lock_authority,
             )
         if target_ref is None or target_ref.source_sequence != target.sequence:
-            raise self._latch(
-                "retention prefix did not accept its exact target"
-            )
+            raise self._latch("retention prefix did not accept its exact target")
         self._settle_retention_boundary()
-        stored_item, exact_ref = (
-            self._exact_authenticated_retention_target(
-                target,
-                request,
-            )
+        stored_item, exact_ref = self._exact_authenticated_retention_target(
+            target,
+            request,
         )
         self._require_retention_coverage(exact_ref, allow_later=False)
         status = self._store.status()
         if (
             exact_ref != target_ref
-            or canonical_json(stored_item.envelope)
-            != simulated_target._canonical_envelope
+            or canonical_json(stored_item.envelope) != simulated_target._canonical_envelope
             or type(status) is not EvidenceStatus
             or status.evidence_head != target.sequence
-            or self._verifier._authority.generation
-            != proof.predicted_generation
+            or self._verifier._authority.generation != proof.predicted_generation
         ):
-            raise self._latch(
-                "retention target commit differs from its consumed proof"
-            )
+            raise self._latch("retention target commit differs from its consumed proof")
         self._advance_retention_evidence_appended(
             journal,
             target,
@@ -2637,9 +2314,7 @@ class DeliveryCoordinator:
         )
         target = state.target
         if type(target) is not RetentionTargetV1:
-            raise self._latch(
-                "historical retention delivery lacks an exact target"
-            )
+            raise self._latch("historical retention delivery lacks an exact target")
         request = state.request
         status_before = self._store.status()
         authority_before = self._verifier._authority
@@ -2651,11 +2326,9 @@ class DeliveryCoordinator:
         )
         self._require_retention_coverage(target_ref, allow_later=True)
         try:
-            replayed = (
-                self._verifier._restricted_historical_retention_replay(
-                    (item, target_ref),
-                    request,
-                )
+            replayed = self._verifier._restricted_historical_retention_replay(
+                (item, target_ref),
+                request,
             )
         except (IngestVerificationError, VerifierCommitError) as error:
             raise self._latch(
@@ -2670,36 +2343,28 @@ class DeliveryCoordinator:
             or replayed.event_type != self._retention_event_type(request)
             or replayed.evidence_priority != "protected"
             or replayed.is_retry is not True
-            or replayed._canonical_envelope
-            != canonical_json(item.envelope)
+            or replayed._canonical_envelope != canonical_json(item.envelope)
             or replayed._normalized_fields_canonical
             != canonical_json(request.model_dump(mode="python"))
             or self._verifier._authority is not authority_before
             or self._store.status() != status_before
             or coverage._snapshot is not coverage_before
         ):
-            raise self._latch(
-                "historical retention replay changed exact live authority"
-            )
+            raise self._latch("historical retention replay changed exact live authority")
         self._settle_retention_boundary()
-        stored_item, settled_ref = (
-            self._exact_authenticated_retention_target(
-                target,
-                request,
-            )
+        stored_item, settled_ref = self._exact_authenticated_retention_target(
+            target,
+            request,
         )
         self._require_retention_coverage(settled_ref, allow_later=True)
         if (
             settled_ref != target_ref
-            or canonical_json(stored_item.envelope)
-            != canonical_json(item.envelope)
+            or canonical_json(stored_item.envelope) != canonical_json(item.envelope)
             or self._verifier._authority is not authority_before
             or self._store.status() != status_before
             or coverage._snapshot is not coverage_before
         ):
-            raise self._latch(
-                "historical retention settlement changed live authority"
-            )
+            raise self._latch("historical retention settlement changed live authority")
         self._advance_retention_evidence_appended(
             journal,
             target,
@@ -2718,9 +2383,7 @@ class DeliveryCoordinator:
             or type(self) is not DeliveryCoordinator
             or self._repair_mode
         ):
-            raise TypeError(
-                "retention target delivery requires its exact factory"
-            )
+            raise TypeError("retention target delivery requires its exact factory")
         async with self._retention_preflight_scope(
             _factory=_RETENTION_DELIVERY_FACTORY,
         ) as lock_authority:
@@ -2747,9 +2410,7 @@ class DeliveryCoordinator:
         ack_body_before = self._ack_journal.pending_request_body()
         local = self._local_state(apply_coverage_barrier=False)
         if local.pending is not None:
-            raise DeliveryRetryableError(
-                "retention target delivery requires pending ACK recovery"
-            )
+            raise DeliveryRetryableError("retention target delivery requires pending ACK recovery")
         try:
             target = state.target
             if (
@@ -2770,10 +2431,7 @@ class DeliveryCoordinator:
                     _factory=_RETENTION_DELIVERY_FACTORY,
                     _lock_authority=_lock_authority,
                 )
-            elif (
-                state.phase == "evidence_appended"
-                and type(target) is RetentionTargetV1
-            ):
+            elif state.phase == "evidence_appended" and type(target) is RetentionTargetV1:
                 _item, result = self._exact_authenticated_retention_target(
                     target,
                     state.request,
@@ -2783,9 +2441,7 @@ class DeliveryCoordinator:
                     allow_later=True,
                 )
             else:
-                raise self._latch(
-                    "retention state phase cannot deliver a target"
-                )
+                raise self._latch("retention state phase cannot deliver a target")
         except BaseException as primary:
             if self._retention_ack_changed(
                 self._ack_journal,
@@ -2802,9 +2458,7 @@ class DeliveryCoordinator:
             ack_before,
             ack_body_before,
         ):
-            raise self._latch(
-                "retention target delivery changed ACK authority"
-            )
+            raise self._latch("retention target delivery changed ACK authority")
         return result
 
     def _clear_retention_blocked_locked(
@@ -2844,9 +2498,7 @@ class DeliveryCoordinator:
             ack_before,
             ack_body_before,
         ):
-            raise self._latch(
-                "retention blocked clear changed ACK authority"
-            )
+            raise self._latch("retention blocked clear changed ACK authority")
 
     @staticmethod
     def _repair_target_bytes(expected: CoreEventV1) -> bytes:
@@ -2859,14 +2511,12 @@ class DeliveryCoordinator:
             raise DeliveryFatalError(
                 "repair target does not have an exact outer identity"
             ) from error
-        if (
-            canonical_json(decoded.model_dump(mode="python")) != raw
-            or expected.envelope.get("event_type")
-            not in {
-                "evidence_repair_authorized",
-                "evidence_repair_completed",
-            }
-        ):
+        if canonical_json(decoded.model_dump(mode="python")) != raw or expected.envelope.get(
+            "event_type"
+        ) not in {
+            "evidence_repair_authorized",
+            "evidence_repair_completed",
+        }:
             raise DeliveryFatalError("repair target is not an exact repair event")
         return raw
 
@@ -2880,9 +2530,7 @@ class DeliveryCoordinator:
             limit=1,
         )
         if len(refs) != 1 or refs[0].source_sequence != expected.sequence:
-            raise self._latch(
-                "exact repair target is absent from authenticated evidence"
-            )
+            raise self._latch("exact repair target is absent from authenticated evidence")
         ref = refs[0]
         try:
             record = self._store.resolve_authenticated_ref(ref)
@@ -2897,9 +2545,7 @@ class DeliveryCoordinator:
             or ref.content_sha256 != expected.content_sha256
             or record.canonical_envelope != expected_envelope
         ):
-            raise self._latch(
-                "authenticated evidence differs from the exact repair target"
-            )
+            raise self._latch("authenticated evidence differs from the exact repair target")
         return ref
 
     def _settle_repair_boundary(self) -> None:
@@ -2907,9 +2553,7 @@ class DeliveryCoordinator:
             self._validate_acceptance_binding()
             before = self._store.status()
             if type(before) is not EvidenceStatus or not before.healthy:
-                raise DeliveryFatalError(
-                    "pre-settlement evidence status is unhealthy"
-                )
+                raise DeliveryFatalError("pre-settlement evidence status is unhealthy")
             self._store.flush_security_boundary()
             self._validate_acceptance_binding()
             after = self._store.status()
@@ -2919,9 +2563,7 @@ class DeliveryCoordinator:
                 or after.evidence_head != before.evidence_head
                 or after.acceptance_cursor != before.acceptance_cursor
             ):
-                raise DeliveryFatalError(
-                    "repair settlement changed acceptance authority"
-                )
+                raise DeliveryFatalError("repair settlement changed acceptance authority")
         except Exception as error:  # noqa: BLE001 - evidence settlement boundary
             raise self._latch(
                 "repair evidence settlement failed",
@@ -2943,9 +2585,7 @@ class DeliveryCoordinator:
                 limit=1,
             )
             if len(refs) != 1:
-                raise self._latch(
-                    "repair ACK cannot advance through authenticated evidence"
-                )
+                raise self._latch("repair ACK cannot advance through authenticated evidence")
             try:
                 self._ack_journal.record_pending(refs[0])
                 pending_state = self._local_state(
@@ -2969,9 +2609,7 @@ class DeliveryCoordinator:
             self._validate_acceptance_binding()
             before = self._store.status()
             if type(before) is not EvidenceStatus or not before.healthy:
-                raise DeliveryFatalError(
-                    "pre-accept repair evidence status is unhealthy"
-                )
+                raise DeliveryFatalError("pre-accept repair evidence status is unhealthy")
             ref = self._acceptance._accept_for_repair(
                 item,
                 _factory=_REPAIR_DELIVERY_FACTORY,
@@ -3014,13 +2652,8 @@ class DeliveryCoordinator:
             )
         await self._post_pending(pending_state)
         confirmed = self._local_state(apply_coverage_barrier=False)
-        if (
-            confirmed.pending is not None
-            or confirmed.confirmed_through != ref.source_sequence
-        ):
-            raise self._latch(
-                "repair ACK did not durably confirm the accepted item"
-            )
+        if confirmed.pending is not None or confirmed.confirmed_through != ref.source_sequence:
+            raise self._latch("repair ACK did not durably confirm the accepted item")
         return ref
 
     async def drain_until_exact(
@@ -3031,9 +2664,7 @@ class DeliveryCoordinator:
     ) -> EvidenceRef:
         """Deliver through one exact repair event with a boundary per accepted item."""
         if not self._repair_mode:
-            raise DeliveryFatalError(
-                "exact repair drain requires the repair factory"
-            )
+            raise DeliveryFatalError("exact repair drain requires the repair factory")
         if settle_each is not True:
             raise ValueError("exact repair drain requires settle_each=True")
         expected_bytes = self._repair_target_bytes(expected)
@@ -3048,9 +2679,7 @@ class DeliveryCoordinator:
 
             target_ref: EvidenceRef | None = None
             if state.evidence_head > expected.sequence:
-                raise self._latch(
-                    "authenticated evidence advanced beyond the exact repair target"
-                )
+                raise self._latch("authenticated evidence advanced beyond the exact repair target")
             if state.evidence_head == expected.sequence:
                 target_ref = self._exact_authenticated_target(expected)
 
@@ -3062,9 +2691,7 @@ class DeliveryCoordinator:
 
             if target_ref is not None:
                 if state.confirmed_through < expected.sequence:
-                    raise self._latch(
-                        "exact repair target lacks durable ACK confirmation"
-                    )
+                    raise self._latch("exact repair target lacks durable ACK confirmation")
                 return target_ref
 
             total_events = 0
@@ -3085,34 +2712,23 @@ class DeliveryCoordinator:
                 )
                 total_response_bytes += response_bytes
                 if total_response_bytes > _MAX_REPAIR_DRAIN_RESPONSE_BYTES:
-                    raise self._latch(
-                        "repair drain response-byte bound exhausted"
-                    )
+                    raise self._latch("repair drain response-byte bound exhausted")
                 if page.reserved_through < expected.sequence:
-                    raise self._latch(
-                        "observer reservation does not include exact repair target"
-                    )
+                    raise self._latch("observer reservation does not include exact repair target")
                 if not page.events:
-                    raise self._latch(
-                        "observer returned no path to the exact repair target"
-                    )
+                    raise self._latch("observer returned no path to the exact repair target")
                 total_events += len(page.events)
                 if total_events > _MAX_REPAIR_DRAIN_EVENTS:
                     raise self._latch("repair drain event bound exhausted")
 
                 for item in page.events:
                     if item.sequence > expected.sequence:
-                        raise self._latch(
-                            "observer passed the exact repair target"
-                        )
+                        raise self._latch("observer passed the exact repair target")
                     if (
                         item.sequence == expected.sequence
-                        and canonical_json(item.model_dump(mode="python"))
-                        != expected_bytes
+                        and canonical_json(item.model_dump(mode="python")) != expected_bytes
                     ):
-                        raise self._latch(
-                            "observer returned a different exact repair target"
-                        )
+                        raise self._latch("observer returned a different exact repair target")
                 for item in page.events:
                     ref = await self._accept_settle_and_confirm(item)
                     if item.sequence == expected.sequence:
@@ -3132,25 +2748,17 @@ class DeliveryCoordinator:
         )
 
         if _factory is not _REPAIR_DELIVERY_FACTORY:
-            raise TypeError(
-                "repair finalization requires the exact finalization factory"
-            )
+            raise TypeError("repair finalization requires the exact finalization factory")
         if (
             type(proof) is not AuthenticatedRepairCompletion
-            or getattr(proof, "_factory_marker", None)
-            is not _FINAL_REPAIR_COMPLETION_FACTORY
+            or getattr(proof, "_factory_marker", None) is not _FINAL_REPAIR_COMPLETION_FACTORY
             or getattr(proof, "_store", None) is not self._store
             or getattr(proof, "_verifier", None) is not self._verifier
-            or getattr(proof, "_acknowledgements", None)
-            is not self._ack_journal
+            or getattr(proof, "_acknowledgements", None) is not self._ack_journal
         ):
-            raise TypeError(
-                "repair finalization requires exact completion authority"
-            )
+            raise TypeError("repair finalization requires exact completion authority")
         if not self._repair_mode:
-            raise DeliveryFatalError(
-                "repair finalization requires the repair delivery factory"
-            )
+            raise DeliveryFatalError("repair finalization requires the repair delivery factory")
         async with self._lock:
             self._local_state(apply_coverage_barrier=False)
             status = self._store.status()
@@ -3161,9 +2769,7 @@ class DeliveryCoordinator:
                 or not self._store._is_bound_verifier(self._verifier)
                 or self._acceptance._repair_mode is not True
             ):
-                raise DeliveryFatalError(
-                    "repair finalization precondition is not exact"
-                )
+                raise DeliveryFatalError("repair finalization precondition is not exact")
             self._closed = True
             await self._close_resources_under_lock()
             proof._clear_under_delivery_fence(
@@ -3175,9 +2781,7 @@ class DeliveryCoordinator:
     def _correlation_journal(self) -> CorrelationRequestJournal:
         journal = self._correlation_requests
         if type(journal) is not CorrelationRequestJournal:
-            raise self._latch(
-                "ordinary delivery lost its correlation-request authority"
-            )
+            raise self._latch("ordinary delivery lost its correlation-request authority")
         return journal
 
     def _correlation_pending(
@@ -3224,9 +2828,7 @@ class DeliveryCoordinator:
         try:
             return PCCCorrelationSnapshotRequestV1.model_validate(
                 {
-                    "schema_version": (
-                        "agmind.pcc-correlation-snapshot-request.v1"
-                    ),
+                    "schema_version": ("agmind.pcc-correlation-snapshot-request.v1"),
                     "trigger_event_id": ref.event_id,
                     "trigger_content_sha256": ref.content_sha256,
                     "trigger_source_sequence": ref.source_sequence,
@@ -3294,14 +2896,8 @@ class DeliveryCoordinator:
             or state.snapshot_event_id is None
             or state.snapshot_content_sha256 is None
         ):
-            raise self._latch(
-                "correlation phase has no exact observed snapshot identity"
-            )
-        head = (
-            self._store.status().evidence_head
-            if evidence_head is None
-            else evidence_head
-        )
+            raise self._latch("correlation phase has no exact observed snapshot identity")
+        head = self._store.status().evidence_head if evidence_head is None else evidence_head
         key = (state.request_sha256, state.snapshot_event_id)
         after = max(
             state.request.trigger_source_sequence,
@@ -3327,9 +2923,7 @@ class DeliveryCoordinator:
                 examined += 1
                 if ref.event_id == state.snapshot_event_id:
                     if ref.content_sha256 != state.snapshot_content_sha256:
-                        raise self._latch(
-                            "correlation snapshot event ID changed content"
-                        )
+                        raise self._latch("correlation snapshot event ID changed content")
                     try:
                         self._acceptance.authenticated_pcc_input(
                             ref,
@@ -3343,15 +2937,16 @@ class DeliveryCoordinator:
                     self._correlation_scan_cursor[key] = after
                     return ref
                 after = ref.source_sequence
-        raise self._latch(
-            "observed correlation snapshot is absent from authenticated evidence"
-        )
+        raise self._latch("observed correlation snapshot is absent from authenticated evidence")
 
     def _correlation_ack_ceiling(
         self,
         *,
         ceiling: int,
         evidence_head: int,
+        hold_floor: int,
+        driven_correlation: str | None,
+        hold_observed_proofs: bool,
     ) -> int:
         if self._repair_mode:
             return ceiling
@@ -3366,14 +2961,33 @@ class DeliveryCoordinator:
                     state,
                     evidence_head=evidence_head,
                 )
-                # An unresolved scan must never raise the ceiling: hold ACK at
-                # the trigger, exactly as if the proof were still unobserved.
-                ceiling = min(
-                    ceiling,
-                    state.request.trigger_source_sequence - 1
-                    if snapshot_ref is None
-                    else snapshot_ref.source_sequence,
-                )
+                if snapshot_ref is None:
+                    # An unresolved scan must never raise the ceiling: hold ACK
+                    # at the trigger, exactly as if the proof were unobserved.
+                    ceiling = min(
+                        ceiling,
+                        state.request.trigger_source_sequence - 1,
+                    )
+                elif not hold_observed_proofs or state.request_sha256 == driven_correlation:
+                    # The state this poll is DRIVING must reach its own
+                    # snapshot inclusively: _ack_correlation_through completes
+                    # the journal only once confirmed_through >= the snapshot,
+                    # so capping the driven state below its snapshot would
+                    # trade the starvation for a permanent deadlock.
+                    ceiling = min(ceiling, snapshot_ref.source_sequence)
+                else:
+                    # Every OTHER pending proof stops the ACK walk one short of
+                    # its snapshot.  The durable anchor must never come to rest
+                    # exactly ON a pcc_correlation_snapshot whose correlation
+                    # journal state is still 'proof_observed': ProjectionStore
+                    # revalidates PCC authority at that sequence and demands a
+                    # unique COMPLETED journal state, so an anchor parked there
+                    # latches the projection (and, downstream, every candidate
+                    # discovery) until the correlation is completed.
+                    ceiling = min(
+                        ceiling,
+                        max(snapshot_ref.source_sequence - 1, hold_floor),
+                    )
             else:
                 raise self._latch("pending correlation phase is invalid")
         return ceiling
@@ -3403,9 +3017,7 @@ class DeliveryCoordinator:
             or ref.source_sequence != after.evidence_head
             or ref.source_sequence <= before.evidence_head
         ):
-            raise DeliveryFatalError(
-                "accepted ref did not advance the exact evidence head"
-            )
+            raise DeliveryFatalError("accepted ref did not advance the exact evidence head")
         self._coverage_adapter.apply_live_accepted(ref, receipt)
         return ref
 
@@ -3478,8 +3090,7 @@ class DeliveryCoordinator:
             # target beyond the observer's own reserved_through.
             if (
                 direct.sequence <= state.request.trigger_source_sequence
-                or direct.envelope.get("event_type")
-                != "pcc_correlation_snapshot"
+                or direct.envelope.get("event_type") != "pcc_correlation_snapshot"
             ):
                 raise ValueError("PCC publication returned an invalid target")
             return direct
@@ -3507,9 +3118,7 @@ class DeliveryCoordinator:
                 or refs[0].event_id != target.event_id
                 or refs[0].content_sha256 != target.content_sha256
             ):
-                raise self._latch(
-                    "persisted PCC target differs from the direct response"
-                )
+                raise self._latch("persisted PCC target differs from the direct response")
             try:
                 self._acceptance.authenticated_pcc_input(
                     refs[0],
@@ -3542,12 +3151,9 @@ class DeliveryCoordinator:
             pages += 1
             response_bytes += raw_size
             if response_bytes > _MAX_CORRELATION_PATH_RESPONSE_BYTES:
-                raise self._latch(
-                    "correlation path responses exceed their aggregate bound"
-                )
+                raise self._latch("correlation path responses exceed their aggregate bound")
             if any(
-                gap.start <= target.sequence and gap.end >= head + 1
-                for gap in page.uncovered_gaps
+                gap.start <= target.sequence and gap.end >= head + 1 for gap in page.uncovered_gaps
             ):
                 return None, accepted, True
             if not page.events or page.reserved_through < target.sequence:
@@ -3556,9 +3162,7 @@ class DeliveryCoordinator:
             advanced = False
             for item in page.events:
                 if item.sequence > target.sequence:
-                    raise self._latch(
-                        "correlation path advanced beyond its direct target"
-                    )
+                    raise self._latch("correlation path advanced beyond its direct target")
                 if item.sequence != expected:
                     return None, accepted, True
                 if item.sequence == target.sequence:
@@ -3582,13 +3186,8 @@ class DeliveryCoordinator:
                             error,
                         )
                     return ref, accepted + 1, False
-                if (
-                    item.event_id == target.event_id
-                    or item.content_sha256 == target.content_sha256
-                ):
-                    raise self._latch(
-                        "correlation target identity appeared at the wrong sequence"
-                    )
+                if item.event_id == target.event_id or item.content_sha256 == target.content_sha256:
+                    raise self._latch("correlation target identity appeared at the wrong sequence")
                 try:
                     intervening_ref = self._accept_live_item(item)
                     self._select_candidate(intervening_ref)
@@ -3615,13 +3214,15 @@ class DeliveryCoordinator:
         budget: int,
     ) -> tuple[int, bool]:
         confirmed = 0
+        driven = state.request_sha256
         while True:
-            local = self._local_state(apply_coverage_barrier=True)
+            local = self._local_state(
+                apply_coverage_barrier=True,
+                driven_correlation=driven,
+            )
             if local.confirmed_through >= snapshot_ref.source_sequence:
                 try:
-                    self._correlation_journal().mark_completed(
-                        state.request_sha256
-                    )
+                    self._correlation_journal().mark_completed(state.request_sha256)
                 except Exception as error:  # noqa: BLE001
                     raise self._latch(
                         "correlation completion durability is uncertain",
@@ -3643,7 +3244,10 @@ class DeliveryCoordinator:
                     return confirmed, True
                 try:
                     self._ack_journal.record_pending(refs[0])
-                    local = self._local_state(apply_coverage_barrier=True)
+                    local = self._local_state(
+                        apply_coverage_barrier=True,
+                        driven_correlation=driven,
+                    )
                 except DeliveryFatalError:
                     raise
                 except Exception as error:  # noqa: BLE001
@@ -3652,9 +3256,7 @@ class DeliveryCoordinator:
                         error,
                     )
             elif local.pending.sequence > snapshot_ref.source_sequence:
-                raise self._latch(
-                    "pending ACK advanced beyond the correlation snapshot"
-                )
+                raise self._latch("pending ACK advanced beyond the correlation snapshot")
             try:
                 await self._post_pending(local)
             except DeliveryAmbiguousAck:
@@ -3671,7 +3273,10 @@ class DeliveryCoordinator:
         # Re-prove the correlation ACK ceiling before any selected request can
         # be promoted to proof_observed.  A recovered journal must never make
         # an already-confirmed trigger look retroactively protected.
-        self._local_state(apply_coverage_barrier=True)
+        self._local_state(
+            apply_coverage_barrier=True,
+            driven_correlation=state.request_sha256,
+        )
         accepted = 0
         if state.phase == "selected":
             target = await self._post_selected_correlation(state)
@@ -3693,9 +3298,7 @@ class DeliveryCoordinator:
                     "correlation proof durability is uncertain",
                     error,
                 )
-            self._discover_unselected_candidates(
-                self._local_state(apply_coverage_barrier=False)
-            )
+            self._discover_unselected_candidates(self._local_state(apply_coverage_barrier=False))
         elif state.phase == "proof_observed":
             resolved = self._snapshot_ref(state)
             if resolved is None:
@@ -3711,6 +3314,75 @@ class DeliveryCoordinator:
         )
         return accepted, confirmed, retry
 
+    def _next_correlation_to_drive(
+        self,
+        pending: tuple[_CorrelationRequestStateV1, ...],
+    ) -> _CorrelationRequestStateV1:
+        """Pick the pending correlation whose progress can free the ACK anchor.
+
+        FINISHING beats STARTING, and the reason is an invariant, not a
+        preference:
+
+        * only a 'proof_observed' state can be completed -- ``mark_completed``
+          is reachable only from :meth:`_ack_correlation_through`;
+        * only completion RAISES the correlation ACK ceiling, because a
+          completed state leaves ``_correlation_ack_ceiling`` entirely;
+        * a 'selected' state can only LOWER that ceiling, to its own
+          trigger - 1.
+
+        So an ACK walk that ran out of ack budget in one poll must be RESUMED
+        in the next, never displaced by newly minted work.  It also cannot be
+        left to chance: :meth:`_accept_path_to_snapshot` SELECTS every
+        intervening trigger it walks past, so driving one correlation mints
+        more 'selected' work the further Core lags behind the observer.  Once
+        the trigger-to-snapshot gap exceeds the trigger spacing, a competing
+        'selected' request exists on every poll -- a scheduler that prefers
+        them starves the oldest proof forever, and the durable ACK anchor
+        comes to rest on a snapshot the projection then refuses.
+
+        Lowest snapshot sequence first: that is the state holding the ceiling
+        down for every other one.  A proof whose snapshot position the bounded
+        scan has not resolved yet sorts last, since it cannot ACK anywhere
+        this poll, but it still outranks any 'selected' work.
+
+        The one exception is a PREREQUISITE rather than new work: a 'selected'
+        request whose trigger sits at or below that snapshot caps the ceiling
+        at ``trigger - 1``, so the proof physically cannot be ACKed until that
+        request is resolved.  Driving it is finishing the same walk, and
+        skipping it would trade the starvation for an immediate livelock --
+        the proof would be re-driven every poll with a ceiling that can never
+        reach its own snapshot.  Every OTHER 'selected' request lives beyond
+        the snapshot, caps the ceiling above it, and must wait.
+        """
+        best: tuple[int, int] | None = None
+        unresolved: int | None = None
+        for index, state in enumerate(pending):
+            if state.phase != "proof_observed":
+                continue
+            snapshot_ref = self._snapshot_ref(state)
+            if snapshot_ref is None:
+                if unresolved is None:
+                    unresolved = index
+                continue
+            candidate = (snapshot_ref.source_sequence, index)
+            if best is None or candidate < best:
+                best = candidate
+        if best is None:
+            # No proof position is known yet: resume the bounded scan of the
+            # first observed proof, or start the oldest selected request.
+            return pending[unresolved if unresolved is not None else 0]
+        blocker: tuple[int, int] | None = None
+        for index, state in enumerate(pending):
+            if state.phase != "selected":
+                continue
+            trigger = state.request.trigger_source_sequence
+            if trigger > best[0]:
+                continue
+            candidate = (trigger, index)
+            if blocker is None or candidate < blocker:
+                blocker = candidate
+        return pending[best[1] if blocker is None else blocker[1]]
+
     async def _ingest_after_coverage_blocked_proof(
         self,
         pending: tuple[_CorrelationRequestStateV1, ...],
@@ -3719,7 +3391,16 @@ class DeliveryCoordinator:
     ) -> int:
         if not pending or any(state.phase == "selected" for state in pending):
             return 0
-        local = self._local_state(apply_coverage_barrier=True)
+        # This probe decides one thing only -- whether COVERAGE is what stops
+        # the ACK walk short of the first unconfirmed proof.  It never ACKs, so
+        # it must read the ceiling without the safety cap that deliberately
+        # holds a non-driven proof one sequence short of its own snapshot;
+        # mistaking that cap for a coverage block would fetch evidence on every
+        # poll and mint exactly the work this scheduler is trying to drain.
+        local = self._local_state(
+            apply_coverage_barrier=True,
+            hold_observed_proofs=False,
+        )
         if local.pending is not None:
             # Never fetch past an ACK whose observer-side result is ambiguous.
             return 0
@@ -3731,15 +3412,10 @@ class DeliveryCoordinator:
                 return 0
             resolved.append(snapshot_ref)
         snapshot_refs = tuple(resolved)
-        if any(
-            local.confirmed_through >= ref.source_sequence
-            for ref in snapshot_refs
-        ):
+        if any(local.confirmed_through >= ref.source_sequence for ref in snapshot_refs):
             # Let the scheduler durably complete already-confirmed proofs first.
             return 0
-        first_unconfirmed_snapshot = min(
-            ref.source_sequence for ref in snapshot_refs
-        )
+        first_unconfirmed_snapshot = min(ref.source_sequence for ref in snapshot_refs)
         if local.delivery_ceiling >= first_unconfirmed_snapshot:
             # ACK can still progress under the current budget; no reconciliation
             # ingest exception is needed.
@@ -3786,9 +3462,7 @@ class DeliveryCoordinator:
 
     async def poll_once(self, *, limit: int = MAX_PAGE_EVENTS) -> PollResult:
         if self._repair_mode:
-            raise DeliveryFatalError(
-                "repair delivery must use drain_until_exact"
-            )
+            raise DeliveryFatalError("repair delivery must use drain_until_exact")
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
@@ -3803,26 +3477,17 @@ class DeliveryCoordinator:
 
             pending_correlations = self._discover_unselected_candidates(state)
             if pending_correlations:
-                next_correlation = next(
-                    (
-                        correlation
-                        for correlation in pending_correlations
-                        if correlation.phase == "selected"
-                    ),
-                    pending_correlations[0],
+                next_correlation = self._next_correlation_to_drive(
+                    pending_correlations,
                 )
-                correlation_accepted, correlation_confirmed, retry = (
-                    await self._drive_correlation(
-                        next_correlation,
-                        budget=remaining_budget,
-                    )
+                correlation_accepted, correlation_confirmed, retry = await self._drive_correlation(
+                    next_correlation,
+                    budget=remaining_budget,
                 )
                 remaining_correlations = self._correlation_pending()
-                correlation_accepted += (
-                    await self._ingest_after_coverage_blocked_proof(
-                        remaining_correlations,
-                        limit=limit,
-                    )
+                correlation_accepted += await self._ingest_after_coverage_blocked_proof(
+                    remaining_correlations,
+                    limit=limit,
                 )
                 retry = retry or bool(remaining_correlations)
                 return self._result(
@@ -3865,18 +3530,14 @@ class DeliveryCoordinator:
                     break
 
             if selected is not None and selected.phase not in TERMINAL_CORRELATION_PHASES:
-                correlation_accepted, correlation_confirmed, retry = (
-                    await self._drive_correlation(
-                        selected,
-                        budget=remaining_budget,
-                    )
+                correlation_accepted, correlation_confirmed, retry = await self._drive_correlation(
+                    selected,
+                    budget=remaining_budget,
                 )
                 remaining_correlations = self._correlation_pending()
-                correlation_accepted += (
-                    await self._ingest_after_coverage_blocked_proof(
-                        remaining_correlations,
-                        limit=limit,
-                    )
+                correlation_accepted += await self._ingest_after_coverage_blocked_proof(
+                    remaining_correlations,
+                    limit=limit,
                 )
                 retry = retry or bool(remaining_correlations)
                 return self._result(
@@ -3936,8 +3597,7 @@ class DeliveryCoordinator:
                     primary = error
                 else:
                     primary.add_note(
-                        "secondary ACK delivery-lease release failure "
-                        f"({type(error).__name__})"
+                        f"secondary ACK delivery-lease release failure ({type(error).__name__})"
                     )
             else:
                 self._lease_released = True

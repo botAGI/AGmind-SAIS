@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, Never
 
@@ -94,8 +95,10 @@ from agmind_immune.policy.models import PolicyError
 if TYPE_CHECKING:
     from agmind_immune.hunter import HunterBundleV1
 
+_LOG = logging.getLogger("agmind_immune.controller")
 _CONTROLLER_FACTORY = object()
 _PROJECTION_BATCH = 100
+_UNRECORDED_PROJECTION_FAILURE = "first cause was not recorded"
 
 RetentionOutcome = Literal[
     "not_due",
@@ -217,30 +220,19 @@ class _ReauthenticatedCandidateAdmission:
 
 
 def _invalid_retention_result(message: str) -> Never:
-    raise CoreControllerAuthorityError(
-        f"Core retention result {message}"
-    )
+    raise CoreControllerAuthorityError(f"Core retention result {message}")
 
 
 def _validate_core_retention_result(result: CoreRetentionResult) -> None:
     if type(result) is not CoreRetentionResult:
         _invalid_retention_result("has an inexact runtime type")
-    if (
-        type(result.outcome) is not str
-        or result.outcome not in _RETENTION_OUTCOMES
-    ):
+    if type(result.outcome) is not str or result.outcome not in _RETENTION_OUTCOMES:
         _invalid_retention_result("has an invalid outcome")
-    if (
-        result.retry_reason is not None
-        and (
-            type(result.retry_reason) is not str
-            or result.retry_reason not in _RETENTION_RETRY_REASONS
-        )
+    if result.retry_reason is not None and (
+        type(result.retry_reason) is not str or result.retry_reason not in _RETENTION_RETRY_REASONS
     ):
         _invalid_retention_result("has an invalid retry reason")
-    if (result.outcome == "retry_required") != (
-        result.retry_reason is not None
-    ):
+    if (result.outcome == "retry_required") != (result.retry_reason is not None):
         _invalid_retention_result("has an inconsistent retry reason")
 
     request_present = result.request_kind is not None
@@ -291,9 +283,7 @@ def _validate_core_retention_result(result: CoreRetentionResult) -> None:
             _invalid_retention_result("exposes identity for a no-op")
     elif result.outcome in {"blocked_unchanged", "blocked_reported"}:
         if result.request_kind != "blocked" or not target_present:
-            _invalid_retention_result(
-                "does not bind an exact blocked observation"
-            )
+            _invalid_retention_result("does not bind an exact blocked observation")
     elif result.outcome == "tombstone_completed":
         if (
             result.request_kind != "tombstone"
@@ -302,26 +292,18 @@ def _validate_core_retention_result(result: CoreRetentionResult) -> None:
             or not 1 <= result.unlinked_bytes <= MAX_UINT64
             or result.projection_rebuilt is not True
         ):
-            _invalid_retention_result(
-                "does not bind an exact tombstone completion"
-            )
+            _invalid_retention_result("does not bind an exact tombstone completion")
     else:
         reason = result.retry_reason
         if reason == "pending_ack":
             if not request_present and target_present:
-                _invalid_retention_result(
-                    "has a target without durable pending identity"
-                )
+                _invalid_retention_result("has a target without durable pending identity")
         elif reason == "ack_prefix_lag":
             if result.request_kind != "tombstone":
-                _invalid_retention_result(
-                    "has a non-tombstone ACK prefix retry"
-                )
+                _invalid_retention_result("has a non-tombstone ACK prefix retry")
         elif reason == "observer_retryable":
             if not request_present:
-                _invalid_retention_result(
-                    "has no durable observer retry identity"
-                )
+                _invalid_retention_result("has no durable observer retry identity")
         else:
             _invalid_retention_result("has no exact retry branch")
 
@@ -330,9 +312,7 @@ def _validate_core_retention_result(result: CoreRetentionResult) -> None:
         or result.unlinked_bytes != 0
         or result.projection_rebuilt is not False
     ):
-        _invalid_retention_result(
-            "reports mutation outside tombstone completion"
-        )
+        _invalid_retention_result("reports mutation outside tombstone completion")
 
 
 def _public_retention_result(execution: object) -> CoreRetentionResult:
@@ -393,6 +373,7 @@ class CoreController:
         self._decision_intents = decision_intents
         self._lock = asyncio.Lock()
         self._projection_healthy = True
+        self._projection_failure: str | None = None
         self._admission_lifecycle = object()
         self._candidate_admission_binding: _CandidateAdmissionBinding | None = None
         self._closed = False
@@ -416,13 +397,8 @@ class CoreController:
         if type(acknowledgements) is not AckJournal:
             raise TypeError("controller requires exact ACK authority")
         if type(correlation_requests) is not CorrelationRequestJournal:
-            raise TypeError(
-                "controller requires exact correlation-request authority"
-            )
-        if (
-            type(registry) is not SpecialUseRegistry
-            or not special_use_registry_is_issued(registry)
-        ):
+            raise TypeError("controller requires exact correlation-request authority")
+        if type(registry) is not SpecialUseRegistry or not special_use_registry_is_issued(registry):
             raise TypeError("controller requires exact issued registry authority")
         if type(coverage) is not CoverageState:
             raise TypeError("controller requires exact coverage authority")
@@ -437,25 +413,18 @@ class CoreController:
             or acceptance.verifier is not verifier
             or not store._is_bound_verifier(verifier)
         ):
-            raise CoreControllerAuthorityError(
-                "acceptance authority binding is invalid"
-            )
+            raise CoreControllerAuthorityError("acceptance authority binding is invalid")
         if not correlation_requests._is_bound_to(store):
-            raise CoreControllerAuthorityError(
-                "correlation-request authority binding is invalid"
-            )
+            raise CoreControllerAuthorityError("correlation-request authority binding is invalid")
         if not projection._is_bound_to(
             store,
             acknowledgements,
             correlation_requests,
             registry,
         ):
-            raise CoreControllerAuthorityError(
-                "projection authority binding is invalid"
-            )
-        if (
-            not callable(getattr(clock, "live_receipt_monotonic", None))
-            or not callable(getattr(clock, "decision_sample", None))
+            raise CoreControllerAuthorityError("projection authority binding is invalid")
+        if not callable(getattr(clock, "live_receipt_monotonic", None)) or not callable(
+            getattr(clock, "decision_sample", None)
         ):
             raise TypeError("controller requires one typed Core clock provider")
         delivery = DeliveryCoordinator.create(
@@ -543,9 +512,7 @@ class CoreController:
             or type(identity.event_id) is not str
             or type(identity.content_sha256) is not str
         ):
-            raise CoreControllerAuthorityError(
-                "ACK identity is not an exact frozen boundary"
-            )
+            raise CoreControllerAuthorityError("ACK identity is not an exact frozen boundary")
 
     @staticmethod
     def _validate_evidence_status(status: EvidenceStatus) -> None:
@@ -555,32 +522,17 @@ class CoreController:
             or type(status.key_healthy) is not bool
             or type(status.repair_pending) is not bool
             or type(status.retention_pending) is not bool
-            or (
-                status.host_id is not None
-                and type(status.host_id) is not str
-            )
+            or (status.host_id is not None and type(status.host_id) is not str)
             or type(status.evidence_head) is not int
             or type(status.acceptance_cursor) is not int
-            or not (
-                0
-                <= status.acceptance_cursor
-                <= status.evidence_head
-                <= MAX_UINT64
-            )
+            or not (0 <= status.acceptance_cursor <= status.evidence_head <= MAX_UINT64)
         ):
-            raise CoreControllerAuthorityError(
-                "evidence status is not an exact frozen snapshot"
-            )
+            raise CoreControllerAuthorityError("evidence status is not an exact frozen snapshot")
 
     @classmethod
     def _validate_ack_snapshot(cls, snapshot: AckJournalSnapshot) -> None:
-        if (
-            type(snapshot) is not AckJournalSnapshot
-            or type(snapshot.healthy) is not bool
-        ):
-            raise CoreControllerAuthorityError(
-                "ACK status is not an exact frozen snapshot"
-            )
+        if type(snapshot) is not AckJournalSnapshot or type(snapshot.healthy) is not bool:
+            raise CoreControllerAuthorityError("ACK status is not an exact frozen snapshot")
         if snapshot.confirmed is not None:
             cls._validate_ack_identity(snapshot.confirmed)
         if snapshot.pending is not None:
@@ -588,9 +540,7 @@ class CoreController:
 
     def _ref_at(self, sequence: int) -> EvidenceRef:
         if type(sequence) is not int or not 1 <= sequence <= MAX_UINT64:
-            raise CoreControllerAuthorityError(
-                "evidence lookup sequence is invalid"
-            )
+            raise CoreControllerAuthorityError("evidence lookup sequence is invalid")
         refs = self._store.authenticated_refs(
             after_sequence=sequence - 1,
             through_sequence=sequence,
@@ -602,9 +552,7 @@ class CoreController:
             or type(refs[0]) is not EvidenceRef
             or refs[0].source_sequence != sequence
         ):
-            raise CoreControllerAuthorityError(
-                "frozen boundary lacks one exact authenticated ref"
-            )
+            raise CoreControllerAuthorityError("frozen boundary lacks one exact authenticated ref")
         return refs[0]
 
     def _ref_host(self, ref: EvidenceRef) -> str:
@@ -619,9 +567,7 @@ class CoreController:
             )
         host_id = record.envelope.get("host_id")
         if type(host_id) is not str:
-            raise CoreControllerAuthorityError(
-                "authenticated ref has no exact host identity"
-            )
+            raise CoreControllerAuthorityError("authenticated ref has no exact host identity")
         return host_id
 
     def _cursor_matches_ref(
@@ -662,13 +608,9 @@ class CoreController:
     ) -> tuple[int, EvidenceRef | None]:
         self._validate_ack_snapshot(snapshot)
         if type(status) is not ProjectionStatus:
-            raise CoreControllerAuthorityError(
-                "projection status is not an exact frozen snapshot"
-            )
+            raise CoreControllerAuthorityError("projection status is not an exact frozen snapshot")
         if type(status.healthy) is not bool:
-            raise CoreControllerAuthorityError(
-                "projection health is not an exact bool"
-            )
+            raise CoreControllerAuthorityError("projection health is not an exact bool")
         if not status.healthy:
             raise CoreControllerAuthorityError("projection status is unhealthy")
         confirmed = snapshot.confirmed
@@ -691,29 +633,46 @@ class CoreController:
             or type(cursor.source_sequence) is not int
             or not 1 <= cursor.source_sequence <= MAX_UINT64
         ):
-            raise CoreControllerAuthorityError(
-                "projection cursor is not an exact frozen cursor"
-            )
+            raise CoreControllerAuthorityError("projection cursor is not an exact frozen cursor")
         current = self._ref_at(cursor.source_sequence)
         if not self._cursor_matches_ref(cursor, current):
             raise CoreControllerAuthorityError(
                 "projection cursor differs from authenticated evidence"
             )
         if cursor.source_sequence > confirmed.sequence:
-            raise CoreControllerAuthorityError(
-                "projection cursor exceeds frozen ACK authority"
-            )
-        if (
-            cursor.source_sequence == confirmed.sequence
-            and not self._cursor_matches_ref(cursor, terminal)
+            raise CoreControllerAuthorityError("projection cursor exceeds frozen ACK authority")
+        if cursor.source_sequence == confirmed.sequence and not self._cursor_matches_ref(
+            cursor, terminal
         ):
             raise CoreControllerAuthorityError(
                 "projection terminal identity differs from frozen ACK authority"
             )
         return cursor.source_sequence, terminal
 
-    def _latch_projection_failure(self) -> None:
+    def _latch_projection_failure(
+        self,
+        reason: str,
+        cause: BaseException | None = None,
+    ) -> None:
+        # A projection latch is permanent for this controller, so everything a
+        # caller observes afterwards is a downstream symptom: only the FIRST
+        # transition carries diagnostic value.  Retaining and logging that
+        # cause is the whole point -- a broad `except` that swallowed it is
+        # why the only exception this deployment ever recorded was
+        # "candidate discovery requires a healthy projection", with nothing
+        # anywhere stating what made the projection unhealthy.
+        detail = reason if cause is None else f"{reason}: {cause!r}"
+        if self._projection_healthy:
+            self._projection_failure = detail
+            _LOG.error("projection authority latched unhealthy: %s", detail)
+        else:
+            _LOG.debug("projection authority already latched: %s", detail)
         self._projection_healthy = False
+
+    def _projection_failure_detail(self) -> str:
+        """Return the retained first cause for an unhealthy projection."""
+        failure = self._projection_failure
+        return failure if failure else _UNRECORDED_PROJECTION_FAILURE
 
     def _catch_up_projection(self) -> int:
         if not self._projection_healthy:
@@ -737,9 +696,7 @@ class CoreController:
                     or final_terminal is not None
                     or final_status.cursor is not None
                 ):
-                    raise CoreControllerAuthorityError(
-                        "empty projection changed during catch-up"
-                    )
+                    raise CoreControllerAuthorityError("empty projection changed during catch-up")
                 return 0
             while cursor < terminal.source_sequence:
                 refs = self._store.authenticated_refs(
@@ -748,9 +705,7 @@ class CoreController:
                     limit=_PROJECTION_BATCH,
                 )
                 if type(refs) is not tuple or not refs:
-                    raise CoreControllerAuthorityError(
-                        "projection catch-up made no progress"
-                    )
+                    raise CoreControllerAuthorityError("projection catch-up made no progress")
                 for ref in refs:
                     if (
                         type(ref) is not EvidenceRef
@@ -792,26 +747,27 @@ class CoreController:
             EvidenceStoreError,
             AckJournalError,
             OSError,
-        ):
-            self._latch_projection_failure()
+        ) as error:
+            self._latch_projection_failure("projection catch-up failed", error)
         return applied
 
     def _catch_up_projection_for_retention(self) -> int:
         evidence = self._store.status()
         self._validate_evidence_status(evidence)
         if not evidence.healthy or evidence.repair_pending:
-            raise CoreControllerAuthorityError(
-                "retention requires healthy evidence authority"
-            )
+            raise CoreControllerAuthorityError("retention requires healthy evidence authority")
         if not evidence.retention_pending:
             return self._catch_up_projection()
         try:
             projection = self._projection.status()
-        except (ProjectionError, OSError):
-            self._latch_projection_failure()
+        except (ProjectionError, OSError) as error:
+            self._latch_projection_failure(
+                "retention projection status is unavailable",
+                error,
+            )
             return 0
         if type(projection) is not ProjectionStatus or not projection.healthy:
-            self._latch_projection_failure()
+            self._latch_projection_failure("retention projection status is inexact or unhealthy")
         return 0
 
     def _read_ack_for_readiness(self) -> AckJournalSnapshot:
@@ -829,17 +785,16 @@ class CoreController:
     def _read_projection_for_readiness(self) -> ProjectionStatus:
         try:
             status = self._projection.status()
-        except (ProjectionError, OSError):
-            self._latch_projection_failure()
+        except (ProjectionError, OSError) as error:
+            self._latch_projection_failure(
+                "projection status is unavailable for readiness",
+                error,
+            )
             return ProjectionStatus(False, None)
         if type(status) is not ProjectionStatus:
-            raise CoreControllerAuthorityError(
-                "projection status is not an exact frozen snapshot"
-            )
+            raise CoreControllerAuthorityError("projection status is not an exact frozen snapshot")
         if type(status.healthy) is not bool:
-            raise CoreControllerAuthorityError(
-                "projection health is not an exact bool"
-            )
+            raise CoreControllerAuthorityError("projection health is not an exact bool")
         return status
 
     def _projection_readiness(
@@ -862,25 +817,27 @@ class CoreController:
                 EvidenceStoreError,
                 AckJournalError,
                 OSError,
-            ):
-                self._latch_projection_failure()
+            ) as error:
+                self._latch_projection_failure(
+                    "confirmed ACK has no authenticated evidence",
+                    error,
+                )
                 terminal = None
         cursor = projection.cursor
         if cursor is None:
             return (
                 0,
-                projection.healthy
-                and self._projection_healthy
-                and confirmed is None,
+                projection.healthy and self._projection_healthy and confirmed is None,
             )
         if type(cursor) is not ProjectionCursor:
-            self._latch_projection_failure()
+            self._latch_projection_failure("projection cursor is not an exact frozen cursor")
             return 0, False
         observed = cursor.source_sequence
         if type(observed) is not int or not 1 <= observed <= MAX_UINT64:
-            self._latch_projection_failure()
+            self._latch_projection_failure("projection cursor sequence is out of exact range")
             return 0, False
         healthy = projection.healthy and self._projection_healthy
+        readiness_cause: BaseException | None = None
         try:
             ref = self._ref_at(observed)
             healthy = (
@@ -891,20 +848,20 @@ class CoreController:
             if confirmed is None or terminal is None or observed > confirmed.sequence:
                 healthy = False
             elif observed == confirmed.sequence:
-                healthy = (
-                    healthy
-                    and ref == terminal
-                    and self._cursor_matches_ref(cursor, ref)
-                )
+                healthy = healthy and ref == terminal and self._cursor_matches_ref(cursor, ref)
         except (
             CoreControllerAuthorityError,
             EvidenceStoreError,
             AckJournalError,
             OSError,
-        ):
+        ) as error:
+            readiness_cause = error
             healthy = False
         if not healthy:
-            self._latch_projection_failure()
+            self._latch_projection_failure(
+                "projection readiness lost its ACK-bound identity",
+                readiness_cause,
+            )
         return observed, healthy
 
     def _decision_sample(self) -> CoreClockSample:
@@ -924,15 +881,11 @@ class CoreController:
         sample: CoreClockSample,
     ) -> MutationReadiness:
         if type(sample) is not CoreClockSample:
-            raise CoreControllerClockError(
-                "Core readiness clock sample is not exact"
-            )
+            raise CoreControllerClockError("Core readiness clock sample is not exact")
         try:
             _validate_core_clock_sample(sample)
         except Exception as error:
-            raise CoreControllerClockError(
-                "Core readiness clock sample is invalid"
-            ) from error
+            raise CoreControllerClockError("Core readiness clock sample is invalid") from error
         evidence = self._store.status()
         self._validate_evidence_status(evidence)
         acknowledgements = self._read_ack_for_readiness()
@@ -961,9 +914,7 @@ class CoreController:
         )
         readiness = self._coverage.mutation_readiness(context)
         if type(readiness) is not MutationReadiness:
-            raise CoreControllerAuthorityError(
-                "coverage returned a non-exact readiness value"
-            )
+            raise CoreControllerAuthorityError("coverage returned a non-exact readiness value")
         return readiness
 
     def _mutation_readiness(self) -> MutationReadiness:
@@ -996,9 +947,7 @@ class CoreController:
         try:
             return canonical_json(copied.model_dump(mode="json"))
         except Exception as error:
-            raise CandidateAdmissionError(
-                "candidate admission facts are not canonical"
-            ) from error
+            raise CandidateAdmissionError("candidate admission facts are not canonical") from error
 
     @staticmethod
     def _readiness_cursors(
@@ -1011,9 +960,7 @@ class CoreController:
             or readiness.reason_codes != ()
             or not (
                 type(readiness.observer_reconcile_generation) is int
-                and 1
-                <= readiness.observer_reconcile_generation
-                <= MAX_UINT64
+                and 1 <= readiness.observer_reconcile_generation <= MAX_UINT64
             )
             or type(readiness.coverage_snapshot_sha256) is not str
             or HEX64.fullmatch(readiness.coverage_snapshot_sha256) is None
@@ -1028,15 +975,10 @@ class CoreController:
             readiness.projection_cursor,
         )
         if (
-            any(
-                type(cursor) is not int or not 0 <= cursor <= MAX_UINT64
-                for cursor in cursors
-            )
+            any(type(cursor) is not int or not 0 <= cursor <= MAX_UINT64 for cursor in cursors)
             or len(set(cursors)) != 1
         ):
-            raise CandidateAdmissionError(
-                "candidate admission cursors are not independently equal"
-            )
+            raise CandidateAdmissionError("candidate admission cursors are not independently equal")
         return cursors
 
     def _require_admission_composition(self) -> None:
@@ -1047,8 +989,7 @@ class CoreController:
             or not self._correlation_requests._is_bound_to(self._store)
             or not self._decision_intents._is_bound_to(self._store)
             or self._coverage._evidence is not self._store
-            or self._coverage._lifecycle_identity
-            is not self._store._lifecycle_identity
+            or self._coverage._lifecycle_identity is not self._store._lifecycle_identity
             or not self._projection._is_bound_to(
                 self._store,
                 self._acknowledgements,
@@ -1080,24 +1021,18 @@ class CoreController:
             or cursor.source_sequence != cursors[3]
             or not self._cursor_matches_ref(cursor, terminal)
         ):
-            raise CandidateAdmissionError(
-                "candidate admission terminal is not exact"
-            )
+            raise CandidateAdmissionError("candidate admission terminal is not exact")
         record = self._store.resolve_authenticated_ref(terminal)
         if (
             type(record) is not StoredEvidenceRecord
             or record.ref != terminal
             or type(record.envelope) is not dict
         ):
-            raise CandidateAdmissionError(
-                "candidate admission terminal is not authenticated"
-            )
+            raise CandidateAdmissionError("candidate admission terminal is not authenticated")
         host_id = record.envelope.get("host_id")
         boot_id = record.envelope.get("boot_id")
         if type(host_id) is not str or type(boot_id) is not str:
-            raise CandidateAdmissionError(
-                "candidate admission terminal lost host lifecycle"
-            )
+            raise CandidateAdmissionError("candidate admission terminal lost host lifecycle")
         return cursor, terminal, host_id, boot_id
 
     @classmethod
@@ -1116,16 +1051,12 @@ class CoreController:
                 and view._evidence_lifecycle is binding.evidence_lifecycle
                 and view.candidate.candidate_id == binding.candidate_id
                 and cls._candidate_bytes(view.candidate) == binding.candidate_bytes
-                and candidate_facts_sha256(view.candidate)
-                == binding.candidate_facts_sha256
-                and view.candidate_facts_sha256
-                == binding.candidate_facts_sha256
-                and view.authority_snapshot_event_id
-                == binding.authority_snapshot_event_id
+                and candidate_facts_sha256(view.candidate) == binding.candidate_facts_sha256
+                and view.candidate_facts_sha256 == binding.candidate_facts_sha256
+                and view.authority_snapshot_event_id == binding.authority_snapshot_event_id
                 and view.projection_cursor == binding.projection_cursor
                 and view.terminal_ref == binding.terminal_ref
-                and view.admission_rebuild_epoch
-                == binding.admission_rebuild_epoch
+                and view.admission_rebuild_epoch == binding.admission_rebuild_epoch
                 and view.authority_revision == binding.authority_revision
                 and view.readiness == binding.readiness
             )
@@ -1135,11 +1066,14 @@ class CoreController:
     def _latch_admission_projection_if_unhealthy(self) -> None:
         try:
             status = self._projection.status()
-        except (ProjectionError, OSError):
-            self._latch_projection_failure()
+        except (ProjectionError, OSError) as error:
+            self._latch_projection_failure(
+                "admission projection status is unavailable",
+                error,
+            )
             return
         if type(status) is not ProjectionStatus or status.healthy is not True:
-            self._latch_projection_failure()
+            self._latch_projection_failure("admission projection status is inexact or unhealthy")
 
     async def issue_candidate_admission(
         self,
@@ -1157,21 +1091,18 @@ class CoreController:
                     self._catch_up_projection()
                     if not self._projection_healthy:
                         raise CandidateAdmissionError(
-                            "candidate admission projection catch-up failed"
+                            "candidate admission projection catch-up failed: "
+                            f"{self._projection_failure_detail()}"
                         )
                     before = self._mutation_readiness()
                     before_cursors = self._readiness_cursors(before)
-                    _cursor, terminal, host_id, boot_id = self._admission_terminal(
-                        before_cursors
-                    )
+                    _cursor, terminal, host_id, boot_id = self._admission_terminal(before_cursors)
                     snapshot = self._projection._issue_candidate_admission_snapshot(
                         candidate_id,
                         _factory=_CANDIDATE_ADMISSION_GATE_FACTORY,
                     )
                     if type(snapshot) is not _CandidateAdmissionSnapshot:
-                        raise CandidateAdmissionError(
-                            "candidate admission candidate is unknown"
-                        )
+                        raise CandidateAdmissionError("candidate admission candidate is unknown")
                     candidate = snapshot.candidate
                     if (
                         type(candidate) is not ContainmentCandidateV1
@@ -1190,18 +1121,16 @@ class CoreController:
                         raise CandidateAdmissionError(
                             "candidate admission cursors changed during issuance"
                         )
-                    final_cursor, final_terminal, final_host, final_boot = (
-                        self._admission_terminal(after_cursors)
+                    final_cursor, final_terminal, final_host, final_boot = self._admission_terminal(
+                        after_cursors
                     )
                     if (
                         final_cursor != snapshot.cursor
                         or final_terminal != snapshot.terminal_ref
                         or final_host != candidate.host_id
                         or final_boot != candidate.boot_id
-                        or after.coverage_snapshot_sha256
-                        != candidate.coverage_snapshot_sha256
-                        or snapshot.candidate_facts_sha256
-                        != candidate_facts_sha256(candidate)
+                        or after.coverage_snapshot_sha256 != candidate.coverage_snapshot_sha256
+                        or snapshot.candidate_facts_sha256 != candidate_facts_sha256(candidate)
                         or snapshot.authority_snapshot_event_id
                         != candidate.correlation_snapshot_event_id
                     ):
@@ -1214,14 +1143,10 @@ class CoreController:
                     view = _issue_candidate_admission_view(
                         candidate=candidate_copy,
                         candidate_facts_sha256=snapshot.candidate_facts_sha256,
-                        authority_snapshot_event_id=(
-                            snapshot.authority_snapshot_event_id
-                        ),
+                        authority_snapshot_event_id=(snapshot.authority_snapshot_event_id),
                         projection_cursor=replace(snapshot.cursor),
                         terminal_ref=replace(snapshot.terminal_ref),
-                        admission_rebuild_epoch=(
-                            snapshot.admission_rebuild_epoch
-                        ),
+                        admission_rebuild_epoch=(snapshot.admission_rebuild_epoch),
                         authority_revision=snapshot.authority_revision,
                         readiness=replace(after),
                         controller_lifecycle=self._admission_lifecycle,
@@ -1234,17 +1159,11 @@ class CoreController:
                         nonce=nonce,
                         candidate_id=candidate.candidate_id,
                         candidate_bytes=candidate_bytes,
-                        candidate_facts_sha256=(
-                            snapshot.candidate_facts_sha256
-                        ),
-                        authority_snapshot_event_id=(
-                            snapshot.authority_snapshot_event_id
-                        ),
+                        candidate_facts_sha256=(snapshot.candidate_facts_sha256),
+                        authority_snapshot_event_id=(snapshot.authority_snapshot_event_id),
                         projection_cursor=replace(snapshot.cursor),
                         terminal_ref=replace(snapshot.terminal_ref),
-                        admission_rebuild_epoch=(
-                            snapshot.admission_rebuild_epoch
-                        ),
+                        admission_rebuild_epoch=(snapshot.admission_rebuild_epoch),
                         authority_revision=snapshot.authority_revision,
                         readiness=replace(after),
                         controller_lifecycle=self._admission_lifecycle,
@@ -1270,9 +1189,7 @@ class CoreController:
                 ValueError,
             ) as error:
                 self._latch_admission_projection_if_unhealthy()
-                raise CandidateAdmissionError(
-                    "candidate admission issuance was denied"
-                ) from error
+                raise CandidateAdmissionError("candidate admission issuance was denied") from error
 
     def _reauthenticate_candidate_admission_locked(
         self,
@@ -1290,15 +1207,14 @@ class CoreController:
             or binding.controller_lifecycle is not self._admission_lifecycle
             or binding.evidence_lifecycle is not self._store._lifecycle_identity
         ):
-            raise CandidateAdmissionError(
-                "candidate admission view is foreign, stale, or mutated"
-            )
+            raise CandidateAdmissionError("candidate admission view is foreign, stale, or mutated")
         self._require_admission_composition()
         if catch_up_projection:
             self._catch_up_projection()
         if not self._projection_healthy:
             raise CandidateAdmissionError(
-                "candidate admission projection catch-up failed"
+                "candidate admission projection catch-up failed: "
+                f"{self._projection_failure_detail()}"
             )
         readiness = (
             self._mutation_readiness()
@@ -1313,17 +1229,10 @@ class CoreController:
             binding.readiness.projection_cursor,
         )
         if cursors != bound_cursors:
-            raise CandidateAdmissionError(
-                "candidate admission boundary is stale"
-            )
+            raise CandidateAdmissionError("candidate admission boundary is stale")
         cursor, terminal, host_id, boot_id = self._admission_terminal(cursors)
-        if (
-            cursor != binding.projection_cursor
-            or terminal != binding.terminal_ref
-        ):
-            raise CandidateAdmissionError(
-                "candidate admission terminal changed"
-            )
+        if cursor != binding.projection_cursor or terminal != binding.terminal_ref:
+            raise CandidateAdmissionError("candidate admission terminal changed")
         snapshot = self._projection._reauthenticate_candidate_admission_snapshot(
             binding.candidate_id,
             admission_rebuild_epoch=binding.admission_rebuild_epoch,
@@ -1332,30 +1241,24 @@ class CoreController:
             _factory=_CANDIDATE_ADMISSION_GATE_FACTORY,
         )
         if type(snapshot) is not _CandidateAdmissionSnapshot:
-            raise CandidateAdmissionError(
-                "candidate admission candidate disappeared"
-            )
+            raise CandidateAdmissionError("candidate admission candidate disappeared")
         candidate = snapshot.candidate
         if (
             type(candidate) is not ContainmentCandidateV1
             or snapshot.invalidation_event_ids
             or snapshot.cursor != binding.projection_cursor
             or snapshot.terminal_ref != binding.terminal_ref
-            or snapshot.admission_rebuild_epoch
-            != binding.admission_rebuild_epoch
+            or snapshot.admission_rebuild_epoch != binding.admission_rebuild_epoch
             or snapshot.authority_revision != binding.authority_revision
             or snapshot.projection_lifecycle is not binding.projection_lifecycle
             or snapshot.evidence_lifecycle is not binding.evidence_lifecycle
             or candidate.host_id != host_id
             or candidate.boot_id != boot_id
             or candidate.candidate_id != binding.candidate_id
-            or snapshot.candidate_facts_sha256
-            != binding.candidate_facts_sha256
-            or candidate_facts_sha256(candidate)
-            != binding.candidate_facts_sha256
+            or snapshot.candidate_facts_sha256 != binding.candidate_facts_sha256
+            or candidate_facts_sha256(candidate) != binding.candidate_facts_sha256
             or self._candidate_bytes(candidate) != binding.candidate_bytes
-            or snapshot.authority_snapshot_event_id
-            != binding.authority_snapshot_event_id
+            or snapshot.authority_snapshot_event_id != binding.authority_snapshot_event_id
         ):
             raise CandidateAdmissionError("candidate admission facts changed")
         final = (
@@ -1364,8 +1267,8 @@ class CoreController:
             else self._mutation_readiness_at(decision_sample)
         )
         final_cursors = self._readiness_cursors(final)
-        final_cursor, final_terminal, final_host, final_boot = (
-            self._admission_terminal(final_cursors)
+        final_cursor, final_terminal, final_host, final_boot = self._admission_terminal(
+            final_cursors
         )
         if (
             final_cursors != bound_cursors
@@ -1374,14 +1277,10 @@ class CoreController:
             or final_host != candidate.host_id
             or final_boot != candidate.boot_id
         ):
-            raise CandidateAdmissionError(
-                "candidate admission authority changed before consume"
-            )
+            raise CandidateAdmissionError("candidate admission authority changed before consume")
         return _ReauthenticatedCandidateAdmission(
             candidate=self._candidate_copy(candidate),
-            authority_snapshot_event_id=(
-                snapshot.authority_snapshot_event_id
-            ),
+            authority_snapshot_event_id=(snapshot.authority_snapshot_event_id),
             projection_cursor=replace(final_cursor),
             terminal_ref=replace(final_terminal),
             readiness=replace(final),
@@ -1420,9 +1319,7 @@ class CoreController:
                 ValueError,
             ) as error:
                 self._latch_admission_projection_if_unhealthy()
-                raise CandidateAdmissionError(
-                    "candidate admission consume was denied"
-                ) from error
+                raise CandidateAdmissionError("candidate admission consume was denied") from error
 
     async def commit_policy_evaluation(
         self,
@@ -1437,28 +1334,27 @@ class CoreController:
                 self._require_open()
                 detached = _detach_policy_evaluation(evaluation)
                 sample, uncertainty_ns = _clock_observation(self._clock)
-                with self._store._source_terminal_scope(
-                    self._store._lifecycle_identity,
-                    _factory=_SOURCE_TERMINAL_FACTORY,
-                ) as source_terminal, self._projection._candidate_admission_scope(
-                    _factory=_CANDIDATE_ADMISSION_GATE_FACTORY,
+                with (
+                    self._store._source_terminal_scope(
+                        self._store._lifecycle_identity,
+                        _factory=_SOURCE_TERMINAL_FACTORY,
+                    ) as source_terminal,
+                    self._projection._candidate_admission_scope(
+                        _factory=_CANDIDATE_ADMISSION_GATE_FACTORY,
+                    ),
                 ):
-                    admitted = (
-                        self._reauthenticate_candidate_admission_locked(
-                            view,
-                            binding,
-                            catch_up_projection=False,
-                            decision_sample=sample,
-                        )
+                    admitted = self._reauthenticate_candidate_admission_locked(
+                        view,
+                        binding,
+                        catch_up_projection=False,
+                        decision_sample=sample,
                     )
                     record = _build_decision_intent_record(
                         candidate=admitted.candidate,
                         evaluation=detached,
                         sample=sample,
                         uncertainty_ns=uncertainty_ns,
-                        authority_snapshot_event_id=(
-                            admitted.authority_snapshot_event_id
-                        ),
+                        authority_snapshot_event_id=(admitted.authority_snapshot_event_id),
                         projection_cursor=admitted.projection_cursor,
                         terminal_ref=admitted.terminal_ref,
                         readiness=admitted.readiness,
@@ -1487,9 +1383,7 @@ class CoreController:
                 ValueError,
             ) as error:
                 self._latch_admission_projection_if_unhealthy()
-                raise CandidateAdmissionError(
-                    "candidate policy commit was denied"
-                ) from error
+                raise CandidateAdmissionError("candidate policy commit was denied") from error
 
     async def _execute_retention_locked(
         self,
@@ -1505,9 +1399,7 @@ class CoreController:
             snapshot = self._acknowledgements.snapshot()
             self._validate_ack_snapshot(snapshot)
             if not snapshot.healthy:
-                raise CoreControllerAuthorityError(
-                    "retention requires one healthy ACK snapshot"
-                )
+                raise CoreControllerAuthorityError("retention requires one healthy ACK snapshot")
             confirmed = snapshot.confirmed
             if confirmed is not None:
                 ref = self._ref_at(confirmed.sequence)
@@ -1518,9 +1410,8 @@ class CoreController:
             pending = snapshot.pending
             if pending is not None:
                 ref = self._ref_at(pending.sequence)
-                if (
-                    pending.sequence <= snapshot.confirmed_through
-                    or not self._ack_matches_ref(pending, ref)
+                if pending.sequence <= snapshot.confirmed_through or not self._ack_matches_ref(
+                    pending, ref
                 ):
                     raise CoreControllerAuthorityError(
                         "retention pending ACK differs from authenticated evidence"
@@ -1535,9 +1426,7 @@ class CoreController:
                 return "tombstone", request.tombstone_id
             if type(request) is RetentionBlockedV1:
                 return "blocked", request.blocked_id
-            raise CoreControllerAuthorityError(
-                "retention state has an inexact request"
-            )
+            raise CoreControllerAuthorityError("retention state has an inexact request")
 
         def target_identity(
             target: RetentionTargetV1 | EvidenceRef | None,
@@ -1556,9 +1445,7 @@ class CoreController:
                     target.event_id,
                     target.content_sha256,
                 )
-            raise CoreControllerAuthorityError(
-                "retention target identity is inexact"
-            )
+            raise CoreControllerAuthorityError("retention target identity is inexact")
 
         def state_observation(
             state: RetentionStateV1,
@@ -1574,9 +1461,7 @@ class CoreController:
             target: RetentionTargetV1 | EvidenceRef | None = (
                 target_ref if target_ref is not None else state.target
             )
-            target_sequence, target_event_id, target_content_sha256 = (
-                target_identity(target)
-            )
+            target_sequence, target_event_id, target_content_sha256 = target_identity(target)
             return _RetentionObservation(
                 outcome=outcome,
                 retry_reason=retry_reason,
@@ -1653,9 +1538,7 @@ class CoreController:
                     "retention selection did not publish exact durable state"
                 )
         elif type(state) is not RetentionStateV1:
-            raise CoreControllerAuthorityError(
-                "retention journal returned an inexact state"
-            )
+            raise CoreControllerAuthorityError("retention journal returned an inexact state")
 
         if state.phase not in {
             "selected",
@@ -1668,13 +1551,9 @@ class CoreController:
 
         selected_max: int | None = None
         if state.operation == "tombstone":
-            selected_max = self._store._retention_selected_max_sequence(
-                state
-            )
+            selected_max = self._store._retention_selected_max_sequence(state)
             if selected_max >= MAX_UINT64:
-                raise RetentionProtocolError(
-                    "retention selection has no surviving ACK position"
-                )
+                raise RetentionProtocolError("retention selection has no surviving ACK position")
             before_delivery = settled_ack()
             if before_delivery.pending is not None:
                 return state_observation(
@@ -1698,12 +1577,10 @@ class CoreController:
             and state.target.sequence > delivery_status.evidence_head
         )
         try:
-            target_ref = (
-                await self._delivery._deliver_retention_target_locked(
-                    journal,
-                    _factory=_RETENTION_DELIVERY_FACTORY,
-                    _lock_authority=_lock_authority,
-                )
+            target_ref = await self._delivery._deliver_retention_target_locked(
+                journal,
+                _factory=_RETENTION_DELIVERY_FACTORY,
+                _lock_authority=_lock_authority,
             )
         except DeliveryRetryableError:
             if not future_observer_path:
@@ -1715,7 +1592,8 @@ class CoreController:
             if (
                 type(durable_state) is not RetentionStateV1
                 or type(durable_raw) is not bytes
-                or durable_state.phase not in {
+                or durable_state.phase
+                not in {
                     "selected",
                     "target_bound",
                 }
@@ -1735,10 +1613,7 @@ class CoreController:
             )
 
         state = journal.state
-        if (
-            type(state) is not RetentionStateV1
-            or state.phase != "evidence_appended"
-        ):
+        if type(state) is not RetentionStateV1 or state.phase != "evidence_appended":
             raise CoreControllerAuthorityError(
                 "retention delivery did not publish exact evidence authority"
             )
@@ -1757,9 +1632,7 @@ class CoreController:
             )
 
         if selected_max is None:
-            raise CoreControllerAuthorityError(
-                "tombstone retention lost its selected range"
-            )
+            raise CoreControllerAuthorityError("tombstone retention lost its selected range")
         surviving_ack = settled_ack()
         if surviving_ack.pending is not None:
             return state_observation(
@@ -1791,17 +1664,12 @@ class CoreController:
             _factory=_RETENTION_PROOF_FACTORY,
         )
         try:
-            rebuild = (
-                self._projection
-                ._rebuild_after_authenticated_retention(
-                    completion,
-                    _factory=_RETENTION_REBUILD_FACTORY,
-                )
+            rebuild = self._projection._rebuild_after_authenticated_retention(
+                completion,
+                _factory=_RETENTION_REBUILD_FACTORY,
             )
             if type(rebuild) is not RebuildReport:
-                raise CoreControllerAuthorityError(
-                    "retention projection rebuild result is inexact"
-                )
+                raise CoreControllerAuthorityError("retention projection rebuild result is inexact")
             rebuilt_ack = settled_ack()
             rebuilt_status = self._projection.status()
             rebuilt_cursor, rebuilt_terminal = self._projection_boundary(
@@ -1830,8 +1698,11 @@ class CoreController:
                 raise CoreControllerAuthorityError(
                     "retention projection rebuild lost exact ACK authority"
                 )
-        except BaseException:
-            self._latch_projection_failure()
+        except BaseException as error:
+            self._latch_projection_failure(
+                "retention projection rebuild failed",
+                error,
+            )
             raise
         self._store._finalize_authenticated_retention_completion(
             completion,
@@ -1846,9 +1717,7 @@ class CoreController:
             state,
             outcome="tombstone_completed",
             target_ref=target_ref,
-            unlinked_manifest_count=len(
-                request.removed_manifest_hashes
-            ),
+            unlinked_manifest_count=len(request.removed_manifest_hashes),
             unlinked_bytes=request.removed_bytes,
             projection_rebuilt=True,
         )
@@ -1859,7 +1728,8 @@ class CoreController:
             projected = self._catch_up_projection_for_retention()
             if not self._projection_healthy:
                 raise CoreControllerAuthorityError(
-                    "retention requires complete projection catch-up"
+                    "retention requires complete projection catch-up: "
+                    f"{self._projection_failure_detail()}"
                 )
             async with self._delivery._retention_preflight_scope(
                 _factory=_RETENTION_DELIVERY_FACTORY,
@@ -1870,7 +1740,7 @@ class CoreController:
             projected += self._catch_up_projection_for_retention()
             if not self._projection_healthy:
                 raise CoreControllerAuthorityError(
-                    "retention projection catch-up failed"
+                    f"retention projection catch-up failed: {self._projection_failure_detail()}"
                 )
             readiness = self._mutation_readiness()
             return _RetentionExecution(
@@ -1885,10 +1755,7 @@ class CoreController:
         return _public_retention_result(execution)
 
     async def poll_once(self, *, limit: int = MAX_PAGE_EVENTS) -> CorePollResult:
-        if (
-            type(limit) is not int
-            or not 1 <= limit <= MAX_PAGE_EVENTS
-        ):
+        if type(limit) is not int or not 1 <= limit <= MAX_PAGE_EVENTS:
             raise ValueError("poll limit must be in 1..100")
         async with self._lock:
             self._require_open()
@@ -1914,7 +1781,8 @@ class CoreController:
             self._catch_up_projection()
             if not self._projection_healthy:
                 raise CoreControllerAuthorityError(
-                    "candidate discovery requires a healthy projection"
+                    "candidate discovery requires a healthy projection: "
+                    f"{self._projection_failure_detail()}"
                 )
             return self._projection._candidate_ids(after=after, limit=limit)
 
@@ -1974,9 +1842,6 @@ class CoreController:
                     if primary is None:
                         primary = error
                     else:
-                        primary.add_note(
-                            "secondary Core cleanup failure "
-                            f"({type(error).__name__})"
-                        )
+                        primary.add_note(f"secondary Core cleanup failure ({type(error).__name__})")
             if primary is not None:
                 raise primary

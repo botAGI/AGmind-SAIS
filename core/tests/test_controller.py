@@ -699,6 +699,61 @@ async def test_controller_projection_catchup_and_readiness_matrix(
 
 
 @pytest.mark.asyncio
+async def test_projection_latch_reports_and_logs_its_first_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The only exception the live host ever recorded was the downstream
+    symptom, because every latch site swallowed the cause.  The latch must now
+    LOG the first cause and carry it in the message readers actually see."""
+    key = private_key(11)
+    acceptance, _store, journal, correlation, registry, coverage, projection, _ = _authorities(
+        tmp_path / "cause"
+    )
+    transport = _Transport(
+        [_page(boot_boundary(key), reserved=1)],
+        ack_count=1,
+    )
+    controller = CoreController.create(
+        acceptance,
+        journal,
+        correlation,
+        registry,
+        coverage,
+        projection,
+        transport,
+        _Clock(),
+    )
+
+    def fail_projection(ref: EvidenceRef) -> object:
+        raise ProjectionConflict(f"unique boot conflict at {ref.source_sequence}")
+
+    monkeypatch.setattr(projection, "apply", fail_projection)
+    with caplog.at_level("ERROR", logger="agmind_immune.controller"):
+        await controller.poll_once()
+    assert controller._projection_healthy is False
+    assert any("unique boot conflict at 1" in record.getMessage() for record in caplog.records)
+
+    with pytest.raises(CoreControllerAuthorityError) as discovery:
+        await controller.candidate_ids()
+    assert "candidate discovery requires a healthy projection" in str(discovery.value)
+    assert "unique boot conflict at 1" in str(discovery.value)
+
+    # Only the FIRST cause is retained: later latches are downstream symptoms.
+    def fail_differently(ref: EvidenceRef) -> object:
+        raise ProjectionConflict(f"a later unrelated symptom at {ref.source_sequence}")
+
+    monkeypatch.setattr(projection, "apply", fail_differently)
+    controller._latch_projection_failure("second latch")
+    with pytest.raises(CoreControllerAuthorityError) as again:
+        await controller.candidate_ids()
+    assert "unique boot conflict at 1" in str(again.value)
+    assert "second latch" not in str(again.value)
+    await controller.close()
+
+
+@pytest.mark.asyncio
 async def test_controller_projection_failure_and_shutdown_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
