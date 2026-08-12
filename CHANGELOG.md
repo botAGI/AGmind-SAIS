@@ -50,6 +50,11 @@ production-ready and no version is tagged.
   `docker_inventory_event` on both the observer and Core sides.
 - Restart recovery tolerates the acked, frame-less crash leftover it later
   deletes.
+- Correlation delivery survives a backlog: the observer reserves a PCC snapshot
+  at its own spool head, so Core no longer rejects the publication response for
+  sitting further than one poll's acceptance budget past its trigger, and no
+  longer latches fatally while re-deriving the proof position — that scan is
+  now bounded per call and resumes from where it stopped.
 - Containerised Go builds no longer fail on VCS stamping or the darwin
   cross-compile.
 

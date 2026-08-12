@@ -964,6 +964,10 @@ class DeliveryCoordinator:
         self._ack_budget = ack_budget
         self._repair_mode = _repair_mode
         self._lock = _DeliveryLock()
+        # Resume cursor for the bounded snapshot scan, keyed by the exact
+        # request/snapshot identity it eliminated a prefix for.  Process-local
+        # by design: losing it only costs a rescan, never authority.
+        self._correlation_scan_cursor: dict[tuple[str, str], int] = {}
         self._retention_lock_owner: asyncio.Task[object] | None = None
         self._retention_lock_authority: object | None = None
         self._fatal: DeliveryFatalError | None = None
@@ -3132,7 +3136,7 @@ class DeliveryCoordinator:
         self,
     ) -> tuple[_CorrelationRequestStateV1, ...]:
         try:
-            return self._correlation_journal().pending()
+            pending = self._correlation_journal().pending()
         except DeliveryFatalError:
             raise
         except Exception as error:  # noqa: BLE001 - journal authority boundary
@@ -3140,6 +3144,12 @@ class DeliveryCoordinator:
                 "correlation-request journal is unavailable",
                 error,
             )
+        if self._correlation_scan_cursor:
+            live = {state.request_sha256 for state in pending}
+            for key in tuple(self._correlation_scan_cursor):
+                if key[0] not in live:
+                    del self._correlation_scan_cursor[key]
+        return pending
 
     def _candidate_request(
         self,
@@ -3221,7 +3231,16 @@ class DeliveryCoordinator:
         state: _CorrelationRequestStateV1,
         *,
         evidence_head: int | None = None,
-    ) -> EvidenceRef:
+    ) -> EvidenceRef | None:
+        # The journal binds the snapshot by content identity, never by a
+        # sequence, so its position has to be re-derived from authenticated
+        # evidence.  The observer publishes the snapshot at ITS OWN spool head,
+        # so the distance from the trigger is exactly how far Core was behind
+        # and is not bounded by anything Core controls.  The scan therefore
+        # stays bounded PER CALL and resumes from a cursor over the prefix it
+        # has already eliminated: exhausting the bound returns None ("not
+        # resolved yet"), never a fatal latch, and the cursor parks immediately
+        # before the snapshot so later polls resolve it in one step.
         if (
             state.phase not in {"proof_observed", "completed"}
             or state.snapshot_event_id is None
@@ -3235,14 +3254,20 @@ class DeliveryCoordinator:
             if evidence_head is None
             else evidence_head
         )
-        after = state.request.trigger_source_sequence
+        key = (state.request_sha256, state.snapshot_event_id)
+        after = max(
+            state.request.trigger_source_sequence,
+            self._correlation_scan_cursor.get(key, 0),
+        )
+        if after >= head:
+            # Nothing this head can still offer beyond the eliminated prefix.
+            return None
         examined = 0
         while after < head:
             remaining = _MAX_CORRELATION_PATH_EVENTS - examined
             if remaining <= 0:
-                raise self._latch(
-                    "correlation snapshot lookup exceeded its event bound"
-                )
+                self._correlation_scan_cursor[key] = after
+                return None
             refs = self._authenticated_refs(
                 after=after,
                 through=head,
@@ -3267,6 +3292,7 @@ class DeliveryCoordinator:
                             "observed correlation snapshot lost PCC authority",
                             error,
                         )
+                    self._correlation_scan_cursor[key] = after
                     return ref
                 after = ref.source_sequence
         raise self._latch(
@@ -3288,12 +3314,17 @@ class DeliveryCoordinator:
                     state.request.trigger_source_sequence - 1,
                 )
             elif state.phase == "proof_observed":
+                snapshot_ref = self._snapshot_ref(
+                    state,
+                    evidence_head=evidence_head,
+                )
+                # An unresolved scan must never raise the ceiling: hold ACK at
+                # the trigger, exactly as if the proof were still unobserved.
                 ceiling = min(
                     ceiling,
-                    self._snapshot_ref(
-                        state,
-                        evidence_head=evidence_head,
-                    ).source_sequence,
+                    state.request.trigger_source_sequence - 1
+                    if snapshot_ref is None
+                    else snapshot_ref.source_sequence,
                 )
             else:
                 raise self._latch("pending correlation phase is invalid")
@@ -3357,10 +3388,15 @@ class DeliveryCoordinator:
             if type(raw) is not bytes:
                 raise TypeError("PCC publication returned non-exact bytes")
             direct = decode_core_event(raw)
+            # The snapshot is reserved at the observer's spool head, so the
+            # distance from the trigger is however far Core is behind, not a
+            # property of the correlation.  Bounding it here would latch fatally
+            # on any backlog longer than one poll's acceptance budget.  The
+            # target stays bounded where the bound is authoritative: the walk in
+            # _accept_path_to_snapshot is budgeted per poll and refuses any
+            # target beyond the observer's own reserved_through.
             if (
                 direct.sequence <= state.request.trigger_source_sequence
-                or direct.sequence - state.request.trigger_source_sequence
-                > _MAX_CORRELATION_PATH_EVENTS
                 or direct.envelope.get("event_type")
                 != "pcc_correlation_snapshot"
             ):
@@ -3580,7 +3616,11 @@ class DeliveryCoordinator:
                 self._local_state(apply_coverage_barrier=False)
             )
         elif state.phase == "proof_observed":
-            snapshot_ref = self._snapshot_ref(state)
+            resolved = self._snapshot_ref(state)
+            if resolved is None:
+                # The bounded scan needs another poll to reach the snapshot.
+                return 0, 0, True
+            snapshot_ref = resolved
         else:
             raise self._latch("delivery received an invalid pending correlation phase")
         confirmed, retry = await self._ack_correlation_through(
@@ -3602,7 +3642,14 @@ class DeliveryCoordinator:
         if local.pending is not None:
             # Never fetch past an ACK whose observer-side result is ambiguous.
             return 0
-        snapshot_refs = tuple(self._snapshot_ref(state) for state in pending)
+        resolved: list[EvidenceRef] = []
+        for state in pending:
+            snapshot_ref = self._snapshot_ref(state)
+            if snapshot_ref is None:
+                # No proof position yet, so no reconciliation exception either.
+                return 0
+            resolved.append(snapshot_ref)
+        snapshot_refs = tuple(resolved)
         if any(
             local.confirmed_through >= ref.source_sequence
             for ref in snapshot_refs
