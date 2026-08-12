@@ -356,7 +356,13 @@ copy_tree() {
 status "installing a minimal, test-free source and runtime tree"
 ensure_directory "$install_root" 0755 root root
 if [[ "$repo_root" != "$install_root" ]]; then
-  for relative_file in .dockerignore go.mod go.sum pyproject.toml uv.lock policies/pcc.rego; do
+  # Both policies are load-bearing: compose bind-mounts each into the OPA container and
+  # passes both on OPA's command line. A missing source path is not a visible failure —
+  # Docker silently creates an empty DIRECTORY at the mount point, OPA then loads no
+  # system.authz rule, and with --authorization=basic it answers every request, including
+  # Core's admission queries, with 500 "authorization policy missing or undefined".
+  for relative_file in .dockerignore go.mod go.sum pyproject.toml uv.lock \
+    policies/pcc.rego policies/authz.rego; do
     copy_file "$relative_file"
   done
   for relative_tree in \
