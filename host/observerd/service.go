@@ -15,11 +15,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"agmind.local/sais/internal/contracts"
 	"agmind.local/sais/internal/uds"
+	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/client"
 )
 
@@ -119,6 +121,37 @@ func (session *dockerEventSession) markTerminal(streamErr error) {
 	close(session.terminalSignal)
 }
 
+// dockerEventInventoryNoise lists the Docker actions that provably cannot change anything
+// ContainerIdentityV1 or the network snapshot holds: an exec runs a process INSIDE an already
+// identified container, and a health status transition is a label on that same container. Neither
+// can alter the full ID, start time, image ID, repo digests, immutable spec, init PID, network
+// attachment, privilege or capability set the inventory is built from.
+//
+// This matters far beyond tidiness. Container healthchecks — including this product's own — emit
+// exec_create/exec_start/exec_die continuously: measured on the reference host, 188 Docker events
+// in 30 s of which ~85% were exec noise. Every one of them drove a full inventory reconcile that
+// signed a docker_reconcile_gap / docker_reconcile_recovered coverage PAIR into the spool, so the
+// observer manufactured evidence about its own healthchecks faster than Core could consume it,
+// the spool climbed to its 256 MB cap over nine hours and the observer fenced itself read-only.
+//
+// The filter is a denylist, not an allowlist, and that direction is deliberate: an action this
+// function has never heard of still reconciles. Missing a real change would leave a stale identity
+// bound to a containment plan; reconciling once too often only costs work.
+func dockerEventCanChangeInventory(message events.Message) bool {
+	switch message.Action {
+	case "exec_create", "exec_start", "exec_die", "exec_detach", "health_status":
+		return false
+	}
+	// Docker reports exec actions with the command appended, e.g.
+	// `exec_start: /bin/health-probe`, so the prefix has to be matched too.
+	for _, prefix := range [...]string{"exec_create:", "exec_start:", "health_status:"} {
+		if strings.HasPrefix(string(message.Action), prefix) {
+			return false
+		}
+	}
+	return true
+}
+
 func (session *dockerEventSession) pump(ctx context.Context) {
 	defer close(session.done)
 	for {
@@ -136,10 +169,13 @@ func (session *dockerEventSession) pump(ctx context.Context) {
 				normalizeDockerEventStreamError(streamErr, open),
 			)
 			return
-		case _, open := <-session.stream.Messages:
+		case message, open := <-session.stream.Messages:
 			if !open {
 				session.markTerminal(io.EOF)
 				return
+			}
+			if !dockerEventCanChangeInventory(message) {
+				continue
 			}
 			select {
 			case session.dirty <- struct{}{}:
