@@ -71,6 +71,14 @@ _MAX_COMPLETED_BATCH = 4_096
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _OPERATION_PREFIX = "pcc_correlation_snapshot:"
+# The only reason a selected request may be abandoned instead of proven: the
+# observer stated, authoritatively and terminally, that the trigger it names is
+# retired and can never be resolved again. New reasons need their own explicit,
+# equally unambiguous observer signal.
+_RETIREMENT_REASONS = ("observer_trigger_retired",)
+# Phases a request can never leave: one proved and confirmed, one abandoned with
+# a stated reason. Delivery must never re-drive either.
+TERMINAL_CORRELATION_PHASES = frozenset({"completed", "retired"})
 
 
 class _DigestState(Protocol):
@@ -108,9 +116,10 @@ class _CorrelationRequestStateV1(ContractModel):
     operation_key: str
     request_sha256: str
     request: PCCCorrelationSnapshotRequestV1
-    phase: Literal["selected", "proof_observed", "completed"]
+    phase: Literal["selected", "proof_observed", "completed", "retired"]
     snapshot_event_id: str | None = None
     snapshot_content_sha256: str | None = None
+    retired_reason: Literal["observer_trigger_retired"] | None = None
 
     @field_validator("request_sha256", "snapshot_content_sha256")
     @classmethod
@@ -141,13 +150,22 @@ class _CorrelationRequestStateV1(ContractModel):
             "snapshot_event_id",
             "snapshot_content_sha256",
         }
-        if self.phase == "selected":
+        if self.phase == "retired":
+            # A retirement is terminal ABANDONMENT: it never carries snapshot
+            # identity (there is no proof) and it must always name its reason.
+            if self.retired_reason is None:
+                raise ValueError("retired phase requires an explicit reason")
+        elif self.retired_reason is not None:
+            raise ValueError("only the retired phase may name a reason")
+        if self.phase in {"selected", "retired"}:
             if (
                 self.snapshot_event_id is not None
                 or self.snapshot_content_sha256 is not None
                 or bool(snapshot_fields & self.model_fields_set)
             ):
-                raise ValueError("selected phase must omit snapshot identity")
+                raise ValueError(
+                    "selected and retired phases must omit snapshot identity"
+                )
         elif (
             self.snapshot_event_id is None
             or self.snapshot_content_sha256 is None
@@ -666,6 +684,15 @@ class CorrelationRequestJournal:
             raise CorrelationRequestJournalCorrupt(
                 "correlation phase does not bind one selected request"
             )
+        if state.phase == "retired":
+            # Terminal abandonment only ever replaces a selection that never
+            # observed a proof; nothing may follow it.
+            if existing.phase != "selected":
+                raise CorrelationRequestJournalCorrupt(
+                    "correlation retirement skips or repeats a transition"
+                )
+            states[state.operation_key] = state
+            return
         if state.phase == "proof_observed":
             if existing.phase != "selected":
                 raise CorrelationRequestJournalCorrupt(
@@ -1176,6 +1203,49 @@ class CorrelationRequestJournal:
             self._append(completed)
             self._states_by_operation[state.operation_key] = completed
             return completed.model_copy(deep=True)
+
+    def mark_retired(
+        self,
+        request_sha256: str,
+        reason: str,
+    ) -> _CorrelationRequestStateV1:
+        """Durably abandon one selected request whose trigger is unresolvable.
+
+        Retirement is terminal and carries an explicit reason. It never invents
+        a proof, never claims completion, and is only legal for a request that
+        never observed one.
+        """
+        with self._operation_boundary():
+            self._require_usable()
+            if reason not in _RETIREMENT_REASONS:
+                raise CorrelationRequestJournalStateError(
+                    "correlation retirement reason is not a stated authority"
+                )
+            state = self._state_for_request(request_sha256)
+            if state.phase == "retired":
+                if state.retired_reason != reason:
+                    self._raise_conflict(
+                        "a correlation request was retired for another reason"
+                    )
+                return state.model_copy(deep=True)
+            if state.phase != "selected":
+                raise CorrelationRequestJournalStateError(
+                    "only a selected correlation request can be retired"
+                )
+            retired = _CorrelationRequestStateV1(
+                schema_version="agmind.correlation-request-state.v1",
+                operation_key=state.operation_key,
+                request_sha256=state.request_sha256,
+                request=state.request,
+                phase="retired",
+                retired_reason=cast(
+                    Literal["observer_trigger_retired"],
+                    reason,
+                ),
+            )
+            self._append(retired)
+            self._states_by_operation[state.operation_key] = retired
+            return retired.model_copy(deep=True)
 
     def completed_for_snapshot(
         self,
@@ -1892,7 +1962,7 @@ class CorrelationRequestJournal:
             return tuple(
                 state.model_copy(deep=True)
                 for state in self._states_by_operation.values()
-                if state.phase != "completed"
+                if state.phase not in TERMINAL_CORRELATION_PHASES
             )
 
     def _is_bound_to(self, store: SegmentStore) -> bool:

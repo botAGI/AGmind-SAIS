@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -402,5 +403,181 @@ func TestPCCAPIPermanentConflictFencePersistenceFailureIsUnavailable(
 		durable.PCCReceiptBytes != before.PCCReceiptBytes ||
 		durable.PCCReceiptHeadHash != before.PCCReceiptHeadHash {
 		t.Errorf("permanent conflict durable state changed: before=%+v after=%+v", before, durable)
+	}
+}
+
+// pccRetiredResponseFixture is the exact wire artifact both sides of the
+// retirement contract are pinned to. Core keys its ONLY terminal path on these
+// bytes, so the observer must produce them byte-for-byte.
+func pccRetiredResponseFixture(t *testing.T) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(
+		"../../contracts/fixtures/v1/observer-pcc-trigger-retired.response.json",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func pccAckThrough(t *testing.T, spool *Spool, through uint64) {
+	t.Helper()
+	for {
+		acked := spool.state.Snapshot().AckSequence
+		if acked >= through {
+			return
+		}
+		next := uint64(0)
+		spool.mutex.Lock()
+		for sequence := range spool.items {
+			if sequence > acked && (next == 0 || sequence < next) {
+				next = sequence
+			}
+		}
+		item := spool.items[next]
+		spool.mutex.Unlock()
+		if next == 0 || next > through {
+			t.Fatalf("no retained sequence to ACK toward %d", through)
+		}
+		if err := spool.Ack(
+			item.Sequence,
+			item.EventID,
+			item.ContentSHA256,
+		); err != nil {
+			t.Fatalf("ACK of sequence %d failed: %v", next, err)
+		}
+	}
+}
+
+func pccCorrelationResponse(
+	t *testing.T,
+	service *Service,
+	request contracts.PCCCorrelationSnapshotRequestV1,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := contracts.CanonicalJSON(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	pccCorrelationHandler(service).ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodPost,
+			"http://unix/v1/events/pcc-correlation-snapshot",
+			bytes.NewReader(raw),
+		),
+	)
+	return response
+}
+
+// A trigger Core itself acknowledged is retired forever: the observer states
+// that as 410 pcc_trigger_retired, the one response Core may treat as terminal.
+// Every other unresolvable or unavailable outcome must stay fail-closed.
+func TestPCCAPIRetiredTriggerIsTheOnlyTerminalRefusal(t *testing.T) {
+	t.Run("acknowledged trigger is stated terminal", func(t *testing.T) {
+		fixture := newPCCFailedPublishFixture(t)
+		pccAckThrough(
+			t,
+			fixture.spool,
+			fixture.request.TriggerSourceSequence,
+		)
+		before := fixture.state.Snapshot()
+		called := []string{}
+		pccFailDownstreamSubstrates(fixture.service, &called)
+
+		_, err := fixture.service.PublishPCCCorrelationSnapshot(
+			context.Background(),
+			fixture.request,
+		)
+		if !errors.Is(err, ErrPCCTriggerRetired) {
+			t.Fatalf("retired trigger error=%v want ErrPCCTriggerRetired", err)
+		}
+		if errors.Is(err, ErrPCCPublicationUnavailable) ||
+			errors.Is(err, ErrPCCPublicationConflict) {
+			t.Fatalf("retired trigger error is ambiguous: %v", err)
+		}
+
+		response := pccCorrelationResponse(t, fixture.service, fixture.request)
+		if response.Code != http.StatusGone {
+			t.Fatalf("retired trigger status=%d body=%q", response.Code, response.Body)
+		}
+		if !bytes.Equal(response.Body.Bytes(), pccRetiredResponseFixture(t)) {
+			t.Fatalf(
+				"retired trigger body=%q want the committed fixture bytes",
+				response.Body.Bytes(),
+			)
+		}
+		if response.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf(
+				"retired trigger Content-Type=%q",
+				response.Header().Get("Content-Type"),
+			)
+		}
+		after := fixture.state.Snapshot()
+		if after.MutationReadOnly ||
+			after.LastSequence != before.LastSequence ||
+			after.PCCReceiptCount != before.PCCReceiptCount {
+			t.Fatalf("retired refusal changed state: before=%+v after=%+v", before, after)
+		}
+		if len(called) != 0 {
+			t.Fatalf("retired trigger invoked downstream substrates: %v", called)
+		}
+	})
+
+	for name, mutate := range map[string]func(
+		*testing.T,
+		*pccFailedPublishFixture,
+	){
+		"unknown sequence": func(t *testing.T, fixture *pccFailedPublishFixture) {
+			t.Helper()
+			fixture.request.TriggerSourceSequence =
+				fixture.state.Snapshot().LastSequence + 100
+		},
+		"mismatched content hash": func(t *testing.T, fixture *pccFailedPublishFixture) {
+			t.Helper()
+			fixture.request.TriggerContentSHA256 = strings.Repeat("9", 64)
+		},
+		"read-only observer": func(t *testing.T, fixture *pccFailedPublishFixture) {
+			t.Helper()
+			// Retired AND read-only: ambiguity must win over terminality.
+			pccAckThrough(
+				t,
+				fixture.spool,
+				fixture.request.TriggerSourceSequence,
+			)
+			if err := fixture.state.PersistReadOnly(
+				"observer_pcc_retirement_ambiguity_test",
+			); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run("fail-closed: "+name, func(t *testing.T) {
+			fixture := newPCCFailedPublishFixture(t)
+			mutate(t, fixture)
+			called := []string{}
+			pccFailDownstreamSubstrates(fixture.service, &called)
+
+			_, err := fixture.service.PublishPCCCorrelationSnapshot(
+				context.Background(),
+				fixture.request,
+			)
+			if err == nil || errors.Is(err, ErrPCCTriggerRetired) {
+				t.Fatalf("ambiguous refusal claimed retirement: %v", err)
+			}
+			response := pccCorrelationResponse(t, fixture.service, fixture.request)
+			if response.Code == http.StatusGone ||
+				bytes.Contains(response.Body.Bytes(), []byte("pcc_trigger_retired")) {
+				t.Fatalf(
+					"ambiguous refusal status=%d body=%q",
+					response.Code,
+					response.Body,
+				)
+			}
+			if len(called) != 0 {
+				t.Fatalf("rejected trigger invoked downstream substrates: %v", called)
+			}
+		})
 	}
 }

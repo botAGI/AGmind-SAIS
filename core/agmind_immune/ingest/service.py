@@ -42,6 +42,7 @@ from agmind_immune.ingest.ack_journal import (
     AckJournalSnapshot,
 )
 from agmind_immune.ingest.correlation_journal import (
+    TERMINAL_CORRELATION_PHASES,
     CorrelationRequestJournal,
     _CorrelationRequestStateV1,
 )
@@ -84,6 +85,13 @@ _MAX_RETENTION_PREFLIGHT_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_RETENTION_TOMBSTONE_REQUEST_BYTES = 16 * 1024
 _MAX_RETENTION_BLOCKED_REQUEST_BYTES = 4 * 1024
 _MAX_CORRELATION_PATH_EVENTS = 4_096
+# The observer's ONE terminal refusal, pinned byte-for-byte against the artifact
+# host/observerd/pcc_api.go emits (contracts/fixtures/v1/
+# observer-pcc-trigger-retired.response.json). Status alone is never enough: a
+# response is only terminal when the status, the exact JSON media type, and
+# these exact bytes all match. Anything else keeps the fail-closed latch.
+_PCC_TRIGGER_RETIRED_STATUS = 410
+_PCC_TRIGGER_RETIRED_BODY = b'{"error":"pcc_trigger_retired"}\n'
 _MAX_CORRELATION_PATH_PAGES = 64
 _MAX_CORRELATION_PATH_RESPONSE_BYTES = 64 * 1024 * 1024
 PCC_CORRELATION_TTL_SECONDS = 120
@@ -346,6 +354,15 @@ class DeliveryAmbiguousAck(DeliveryRetryableError):
 
 class DeliveryFatalError(DeliveryError):
     """Delivery authority or protocol state is unsafe until restart/operator repair."""
+
+
+class CorrelationTriggerRetiredError(DeliveryError):
+    """The observer stated this exact request's trigger is retired forever.
+
+    This is the only observer refusal Core may treat as terminal for one
+    request: it is neither retryable (no retry can resolve a retired trigger)
+    nor fatal (the observer is healthy and every other request still works).
+    """
 
 
 class ObserverCoreTransport(Protocol):
@@ -631,6 +648,7 @@ class HTTPXObserverCoreTransport:
         operation: str,
         request_limit: int | None = None,
         request_limit_label: str | None = None,
+        terminal_refusal: tuple[int, bytes, type[DeliveryError]] | None = None,
     ) -> bytes:
         if self._closed:
             raise DeliveryFatalError("observer transport is closed")
@@ -673,6 +691,31 @@ class HTTPXObserverCoreTransport:
                             f"observer {operation} response exceeds bound"
                         )
                     return raw
+                if (
+                    terminal_refusal is not None
+                    and response.status_code == terminal_refusal[0]
+                ):
+                    # Read, do not discard: the terminal claim is only accepted
+                    # when the observer's exact stated artifact is delivered.
+                    # A truncated, padded, or differently-worded body is
+                    # ambiguous and must keep the fail-closed status path.
+                    expected = terminal_refusal[1]
+                    stated = await self._read_raw_bounded(
+                        response,
+                        len(expected) + 1,
+                    )
+                    if (
+                        response.headers.get("Content-Type") == "application/json"
+                        and stated == expected
+                    ):
+                        raise terminal_refusal[2](
+                            f"observer {operation} POST refused the request as "
+                            f"permanently unresolvable"
+                        )
+                    raise DeliveryFatalError(
+                        f"observer {operation} POST returned "
+                        f"{response.status_code}"
+                    )
                 await self._discard_error_body(response)
                 if response.status_code == 409:
                     raise DeliveryFatalError(
@@ -709,6 +752,11 @@ class HTTPXObserverCoreTransport:
             operation="PCC correlation snapshot",
             request_limit=4 * 1024,
             request_limit_label="4 KiB",
+            terminal_refusal=(
+                _PCC_TRIGGER_RETIRED_STATUS,
+                _PCC_TRIGGER_RETIRED_BODY,
+                CorrelationTriggerRetiredError,
+            ),
         )
 
     async def publish_repair_authorization(self, canonical_body: bytes) -> bytes:
@@ -3361,6 +3409,33 @@ class DeliveryCoordinator:
         self._coverage_adapter.apply_live_accepted(ref, receipt)
         return ref
 
+    def _retire_correlation(
+        self,
+        state: _CorrelationRequestStateV1,
+        reason: str,
+        cause: BaseException,
+    ) -> None:
+        """Durably abandon one request the observer stated is unresolvable."""
+        try:
+            retired = self._correlation_journal().mark_retired(
+                state.request_sha256,
+                reason,
+            )
+        except Exception as error:  # noqa: BLE001 - journal authority boundary
+            raise self._latch(
+                "correlation retirement durability is uncertain",
+                error,
+            )
+        if (
+            retired.phase != "retired"
+            or retired.retired_reason != reason
+            or retired.request_sha256 != state.request_sha256
+        ):
+            raise self._latch(
+                "correlation retirement did not record its exact reason",
+                cause,
+            )
+
     async def _post_selected_correlation(
         self,
         state: _CorrelationRequestStateV1,
@@ -3370,6 +3445,12 @@ class DeliveryCoordinator:
             raw = await self._transport.publish_correlation_snapshot(body)
         except asyncio.CancelledError:
             raise
+        except CorrelationTriggerRetiredError as error:
+            # The observer proved this trigger is gone for good. Abandon the
+            # request durably, with its reason, and keep serving: latching here
+            # would brick every future delivery over one unresolvable request.
+            self._retire_correlation(state, "observer_trigger_retired", error)
+            return None
         except DeliveryRetryableError:
             return None
         except DeliveryFatalError as error:
@@ -3681,7 +3762,7 @@ class DeliveryCoordinator:
                     error,
                 )
             accepted += 1
-            if selected is not None and selected.phase != "completed":
+            if selected is not None and selected.phase not in TERMINAL_CORRELATION_PHASES:
                 break
         return accepted
 
@@ -3780,10 +3861,10 @@ class DeliveryCoordinator:
                     )
                 accepted += 1
                 selected = self._select_candidate(ref)
-                if selected is not None and selected.phase != "completed":
+                if selected is not None and selected.phase not in TERMINAL_CORRELATION_PHASES:
                     break
 
-            if selected is not None and selected.phase != "completed":
+            if selected is not None and selected.phase not in TERMINAL_CORRELATION_PHASES:
                 correlation_accepted, correlation_confirmed, retry = (
                     await self._drive_correlation(
                         selected,

@@ -25,6 +25,13 @@ var (
 	ErrPriorityQuota = errors.New("priority spool quota exhausted")
 	ErrAckInvalid    = errors.New("invalid spool acknowledgement")
 	errSpoolReadOnly = errors.New("observer spool mutation read-only")
+	// errSpoolSequenceRetired marks the ONE unresolvable lookup outcome the
+	// observer can prove is permanent: Core's own durable ACK already covers
+	// the sequence, so the frame is retired and can never come back. Every
+	// other absence (never seen, identity mismatch, corrupt frame) stays an
+	// undecorated os.ErrNotExist / ErrSpoolCorrupt so callers keep their
+	// fail-closed behaviour.
+	errSpoolSequenceRetired = errors.New("observer spool sequence retired by ACK")
 )
 
 type Tier string

@@ -65,7 +65,17 @@ func pccCorrelationHandler(backend any) http.Handler {
 			proofRequest,
 		)
 		if err != nil {
-			if errors.Is(err, ErrPCCPublicationConflict) ||
+			if errors.Is(err, ErrPCCTriggerRetired) {
+				// Terminal, and stated as such: the trigger is retired, so no
+				// retry of this exact request can ever succeed. 410 Gone plus a
+				// dedicated code, never reused for a transport or availability
+				// failure, is the entire signal Core may treat as terminal.
+				fixedAPIError(
+					writer,
+					http.StatusGone,
+					"pcc_trigger_retired",
+				)
+			} else if errors.Is(err, ErrPCCPublicationConflict) ||
 				errors.Is(err, ErrPCCReceiptConflict) {
 				fixedAPIError(
 					writer,

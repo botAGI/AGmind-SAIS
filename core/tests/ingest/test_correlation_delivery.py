@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import agmind_immune.ingest.correlation_journal as correlation_module
+import httpx
 import pytest
 from agmind_immune.canonicaljson import (
     canonical_json,
@@ -22,6 +23,7 @@ from agmind_immune.ingest.service import (
     DeliveryCoordinator,
     DeliveryFatalError,
     DeliveryRetryableError,
+    HTTPXObserverCoreTransport,
 )
 from tests.ingest.test_pcc_correlation_snapshot import (
     _candidate_trigger,
@@ -34,6 +36,7 @@ from tests.ingest.test_pcc_correlation_snapshot import (
 from tests.ingest.test_service import (
     _coordinator,
     _DeliveryClock,
+    _OneChunkStream,
     _page_bytes,
     _recovered_coordinator,
     _ScriptedTransport,
@@ -1316,6 +1319,264 @@ async def test_invalid_cross_boot_chain_never_reaches_proof_observed(
     assert tuple(state.phase for state in correlation.pending()) == ("selected",)
     assert acknowledgements.snapshot().confirmed_through == 1
     assert acknowledgements.snapshot().pending is None
+    await _close_runtime(
+        delivery,
+        coverage,
+        correlation,
+        acknowledgements,
+        store,
+    )
+
+
+# --- observer-stated trigger retirement ------------------------------------
+#
+# Production artifact under test: the exact bytes host/observerd/pcc_api.go
+# writes for a retired trigger. Both sides are pinned to this one file, so a
+# reworded observer refusal breaks the Go test, not just this one.
+_RETIRED_RESPONSE = Path(
+    "contracts/fixtures/v1/observer-pcc-trigger-retired.response.json"
+).read_bytes()
+_JSON_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Content-Type-Options": "nosniff",
+}
+type _PCCResponse = tuple[int, dict[str, str], bytes | BaseException]
+
+
+class _ObserverHTTPStub:
+    """The observer Core-only API, served to the REAL Core transport."""
+
+    def __init__(
+        self,
+        *,
+        pcc: _PCCResponse | BaseException | None = None,
+        pages: tuple[bytes, ...] = (),
+    ) -> None:
+        self.pcc = pcc
+        self.pages = list(pages)
+        self.paths: list[str] = []
+        self.bodies: list[bytes] = []
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.paths.append(path)
+        self.bodies.append(await request.aread())
+        if path == "/v1/events/pcc-correlation-snapshot":
+            if self.pcc is None:
+                raise AssertionError("unexpected PCC publication")
+            if isinstance(self.pcc, BaseException):
+                raise self.pcc
+            status, headers, body = self.pcc
+            return httpx.Response(
+                status,
+                headers=headers,
+                stream=_OneChunkStream(body),
+            )
+        if path == "/v1/events/ack":
+            return httpx.Response(204, stream=_OneChunkStream(b""))
+        if path == "/v1/events":
+            if not self.pages:
+                raise AssertionError("unexpected fetch")
+            return httpx.Response(
+                200,
+                headers=_JSON_HEADERS,
+                stream=_OneChunkStream(self.pages.pop(0)),
+            )
+        raise AssertionError(f"unexpected observer path {path}")
+
+    def transport(self) -> HTTPXObserverCoreTransport:
+        return HTTPXObserverCoreTransport(
+            Path("/run/agmind-sais/observer-core/socket"),
+            transport=httpx.MockTransport(self.handler),
+        )
+
+    @property
+    def publications(self) -> int:
+        return self.paths.count("/v1/events/pcc-correlation-snapshot")
+
+
+def _durable_states(
+    correlation: CorrelationRequestJournal,
+) -> tuple[tuple[str, str | None], ...]:
+    return tuple(
+        (state.phase, state.retired_reason)
+        for state in correlation._states_by_operation.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_observer_stated_retirement_abandons_the_request_and_keeps_serving(
+    tmp_path: Path,
+) -> None:
+    """A journalled 'selected' request whose trigger the observer retired.
+
+    This is the production brick: Core reselects the same durable request after
+    every restart. The observer's stated refusal must retire it durably instead
+    of latching delivery forever.
+    """
+    path = tmp_path / "retired"
+    (
+        acceptance,
+        store,
+        acknowledgements,
+        correlation,
+        coverage,
+        _trigger,
+        _snapshot,
+        expected_body,
+    ) = _seed_selected(path)
+    stub = _ObserverHTTPStub(
+        pcc=(410, dict(_JSON_HEADERS), _RETIRED_RESPONSE),
+    )
+    delivery = DeliveryCoordinator.create(
+        acceptance,
+        acknowledgements,
+        correlation,
+        stub.transport(),
+        coverage=coverage,
+        clock=_DeliveryClock(),
+    )
+
+    # (a) The refusal is absorbed: no fatal latch, delivery stays usable.
+    result = await delivery.poll_once()
+
+    assert stub.bodies == [expected_body]
+    assert result.retry_required is True
+    assert correlation.pending() == ()
+    assert _durable_states(correlation) == (("retired", "observer_trigger_retired"),)
+    await _close_runtime(
+        delivery,
+        coverage,
+        correlation,
+        acknowledgements,
+        store,
+    )
+
+    # (b) The retirement is durable: a restart replays it as terminal and the
+    #     request is never re-driven (a second POST would raise here).
+    key = private_key(11)
+    follow_on = envelope_value(
+        key,
+        sequence=3,
+        normalized_fields={"kind": "after-retirement"},
+    )
+    restarted = _ObserverHTTPStub(
+        pages=(_page_bytes(follow_on, acked_through=1, reserved_through=3),),
+    )
+    (
+        _acceptance,
+        store,
+        acknowledgements,
+        correlation,
+        coverage,
+        delivery,
+    ) = _reopen_runtime(path, restarted.transport())
+
+    assert correlation.pending() == ()
+    assert _durable_states(correlation) == (("retired", "observer_trigger_retired"),)
+
+    # (c) Delivery continues: the retired trigger no longer pins the ACK
+    #     ceiling, so Core ingests and confirms past it.
+    resumed = await delivery.poll_once()
+
+    assert restarted.publications == 0
+    assert resumed.accepted == 1
+    assert resumed.confirmed_through == 3
+    assert acknowledgements.snapshot().pending is None
+    assert correlation.pending() == ()
+    await _close_runtime(
+        delivery,
+        coverage,
+        correlation,
+        acknowledgements,
+        store,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "pcc", "expected"),
+    [
+        (
+            "malformed request refusal",
+            (400, dict(_JSON_HEADERS), b'{"error":"invalid_pcc_correlation_request"}\n'),
+            DeliveryFatalError,
+        ),
+        (
+            "gone with another reason",
+            (410, dict(_JSON_HEADERS), b'{"error":"pcc_publication_unavailable"}\n'),
+            DeliveryFatalError,
+        ),
+        (
+            "gone without the exact media type",
+            (410, {"Content-Type": "application/json; charset=utf-8"}, _RETIRED_RESPONSE),
+            DeliveryFatalError,
+        ),
+        (
+            "gone with a truncated statement",
+            (410, dict(_JSON_HEADERS), _RETIRED_RESPONSE[:-1]),
+            DeliveryFatalError,
+        ),
+        (
+            "gone with a padded statement",
+            (410, dict(_JSON_HEADERS), _RETIRED_RESPONSE + b" "),
+            DeliveryFatalError,
+        ),
+        (
+            "gone with an empty body",
+            (410, dict(_JSON_HEADERS), b""),
+            DeliveryFatalError,
+        ),
+        (
+            "transport failure mid-refusal",
+            httpx.ConnectError("observer socket vanished"),
+            None,
+        ),
+        (
+            "broken stream mid-refusal",
+            (410, dict(_JSON_HEADERS), httpx.ReadError("truncated refusal")),
+            None,
+        ),
+    ],
+)
+async def test_ambiguous_refusals_never_retire_the_request(
+    tmp_path: Path,
+    name: str,
+    pcc: _PCCResponse | BaseException,
+    expected: type[BaseException] | None,
+) -> None:
+    """Only the exact stated artifact is terminal; everything else fails closed."""
+    path = tmp_path / name.replace(" ", "-")
+    (
+        acceptance,
+        store,
+        acknowledgements,
+        correlation,
+        coverage,
+        _trigger,
+        _snapshot,
+        _expected_body,
+    ) = _seed_selected(path)
+    stub = _ObserverHTTPStub(pcc=pcc)
+    delivery = DeliveryCoordinator.create(
+        acceptance,
+        acknowledgements,
+        correlation,
+        stub.transport(),
+        coverage=coverage,
+        clock=_DeliveryClock(),
+    )
+
+    if expected is None:
+        result = await delivery.poll_once()
+        assert result.retry_required is True
+    else:
+        with pytest.raises(expected):
+            await delivery.poll_once()
+
+    assert tuple(state.phase for state in correlation.pending()) == ("selected",)
+    assert _durable_states(correlation) == (("selected", None),)
+    assert acknowledgements.snapshot().confirmed_through == 1
     await _close_runtime(
         delivery,
         coverage,

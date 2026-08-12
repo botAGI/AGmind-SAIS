@@ -57,5 +57,11 @@ production-ready and no version is tagged.
   now bounded per call and resumes from where it stopped.
 - Containerised Go builds no longer fail on VCS stamping or the darwin
   cross-compile.
+- A correlation request whose trigger the observer has retired no longer bricks
+  Core. The observer now states that one terminal outcome explicitly
+  (`410 pcc_trigger_retired`, keyed on the trigger being at or below the durable
+  ACK anchor), and Core abandons the request durably in its correlation journal
+  as `phase: retired` with a stated reason instead of latching fatally forever.
+  Every other refusal — transport, protocol, or ambiguous — still fails closed.
 
 [Unreleased]: https://github.com/botAGI/AGmind-SAIS/commits/main

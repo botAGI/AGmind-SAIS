@@ -895,10 +895,15 @@ func (spool *Spool) lookupUnacknowledgedLocked(
 		return SpoolItem{}, errors.Join(ErrSpoolCorrupt, errSpoolReadOnly)
 	}
 	if spool.closed || sourceSequence == 0 ||
-		sourceSequence <= snapshot.AckSequence ||
 		!eventPattern.MatchString(eventID) ||
 		!hex64Pattern.MatchString(contentSHA256) {
 		return SpoolItem{}, os.ErrNotExist
+	}
+	if sourceSequence <= snapshot.AckSequence {
+		// Retirement is authoritative and permanent: the ACK anchor only ever
+		// advances, and it advanced because Core itself confirmed the frame.
+		// Joined with os.ErrNotExist so every existing caller is unchanged.
+		return SpoolItem{}, errors.Join(os.ErrNotExist, errSpoolSequenceRetired)
 	}
 	item, found := spool.items[sourceSequence]
 	if !found || item.EventID != eventID || item.ContentSHA256 != contentSHA256 {

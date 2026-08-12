@@ -264,13 +264,15 @@ blocking) body is read, and there is no public-socket exposure. Only Core may re
 peer-credential checks bound the trust boundary to the local Core UID, and authenticating before
 the body read prevents an unauthenticated peer from tying up the handler with a slow body. The
 handler strictly reads one bounded canonical request and maps outcomes exactly: created to 201,
-exact retry to 200, conflict to 409, hard-fence unavailable to 503 with a fixed code, returning
+exact retry to 200, conflict to 409, a retired trigger to 410 with a fixed code (see the
+`retired` phase amendment below), hard-fence unavailable to 503 with a fixed code, returning
 the exact `CoreEventV1` JSON.
 
 On the Core side, `publish_correlation_snapshot` POSTs the exact canonical bytes — no mutation,
 no redirects, no content-encoding — with the request bounded to 4 KiB and the response to
 `MAX_CORE_EVENT_RESPONSE_BYTES`. Only 200/201 with exact JSON succeed; a typed 503 maps to
-`DeliveryRetryableError` and 409 to `DeliveryFatalError`. The tight request bound reflects the
+`DeliveryRetryableError`, 409 to `DeliveryFatalError`, and only the exact stated 410 artifact to
+`CorrelationTriggerRetiredError`. The tight request bound reflects the
 frozen five-field request: any schema change that grows past 4 KiB breaks transport by design.
 
 ### Core persists a three-phase correlation request journal in the evidence root
@@ -292,6 +294,24 @@ The request must be durable before the POST so a crash cannot produce two differ
 one trigger; keeping it in the evidence root binds request state to the same integrity domain as
 the evidence it governs. Recovery replays the legal phase union per operation, re-canonicalizes
 the nested request, recomputes hash and operation key, and refuses an unproven tail.
+
+**Amendment — the fourth phase, `retired`.** A `selected` request can name a trigger the observer
+has legitimately retired (its sequence is at or below the observer's durable ACK anchor, so the
+frame is gone and no retry can ever resolve it). The original three-phase machine had no terminal
+outcome for that, so the refusal latched delivery fatally and every restart re-drove the same
+journalled request — a permanent, durable brick. The machine now admits
+`selected -> retired` as a terminal abandonment carrying a mandatory `retired_reason`
+(`observer_trigger_retired`). It never carries snapshot identity, never claims completion,
+nothing may follow it, and it is journalled like any other phase, so a restart replays it as
+terminal. The observer states the outcome explicitly — `410 Gone` with the fixed body
+`{"error":"pcc_trigger_retired"}` (pinned for both sides in
+`contracts/fixtures/v1/observer-pcc-trigger-retired.response.json`) — and Core accepts the
+terminal path only when status, exact JSON media type, and exact body bytes all match. Every
+other refusal, including `400`, `409`, `503`, a `410` worded differently, and any transport or
+stream failure, keeps the previous fail-closed behaviour. Whether a retirement should ALSO be
+published as a signed fact ("a candidate was abandoned because its evidence retired") is left
+open: Core signs nothing today, and the observer has no envelope for it, so the durable
+hash-chained journal record is the current authority.
 
 **Superseded detail — record cap.** The original design fixed this journal at 4,096 records.
 Current code supersedes that with `_MAX_RECORDS = 12_291` (3 × 4,097): the planned cap counted

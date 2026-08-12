@@ -18,9 +18,15 @@ import (
 )
 
 var (
-	ErrPCCPublicationUnavailable           = errors.New("PCC publication unavailable")
-	ErrPCCPublicationConflict              = errors.New("PCC publication request conflict")
-	ErrPCCTriggerInvalid                   = errors.New("PCC trigger authority invalid")
+	ErrPCCPublicationUnavailable = errors.New("PCC publication unavailable")
+	ErrPCCPublicationConflict    = errors.New("PCC publication request conflict")
+	ErrPCCTriggerInvalid         = errors.New("PCC trigger authority invalid")
+	// ErrPCCTriggerRetired is the ONLY unresolvable-trigger outcome the
+	// observer states as terminal to Core: the trigger sequence is at or below
+	// the durable ACK anchor, so the observer retired it and no retry can ever
+	// resolve it. Everything else that cannot be resolved stays
+	// ErrPCCTriggerInvalid / ErrPCCPublicationUnavailable.
+	ErrPCCTriggerRetired                   = errors.New("PCC trigger retired by Core ACK")
 	ErrPCCReceiptRequired                  = errors.New("PCC snapshot requires specialized receipt")
 	ErrPCCDockerNetworkSnapshotUnavailable = errors.New(
 		"PCC Docker network snapshot unavailable",
@@ -807,6 +813,13 @@ func (service *Service) PublishPCCCorrelationSnapshot(
 		}
 		if errors.Is(err, ErrSpoolCorrupt) {
 			_ = state.PersistReadOnly("observer_pcc_trigger_lookup_corrupt")
+		}
+		if errors.Is(err, errSpoolSequenceRetired) &&
+			!errors.Is(err, ErrSpoolCorrupt) {
+			return PCCCorrelationPublication{}, errors.Join(
+				ErrPCCTriggerRetired,
+				err,
+			)
 		}
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, ErrSpoolCorrupt) {
 			return PCCCorrelationPublication{}, errors.Join(
