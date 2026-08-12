@@ -1061,21 +1061,47 @@ func (service *Service) monitorDockerContinuously(ctx context.Context) {
 	}
 }
 
+// missingObserverRuntimeDependency names the first dependency the runtime needs and does not have,
+// or "" when every one is present. Ten nil checks used to collapse into a single opaque sentence,
+// which was all an operator saw in the journal when the daemon refused to start: it identified
+// nothing, so diagnosis meant reading this source. The names describe internal wiring an operator
+// already controls on the host, so stating them discloses nothing.
+func missingObserverRuntimeDependency(
+	daemon *Daemon,
+	options observerRuntimeOptions,
+) string {
+	if daemon == nil {
+		return "daemon"
+	}
+	switch {
+	case daemon.state == nil:
+		return "durable state"
+	case daemon.spool == nil:
+		return "evidence spool"
+	case daemon.signer == nil:
+		return "event signer"
+	case options.openDocker == nil:
+		return "Docker reader"
+	case options.processes == nil:
+		return "process table reader"
+	case options.groupID == nil:
+		return "group resolver"
+	case options.userID == nil:
+		return "user resolver"
+	case options.listen == nil:
+		return "socket listener"
+	case options.now == nil:
+		return "clock"
+	}
+	return ""
+}
+
 func (daemon *Daemon) runWithOptions(
 	ctx context.Context,
 	options observerRuntimeOptions,
 ) error {
-	if daemon == nil ||
-		daemon.state == nil ||
-		daemon.spool == nil ||
-		daemon.signer == nil ||
-		options.openDocker == nil ||
-		options.processes == nil ||
-		options.groupID == nil ||
-		options.userID == nil ||
-		options.listen == nil ||
-		options.now == nil {
-		return fmt.Errorf("observer runtime dependencies unavailable")
+	if missing := missingObserverRuntimeDependency(daemon, options); missing != "" {
+		return fmt.Errorf("observer runtime dependency unavailable: %s", missing)
 	}
 	if err := daemon.config.Validate(); err != nil {
 		return err
